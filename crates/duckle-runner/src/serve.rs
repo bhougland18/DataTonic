@@ -3253,10 +3253,25 @@ mod tests {
             200,
             "a viewer may read the catalog"
         );
+        let refused = route_console(&request("POST", "/api/deploy", Some(&viewer)), &state);
+        assert_eq!(refused.code(), 403, "a viewer must not deploy");
+
+        // The shape of the refusal, not just its code. `docs/current/ci-and-orchestration.md`
+        // tells people writing a CI step that a mis-scoped key comes back as
+        // `{"error": "..."}`, and a pipeline that reads it with `jq -r .error` breaks
+        // silently if this ever becomes plain text. The console has both kinds of refusal
+        // in it - the cross-origin guard answers text/plain - so which one this route uses
+        // is worth holding still.
         assert_eq!(
-            route_console(&request("POST", "/api/deploy", Some(&viewer)), &state).code(),
-            403,
-            "a viewer must not deploy"
+            refused.content_type, "application/json",
+            "a documented JSON refusal became {}",
+            refused.content_type
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&refused.body).expect("a 403 body must parse as JSON");
+        assert_eq!(
+            body["error"], "this needs the admin role; you have viewer",
+            "the refusal must say which role is needed and which one the caller has"
         );
     }
 
