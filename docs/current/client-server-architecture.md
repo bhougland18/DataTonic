@@ -254,10 +254,12 @@ at open time to avoid a world-readable window. Windows gets default inherited pe
 the UI and in logs* - it does not encrypt anything on disk. Treat `contexts/*.json` as
 readable.
 
-**`.duckle/.gitignore` does not cover everything sensitive.** It excludes `secrets/` and
-`keys/`, which is the important half. It does **not** exclude `.duckle/settings.json` (AI
-key, proxy URL which may embed `user:pass`) or `.duckle/deploy-targets.json` (encrypted, but
-still). Check before committing a workspace.
+**`.duckle/.gitignore` now covers the whole set**, and is re-asserted before every stage
+rather than only at `git init`: `secrets/`, `keys/`, `locks/`, `settings.json`,
+`deploy-targets.json` and the console database. Earlier builds wrote a shorter list and
+never revisited it, so a workspace created before this change kept the old file; opening it
+in a current build and staging anything repairs it. If you have such a workspace and do not
+want to wait, check `git check-ignore -v .duckle/keys/secret.key` says it is ignored.
 
 **Only 15 field names are encrypted in a connection.** The list is an explicit allowlist -
 `password`, `secretKey`, `accessKey`, `accountKey` and so on. A credential you put in a

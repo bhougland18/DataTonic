@@ -243,6 +243,10 @@ pub fn clone(parent: &Path, url: &str, folder_name: &str) -> GitResult<PathBuf> 
 }
 
 pub fn add_all(workspace: &Path) -> GitResult<()> {
+    // Before staging, not only at git init. This is what repairs a workspace whose
+    // ignore file was written before the list grew; without it, an older workspace
+    // stays one click away from committing its own encryption key.
+    write_gitignore_safety(workspace);
     run_git(workspace, &["add", "-A"])?;
     Ok(())
 }
@@ -424,17 +428,46 @@ pub fn clear_pat(workspace: &Path) -> GitResult<()> {
     Ok(())
 }
 
-/// Ensure `<workspace>/.duckle/.gitignore` excludes the `secrets/` dir (cached
-/// PAT) and the `keys/` dir (the connection-secret encryption key). The
-/// encrypted `connections/` files are safe to commit; the key is not.
-/// Idempotent - only adds a line if it is missing.
+/// Everything under `.duckle/` that must never reach a remote.
+///
+/// The Commit button stages with `git add -A`, so this list is not advice: anything
+/// missing from it is something Duckle itself will push.
+///
+/// - `keys/` is the key that decrypts `connections/`. The encrypted connection files are
+///   safe to commit precisely BECAUSE this is not.
+/// - `secrets/` is the cached Git token.
+/// - `settings.json` holds the AI API key and the HTTP proxy URL, which may carry
+///   `user:pass`. Neither is encrypted.
+/// - `deploy-targets.json` holds server API keys. They are encrypted with `keys/`, so
+///   committing both would undo that; and a list of your servers is not repository
+///   content anyway.
+/// - `console.db*` holds server accounts and API-key hashes, plus its WAL sidecars.
+/// - `locks/` is runtime state that changes on every run.
+const GITIGNORE_SAFETY: &[&str] = &[
+    "secrets/",
+    "keys/",
+    "locks/",
+    "settings.json",
+    "deploy-targets.json",
+    "console.db",
+    "console.db-wal",
+    "console.db-shm",
+];
+
+/// Ensure `<workspace>/.duckle/.gitignore` excludes everything in [`GITIGNORE_SAFETY`].
+///
+/// Idempotent, and deliberately re-run before every commit rather than only at git init:
+/// the list has grown over time, and a workspace whose ignore file was written by an
+/// older build keeps that older file forever. One was found on a real machine holding
+/// only `secrets/`, which left the encryption key, the AI key and the proxy URL staged
+/// for the next commit.
 fn write_gitignore_safety(workspace: &Path) {
     let dir = workspace.join(".duckle");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(".gitignore");
     let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut changed = false;
-    for need in ["secrets/", "keys/"] {
+    for need in GITIGNORE_SAFETY.iter().copied() {
         if !existing.lines().any(|l| l.trim() == need) {
             if existing.is_empty() {
                 existing = format!("{}\n", need);
@@ -482,6 +515,41 @@ fn looks_like_auth_failure(stderr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// The Commit button stages with `git add -A`, so anything this list misses is
+    /// something Duckle itself will push to a remote.
+    ///
+    /// This started as a real workspace on this machine whose `.duckle/.gitignore` held
+    /// only `secrets/`: the encryption key, the AI API key and the proxy URL were all
+    /// untracked-but-not-ignored, and one click would have committed them. The list had
+    /// grown since that file was written and nothing ever revisited it.
+    #[test]
+    fn the_ignore_list_covers_everything_a_commit_would_otherwise_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        // An older workspace: the file exists but predates most of the list.
+        std::fs::create_dir_all(ws.join(".duckle")).unwrap();
+        std::fs::write(ws.join(".duckle").join(".gitignore"), "secrets/
+").unwrap();
+
+        write_gitignore_safety(ws);
+
+        let got = std::fs::read_to_string(ws.join(".duckle").join(".gitignore")).unwrap();
+        let lines: Vec<&str> = got.lines().map(str::trim).collect();
+        for need in GITIGNORE_SAFETY {
+            assert!(
+                lines.contains(need),
+                "a commit would push {need}; the ignore file says {got:?}"
+            );
+        }
+        // The key is the one that matters most: it decrypts everything else.
+        assert!(lines.contains(&"keys/"), "the encryption key would be committed");
+        // Idempotent: running it again must not duplicate anything.
+        write_gitignore_safety(ws);
+        let twice = std::fs::read_to_string(ws.join(".duckle").join(".gitignore")).unwrap();
+        assert_eq!(got, twice, "running it twice changed the file");
+    }
 
     #[test]
     fn detect_provider_works() {
