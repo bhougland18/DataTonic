@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Deploy Duckle on AWS, Azure or GCP - Duckle</title>
-<meta name="description" content="Deploy Duckle on your own cloud: EC2, ECS and EKS on AWS, VM, Container Apps and AKS on Azure, Compute Engine and GKE on Google Cloud. Working manifests, systemd units and the mistakes that cost an afternoon." />
+<meta name="description" content="Deploy Duckle on your own servers or cloud: how the studio and server fit together, a twelve-step walkthrough from an empty folder to a scheduled run, then EC2, ECS and EKS on AWS, VM, Container Apps and AKS on Azure, Compute Engine and GKE on Google Cloud." />
 <meta name="keywords" content="deploy ETL, self-hosted ETL, Duckle on EKS, Duckle on AWS, ETL on Kubernetes, self-hosted data pipelines, ETL EC2, ETL AKS, ETL GKE, docker ETL, scheduled data pipelines" />
 <meta property="og:title" content="Deploy Duckle on your own cloud" />
 <meta property="og:description" content="EC2, ECS and EKS on AWS. VM, Container Apps and AKS on Azure. Compute Engine and GKE on Google Cloud. Working manifests and the three things that stop people." />
@@ -82,7 +82,7 @@
   .rung:first-child { border-radius:var(--radius-sm) var(--radius-sm) 0 0; }
   .rung:last-child { border-radius:0 0 var(--radius-sm) var(--radius-sm); }
   .rung + .rung { border-top:0; }
-  .rung b { font-family:var(--mono); font-size:.9rem; }
+  .rung > b { font-family:var(--mono); font-size:.9rem; }
   .rung span { color:var(--ink-2); font-size:.92rem; line-height:1.6; }
   .rung em { color:var(--ink); font-style:normal; font-weight:600; }
   ul.tight { margin:10px 0 16px; padding-left:20px; color:var(--ink-2); font-size:.92rem; line-height:1.7; }
@@ -103,7 +103,7 @@
   "@context": "https://schema.org",
   "@type": "TechArticle",
   "headline": "Deploy Duckle on AWS, Azure or GCP",
-  "description": "Self-host Duckle on your own cloud: EC2, ECS on Fargate and EKS on AWS; Virtual Machine, Container Apps and AKS on Azure; Compute Engine and GKE on Google Cloud. Working manifests, systemd units, roles, and the mistakes that cost an afternoon.",
+  "description": "Deploy Duckle on servers or a cloud account you own. The client-server architecture with diagrams, a twelve-step walkthrough from an empty folder to a scheduled run, then working manifests for EC2, ECS on Fargate and EKS on AWS; Virtual Machine, Container Apps and AKS on Azure; Compute Engine and GKE on Google Cloud.",
   "author": { "@type": "Organization", "name": "SlothFlow Labs" },
   "publisher": {
     "@type": "Organization",
@@ -219,8 +219,10 @@
     <p class="cap">Three crossings, and the boundary is drawn only where something crosses it. <b>Deploying needs the admin role and turning the schedule on needs only operator</b>, because shipping code to a host and deciding when trusted code runs are different sizes of decision.</p>
 
     <div class="dep-toc">
+      <a href="#architecture">Architecture</a>
       <a href="#modes">Two server modes</a>
       <a href="#stoppers">Three stoppers</a>
+      <a href="#steps">Step by step</a>
       <a href="#reference">Reference</a>
       <a href="#auth">Who can do what</a>
       <a href="#aws">AWS</a>
@@ -229,6 +231,131 @@
       <a href="#scaling">Scaling</a>
       <a href="#hardening">Hardening</a>
     </div>
+  </div>
+</section>
+
+<section class="section" id="architecture">
+  <div class="wrap">
+    <h2>The two halves, and what crosses between them</h2>
+    <p class="muted">Duckle is one program in two roles. Knowing which half holds what explains every rule further down this page.</p>
+
+    <div class="dgram">
+      <svg viewBox="0 0 900 300" role="img" aria-label="Your machine runs the Duckle Studio against a workspace folder. A server you own runs duckle-runner serve against a workspace folder in the same format, with a web console in front of it. Deploying sends a pipeline from the studio to the server and needs the admin role.">
+        <defs>
+          <marker id="h-go" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--dg-go)"/>
+          </marker>
+          <marker id="h-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-2)" opacity=".8"/>
+          </marker>
+        </defs>
+
+        <text class="lane" x="24" y="26">YOUR MACHINE</text>
+        <text class="lane" x="516" y="26">A SERVER YOU OWN</text>
+        <line class="bound" x1="455" y1="14" x2="455" y2="290"/>
+
+        <rect class="a-box" x="24" y="48" width="330" height="62" rx="8"/>
+        <text class="a-t" x="44" y="74">Duckle Studio</text>
+        <text class="a-s" x="44" y="94">author, preview, run on your own machine</text>
+
+        <rect class="a-box" x="24" y="170" width="330" height="62" rx="8"/>
+        <text class="a-t" x="44" y="196">Workspace folder</text>
+        <text class="a-s" x="44" y="216">pipelines, connections, contexts</text>
+
+        <line class="a-line" x1="185" y1="112" x2="185" y2="166" marker-end="url(#h-p)"/>
+        <line class="a-line" x1="205" y1="168" x2="205" y2="114" marker-end="url(#h-p)"/>
+
+        <rect class="a-box" x="516" y="48" width="360" height="62" rx="8"/>
+        <text class="a-t" x="536" y="74">duckle-runner serve</text>
+        <text class="a-s" x="536" y="94">execute, schedule, record</text>
+
+        <rect class="a-box" x="516" y="170" width="360" height="62" rx="8"/>
+        <text class="a-t" x="536" y="196">Workspace folder</text>
+        <text class="a-s" x="536" y="216">the same format, so the file just runs</text>
+
+        <rect class="a-box" x="516" y="248" width="360" height="42" rx="8"/>
+        <text class="a-t" x="536" y="274">Web console, in a browser</text>
+
+        <line class="a-line" x1="692" y1="112" x2="692" y2="166" marker-end="url(#h-p)"/>
+        <line class="a-line" x1="712" y1="168" x2="712" y2="114" marker-end="url(#h-p)"/>
+        <polyline class="a-line" points="878,269 890,269 890,79 880,79" marker-end="url(#h-p)"/>
+        <text class="lb-q" x="884" y="176" text-anchor="middle" transform="rotate(-90 884 176)">served by</text>
+
+        <line class="a-go" x1="358" y1="79" x2="510" y2="79" marker-end="url(#h-go)"/>
+        <text class="lb-go" x="434" y="68" text-anchor="middle">DEPLOY</text>
+        <text class="lb-q" x="434" y="99" text-anchor="middle">admin</text>
+      </svg>
+    </div>
+    <p class="cap">One arrow crosses, and it goes one way. The studio never reads the server's workspace and the server never reaches back into yours, which is why a deploy is a copy and not a sync: <b>the file you authored is the file that runs</b>.</p>
+
+    <h3 class="dep-h3">How the studio gets a key, once</h3>
+    <div class="dgram">
+      <svg viewBox="0 0 900 286" role="img" aria-label="Setting up once: the studio asks GET slash setup and the server answers 200 unclaimed or 410 already set up, then the studio posts to the claim endpoint and receives a token that is issued once and never again. Every time after that the studio calls deploy with that token as a bearer credential.">
+        <defs>
+          <marker id="h-req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--dg-go)"/>
+          </marker>
+          <marker id="h-res" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-2)" opacity=".85"/>
+          </marker>
+        </defs>
+
+        <rect class="a-box" x="86" y="14" width="150" height="34" rx="8"/>
+        <text class="a-t" x="161" y="36" text-anchor="middle">Studio</text>
+        <rect class="a-box" x="664" y="14" width="150" height="34" rx="8"/>
+        <text class="a-t" x="739" y="36" text-anchor="middle">Server</text>
+        <line class="bound" x1="161" y1="52" x2="161" y2="276"/>
+        <line class="bound" x1="739" y1="52" x2="739" y2="276"/>
+
+        <text class="lane" x="24" y="78">SETTING UP, ONCE</text>
+        <line class="a-go" x1="163" y1="104" x2="735" y2="104" marker-end="url(#h-req)"/>
+        <text class="lb-go" x="450" y="96" text-anchor="middle">GET /setup</text>
+        <line class="a-line" x1="737" y1="132" x2="165" y2="132" marker-end="url(#h-res)"/>
+        <text class="lb-q" x="450" y="124" text-anchor="middle">200 unclaimed, or 410 already set up</text>
+
+        <line class="a-go" x1="163" y1="166" x2="735" y2="166" marker-end="url(#h-req)"/>
+        <text class="lb-go" x="450" y="158" text-anchor="middle">POST /api/setup/claim</text>
+        <line class="a-line" x1="737" y1="194" x2="165" y2="194" marker-end="url(#h-res)"/>
+        <text class="lb-q" x="450" y="186" text-anchor="middle">a token, issued once and never again</text>
+
+        <text class="lane" x="24" y="238">EVERY TIME AFTER THAT</text>
+        <line class="a-go" x1="163" y1="262" x2="735" y2="262" marker-end="url(#h-req)"/>
+        <text class="lb-go" x="450" y="254" text-anchor="middle">POST /api/deploy, carrying that token</text>
+      </svg>
+    </div>
+    <p class="cap">The token is shown once because the server stores only a hash of it. Lose it and you mint another with <code>console key-add</code>; there is no screen anywhere that will show you the old one.</p>
+
+    <h3 class="dep-h3">The three states a server can be in</h3>
+    <div class="dgram">
+      <svg viewBox="0 0 900 200" role="img" aria-label="A server is in one of three states. Local means loopback with no accounts, so it is open and reaching it means sitting at it. Unclaimed means reachable with no accounts, so only the setup route answers and only for fifteen minutes. Claimed means it has accounts or a token, so ordinary sign-in and roles apply.">
+        <defs>
+          <marker id="h-st" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--dg-go)"/>
+          </marker>
+        </defs>
+        <rect class="a-box" x="24" y="30" width="250" height="88" rx="8"/>
+        <text class="a-t" x="44" y="56">Local</text>
+        <text class="a-s" x="44" y="78">loopback, no accounts</text>
+        <text class="a-s" x="44" y="98">open: reaching it means sitting at it</text>
+
+        <rect class="a-box" x="322" y="30" width="250" height="88" rx="8"/>
+        <text class="a-t" x="342" y="56">Unclaimed</text>
+        <text class="a-s" x="342" y="78">reachable, no accounts</text>
+        <text class="a-s" x="342" y="98">only /setup answers, for 15 minutes</text>
+
+        <rect class="a-box" x="620" y="30" width="256" height="88" rx="8"/>
+        <text class="a-t" x="640" y="56">Claimed</text>
+        <text class="a-s" x="640" y="78">has accounts or a token</text>
+        <text class="a-s" x="640" y="98">ordinary sign-in, roles apply</text>
+
+        <line class="a-go" x1="576" y1="74" x2="616" y2="74" marker-end="url(#h-st)"/>
+        <text class="lb-go" x="596" y="64" text-anchor="middle">claimed</text>
+
+        <polyline class="a-go" points="149,122 149,162 748,162 748,122" marker-end="url(#h-st)"/>
+        <text class="lb-go" x="449" y="178" text-anchor="middle">an account is created</text>
+      </svg>
+    </div>
+    <p class="cap">A server bound off this machine with no credential <b>refuses to start</b> rather than coming up open. The fifteen-minute window exists so an unclaimed server on a network cannot sit waiting to be claimed by whoever reaches it first.</p>
   </div>
 </section>
 
@@ -286,6 +413,47 @@
       <b>Probe <code>/healthz</code>, and nothing else.</b>
       <p><code>GET /healthz</code> is the one route that needs no credential. It answers <code>ok</code> and says nothing about the workspace, so an orchestrator can check liveness without holding a token. Every other route returns 401 without one, so pointing a probe at <code>/</code> marks the pod unhealthy forever.</p>
     </div>
+  </div>
+</section>
+
+<section class="section" id="steps">
+  <div class="wrap">
+    <h2>From an empty folder to a scheduled run</h2>
+    <p class="muted">Twelve steps, in order, none of them cloud-specific. Do this once on any box you can reach and the provider sections below are only a different way to start the same process.</p>
+
+    <h3 class="dep-h3">Part 1: start a server</h3>
+    <div class="ladder">
+      <div class="rung"><b>Step 1</b><span><em>Make an empty folder for it.</em> <code>C:\duckle-server</code> or <code>~/duckle-server</code>. This becomes the server's workspace, and Duckle writes everything it needs inside it. Do not point it at your studio workspace.</span></div>
+      <div class="rung"><b>Step 2</b><span><em>Get the runner onto the box.</em> Either the studio's setup wizard, which saves it under your app-data folder, or download <code>duckle-runner-linux-x64</code> from the latest release. Remember it does not bundle DuckDB: set <code>DUCKLE_DUCKDB_BIN</code>.</span></div>
+      <div class="rung"><b>Step 3</b><span><em>Start it.</em> <code>duckle-runner serve --workspace ~/duckle-server --host 0.0.0.0 --port 8095</code>. <b>Without <code>--host 0.0.0.0</code> it binds to loopback</b>, the studio cannot reach it, and it can never be claimed. This is the single most common way to lose an afternoon.</span></div>
+    </div>
+
+    <h3 class="dep-h3">Part 2: connect the studio to it</h3>
+    <div class="ladder">
+      <div class="rung"><b>Step 4</b><span><em>Finish the wizard.</em> In the studio, choose where the server runs and give it the address, <code>http://&lt;host&gt;:8095</code>. The studio checks it answers before it offers to claim it.</span></div>
+      <div class="rung"><b>Step 5</b><span><em>Claim it, within 15 minutes.</em> The server hands back a token exactly once and stores only a hash. The studio keeps it encrypted, so you never paste it again. Miss the window and you restart the server to reopen it.</span></div>
+      <div class="rung"><b>Step 6</b><span><em>Check it locked itself down.</em> Reload <code>/setup</code> in a browser. It must answer <code>410 Gone</code>. If it still shows the claim page, it is still claimable by anyone who can reach the port.</span></div>
+    </div>
+
+    <h3 class="dep-h3">Part 3: publish a pipeline</h3>
+    <div class="ladder">
+      <div class="rung"><b>Step 7</b><span><em>Open a pipeline</em> in the studio, one that already runs locally. Deploying does not validate it for you; a pipeline that is broken here is broken there.</span></div>
+      <div class="rung"><b>Step 8</b><span><em>Deploy it.</em> Needs the <b>admin</b> role. The dialog lists exactly what is about to leave the machine, including how many cached preview rows it is stripping, and will show you the literal JSON before you send it.</span></div>
+    </div>
+
+    <h3 class="dep-h3">Part 4: confirm what actually landed</h3>
+    <div class="ladder">
+      <div class="rung"><b>Step 9</b><span><em>Look at the server's folder.</em> <code>pipelines/&lt;name&gt;.json</code> is now there. That file, not a database row, is the deployed pipeline, which is why the server workspace is worth putting in git.</span></div>
+      <div class="rung"><b>Step 10</b><span><em>Check what did not travel.</em> Cached preview rows are removed, and <code>${...}</code> placeholders are left unresolved on purpose, so no path or credential from your machine is baked into the copy. The server resolves them from its own environment.</span></div>
+    </div>
+
+    <h3 class="dep-h3">Part 5: run it on the server</h3>
+    <div class="ladder">
+      <div class="rung"><b>Step 11</b><span><em>Get yourself a console login.</em> This is the step people get stuck on: claiming gave <b>the studio</b> a key, not you. Run <code>duckle-runner console add-user &lt;name&gt; --role admin</code> on the box to mint your own.</span></div>
+      <div class="rung"><b>Step 12</b><span><em>Sign in and run it.</em> Open the console, run the pipeline once by hand, and watch the run appear with its rows and duration. Only then turn the schedule on: <b>a deployed schedule always arrives switched off</b>, so nothing starts firing behind your back.</span></div>
+    </div>
+
+    <p class="cap">Step 12 is deliberately two acts. Deploying needs admin and turning a schedule on needs only operator, because shipping code to a host and deciding when already-trusted code runs are different sizes of decision.</p>
   </div>
 </section>
 
