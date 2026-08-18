@@ -234,6 +234,7 @@ parameters and deployed pipeline contents never end up in it.
 | --- | --- | --- |
 | `connections/*.json` | connection secrets | **AES-256-GCM**, per-value, random 12-byte nonce |
 | `.duckle/keys/secret.key` | the key that decrypts the above | **plaintext**, `0600` on Unix |
+| `.duckle/secrets/git.json` | cached Git token | **AES-256-GCM**, `0600` on Unix |
 | `.duckle/deploy-targets.json` | server API keys | **AES-256-GCM**, same key |
 | `pipelines/*.json` | your pipelines | **plaintext** - including any credential copied in (see section 3) |
 | `contexts/*.json` | context variables | **plaintext, even ones marked "secret"** |

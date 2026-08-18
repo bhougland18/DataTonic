@@ -392,14 +392,37 @@ pub fn save_pat(workspace: &Path, token: &str) -> GitResult<()> {
     let key = crate::secrets::workspace_key(workspace, true)?;
     let stored = crate::secrets::encrypt_value(&key, token)?;
     let body = serde_json::to_string_pretty(&StoredPat { pat: stored }).map_err(|e| e.to_string())?;
-    std::fs::write(&path, body).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    write_owner_only(&path, body.as_bytes())?;
     write_gitignore_safety(workspace);
-    // Tighten file perms on Unix so other local users can't read it.
+    Ok(())
+}
+
+/// Write a file that only its owner can read, owner-only FROM THE START on Unix.
+///
+/// Writing first and chmod'ing after leaves a brief window in which the file is
+/// world-readable, which is the same TOCTOU the workspace key file already avoids. The
+/// contents here are encrypted, so the window is not catastrophic, but a credential file
+/// should not be readable by other local users even for an instant.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> GitResult<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("create {}: {}", path.display(), e))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("write {}: {}", path.display(), e))?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    // One tail for both platforms: an early `return` inside the cfg(unix) block would
+    // leave this function with no trailing expression once the other block is compiled
+    // out, which type-checks on Windows and fails to build on Linux.
     Ok(())
 }
 
@@ -417,6 +440,11 @@ pub fn load_pat(workspace: &Path) -> GitResult<String> {
         return crate::secrets::decrypt_value(&key, &parsed.pat)
             .map_err(|e| format!("decrypt git token: {}", e));
     }
+    // A token written before encryption existed. Accepting it forever leaves a credential
+    // in the clear on disk for as long as the workspace lives, so it is re-saved encrypted
+    // the first time it is used. Best-effort: if the upgrade cannot be done the token still
+    // works, because refusing here would lock somebody out of their own remote.
+    let _ = save_pat(workspace, &parsed.pat);
     Ok(parsed.pat)
 }
 
@@ -549,6 +577,39 @@ mod tests {
         write_gitignore_safety(ws);
         let twice = std::fs::read_to_string(ws.join(".duckle").join(".gitignore")).unwrap();
         assert_eq!(got, twice, "running it twice changed the file");
+    }
+
+    /// A token written before encryption existed must not stay in the clear. Reading it
+    /// once upgrades the file, so the plaintext stops existing rather than persisting for
+    /// as long as the workspace does.
+    #[test]
+    fn a_legacy_plaintext_token_is_re_encrypted_when_it_is_first_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let path = pat_path(ws);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"pat":"ghp_legacyplaintext"}"#).unwrap();
+
+        let got = load_pat(ws).expect("a legacy token must still load");
+        assert_eq!(got, "ghp_legacyplaintext", "the token itself must be unchanged");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("ghp_legacyplaintext"),
+            "the plaintext token is still on disk: {on_disk}"
+        );
+        assert_eq!(load_pat(ws).unwrap(), "ghp_legacyplaintext", "re-read after upgrade");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_token_file_is_never_world_readable_even_briefly() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        save_pat(ws, "ghp_secret").unwrap();
+        let mode = std::fs::metadata(pat_path(ws)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "group/other can read the token file: {mode:o}");
     }
 
     #[test]
