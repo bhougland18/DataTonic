@@ -6277,6 +6277,33 @@ html[dir='rtl'] .topbar-lang {
     gap: 12px;
 }
 
+/* Deploy manifest: what is about to leave the machine, shown rather than promised. */
+.deploy-manifest {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-1);
+    padding: 10px 12px;
+}
+.deploy-manifest-head {
+    font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--text-3); margin-bottom: 6px;
+}
+.deploy-manifest-list {
+    margin: 0; padding-left: 18px;
+    color: var(--text-2); font-size: 12.5px; line-height: 1.7;
+}
+.deploy-manifest-json { margin-top: 8px; }
+.deploy-manifest-json summary {
+    cursor: pointer; color: var(--text-3); font-size: 12.5px;
+}
+.deploy-manifest-json summary:hover { color: var(--text-1); }
+.deploy-manifest-json pre {
+    margin: 8px 0 0; max-height: 220px; overflow: auto;
+    font-family: Consolas, ui-monospace, monospace; font-size: 11.5px;
+    line-height: 1.55; color: var(--text-2);
+    background: var(--bg-2); border-radius: var(--radius-sm); padding: 8px 10px;
+}
+
 /* Backfill modal: inspect/reset xf.incremental + ducklake CDC saved state. */
 .modal-backfill {
     width: 100%;

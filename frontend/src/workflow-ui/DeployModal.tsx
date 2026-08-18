@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Check, Loader2, Server, ShieldCheck, X } from 'lucide-react';
 import {
@@ -107,6 +107,28 @@ export default function DeployModal({
         };
     }, [workspacePath, pipelineId, onClose]);
 
+    /**
+     * Exactly what will be sent, computed the same way the send computes it.
+     *
+     * The point of showing this is that it can be checked rather than believed: the
+     * counts, the removals and the JSON below all come from this one value, so the
+     * preview cannot claim one thing while the request carries another.
+     */
+    const outgoing = useMemo(() => stripPreviewRows(pipeline), [pipeline]);
+    const summary = useMemo(() => {
+        const doc = (outgoing ?? {}) as { nodes?: unknown[]; edges?: unknown[] };
+        const before = (pipeline ?? {}) as { nodes?: { data?: Record<string, unknown> }[] };
+        const previewsDropped = (before.nodes ?? []).filter(
+            n => n?.data && 'sampleRows' in n.data,
+        ).length;
+        return {
+            nodes: doc.nodes?.length ?? 0,
+            edges: doc.edges?.length ?? 0,
+            previewsDropped,
+            bytes: JSON.stringify(outgoing ?? {}).length,
+        };
+    }, [outgoing, pipeline]);
+
     const send = useCallback(async () => {
         if (!workspacePath || !target) return;
         setBusy(true);
@@ -117,10 +139,8 @@ export default function DeployModal({
                 workspacePath,
                 target,
                 name.trim(),
-                // The same stripping the save path does. `sampleRows` holds real rows read
-                // from a real source during a preview, and deploying them would put live
-                // data on a server for no reason at all.
-                stripPreviewRows(pipeline),
+                // The value the preview above showed, not a second computation of it.
+                outgoing,
                 wanted ?? undefined,
             );
             const r = (result ?? {}) as Record<string, unknown>;
@@ -142,7 +162,7 @@ export default function DeployModal({
         } finally {
             setBusy(false);
         }
-    }, [workspacePath, target, name, pipeline, schedule, sendSchedule]);
+    }, [workspacePath, target, name, outgoing, schedule, sendSchedule]);
 
     const handleBackdrop = (e: React.MouseEvent) => {
         if (e.target === e.currentTarget) onClose();
@@ -236,6 +256,32 @@ export default function DeployModal({
                                     </label>
                                 </div>
                             ) : null}
+
+                            <div className="deploy-manifest">
+                                <div className="deploy-manifest-head">
+                                    What will be sent
+                                </div>
+                                <ul className="deploy-manifest-list">
+                                    <li>
+                                        {summary.nodes} node{summary.nodes === 1 ? '' : 's'} and{' '}
+                                        {summary.edges} connection
+                                        {summary.edges === 1 ? '' : 's'}, {summary.bytes} bytes
+                                    </li>
+                                    <li>
+                                        {summary.previewsDropped > 0
+                                            ? `Cached preview rows removed from ${summary.previewsDropped} node${summary.previewsDropped === 1 ? '' : 's'}`
+                                            : 'No cached preview rows to remove'}
+                                    </li>
+                                    <li>
+                                        Placeholders left unresolved, so no path from this machine
+                                        travels
+                                    </li>
+                                </ul>
+                                <details className="deploy-manifest-json">
+                                    <summary>Show the exact JSON</summary>
+                                    <pre>{JSON.stringify(outgoing, null, 2)}</pre>
+                                </details>
+                            </div>
 
                             <p className="setup-note">
                                 <ShieldCheck size={14} />

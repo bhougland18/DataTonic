@@ -84,6 +84,10 @@ flowchart LR
 
 **`sampleRows` are real rows from your real sources**, cached when you previewed a node. They are stripped by the same function that strips them before writing to disk. Deploying them would put live data on a server for no reason at all.
 
+The Deploy dialog shows this rather than asserting it: before you send, it lists the node
+and connection counts, the exact byte size, how many nodes had cached preview rows removed,
+and offers the literal JSON that is about to leave. Nothing below has to be taken on trust.
+
 **Placeholders stay placeholders.** The studio does not resolve `${...}` before sending, so your machine's absolute paths do not travel; the server re-resolves them against its own workspace. This is also why a pipeline written on Windows runs on a Linux server unchanged.
 
 ### Which of these actually keeps a secret out of the pipeline
