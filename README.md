@@ -414,6 +414,10 @@ The one thing Duckle does not do is split a single query across a cluster the wa
 > Want the studio to publish straight to a running server instead? That is the other
 > route: connect a server once, then **Deploy to a server** from the editor. Step by step
 > in [docs/current/server-deployment.md](docs/current/server-deployment.md).
+>
+> Promoting from CI instead, or driving Duckle from Airflow, Dagster or Temporal? See
+> [docs/current/ci-and-orchestration.md](docs/current/ci-and-orchestration.md), with
+> copyable GitHub Actions and GitLab CI templates in [docs/ci/](docs/ci/).
 
 The in-app scheduler runs only while Duckle is open. To run a pipeline on a server with no desktop app, **Build Pipeline** turns it into ONE self-contained executable - the equivalent of a standalone "Job".
 

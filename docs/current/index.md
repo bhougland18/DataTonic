@@ -50,7 +50,13 @@ This guide is organized into the following sections to help you get the most out
 * Why a deployed schedule always arrives **switched off**.
 * Signing in to the web console, and the three roles.
 
-### 8. [Desktop Shell & Workspace Git Flow](architecture.md)
+### 8. [CI/CD and External Orchestrators](ci-and-orchestration.md)
+* Getting pipelines from a **merge onto a server** with GitHub Actions or GitLab CI.
+* Why a deployed schedule always arrives **switched off**, and which role does what.
+* Running Duckle from **Airflow, Dagster or Temporal**, and what each route costs you.
+* **Prometheus metrics** and the run-history API for dashboards of your own.
+
+### 9. [Desktop Shell & Workspace Git Flow](architecture.md)
 * Working with multiple workspace folders.
 * Using the built-in **Git Panel** to stage, commit, branch, and push your visual pipeline files.
 * Securely managing encrypted connection passwords.

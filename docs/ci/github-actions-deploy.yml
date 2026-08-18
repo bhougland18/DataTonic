@@ -1,0 +1,128 @@
+# Duckle pipeline deployment for GitHub Actions.
+#
+# Copy this to .github/workflows/duckle-deploy.yml in the repository that holds
+# your pipelines (not this repository). It validates every pipeline on a pull
+# request, and installs them onto a running Duckle server when a change reaches
+# your default branch.
+#
+# This is the promotion half. Validation on its own lives in github-actions.yml
+# and is safe on every commit from anywhere; deployment writes to a real server,
+# so it is deliberately gated on `push` to one branch and on an environment.
+#
+# WHAT YOU NEED FIRST
+#
+#   1. A Duckle server somebody has already claimed and that this runner can
+#      reach. See docs/current/server-deployment.md.
+#
+#   2. A machine key with the admin role, minted ON THE SERVER:
+#
+#        duckle-runner console key-add github-actions --role admin --expires-days 90
+#
+#      It is printed once and stored only as a hash. Deploying needs `admin`
+#      because a deployed pipeline runs shell and SQL on that host; a key with
+#      any lesser role is refused with 403. Give it an expiry and rotate it.
+#
+#   3. Two repository secrets:
+#        DUCKLE_URL   https://duckle.internal        (no trailing slash)
+#        DUCKLE_KEY   the key from step 2
+
+name: Duckle deploy
+
+on:
+  push:
+    branches: [main]
+  # Pull requests validate but never deploy: the job below is gated on the
+  # branch, so a fork can run the gate and cannot reach your server or your
+  # secrets.
+  pull_request:
+
+# One deployment at a time. Two merges landing together would otherwise race to
+# write the same pipeline files, and the second would win by accident rather
+# than by being newer.
+concurrency:
+  group: duckle-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The headless runner is a static musl binary with no shared-library
+      # dependencies, so it needs no apt packages. Do not substitute the desktop
+      # asset: Duckle-linux-x64 is a Tauri binary that requires libwebkit2gtk at
+      # load time and cannot start on a runner with no GUI libraries.
+      #
+      # Swap `latest` for a tag (e.g. v0.6.0) if you want reproducible CI.
+      - name: Fetch duckle-runner
+        run: |
+          curl -fsSL -o duckle-runner \
+            https://github.com/slothflowlabs/duckle/releases/latest/download/duckle-runner-linux-x64
+          chmod +x duckle-runner
+
+      # Opens no source, writes no sink, needs no credentials and no network.
+      # Exit codes are stable: 0 clean, 1 a pipeline did not compile, 2 bad
+      # usage or an unreadable file.
+      - name: Validate pipelines
+        run: ./duckle-runner validate
+
+  deploy:
+    needs: validate
+    # Only from the default branch. A pull request has already been validated
+    # above and stops there.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # An environment gives you a required-reviewer gate and an audit trail on
+    # the GitHub side, which is worth having on the job that writes to a server.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every pipeline under ./pipelines, deployed under its own file name.
+      #
+      # The server writes each one through a temporary file and renames it into
+      # place, so a scheduler tick on the far end can never read half a
+      # pipeline. Deploying the same name again replaces it.
+      #
+      # A schedule sent alongside a pipeline ALWAYS arrives switched off. That
+      # is the server's rule, not this file's: a cadence that was merged must
+      # not start firing the moment it lands. Someone with the operator role
+      # turns it on in the console, deliberately, once.
+      - name: Deploy pipelines
+        env:
+          DUCKLE_URL: ${{ secrets.DUCKLE_URL }}
+          DUCKLE_KEY: ${{ secrets.DUCKLE_KEY }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          found=0
+          for f in pipelines/*.json; do
+            found=1
+            name="$(basename "$f" .json)"
+            echo "Deploying $name"
+            # --fail-with-body so a 401/403 shows the server's own explanation,
+            # which says whether the key was revoked or simply lacks the role.
+            curl --fail-with-body -sS -X POST "$DUCKLE_URL/api/deploy" \
+              -H "Authorization: Bearer $DUCKLE_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -c --arg n "$name" '{name: $n, pipeline: .}' "$f")"
+            echo
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No pipelines under ./pipelines - nothing to deploy." >&2
+            exit 1
+          fi
+
+# WHAT THIS DELIBERATELY DOES NOT DO
+#
+# It does not turn schedules on. Shipping code and deciding when it runs are
+# different sizes of decision, which is why they need different roles: deploying
+# is admin, enabling a schedule is operator.
+#
+# It does not run your pipelines. A green deploy means the file is installed,
+# not that it works against production data. Trigger a run from the console, or
+# from your orchestrator - see docs/current/ci-and-orchestration.md.
+#
+# It does not roll back. The previous version of a pipeline is whatever is in
+# git; redeploy the earlier commit to go back.

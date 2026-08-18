@@ -1,0 +1,105 @@
+# Duckle pipeline deployment for GitLab CI.
+#
+# Copy this into .gitlab-ci.yml in the repository that holds your pipelines
+# (not this repository), or `include:` it from your existing config. It
+# validates on every commit and installs pipelines onto a running Duckle server
+# when a change reaches your default branch.
+#
+# This is the promotion half. Validation on its own lives in gitlab-ci.yml and
+# is safe anywhere; deployment writes to a real server, so it is gated on the
+# default branch and on a protected environment.
+#
+# WHAT YOU NEED FIRST
+#
+#   1. A Duckle server somebody has already claimed and that this runner can
+#      reach. See docs/current/server-deployment.md.
+#
+#   2. A machine key with the admin role, minted ON THE SERVER:
+#
+#        duckle-runner console key-add gitlab-ci --role admin --expires-days 90
+#
+#      It is printed once and stored only as a hash. Deploying needs `admin`
+#      because a deployed pipeline runs shell and SQL on that host; a lesser
+#      role is refused with 403. Give it an expiry and rotate it.
+#
+#   3. Two CI/CD variables, both MASKED, and DUCKLE_KEY also PROTECTED so it is
+#      only exposed to protected branches:
+#        DUCKLE_URL   https://duckle.internal        (no trailing slash)
+#        DUCKLE_KEY   the key from step 2
+
+stages:
+  - validate
+  - deploy
+
+.duckle-runner: &duckle-runner
+  # The headless runner is a static musl binary with no shared-library
+  # dependencies, so alpine is enough. Do not substitute the desktop asset:
+  # Duckle-linux-x64 is a Tauri binary requiring libwebkit2gtk and the GTK
+  # stack at load time, and cannot start on an image with no GUI libraries.
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache curl jq
+    # Swap `latest` for a tag (e.g. v0.6.0) if you want reproducible CI.
+    - |
+      curl -fsSL -o duckle-runner \
+        https://github.com/slothflowlabs/duckle/releases/latest/download/duckle-runner-linux-x64
+    - chmod +x duckle-runner
+
+duckle-validate:
+  <<: *duckle-runner
+  stage: validate
+  # Opens no source, writes no sink, needs no credentials and no network.
+  # Exit codes are stable: 0 clean, 1 a pipeline did not compile, 2 bad usage
+  # or an unreadable file.
+  script:
+    - ./duckle-runner validate
+
+duckle-deploy:
+  <<: *duckle-runner
+  stage: deploy
+  # Default branch only. Everything else has already been validated above and
+  # stops there, so a fork branch can run the gate and never reach the server.
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  environment:
+    name: production
+  # One deployment at a time: two merges landing together would otherwise race
+  # to write the same files, and the second would win by accident.
+  resource_group: duckle-deploy
+  # A schedule sent alongside a pipeline ALWAYS arrives switched off. That is
+  # the server's rule, not this file's: a cadence that was merged must not start
+  # firing the moment it lands. Someone with the operator role turns it on in
+  # the console, deliberately, once.
+  script:
+    - |
+      set -eu
+      found=0
+      for f in pipelines/*.json; do
+        [ -e "$f" ] || continue
+        found=1
+        name="$(basename "$f" .json)"
+        echo "Deploying $name"
+        # --fail-with-body so a 401/403 shows the server's own explanation,
+        # which says whether the key was revoked or simply lacks the role.
+        curl --fail-with-body -sS -X POST "$DUCKLE_URL/api/deploy" \
+          -H "Authorization: Bearer $DUCKLE_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -c --arg n "$name" '{name: $n, pipeline: .}' "$f")"
+        echo
+      done
+      if [ "$found" -eq 0 ]; then
+        echo "No pipelines under ./pipelines - nothing to deploy." >&2
+        exit 1
+      fi
+
+# WHAT THIS DELIBERATELY DOES NOT DO
+#
+# It does not turn schedules on. Shipping code and deciding when it runs are
+# different sizes of decision, which is why they need different roles: deploying
+# is admin, enabling a schedule is operator.
+#
+# It does not run your pipelines. A green deploy means the file is installed,
+# not that it works against production data.
+#
+# It does not roll back. The previous version is whatever is in git; redeploy
+# the earlier commit to go back.
