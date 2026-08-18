@@ -126,7 +126,50 @@ curl -X POST "$DUCKLE_URL/api/run" \
   -d '{"file":"orders_etl.json"}'
 ```
 
-`file` is a path inside the server's workspace, and is required. `params` is optional and supplies values for `${...}` placeholders. The call is **synchronous**: it returns when the pipeline finishes, with the run's status, duration and per-node detail. Needs the `operator` role.
+`file` is a path inside the server's workspace, and is required - the canonical form is `pipelines/<id>.json`. `params` is optional and supplies values for `${...}` placeholders. Needs the `operator` role.
+
+> ### Read this before writing an operator
+>
+> **A failed pipeline still answers `HTTP 200`.** The failure is only in the body:
+>
+> ```json
+> {"id":"orders_etl","status":"error","durationMs":41,
+>  "error":"DuckDB engine isn't installed yet. Open Setup to install it.","nodes":{}}
+> ```
+>
+> An operator that trusts the HTTP status alone - `resp.raise_for_status()` and nothing
+> else - will mark failed loads as **successful**, and nobody will find out until the
+> downstream numbers are wrong.
+>
+> **Check `status` yourself.** It is one of `"ok"`, `"error"` or `"cancelled"`; treat
+> anything that is not `"ok"` as a failure.
+>
+> A non-2xx status means the run could not be *started* at all: `400` for a missing or
+> unreadable file, `401`/`403` for a credential problem. Both cases need handling, and
+> they are not the same case.
+
+The response has exactly five keys - `id`, `status`, `durationMs`, `error`, `nodes` -
+and `error` is present as `null` on success rather than omitted.
+
+### Four things that will shape your operator
+
+**It is fully synchronous.** The connection stays open for the whole run and returns when
+it finishes. There is no run id and nothing to poll, so any client, proxy or load-balancer
+timeout in front of it must be longer than your slowest pipeline, or you will lose the
+result of a run that actually succeeded.
+
+**One run at a time, by default.** The console serialises runs; raise it with
+`DUCKLE_MAX_CONCURRENT_RUNS`. Two tasks firing together queue rather than fail, and the
+wait is unbounded - so that client timeout matters here too.
+
+**This route does not take the cross-process run lock.** The scheduler does, but a manual
+`/api/run` does not, so a run triggered here can overlap a run of the same pipeline
+started from a desktop app on the same workspace. If two things might trigger one
+pipeline, let one of them own it.
+
+**An empty string parameter is dropped, not sent.** `{"params":{"month":""}}` falls
+through to the workspace default rather than overriding it with blank. If `params` is not
+a JSON object it is ignored silently.
 
 ### Choosing between them
 
