@@ -30,6 +30,7 @@ type Props = {
     onSchedulePipeline: (id: string) => void;
     onBackfillPipeline: (id: string) => void;
     onBuildPipeline: (id: string) => void;
+    onDeployPipeline?: (id: string) => void;
 };
 
 export default function LeftSidebar({
@@ -54,6 +55,7 @@ export default function LeftSidebar({
     onSchedulePipeline,
     onBackfillPipeline,
     onBuildPipeline,
+    onDeployPipeline,
 }: Props) {
     const { t } = useTranslation();
     const [tab, setTab] = useState<SideTab>('palette');
@@ -108,6 +110,7 @@ export default function LeftSidebar({
                         onSchedulePipeline={onSchedulePipeline}
                         onBackfillPipeline={onBackfillPipeline}
                         onBuildPipeline={onBuildPipeline}
+                        onDeployPipeline={onDeployPipeline}
                     />
                 )}
             </div>

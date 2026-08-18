@@ -10,6 +10,7 @@ import {
     Play,
     Plus,
     Save,
+    Server,
     Square,
     Upload,
     Workflow,
@@ -40,6 +41,8 @@ type Props = {
     onAutoLayout: () => void;
     onCopySql: () => void;
     onExportJson: () => void;
+    /** Undefined in the web editor: deploying goes through a desktop-only command. */
+    onDeploy?: () => void;
     onExportSqlFile: () => void;
     onImportJson: () => void;
     /** Undefined in the web editor, where the engine-side translator is unreachable. */
@@ -64,6 +67,7 @@ export default function EditorHeader({
     onAutoLayout,
     onCopySql,
     onExportJson,
+    onDeploy,
     onExportSqlFile,
     onImportJson,
     onImportJob,
@@ -269,6 +273,25 @@ export default function EditorHeader({
                                     </div>
                                 </div>
                             </button>
+                            {onDeploy ? (
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="toolbar-more-item"
+                                    onClick={fire(onDeploy)}
+                                >
+                                    <Server size={13} />
+                                    <div>
+                                        <div>{t('header.deploy', 'Deploy to a server…')}</div>
+                                        <div className="toolbar-more-desc">
+                                            {t(
+                                                'header.deployDesc',
+                                                'Send this pipeline to a server you own',
+                                            )}
+                                        </div>
+                                    </div>
+                                </button>
+                            ) : null}
                             <button
                                 type="button"
                                 role="menuitem"

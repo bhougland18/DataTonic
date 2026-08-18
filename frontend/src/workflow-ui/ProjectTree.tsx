@@ -13,6 +13,7 @@ import {
     FolderPlus,
     History,
     Package,
+    Server,
     Pencil,
     Plug,
     Plus,
@@ -50,6 +51,8 @@ type Props = {
     onSchedulePipeline: (id: string) => void;
     onBackfillPipeline: (id: string) => void;
     onBuildPipeline: (id: string) => void;
+    /** Undefined in the web editor: deploying goes through a desktop-only command. */
+    onDeployPipeline?: (id: string) => void;
 };
 
 // Built-in top-level containers. They anchor the tree, so they cannot be
@@ -116,6 +119,7 @@ export default function ProjectTree(props: Props) {
         onSchedulePipeline,
         onBackfillPipeline,
         onBuildPipeline,
+        onDeployPipeline,
     } = props;
 
     // Walk up to find which root folder this item lives under.
@@ -354,6 +358,15 @@ export default function ProjectTree(props: Props) {
                 icon: <Package size={ICON_SIZE} />,
                 onClick: () => onBuildPipeline(item.id),
             });
+            if (onDeployPipeline) {
+                items.push({
+                    kind: 'item',
+                    key: 'deploy',
+                    label: 'Deploy to a server…',
+                    icon: <Server size={ICON_SIZE} />,
+                    onClick: () => onDeployPipeline(item.id),
+                });
+            }
         }
         items.push({
             kind: 'item',

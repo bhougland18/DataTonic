@@ -36,6 +36,7 @@ import {
 } from './tauri-bridge';
 import ScheduleEditorModal from './workflow-ui/ScheduleEditorModal';
 import PlansModal from './workflow-ui/PlansModal';
+import DeployModal from './workflow-ui/DeployModal';
 import BackfillModal from './workflow-ui/BackfillModal';
 import RunParametersModal from './workflow-ui/RunParametersModal';
 import BuildPipelineModal from './workflow-ui/BuildPipelineModal';
@@ -2377,6 +2378,7 @@ export default function App() {
     const [showTrust, setShowTrust] = useState(false);
     const [showCatalog, setShowCatalog] = useState(false);
     const [showPlans, setShowPlans] = useState(false);
+    const [deployModalPipelineId, setDeployModalPipelineId] = useState<string | null>(null);
 
     const openJobIds = useMemo(() => new Set(jobs.map(j => j.id)), [jobs]);
 
@@ -2681,6 +2683,7 @@ export default function App() {
                     onSchedulePipeline={handleSchedulePipeline}
                     onBackfillPipeline={handleBackfillPipeline}
                     onBuildPipeline={handleBuildPipeline}
+                    onDeployPipeline={isInTauri() ? setDeployModalPipelineId : undefined}
                 />
                 <section className="canvas-shell" data-tour="canvas">
                     <EditorHeader
@@ -2699,6 +2702,9 @@ export default function App() {
                         onAutoLayout={handleAutoLayout}
                         onCopySql={handleCopySql}
                         onExportJson={handleExportJson}
+                        onDeploy={
+                            isInTauri() ? () => setDeployModalPipelineId(activeJobId) : undefined
+                        }
                         onExportSqlFile={handleExportSql}
                         onImportJson={handleImportJson}
                         onImportJob={isInTauri() ? handleImportJob : undefined}
@@ -2878,6 +2884,20 @@ export default function App() {
                         setRunParamPrompt(null);
                         void launchRun(target, values);
                     }}
+                />
+            ) : null}
+
+            {deployModalPipelineId ? (
+                <DeployModal
+                    pipelineId={deployModalPipelineId}
+                    pipelineName={
+                        repo.find(r => r.id === deployModalPipelineId)?.name ??
+                        deployModalPipelineId
+                    }
+                    // What the editor holds right now, which is what was just tested here.
+                    pipeline={pipelineData[deployModalPipelineId] ?? EMPTY_PIPELINE}
+                    workspacePath={workspacePathState}
+                    onClose={() => setDeployModalPipelineId(null)}
                 />
             ) : null}
 

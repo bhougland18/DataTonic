@@ -6266,6 +6266,17 @@ html[dir='rtl'] .topbar-lang {
     font-size: 0.88rem;
 }
 
+/* Deploy modal: send a pipeline to a server this workspace is connected to. */
+.modal-deploy {
+    width: 100%;
+    max-width: 560px;
+}
+.modal-deploy-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
 /* Backfill modal: inspect/reset xf.incremental + ducklake CDC saved state. */
 .modal-backfill {
     width: 100%;
