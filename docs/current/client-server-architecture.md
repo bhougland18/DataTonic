@@ -110,11 +110,11 @@ host decrypts it at run time against *its own* connections.
 resolved on the server from the server's own environment, which is what you want anyway,
 because production credentials should not be the ones on your laptop.
 
-> **A related asymmetry worth knowing.** `duckle-runner build`, which packages a pipeline
-> into a standalone artifact, runs a leak guard: it redacts detected secrets and *aborts
-> the build* if a raw secret still appears. **Deploy has no such guard.** The same pipeline
-> that `build` would refuse to package, `deploy` will happily send. That is a gap we intend
-> to close; until then the table above is the rule.
+> **Deploy refuses to send one.** A pipeline carrying a credential in plain text under a
+> secret-shaped key is rejected before anything leaves the machine, naming the node and the
+> property so you know which field to change. `duckle-runner build` applies the same
+> judgement when packaging an artifact, and both read it from one place so they cannot
+> come to differ.
 
 ---
 

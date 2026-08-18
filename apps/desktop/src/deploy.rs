@@ -226,6 +226,21 @@ pub fn deploy(
     pipeline: &Value,
     schedule: Option<&Value>,
 ) -> Result<Value, String> {
+    // Refuse before anything leaves the machine. `duckle-runner build` already declines to
+    // package a pipeline carrying a typed-in credential; sending one to a server is the same
+    // mistake with a wider blast radius, because it lands in a file on a host other people
+    // can read. The judgement lives in the engine so the two paths cannot disagree about
+    // what counts as a secret.
+    let leaked = duckle_duckdb_engine::literal_secrets(pipeline);
+    if !leaked.is_empty() {
+        return Err(format!(
+            "This pipeline carries a credential in plain text: {}. Deploying would copy it onto \
+             the server, where anyone who can sign in may read it. Replace the value with \
+             ${{ENV:NAME}} and set that variable on the server, then deploy again.",
+            leaked.join(", ")
+        ));
+    }
+
     let (url, key) = target_credential(workspace, target)?;
     let mut body = json!({ "name": name, "pipeline": pipeline });
     if let Some(s) = schedule {

@@ -30,6 +30,52 @@ pub fn is_secret_prop_key(key: &str) -> bool {
     .any(|needle| k.contains(needle))
 }
 
+/// Every secret-keyed property in a pipeline whose value is a literal rather than a
+/// placeholder, named as `node label / property key`.
+///
+/// A value under a key like `password` or `accessKey` is a credential. Written as
+/// `${ENV:NAME}` or `${context.var}` it is a reference and travels harmlessly; typed in
+/// directly it IS the credential, and goes wherever the pipeline goes - into the workspace
+/// file, into git if the workspace is committed, and into the body of a deploy.
+///
+/// `duckle-runner build` already refuses to package a pipeline in that state. This is the
+/// same judgement, shared so the deploy path can apply it rather than growing a second
+/// opinion about what counts as a secret.
+///
+/// Empty values are ignored: an unfilled field is not a leak.
+pub fn literal_secrets(doc: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(nodes) = doc.get("nodes").and_then(|n| n.as_array()) else {
+        return out;
+    };
+    for node in nodes {
+        let data = node.get("data");
+        let label = data
+            .and_then(|d| d.get("label"))
+            .and_then(|l| l.as_str())
+            .or_else(|| node.get("id").and_then(|i| i.as_str()))
+            .unwrap_or("a node");
+        let Some(props) = data.and_then(|d| d.get("properties")).and_then(|p| p.as_object())
+        else {
+            continue;
+        };
+        for (key, value) in props {
+            if !is_secret_prop_key(key) {
+                continue;
+            }
+            let Some(text) = value.as_str() else { continue };
+            let text = text.trim();
+            // A placeholder is a reference to a secret, not the secret. `${ENV:PGPASS}`,
+            // `${context.pw}` and a saved-connection ref all pass.
+            if text.is_empty() || (text.starts_with("${") && text.ends_with('}')) {
+                continue;
+            }
+            out.push(format!("{label} / {key}"));
+        }
+    }
+    out
+}
+
 /// A secret found in the pipeline: its plaintext VALUE and the named
 /// placeholder that stands in for it in exported SQL (e.g. value
 /// "sup3r" under prop key "password" -> placeholder "${DUCKLE_PASSWORD}").
@@ -1175,9 +1221,44 @@ pub(crate) fn chunk_text(text: &str, size: usize, overlap: usize) -> Vec<String>
 
 #[cfg(test)]
 mod tests {
+    /// A credential typed straight into a node travels with the pipeline: into the
+    /// workspace file, into git if that is committed, and into a deploy body. `build`
+    /// already refuses to package one; this is the shared judgement the deploy path uses
+    /// so the two cannot disagree about what a secret is.
+    #[test]
+    fn a_typed_in_credential_is_reported_and_a_placeholder_is_not() {
+        let doc = serde_json::json!({
+            "nodes": [
+                { "id": "n1", "data": { "label": "Postgres",
+                    "properties": { "host": "db.internal", "password": "hunter2" } } },
+                { "id": "n2", "data": { "label": "S3",
+                    "properties": { "accessKey": "${ENV:AWS_KEY}", "secretKey": "" } } },
+                { "id": "n3", "data": { "label": "Ref",
+                    "properties": { "password": "${context.pgpass}" } } }
+            ]
+        });
+
+        let found = literal_secrets(&doc);
+        assert_eq!(found, ["Postgres / password"], "found: {found:?}");
+    }
+
+    /// The shapes that must not panic or report: no nodes, no data, no properties.
+    #[test]
+    fn a_pipeline_with_nothing_to_scan_reports_nothing() {
+        for doc in [
+            serde_json::json!({}),
+            serde_json::json!({ "nodes": [] }),
+            serde_json::json!({ "nodes": [{ "id": "n1" }] }),
+            serde_json::json!({ "nodes": [{ "id": "n1", "data": {} }] }),
+            serde_json::json!({ "nodes": [{ "id": "n1", "data": { "properties": {} } }] }),
+        ] {
+            assert!(literal_secrets(&doc).is_empty(), "reported on {doc}");
+        }
+    }
+
     use super::{
-        finalize_xlsx_whitespace, infer_avro_nullable_field, is_secret_prop_key, stream_xml_rows,
-        walk_xml_to_rows,
+        finalize_xlsx_whitespace, infer_avro_nullable_field, is_secret_prop_key, literal_secrets,
+        stream_xml_rows, walk_xml_to_rows,
     };
     use serde_json::json;
     use std::io::{Read, Write};
