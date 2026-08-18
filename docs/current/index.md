@@ -44,7 +44,13 @@ This guide is organized into the following sections to help you get the most out
 * Tracking execution history, duration, and error reports within the scheduler list.
 * (Planned for 1.0) Executing saved pipelines headlessly from the terminal.
 
-### 7. [Desktop Shell & Workspace Git Flow](architecture.md)
+### 7. [Running Duckle on a Server](server-deployment.md)
+* Standing a server up and **claiming it from the studio**, with no shell session on the box.
+* **Deploying a pipeline** from the desktop, and what travels with it.
+* Why a deployed schedule always arrives **switched off**.
+* Signing in to the web console, and the three roles.
+
+### 8. [Desktop Shell & Workspace Git Flow](architecture.md)
 * Working with multiple workspace folders.
 * Using the built-in **Git Panel** to stage, commit, branch, and push your visual pipeline files.
 * Securely managing encrypted connection passwords.

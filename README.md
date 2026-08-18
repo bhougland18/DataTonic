@@ -411,6 +411,10 @@ The one thing Duckle does not do is split a single query across a cluster the wa
 
 ## Server deployment (Build Pipeline)
 
+> Want the studio to publish straight to a running server instead? That is the other
+> route: connect a server once, then **Deploy to a server** from the editor. Step by step
+> in [docs/current/server-deployment.md](docs/current/server-deployment.md).
+
 The in-app scheduler runs only while Duckle is open. To run a pipeline on a server with no desktop app, **Build Pipeline** turns it into ONE self-contained executable - the equivalent of a standalone "Job".
 
 Right-click a pipeline (in the project tree or on the canvas) and choose **Build Pipeline**. The output is a single file named after the pipeline (`orders_etl.exe` on Windows, `orders_etl` on macOS / Linux) that embeds everything it needs:
