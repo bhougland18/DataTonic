@@ -70,6 +70,10 @@
     padding: 8px 12px; font-size: 13px; outline: none; }
   input:focus, select:focus { border-color: var(--line-2); }
   input[type=number] { width: 76px; }
+  /* A checkbox is drawn by the OS and filled with the OS accent, which is blue on a
+     default Windows and sits badly beside orange controls. `accent-color` is the only
+     hook a native control offers, so it is set once here. */
+  input[type=checkbox], input[type=radio] { accent-color: var(--orange); }
   .chips { display: flex; gap: 6px; }
   .chip { background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); border-radius: 20px;
     padding: 6px 14px; cursor: pointer; font-size: 13px; transition: .12s; }

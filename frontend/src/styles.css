@@ -149,6 +149,16 @@ textarea {
     font-feature-settings: inherit;
 }
 
+/* Checkboxes and radios are drawn by the OS, and the tick it fills them with is
+   the OS accent (blue on a default Windows) rather than ours. That put a stock
+   blue control next to orange buttons on every dialog that has one. `accent-color`
+   is the only hook a native control gives for this, so it is set once here rather
+   than per dialog. */
+input[type='checkbox'],
+input[type='radio'] {
+    accent-color: var(--accent);
+}
+
 /* Native <select> popup options. Without an explicit background the
    browser draws the dropdown list with the OS default (white) while our
    light text stays light, so options are invisible in dark mode. Both
@@ -4328,7 +4338,19 @@ html[dir='rtl'] .topbar-lang {
     font-size: 0.7692rem;
 }
 
-.modal-select {
+/*
+ * The dropdown arrow, drawn as two gradient triangles.
+ *
+ * Qualified with `select` and repeated for `:focus` on purpose. Every use of this class in
+ * the app also carries `.modal-input`, which is defined LATER at equal specificity and sets
+ * `background` as a shorthand - and a shorthand resets `background-image` to none. So a
+ * plain `.modal-select` lost the arrow everywhere it was used, and `.modal-input:focus`
+ * would take it away again the moment the control was focused. `select.modal-select` beats
+ * `.modal-input`, and `select.modal-select:focus` beats `.modal-input:focus`, which makes
+ * this hold wherever the rule happens to sit in the file.
+ */
+select.modal-select,
+select.modal-select:focus {
     appearance: none;
     background-image: linear-gradient(45deg, transparent 50%, var(--text-3) 50%),
         linear-gradient(135deg, var(--text-3) 50%, transparent 50%);

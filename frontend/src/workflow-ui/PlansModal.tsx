@@ -432,6 +432,11 @@ function PlanForm({
                     onChange={e => onChange({ ...draft, id: e.target.value })}
                     placeholder="nightly"
                 />
+                <div className="modal-field-hint">
+                    {replacing
+                        ? 'Fixed once the plan exists. A schedule points at this id, so changing it would leave that schedule pointing at nothing.'
+                        : 'Short, and permanent. Schedules point at this rather than at the name, so the name stays free to change.'}
+                </div>
             </div>
 
             <div className="modal-field">
