@@ -88,6 +88,35 @@
   ul.tight { margin:10px 0 16px; padding-left:20px; color:var(--ink-2); font-size:.92rem; line-height:1.7; }
   ul.tight li { margin:2px 0; }
 </style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://duckle.org/" },
+    { "@type": "ListItem", "position": 2, "name": "Deploy", "item": "https://duckle.org/deploy.html" }
+  ]
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Deploy Duckle on AWS, Azure or GCP",
+  "description": "Self-host Duckle on your own cloud: EC2, ECS on Fargate and EKS on AWS; Virtual Machine, Container Apps and AKS on Azure; Compute Engine and GKE on Google Cloud. Working manifests, systemd units, roles, and the mistakes that cost an afternoon.",
+  "author": { "@type": "Organization", "name": "SlothFlow Labs" },
+  "publisher": {
+    "@type": "Organization",
+    "name": "SlothFlow Labs",
+    "logo": { "@type": "ImageObject", "url": "https://duckle.org/assets/img/duckle-mark.v4.svg" }
+  },
+  "datePublished": "2026-08-07",
+  "dateModified": "2026-08-18",
+  "mainEntityOfPage": "https://duckle.org/deploy.html",
+  "image": "https://duckle.org/assets/img/og-card.png",
+  "keywords": "self-hosted ETL, deploy ETL on AWS, ETL on Kubernetes, DuckDB server, ECS Fargate, EKS, AKS, GKE, Compute Engine, data pipeline scheduler"
+}
+</script>
 </head>
 <body>
 
@@ -268,6 +297,18 @@
     <pre><code>ghcr.io/slothflowlabs/duckle-web:latest    # runner + DuckDB CLI + editor bundle
 port 8080                                 # plain HTTP, TLS lives in your proxy
 volume /workspace                         # pipelines, state, logs, keys</code></pre>
+
+    <h3 class="dep-h3">Without a container</h3>
+    <p class="muted">Every release publishes <code>duckle-runner-linux-x64</code> as an asset. It is static musl with no shared-library dependencies, so it runs on alpine or in a scratch image, and on a VM it replaces the whole Docker step above.</p>
+    <pre><code>curl -sSLo /usr/local/bin/duckle-runner   https://github.com/slothflowlabs/duckle/releases/latest/download/duckle-runner-linux-x64
+chmod +x /usr/local/bin/duckle-runner
+
+# The runner does NOT bundle DuckDB. Install the CLI and point at it,
+# or every run fails looking for a binary that is not there.
+export DUCKLE_DUCKDB_BIN=/usr/local/bin/duckdb    # DuckDB 1.5.4, the pinned version
+
+duckle-runner serve --host 0.0.0.0 --port 8080 --workspace /srv/duckle</code></pre>
+    <p class="muted">Do not substitute the desktop build for this. <code>Duckle-linux-x64</code> is a Tauri binary that resolves libwebkit2gtk and the GTK stack at load time, so it cannot start on a server with no GUI libraries. The runner is the headless one.</p>
 
     <h3 class="dep-h3">Environment</h3>
     <table class="dep-table">

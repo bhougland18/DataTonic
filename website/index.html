@@ -72,7 +72,7 @@
       "name": "Duckle",
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "Windows, macOS, Linux",
-      "description": "Duckle is the open ETL stack built on DuckDB. Build as many pipelines as you need: write them in Python, wire them from 190 connectors and 360+ components, or draw them on a canvas, with an MCP server for AI agents. Pipelines call, schedule and retry each other, and run anywhere - laptop, CI, headless, or browser.",
+      "description": "Duckle is the open ETL stack built on DuckDB. Build as many pipelines as you need: write them in Python, wire them from 190 connectors and 380+ components, or draw them on a canvas, with an MCP server for AI agents. Pipelines call, schedule and retry each other, and run anywhere - laptop, CI, headless, or browser.",
       "url": "https://duckle.org/",
       "downloadUrl": "https://github.com/slothflowlabs/duckle/releases/latest",
       "softwareVersion": "0.6.1",
@@ -95,7 +95,7 @@
     { "@type": "Question", "name": "Is Duckle free?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Duckle is open source under MIT or Apache-2.0. There is no per-row, per-connector, or per-seat billing, and nothing to self-host or operate." } },
     { "@type": "Question", "name": "What engine does Duckle run on?", "acceptedAnswer": { "@type": "Answer", "text": "Duckle runs on DuckDB, an embedded columnar engine. Visual pipelines compile to SQL and execute locally at native DuckDB speed, with no external warehouse or server in the loop." } },
     { "@type": "Question", "name": "Does Duckle need the cloud or a server?", "acceptedAnswer": { "@type": "Answer", "text": "No. Duckle runs anywhere you point it - your laptop, CI, or a server - and fully offline when you want, on the embedded DuckDB engine. There is no account and no telemetry, which makes it suitable for air-gapped and compliance-sensitive work. It reads from and writes to cloud systems when you need to; it just does not require them." } },
-    { "@type": "Question", "name": "How many components does Duckle have?", "acceptedAnswer": { "@type": "Answer", "text": "Duckle ships 360+ components, all available today, spanning sources, transforms, sinks, data-quality checks, control-flow nodes, and code runners for databases, warehouses, lakehouses, object storage, streaming, NoSQL, and SaaS APIs." } },
+    { "@type": "Question", "name": "How many components does Duckle have?", "acceptedAnswer": { "@type": "Answer", "text": "Duckle ships 385 components, 367 available today, spanning sources, transforms, sinks, data-quality checks, control-flow nodes, and code runners for databases, warehouses, lakehouses, object storage, streaming, NoSQL, and SaaS APIs." } },
     { "@type": "Question", "name": "Can Duckle run dbt?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Duckle runs dbt on DuckDB with a visual GUI, using a fast build engine by default and falling back to dbt-core when needed, so you can build, test, and schedule dbt projects without leaving the studio." } },
     { "@type": "Question", "name": "Does Duckle have an AI assistant?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Duckie is an on-device AI assistant that generates pipelines from plain English with no API key and no telemetry. Duckle also ships an MCP server so external AI agents can list, generate, validate, and run pipelines." } },
     { "@type": "Question", "name": "Is there an open-source alternative to Fivetran or Airbyte?", "acceptedAnswer": { "@type": "Answer", "text": "Duckle is a free, open-source ETL/ELT tool that covers similar ground to hosted platforms like Fivetran and Airbyte, but runs locally. It moves data across 190 sources and destinations with no per-row, per-connector, or per-seat billing and nothing to host or operate. Pipelines are built visually or from plain English and compile to readable DuckDB SQL." } },
@@ -135,7 +135,7 @@
           <div class="mlbl">The platform</div>
           <a href="#product"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span><span><b>Visual canvas</b><span>Drag, wire, run. Compiles to readable SQL.</span></span></a>
           <a href="#duckie"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="7" width="16" height="12" rx="2"/><path d="M12 7V4M9 13h.01M15 13h.01"/></svg></span><span><b>Duckie AI</b><span>Describe a pipeline; it builds it, locally.</span></span></a>
-          <a href="docs/components.html"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg></span><span><b>360+ components</b><span>Sources, transforms, sinks, quality, control.</span></span></a>
+          <a href="docs/components.html"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg></span><span><b>380+ components</b><span>Sources, transforms, sinks, quality, control.</span></span></a>
           <a href="docs/automation.html"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg></span><span><b>Schedule &amp; deploy</b><span>Cron, headless runner, MCP server.</span></span></a>
           <a href="deploy.html"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg></span><span><b>Deploy to your cloud</b><span>AWS, Azure and Google Cloud, with manifests.</span></span></a>
         </div>
@@ -337,7 +337,7 @@
         <h2>Automate pipelines end to end, without writing SQL</h2>
         <p>Drag sources, transforms, validators and sinks onto a canvas and wire them together. The visual <b>Map</b> editor joins a main input to up to three lookups with per-output typed expressions and an inline filter. Every node still compiles to readable SQL you can inspect in the Plan tab.</p>
         <ul class="feat-list">
-          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> 128 transforms: joins, windows, aggregates, CDC/SCD, AI, quality</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> 141 transforms: joins, windows, aggregates, CDC/SCD, AI, quality</li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Validators route bad rows to a reject port</li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Generated SQL on every node - never a black box</li>
         </ul>
@@ -465,7 +465,7 @@
         </details>
         <details class="faq-item">
           <summary><h3>How many components does Duckle have?</h3></summary>
-          <p>Duckle ships 360+ components, all available today, spanning sources, transforms, sinks, data-quality checks, control-flow nodes, and code runners for databases, warehouses, lakehouses, object storage, streaming, NoSQL, and SaaS APIs.</p>
+          <p>Duckle ships 385 components, 367 available today, spanning sources, transforms, sinks, data-quality checks, control-flow nodes, and code runners for databases, warehouses, lakehouses, object storage, streaming, NoSQL, and SaaS APIs.</p>
         </details>
         <details class="faq-item">
           <summary><h3>Can Duckle run dbt?</h3></summary>

@@ -13,7 +13,7 @@ catalog the application itself reads, so the names and counts here are exact.
 - Free and open source, dual-licensed MIT OR Apache-2.0. No per-row, per-connector, or per-seat billing.
 - Local-first desktop app: runs fully offline, no account and no telemetry, suitable for air-gapped and compliance-sensitive work.
 - Engine: pipelines compile to SQL and execute on DuckDB, an in-process analytical database, at native speed.
-- 382 components, 364 available today: sources, transforms, destinations, data-quality checks, control-flow nodes, and code runners.
+- 385 components, 367 available today: sources, transforms, destinations, data-quality checks, control-flow nodes, and code runners.
 - 173 connectors (106 sources / 67 destinations): databases, warehouses, lakehouses, object stores, streaming brokers, NoSQL, vector databases, geospatial formats, and SaaS APIs.
 - Transformation: 140 transforms including joins, window functions, aggregates, CDC/SCD, incremental loads, upsert with delete propagation, and a visual Map (tMap-style) editor.
 - Data quality: 27 checks, plus 18 control-flow nodes for branching, iteration, parallel branches, and calling child pipelines.
@@ -111,6 +111,7 @@ marked [planned] or [preview] are not usable yet.
 - `src.elastic` Elasticsearch: Read docs from an Elasticsearch index via the _search API. from+size pagination (up to 10000 rows by default); ApiKey auth
 - `src.email` Email (IMAP): Fetch the N most recent messages from an IMAP mailbox. TLS via rustls (default port 993). Basic auth (user/password). Each message becomes a row {uid, from, to, subject, date, body_text}. OAuth (gmail / o365) is on the roadmap
 - `src.eventhubs` Azure Event Hubs [planned]: Reads data from Azure Event Hubs
+- `src.excel-online` Microsoft Excel Online [planned]: Reads data from Microsoft Excel Online
 - `src.excel` Excel (XLSX): Read .xlsx via the DuckDB excel extension
 - `src.excel-online` Microsoft Excel Online [planned]: Reads data from Microsoft Excel Online
 - `src.fixedwidth` Fixed-width: Read positional / fixed-width text files (mainframe / banking exports). Form provides a columns array - {name, start (1-based), width}; engine builds SUBSTR projections. Trailing whitespace stripped by default
@@ -151,6 +152,7 @@ marked [planned] or [preview] are not usable yet.
 - `src.opensearch` OpenSearch: Read docs from an OpenSearch index via the _search API. Same wire as Elasticsearch; same ApiKey auth
 - `src.oracle` Oracle: Read Oracle via the official `oracle` Rust crate (ODPI-C). Built into the shipped binary - users need Oracle Instant Client (libclntsh.{so,dll,dylib}) on the library path at RUNTIME; the executor surfaces a clear OCI loader error if it's missing. SQL auth via user / password; EZ Connect string for host:port/service_name
 - `src.orc` ORC [planned]: Reads data from ORC
+- `src.pixeltable` Pixeltable: Read a Pixeltable table, the multimodal AI data store, exchanged through Parquet; supports versioned reads via table:N
 - `src.parquet` Parquet: Read columnar Parquet files
 - `src.pgvector` pgvector (Postgres): Read embeddings + metadata via DuckDB postgres ATTACH (server must have CREATE EXTENSION vector)
 - `src.pinecone` Pinecone [preview]: Fetch or similarity-search vectors (Pinecone has no list-all-vectors endpoint; the proper shape is a query node, on the roadmap)
@@ -241,6 +243,7 @@ marked [planned] or [preview] are not usable yet.
 - `snk.opensearch` OpenSearch: Bulk-index docs via the OpenSearch _bulk NDJSON API (same shape as Elasticsearch)
 - `snk.oracle` Oracle: INSERT to Oracle via the official `oracle` Rust crate. Built into the shipped binary - users need Oracle Instant Client on the library path at runtime. Multi-row INSERT ALL ... SELECT 1 FROM dual idiom batched at 1000 rows
 - `snk.orc` ORC [planned]: Writes data to ORC
+- `snk.pixeltable` Pixeltable: Write rows into a Pixeltable table, inserting into an existing table or creating one from the incoming rows
 - `snk.parquet` Parquet: Write columnar Parquet files
 - `snk.pgvector` pgvector (Postgres): Write embeddings to a Postgres table (server must have CREATE EXTENSION vector)
 - `snk.pinecone` Pinecone: Upsert vectors to a Pinecone index via /vectors/upsert with Api-Key auth
@@ -400,6 +403,7 @@ marked [planned] or [preview] are not usable yet.
 - `xf.substring` Substring: Transforms data with Substring
 - `xf.surrogatekey` Surrogate Key: Add a warehouse dimension key derived from the business/natural key columns: hash mode (md5 of the key, stable across runs so the same business key always maps to the same surrogate) or sequence mode (1..N integer ordered by the key). Unlike UUID (random per row), this is deterministic
 - `xf.text.base64` Base64: Encode a column to base64 text, or decode base64 back to bytes
+- `xf.text.tocolumns` Text to Columns: Split a delimited column into separate named columns
 - `xf.text.match` Text Match: Boolean: does the string contain / start with / end with a substring (DuckDB contains / starts_with / ends_with)
 - `xf.text.padding` Pad String: Left or right pad to a fixed length (zero-pad IDs, right-pad for fixed-width output)
 - `xf.text.repeat` Repeat: Repeat a string column N times
