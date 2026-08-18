@@ -262,6 +262,6 @@ The split follows what an action can destroy rather than which screen it lives o
 
 ## Next steps
 
-* [Scheduler & Automation](scheduler.md) — cron, intervals and file watches in depth
-* [Desktop Shell & Workspace Git Flow](architecture.md) — putting pipelines in version control
+* [Scheduler & Automation](scheduler.md) - cron, intervals and file watches in depth
+* [Desktop Shell & Workspace Git Flow](architecture.md) - putting pipelines in version control
 * Full cloud recipes for AWS, Azure and Google Cloud: <https://duckle.org/deploy.html>

@@ -44,19 +44,25 @@ This guide is organized into the following sections to help you get the most out
 * Tracking execution history, duration, and error reports within the scheduler list.
 * (Planned for 1.0) Executing saved pipelines headlessly from the terminal.
 
-### 7. [Running Duckle on a Server](server-deployment.md)
+### 7. [How the Studio and the Server Fit Together](client-server-architecture.md)
+* Diagrams of **what each half owns** and the four requests that pass between them.
+* **What is stripped** before a pipeline is sent, and what is not.
+* Where every credential is stored, in what form, **including the sharp edges**.
+* Why deployed code **cannot start itself**.
+
+### 8. [Running Duckle on a Server](server-deployment.md)
 * Standing a server up and **claiming it from the studio**, with no shell session on the box.
 * **Deploying a pipeline** from the desktop, and what travels with it.
 * Why a deployed schedule always arrives **switched off**.
 * Signing in to the web console, and the three roles.
 
-### 8. [CI/CD and External Orchestrators](ci-and-orchestration.md)
+### 9. [CI/CD and External Orchestrators](ci-and-orchestration.md)
 * Getting pipelines from a **merge onto a server** with GitHub Actions or GitLab CI.
 * Why a deployed schedule always arrives **switched off**, and which role does what.
 * Running Duckle from **Airflow, Dagster or Temporal**, and what each route costs you.
 * **Prometheus metrics** and the run-history API for dashboards of your own.
 
-### 9. [Desktop Shell & Workspace Git Flow](architecture.md)
+### 10. [Desktop Shell & Workspace Git Flow](architecture.md)
 * Working with multiple workspace folders.
 * Using the built-in **Git Panel** to stage, commit, branch, and push your visual pipeline files.
 * Securely managing encrypted connection passwords.

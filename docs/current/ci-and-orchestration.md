@@ -101,7 +101,7 @@ A refusal explains itself: a mis-scoped key gets `{"error":"this needs the admin
 
 ### The two ways in
 
-**A. The command line** — for a `BashOperator`, a `KubernetesPodOperator`, or a Temporal activity.
+**A. The command line** - for a `BashOperator`, a `KubernetesPodOperator`, or a Temporal activity.
 
 ```bash
 duckle-runner --pipeline pipelines/orders_etl.json
@@ -117,7 +117,7 @@ The binary is a static musl executable with no shared-library dependencies, so i
 
 That `1` versus `2` split is the useful part: a task can retry on `2` and alert on `1`.
 
-**B. The HTTP API** — for an `HttpOperator` or a Dagster resource, against a running console.
+**B. The HTTP API** - for an `HttpOperator` or a Dagster resource, against a running console.
 
 ```bash
 curl -X POST "$DUCKLE_URL/api/run" \
@@ -189,7 +189,7 @@ If you want your orchestrator to own the schedule *and* Duckle to keep its own h
 
 ### A note on overlap
 
-If Airflow owns the schedule, Duckle's own scheduler and Plans are redundant, and you should leave them switched off rather than run both. Two schedulers pointed at one workspace will not corrupt anything — every run takes a lock on its pipeline, and the second is refused rather than doubled — but you will have two places that believe they decide when things run, and only one of them will be right.
+If Airflow owns the schedule, Duckle's own scheduler and Plans are redundant, and you should leave them switched off rather than run both. Two schedulers pointed at one workspace will not corrupt anything - every run takes a lock on its pipeline, and the second is refused rather than doubled - but you will have two places that believe they decide when things run, and only one of them will be right.
 
 ---
 
