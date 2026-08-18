@@ -23,10 +23,42 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Default DuckDB binary location used when neither --duckdb nor
-/// DUCKLE_DUCKDB_BIN is given.
-const DEFAULT_DUCKDB: &str =
-    "C:/Users/Sourav Roy/AppData/Roaming/io.duckle.app/engines/duckdb/duckdb.exe";
+/// The per-user application-data directory the desktop app installs engines into.
+///
+/// The runner is a plain binary with no Tauri path resolver, so the same three rules
+/// Tauri applies are applied here instead. Returns None when the environment does not
+/// say where the user's data lives, which is normal in a container and is why the
+/// caller treats a missing default as "no DuckDB found" rather than an error.
+fn app_data_base() -> Option<PathBuf> {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|h| h.join(".local").join("share")))
+    }
+}
+
+/// Where the desktop app puts the DuckDB CLI under a given application-data base.
+///
+/// Kept separate from reading the environment so the layout can be asserted without
+/// touching process state: `engines/<id>/<binary>` mirrors `engine_manager::binary_path`,
+/// and the two have to agree or the runner looks in a folder nothing installs to.
+fn duckdb_under(app_data_base: &Path) -> PathBuf {
+    app_data_base
+        .join("io.duckle.app")
+        .join("engines")
+        .join("duckdb")
+        .join(if cfg!(windows) { "duckdb.exe" } else { "duckdb" })
+}
+
+/// The DuckDB binary to fall back on, derived from this machine.
+fn default_duckdb_path() -> Option<PathBuf> {
+    app_data_base().map(|b| duckdb_under(&b))
+}
 
 /// Minimum length for a string to be treated as a secret. Below this we
 /// risk corrupting structural tokens (a 1-3 char "secret" could be a
@@ -416,7 +448,7 @@ fn resolve_duckdb_src(flag: &Option<PathBuf>) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let p = PathBuf::from(DEFAULT_DUCKDB);
+    let p = default_duckdb_path()?;
     if p.exists() {
         Some(p)
     } else {
@@ -1000,4 +1032,57 @@ fn render_manifest(
         JsonValue::Array(sorted.into_iter().map(JsonValue::String).collect()),
     );
     serde_json::to_string_pretty(&JsonValue::Object(m)).unwrap_or_else(|_| "{}".to_string())
+}
+
+
+#[cfg(test)]
+mod duckdb_default_tests {
+    use super::*;
+
+    /// The fallback has to describe THIS machine. It was a compiled-in absolute path
+    /// naming one developer's Windows profile, so on every other machine it pointed at a
+    /// directory that does not exist, and the string shipped inside the released binary.
+    ///
+    /// Asserting "the path looks right" is not enough to catch that: on the machine the
+    /// path was taken from, a baked-in constant and a correctly derived path are the same
+    /// string. So the test moves the environment and requires the answer to move with it.
+    #[test]
+    fn the_default_duckdb_path_follows_this_machine_rather_than_a_baked_in_one() {
+        let key = if cfg!(windows) { "APPDATA" } else { "HOME" };
+        let saved = std::env::var_os(key);
+        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var(key, "/duckle-test-base");
+        std::env::remove_var("XDG_DATA_HOME");
+
+        let got = default_duckdb_path();
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        if let Some(v) = saved_xdg {
+            std::env::set_var("XDG_DATA_HOME", v);
+        }
+
+        let got = got.expect("a default path");
+        assert!(
+            got.starts_with("/duckle-test-base"),
+            "the default DuckDB path ignores the environment and is baked in: {}",
+            got.display()
+        );
+    }
+
+    /// The layout must match what `engine_manager` installs, or the runner looks in a
+    /// folder nothing ever writes to.
+    #[test]
+    fn the_default_path_is_the_folder_the_desktop_installs_into() {
+        let got = duckdb_under(Path::new("/base"));
+        let want = Path::new("/base")
+            .join("io.duckle.app")
+            .join("engines")
+            .join("duckdb")
+            .join(if cfg!(windows) { "duckdb.exe" } else { "duckdb" });
+        assert_eq!(got, want);
+        assert_ne!(duckdb_under(Path::new("/one")), duckdb_under(Path::new("/two")));
+    }
 }
