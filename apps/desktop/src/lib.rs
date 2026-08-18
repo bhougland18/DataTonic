@@ -1265,7 +1265,7 @@ fn deploy_target_claim(
     name: String,
     url: String,
     admin_label: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     deploy::claim(&ws_path(&workspace_path), &name, &url, &admin_label)
 }
 

@@ -628,14 +628,20 @@ export async function deployTargetProbe(url: string): Promise<'unclaimed' | 'cla
     return await invoke<'unclaimed' | 'claimed'>('deploy_target_probe', { url });
 }
 
-/** Finish setting up a server that nobody has claimed, and keep the key it returns. */
+/**
+ * Finish setting up a server that nobody has claimed, and keep the key it returns.
+ *
+ * Answers with that key, ONCE. The app stores its own encrypted copy either way; this is
+ * so the person who just claimed the server can also sign in to its console with a
+ * browser, which otherwise needed a shell session on the box.
+ */
 export async function deployTargetClaim(
     workspacePath: string,
     name: string,
     url: string,
     adminLabel: string,
-): Promise<void> {
-    await invoke('deploy_target_claim', { workspacePath, name, url, adminLabel });
+): Promise<string> {
+    return await invoke<string>('deploy_target_claim', { workspacePath, name, url, adminLabel });
 }
 
 /** Save a server that is already set up, with a key an administrator gave you. */

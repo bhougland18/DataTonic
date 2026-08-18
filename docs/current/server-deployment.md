@@ -27,8 +27,14 @@ The studio is where pipelines are written. The server is where they run, on a cl
 
 ### Step 1. Make an empty folder for it
 
+**Windows**
 ```bat
 mkdir C:\duckle-server
+```
+
+**macOS / Linux**
+```bash
+mkdir -p ~/duckle-server
 ```
 
 It must be a **new, empty folder**. A workspace that already has accounts in it counts as already set up, and cannot be claimed.
@@ -42,7 +48,13 @@ You do not have to download anything. The studio carries the server binary insid
 3. Choose **My team, on a server**, then **Custom**.
 4. Press **Save the runner**.
 
-It writes `duckle-runner.exe` into `%APPDATA%\io.duckle.app\server\` and shows you the exact command to start it. Leave the wizard open on this screen.
+It writes the runner into the app's own folder and shows you the exact command to start it. Leave the wizard open on this screen.
+
+| Platform | Where it lands |
+| --- | --- |
+| Windows | `%APPDATA%\io.duckle.app\server\duckle-runner.exe` |
+| macOS | `~/Library/Application Support/io.duckle.app/server/duckle-runner` |
+| Linux | `~/.local/share/io.duckle.app/server/duckle-runner` |
 
 > Deploying to AWS, Azure or Google Cloud instead? Pick that provider in the same step and it gives you a container command for it. The rest of this guide is unchanged.
 
@@ -50,9 +62,17 @@ It writes `duckle-runner.exe` into `%APPDATA%\io.duckle.app\server\` and shows y
 
 Paste the command the wizard gave you into a terminal. It looks like this:
 
+**Windows**
 ```bat
-cd "C:\Users\<you>\AppData\Roaming\io.duckle.app\server"
+cd "%APPDATA%\io.duckle.app\server"
 .\duckle-runner.exe serve --workspace C:\duckle-server --host 0.0.0.0 --port 8095
+```
+
+**macOS / Linux**
+```bash
+# Linux: cd ~/.local/share/io.duckle.app/server
+cd ~/Library/Application\ Support/io.duckle.app/server
+./duckle-runner serve --workspace ~/duckle-server --host 0.0.0.0 --port 8095
 ```
 
 Wait for this line:
@@ -91,7 +111,12 @@ Type your name and press **Claim it**.
 * The studio ends on **"Connected to prod"**.
 * The terminal logs `claimed by '<you>'; setup is closed`.
 
-The server now has an administrator, and setup is closed for good. The key it issued is stored on this machine, encrypted with your workspace key, and is never shown again.
+The server now has an administrator, and setup is closed for good.
+
+The wizard then shows you an **administrator token, once**. Copy it somewhere safe: it is
+what you sign in to the web console with, and it cannot be recovered afterwards. Duckle
+keeps its own encrypted copy for deploying, so losing yours costs you the browser login,
+not the connection.
 
 ### Step 6. Check it locked down
 
@@ -124,24 +149,42 @@ If that pipeline has a schedule, the dialog offers to send it too, and tells you
 
 ### Step 9. Look at the server's folder
 
+**Windows**
 ```bat
 dir C:\duckle-server
+```
+
+**macOS / Linux**
+```bash
+ls ~/duckle-server
 ```
 
 Your pipeline is there as a `.json` file.
 
 ### Step 10. Check what did not travel
 
+**Windows**
 ```bat
 findstr /C:"sampleRows" C:\duckle-server\*.json
+```
+
+**macOS / Linux**
+```bash
+grep -l sampleRows ~/duckle-server/*.json
 ```
 
 No matches is the correct answer. Preview rows are real rows read from your real sources, and they are stripped out before anything is sent.
 
 If a schedule went with it:
 
+**Windows**
 ```bat
 type C:\duckle-server\schedules.json
+```
+
+**macOS / Linux**
+```bash
+cat ~/duckle-server/schedules.json
 ```
 
 It will say `"enabled": false`. **A deployed schedule always arrives switched off.** A cadence someone set while testing must not start firing the moment it reaches a server; turning it on is a separate, deliberate act.
@@ -150,16 +193,26 @@ It will say `"enabled": false`. **A deployed schedule always arrives switched of
 
 ## Part 5: Run it on the server
 
-### Step 11. Make yourself a console login
+### Step 11. Get a console login
 
-Claiming gave the *studio* a key. To sign in to the console with a *browser* you need your own token. In a second terminal, leaving the server running:
+Use the administrator token the wizard showed you in Step 5. That is all you need.
 
+**Lost it, or setting someone else up?** Mint another from a terminal, leaving the server
+running:
+
+**Windows**
 ```bat
-cd "C:\Users\<you>\AppData\Roaming\io.duckle.app\server"
-.\duckle-runner.exe console add-user sourav --role admin --workspace C:\duckle-server
+cd "%APPDATA%\io.duckle.app\server"
+.\duckle-runner.exe console add-user alex --role admin --workspace C:\duckle-server
 ```
 
-It prints a token **once**. It is stored only as a hash and cannot be recovered, so keep it somewhere safe or generate another later.
+**macOS / Linux**
+```bash
+./duckle-runner console add-user alex --role admin --workspace ~/duckle-server
+```
+
+It prints a token **once** and stores only a hash, so it cannot be read back later.
+Generate a new one rather than hunting for an old one.
 
 ### Step 12. Sign in and run it
 
@@ -179,7 +232,7 @@ Open `http://127.0.0.1:8095` and sign in with that token.
 ## When you are finished
 
 * Stop the server with `Ctrl+C`. Binding to `0.0.0.0` really does expose the port on your network, and restarting reopens the fifteen-minute claim window.
-* Delete `C:\duckle-server` if it was only a rehearsal.
+* Delete `C:\duckle-server` (or `~/duckle-server`) if it was only a rehearsal.
 
 ---
 

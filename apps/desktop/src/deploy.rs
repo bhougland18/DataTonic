@@ -148,7 +148,12 @@ pub fn probe(url: &str) -> Result<String, String> {
 ///
 /// This is the whole point of the desktop being the setup client: a server can be brought
 /// up in a cloud with no shell session, and finished from here.
-pub fn claim(workspace: &Path, name: &str, url: &str, admin_label: &str) -> Result<(), String> {
+pub fn claim(
+    workspace: &Path,
+    name: &str,
+    url: &str,
+    admin_label: &str,
+) -> Result<String, String> {
     let url = clean_url(url)?;
     let label = admin_label.trim();
     if label.is_empty() {
@@ -176,7 +181,16 @@ pub fn claim(workspace: &Path, name: &str, url: &str, admin_label: &str) -> Resu
         .ok_or("the server did not return a key")?;
     // Saved straight away. The key is shown once by the server, so a claim that is not
     // stored here is a server nobody can get back into.
-    save_target(workspace, name, &url, &token)
+    save_target(workspace, name, &url, &token)?;
+    // ...and handed back, once, so the person who just claimed the server can also sign in
+    // to its console with a browser. Without this they had a server they administered and
+    // no way to open it, and had to run `console add-user` on the box - the one shell step
+    // in a flow whose whole point is not needing one.
+    //
+    // This is not the same as letting a STORED key back out, which `list_targets` refuses
+    // and a test pins. This value has just been minted, is never readable again from
+    // anywhere, and is exactly what `console add-user` prints.
+    Ok(token)
 }
 
 /// Ask a target who we are, which is the only way to find out before deploying whether the

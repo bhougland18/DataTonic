@@ -133,6 +133,15 @@ export default function SetupWizard({ workspacePath, onDone }: Props) {
     const [provider, setProvider] = useState<Provider>('custom');
     const [runner, setRunner] = useState<StagedRunner | null>(null);
     const [copied, setCopied] = useState(false);
+    /**
+     * The administrator token, shown once after claiming.
+     *
+     * The app keeps its own encrypted copy regardless; this is so the person who just
+     * claimed the server can also open its console in a browser. Without it they
+     * administered a server they could not sign in to, and had to run `console add-user`
+     * on the box - the one shell step in a flow built to avoid needing one.
+     */
+    const [adminToken, setAdminToken] = useState<string | null>(null);
 
     const copy = async (text: string) => {
         setCopied(await copyText(text));
@@ -190,7 +199,7 @@ export default function SetupWizard({ workspacePath, onDone }: Props) {
         setBusy(true);
         setError(null);
         try {
-            await deployTargetClaim(workspacePath, name, url, admin);
+            setAdminToken(await deployTargetClaim(workspacePath, name, url, admin));
             setBusy(false);
             setStep('done');
         } catch (e) {
@@ -477,6 +486,31 @@ export default function SetupWizard({ workspacePath, onDone }: Props) {
                             Build a pipeline here, then deploy it to {name}. Its schedule arrives
                             switched off, so nothing starts running until you say so.
                         </p>
+                        {adminToken ? (
+                            <>
+                                <p className="setup-sub">
+                                    This is your administrator sign-in for {url}. It is shown{' '}
+                                    <b>once</b> and cannot be recovered, so keep it somewhere safe.
+                                </p>
+                                <div className="setup-command">
+                                    <pre>{adminToken}</pre>
+                                    <button
+                                        className="setup-alt"
+                                        type="button"
+                                        onClick={() => copy(adminToken)}
+                                    >
+                                        <Copy size={13} /> {copied ? 'Copied' : 'Copy'}
+                                    </button>
+                                </div>
+                                <p className="setup-note">
+                                    <ShieldCheck size={14} />
+                                    <span>
+                                        Duckle already saved its own encrypted copy for deploying,
+                                        so you only need this one to open the console in a browser.
+                                    </span>
+                                </p>
+                            </>
+                        ) : null}
                         <div className="setup-actions">
                             <button className="setup-next" onClick={() => onDone('server')}>
                                 <Server size={15} /> Start building
