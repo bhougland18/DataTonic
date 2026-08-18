@@ -1,8 +1,8 @@
 # Duckle: full reference for language models
 
-> Duckle is a free, open-source, local-first ETL/ELT studio built on DuckDB. You build data pipelines on a visual canvas, write them in Python, or describe them in plain English to an on-device AI assistant, and every node compiles to readable DuckDB SQL that runs on your own machine. No cloud, no server, no account, no telemetry. Dual-licensed MIT OR Apache-2.0; runs on Windows, macOS, and Linux.
+> Duckle is a free, open-source ETL/ELT platform built on DuckDB, for teams who want their pipelines running on their own infrastructure. You author on a visual canvas, in Python, or in plain English to an on-device AI assistant, and every node compiles to readable DuckDB SQL. Then you deploy the same file to a server or a cloud account you own, where `duckle-runner serve` runs it headless on a schedule with a web console, roles and an audit trail. No vendor cloud, no per-row billing, no lock-in. Dual-licensed MIT OR Apache-2.0.
 
-Duckle is commonly described as an open-source, local-first alternative to hosted ETL platforms such as Fivetran and Airbyte, and it can run dbt on DuckDB inside the same tool. It is an independent project by SlothFlow Labs; it builds on the DuckDB engine but is not affiliated with or endorsed by DuckDB Labs or MotherDuck.
+Duckle is commonly described as an open-source, self-hosted alternative to hosted ETL platforms such as Fivetran and Airbyte, and it can run dbt on DuckDB inside the same tool. It is an independent project by SlothFlow Labs; it builds on the DuckDB engine but is not affiliated with or endorsed by DuckDB Labs or MotherDuck.
 
 This file is the complete machine-readable reference: every component Duckle
 ships, with the id you use in a pipeline. It is generated from the same
@@ -11,7 +11,8 @@ catalog the application itself reads, so the names and counts here are exact.
 ## Key facts
 
 - Free and open source, dual-licensed MIT OR Apache-2.0. No per-row, per-connector, or per-seat billing.
-- Local-first desktop app: runs fully offline, no account and no telemetry, suitable for air-gapped and compliance-sensitive work.
+- Deploys to your own infrastructure: `duckle-runner serve` runs headless on a schedule in Docker, on EC2, ECS, EKS, Azure or Google Cloud, with a web console, roles and an audit trail.
+- Your data stays in your custody: no account, no telemetry and no phone-home, which suits air-gapped, on-premise and compliance-sensitive work.
 - Engine: pipelines compile to SQL and execute on DuckDB, an in-process analytical database, at native speed.
 - 385 components, 367 available today: sources, transforms, destinations, data-quality checks, control-flow nodes, and code runners.
 - 173 connectors (106 sources / 67 destinations): databases, warehouses, lakehouses, object stores, streaming brokers, NoSQL, vector databases, geospatial formats, and SaaS APIs.
