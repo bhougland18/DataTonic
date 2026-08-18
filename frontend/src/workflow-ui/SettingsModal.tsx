@@ -15,6 +15,7 @@ import {
     settingsSetContextFile,
 } from '../tauri-bridge';
 import { loadPersisted, savePersisted } from '../persistence';
+import { openExternal } from '../tauri-io';
 import {
     DEFAULT_FONT_SIZE,
     MAX_FONT_SIZE,
@@ -199,6 +200,20 @@ export function SettingsModal({
         boxSizing: 'border-box',
     };
     const help: React.CSSProperties = { marginTop: 0, marginBottom: 8, fontSize: '0.9231rem', opacity: 0.7 };
+    // The security table. Deliberately two columns of plain text rather than a grid of
+    // reassurance: the second column is where the honest answers live, and a reader
+    // should be able to scan for the ones that are not green.
+    const secTable: React.CSSProperties = {
+        display: 'flex', flexDirection: 'column', gap: 6,
+        borderTop: '1px solid var(--border-2, #2a2a2a)', paddingTop: 10,
+    };
+    const secRow: React.CSSProperties = {
+        display: 'flex', justifyContent: 'space-between', gap: 16,
+        fontSize: '0.9231rem', flexWrap: 'wrap',
+    };
+    const secWhat: React.CSSProperties = { opacity: 0.85 };
+    const secGood: React.CSSProperties = { color: 'var(--success)', textAlign: 'right' };
+    const secWarn: React.CSSProperties = { color: 'var(--accent-warn, #d0902f)', textAlign: 'right' };
 
     const Section = ({ id, title, children }: { id: string; title: string; children: ReactNode }) => {
         const open = expanded.has(id);
@@ -455,6 +470,76 @@ export function SettingsModal({
                             <input type="checkbox" checked={showMinimap} onChange={e => toggleMinimap(e.target.checked)} />
                             Show the minimap in the corner of the canvas
                         </label>
+                    </Section>
+
+                    <Section id="security" title="Security and privacy">
+                        <p style={help}>
+                            Where this workspace keeps credentials, and what is protected. The
+                            same facts are in the architecture guide, with citations.
+                        </p>
+
+                        <div style={secTable}>
+                            <div style={secRow}>
+                                <span style={secWhat}>Connection secrets</span>
+                                <span style={secGood}>AES-256-GCM, per value</span>
+                            </div>
+                            <div style={secRow}>
+                                <span style={secWhat}>Server API keys</span>
+                                <span style={secGood}>AES-256-GCM</span>
+                            </div>
+                            <div style={secRow}>
+                                <span style={secWhat}>Cached Git token</span>
+                                <span style={secGood}>AES-256-GCM</span>
+                            </div>
+                            <div style={secRow}>
+                                <span style={secWhat}>The key that decrypts them</span>
+                                <span style={secWarn}>
+                                    plain file in .duckle/keys, beside what it protects
+                                </span>
+                            </div>
+                            <div style={secRow}>
+                                <span style={secWhat}>Context variables, even "secret" ones</span>
+                                <span style={secWarn}>plain text on disk</span>
+                            </div>
+                            <div style={secRow}>
+                                <span style={secWhat}>AI key and proxy URL</span>
+                                <span style={secWarn}>plain text in .duckle/settings.json</span>
+                            </div>
+                            <div style={secRow}>
+                                <span style={secWhat}>Values typed into a pipeline field</span>
+                                <span style={secWarn}>plain text; use ${'{'}ENV:NAME{'}'}</span>
+                            </div>
+                        </div>
+
+                        <p style={{ ...help, marginTop: 12 }}>
+                            Encryption here defends a stray file, a backup or a commit. It does
+                            not defend a copied workspace folder, because the key travels with
+                            it. Everything above is excluded from git automatically.
+                        </p>
+
+                        <p style={{ ...help, marginTop: 12 }}>
+                            <b>No telemetry.</b> No analytics, usage reporting or crash reporting
+                            of any kind. One automatic outbound call exists: a version check
+                            against a public GitHub URL that sends nothing about you or your work.
+                        </p>
+
+                        {workspace ? (
+                            <p style={{ ...help, marginTop: 12, wordBreak: 'break-all' }}>
+                                This workspace: <code>{workspace}</code>
+                            </p>
+                        ) : null}
+
+                        <button
+                            type="button"
+                            style={btn}
+                            onClick={() =>
+                                void openExternal(
+                                    'https://github.com/slothflowlabs/duckle/blob/main/docs/current/client-server-architecture.md',
+                                )
+                            }
+                        >
+                            Read the architecture guide
+                        </button>
                     </Section>
 
                     <Section id="tour" title="First run">
