@@ -1,6 +1,6 @@
 {
   "projectName": "duckle",
-  "projectOwner": "ducklelabs",
+  "projectOwner": "slothflowlabs",
   "repoType": "github",
   "repoHost": "https://github.com",
   "files": [
@@ -12,7 +12,7 @@
   "commitType": "docs",
   "contributorsPerLine": 7,
   "contributorsSortAlphabetically": false,
-  "badgeTemplate": "[![All Contributors](https://img.shields.io/github/all-contributors/ducklelabs/duckle?color=ff6900&style=flat-square)](#contributors)",
+  "badgeTemplate": "[![All Contributors](https://img.shields.io/github/all-contributors/slothflowlabs/duckle?color=ff6900&style=flat-square)](#contributors)",
   "contributors": [
     {
       "login": "mitslabo",
