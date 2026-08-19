@@ -429,10 +429,62 @@ fn web_sign_in(state: &WebState, req: &Request) -> Reply {
     }
 }
 
+/// The editor's gate: cross-origin, then identity, then role.
+///
+/// Extracted so the streaming route is held to the SAME checks as every other
+/// route. It used to be reachable without any of them: `handle_web` matched
+/// `/api/run_stream` and returned BEFORE calling `route_web`, which is where the
+/// cross-origin guard, the sign-in check and the role check all live. Since
+/// `run_stream` executes a pipeline taken from the request body, and resolves
+/// this workspace's saved connections into it, that route accepted an
+/// unauthenticated request and ran it with the workspace's credentials.
+///
+/// The reason for the early return was real - Server-Sent Events keep the socket
+/// open, so there is no finished `Reply` to hand back - but the answer is to run
+/// the checks first, not to skip them.
+fn web_gate(
+    req: &Request,
+    state: &WebState,
+    needed: console_auth::Role,
+    action: &str,
+) -> Result<console_auth::Identity, Reply> {
+    if req.method == "POST" && req.path.starts_with("/api/") && !guard_local(req, &state.host) {
+        return Err(respond_403("blocked: cross-origin or non-local request"));
+    }
+    let Some(who) = state.console.identify(req.authorization.as_deref(), req.cookie.as_deref())
+    else {
+        audit::record(&state.workspace, None, action, &req.path, audit::Outcome::Unauthenticated);
+        return Err(respond_err("401 Unauthorized", "sign in to use the editor"));
+    };
+    if !who.role.allows(needed) {
+        audit::record(&state.workspace, Some(&who), action, &req.path, audit::Outcome::Denied);
+        return Err(respond_403(&format!(
+            "this needs the {} role; you have {}",
+            needed.as_str(),
+            who.role.as_str()
+        )));
+    }
+    Ok(who)
+}
+
 fn handle_web(mut stream: TcpStream, state: &WebState) -> Result<(), String> {
     let req = read_request(&mut stream)?;
-    // Server-Sent Events keep the socket: there is no finished response to hand back.
+    // Server-Sent Events keep the socket: there is no finished response to hand
+    // back, so this route is dispatched here rather than through `route_web`.
+    // It is gated FIRST, with the same checks `route_web` applies - running a
+    // caller-supplied pipeline needs at least the operator role.
     if req.method == "POST" && req.path == "/api/run_stream" {
+        let who = match web_gate(&req, state, console_auth::Role::Operator, "editor.api") {
+            Ok(w) => w,
+            Err(reply) => return write_reply(&mut stream, &reply),
+        };
+        audit::record(
+            &state.workspace,
+            Some(&who),
+            "editor.api",
+            &req.path,
+            audit::Outcome::Allowed,
+        );
         let body = req.body.clone();
         return run_stream(&mut stream, state, &body);
     }
@@ -2904,7 +2956,7 @@ mod tests {
         deploy_target, is_public_route, load_schedules, plan_step_outcome, route_console,
         scheduler_notice, Request,
         migrate_legacy_schedules, normalize_cron, read_pipeline_file, read_request,
-        save_schedule_at, RunGate, State, HEALTH_PATH, MAX_BODY,
+        save_schedule_at, web_gate, RunGate, State, WebState, HEALTH_PATH, MAX_BODY,
     };
     use std::sync::Mutex;
     use duckle_duckdb_engine::schedules::{self, ScheduleKind};
@@ -3234,6 +3286,45 @@ mod tests {
     /// A --token caller is an admin, so this proves the role gate rather than the token
     /// gate: an unknown route falls to admin and a viewer must not reach it.
     #[test]
+
+    /// `/api/run_stream` executes a pipeline supplied in the request body, and
+    /// resolves this workspace's saved connections into it before running. It was
+    /// dispatched by `handle_web` before `route_web` was ever called, so it ran
+    /// with no cross-origin guard, no sign-in and no role check: an unauthenticated
+    /// POST executed arbitrary work with the workspace's credentials, on an image
+    /// whose entrypoint is `duckle-runner web`.
+    ///
+    /// The gate is asserted here rather than through `handle_web`, which owns a
+    /// socket. Reverting `web_gate`'s identity check turns this red.
+    #[test]
+    fn the_streaming_run_route_is_not_reachable_without_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            dist: ws.clone(),
+            host: "0.0.0.0".into(),
+            run_lock: RunGate::new(1),
+            console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+        };
+
+        let anonymous = request("POST", "/api/run_stream", None);
+        let refused = web_gate(&anonymous, &state, console_auth::Role::Operator, "editor.api")
+            .expect_err("an unauthenticated streaming run must be refused");
+        assert_eq!(
+            refused.code(),
+            401,
+            "unauthenticated /api/run_stream answered {} instead of 401",
+            refused.code()
+        );
+
+        let bearer = format!("Bearer {}", "s3cret");
+        let signed_in = request("POST", "/api/run_stream", Some(&bearer));
+        web_gate(&signed_in, &state, console_auth::Role::Operator, "editor.api")
+            .expect("a credentialed operator must still be allowed to run");
+    }
+
     fn a_role_that_is_not_enough_is_refused_not_admitted() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().canonicalize().unwrap();

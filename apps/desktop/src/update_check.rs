@@ -18,7 +18,16 @@ use std::time::Duration;
 
 /// Duckle's own repository - the source of releases to check against (NOT the
 /// user's workspace remote).
-const REPO: &str = "ducklelabs/duckle";
+///
+/// This value decides where the updater fetches release metadata, and the
+/// `browser_download_url` in that response is what `self_update` downloads and
+/// executes. It must therefore name a repository under an organisation WE
+/// CONTROL. It said `ducklelabs/duckle` after the move to `slothflowlabs`, and
+/// kept working only because GitHub redirects a renamed repository - a redirect
+/// that stops the moment anybody registers the abandoned name. Whoever did so
+/// would have served signed-looking updates to every installed copy, because the
+/// checksum the updater verifies against is fetched from the same release.
+const REPO: &str = "slothflowlabs/duckle";
 
 /// An asset must be newer than the running build by at least this much to count
 /// as an update. The release job runs ~14 min before its asset is uploaded, so
@@ -182,4 +191,26 @@ pub fn check() -> UpdateInfo {
     // No release carried our asset (e.g. nothing published yet).
     info.error.get_or_insert_with(|| "no matching release asset found".into());
     info
+}
+
+
+#[cfg(test)]
+mod repo_origin_tests {
+    /// The updater's release source has to be an organisation we own.
+    ///
+    /// This is a regression test for a real defect: after the move to
+    /// `slothflowlabs` this constant still read `ducklelabs/duckle`, an
+    /// organisation that no longer existed and that anybody could have
+    /// registered. GitHub's rename redirect hid it, so nothing failed, no test
+    /// broke, and the app went on asking an abandoned name where to fetch its
+    /// own replacement. Renames are exactly the kind of change that leaves a
+    /// constant like this behind, so it is pinned rather than trusted.
+    #[test]
+    fn the_update_source_is_an_organisation_we_control() {
+        assert_eq!(
+            super::REPO,
+            "slothflowlabs/duckle",
+            "the updater is pointed at a repository we may not own"
+        );
+    }
 }
