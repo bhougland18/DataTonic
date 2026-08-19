@@ -355,7 +355,7 @@
         <text class="lb-go" x="449" y="178" text-anchor="middle">an account is created</text>
       </svg>
     </div>
-    <p class="cap">A server bound off this machine with no credential <b>refuses to start</b> rather than coming up open. The fifteen-minute window exists so an unclaimed server on a network cannot sit waiting to be claimed by whoever reaches it first.</p>
+    <p class="cap">A server bound off this machine with no credential comes up <b>unclaimed</b>, not open and not refused: for fifteen minutes anyone who can reach it can claim it and become its administrator, so that setup can be finished in a browser. Supply a credential before you expose it and that window never opens.</p>
   </div>
 </section>
 
@@ -396,8 +396,8 @@
 
     <div class="dep-grid">
       <div class="dep-card">
-        <h4>1. It refuses to start without a credential</h4>
-        <p>On <code>127.0.0.1</code> the console is open, because reaching it means already being on the machine. Bind to any other address and it <b>will not start</b> until you pass <code>--token</code>, set <code>DUCKLE_CONSOLE_TOKEN</code>, or create accounts. That is deliberate: a bind that cannot be authenticated should fail rather than serve and warn.</p>
+        <h4>1. Without a credential it starts claimable</h4>
+        <p>On <code>127.0.0.1</code> the console is open, because reaching it means already being on the machine. Bind to any other address with no credential and it starts <b>unclaimed</b>: for fifteen minutes anyone who reaches it can claim administrator. Pass <code>--token</code>, set <code>DUCKLE_CONSOLE_TOKEN</code>, or create accounts first. An empty value is refused rather than treated as absent, so an unresolved secret fails loudly instead of opening that window<code>DUCKLE_CONSOLE_TOKEN</code>, or create accounts. That is deliberate: a bind that cannot be authenticated should fail rather than serve and warn.</p>
       </div>
       <div class="dep-card">
         <h4>2. Your proxy terminates TLS</h4>
@@ -506,7 +506,7 @@ duckle-runner serve --host 0.0.0.0 --port 8080 --workspace /srv/duckle</code></p
       </div>
       <div class="dep-card">
         <h4>You put it on a server and it refused to start</h4>
-        <p>That is the feature, not a fault. The console can run any pipeline in the workspace, and a pipeline runs shell and SQL, so reaching it equals running code on that host. A bind it cannot authenticate fails instead of serving anyone. Give it <code>DUCKLE_CONSOLE_TOKEN</code> and it starts.</p>
+        <p>That is the feature, not a fault. The console can run any pipeline in the workspace, and a pipeline runs shell and SQL, so reaching it equals running code on that host. A bind it cannot authenticate comes up claimable and says so loudly, rather than serving anyone quietly. Give it <code>DUCKLE_CONSOLE_TOKEN</code> and it starts.</p>
       </div>
       <div class="dep-card">
         <h4>A machine needs in</h4>

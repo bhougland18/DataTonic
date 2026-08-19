@@ -360,7 +360,7 @@ Nothing here depends on a person's machine being switched on:
 
 Working recipes for **AWS (EC2, ECS, EKS)**, **Azure (VM, Container Apps, AKS)** and **Google Cloud (Compute Engine, GKE)**, with manifests and the mistakes worth avoiding, are at **[duckle.org/deploy](https://duckle.org/deploy.html)**. Three things worth knowing before you start:
 
-- The console **refuses to start** on a non-loopback bind without a credential. Pass `--token`, set `DUCKLE_CONSOLE_TOKEN`, or create accounts with `duckle-runner console add-user`. Who can do what, and [how one request is decided](#how-a-request-is-decided), is set out under [Sign-in and roles](#sign-in-and-roles).
+- On a non-loopback bind with no credential the console starts **unclaimed**, and for 15 minutes anyone who can reach it can claim it and become its administrator. Pass `--token`, set `DUCKLE_CONSOLE_TOKEN`, or create accounts with `duckle-runner console add-user` before exposing it. An empty value is refused rather than treated as absent, so an unresolved secret fails loudly instead of opening that window. Who can do what, and [how one request is decided](#how-a-request-is-decided), is set out under [Sign-in and roles](#sign-in-and-roles).
 - The **scheduler runs in `serve`**, not in the editor. Start the editor with schedules armed and it now says so rather than leaving you to wonder why nothing fired.
 - **`GET /healthz`** needs no credential and answers `ok`, so a Kubernetes probe or a load balancer can check liveness without holding a token. Every other route is authenticated, so pointing a probe anywhere else reports the pod unhealthy forever.
 

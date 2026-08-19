@@ -2,8 +2,9 @@
 # app. Local-first: your data + pipelines stay in the mounted workspace; the
 # engine runs in the container, nothing is sent to any Duckle-hosted service.
 #
-# The entrypoint binds 0.0.0.0, which REFUSES TO START without a credential, so
-# a token is not optional here. Serve plain HTTP behind a reverse proxy for TLS.
+# The entrypoint binds 0.0.0.0. With no credential the console starts UNCLAIMED
+# and anyone who reaches it can claim administrator for 15 minutes, so a token is
+# not optional here. Serve plain HTTP behind a reverse proxy for TLS.
 #
 #   docker build -f Dockerfile.web -t duckle-web .
 #   docker run -p 8080:8080 -v /path/to/workspace:/workspace \

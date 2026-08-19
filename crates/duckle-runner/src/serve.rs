@@ -89,9 +89,10 @@ fn parse_serve_args() -> Result<ServeArgs, String> {
                      --tick-interval <secs> Scheduler poll cadence in seconds (default 15; also DUCKLE_TICK_INTERVAL)\n    \
                      --token <secret>       Shared sign-in token (also DUCKLE_CONSOLE_TOKEN)\n\n\
                      On 127.0.0.1 with no accounts the console is open, because reaching it\n\
-                     means already being on the machine. Any other --host REFUSES TO START\n\
-                     without a credential: pass --token, set DUCKLE_CONSOLE_TOKEN, or give\n\
-                     people their own with `duckle-runner console add-user <name> --role ...`.\n\
+                     means already being on the machine. On any other --host with no credential\n\
+                     it starts UNCLAIMED: for 15 minutes anyone who can reach it can claim\n\
+                     it and become its administrator. Supply --token, DUCKLE_CONSOLE_TOKEN,\n\
+                     or `duckle-runner console add-user <name> --role ...` to skip that.\n\
                      Put it behind a reverse proxy if you need TLS."
                 );
                 std::process::exit(0);
@@ -210,14 +211,26 @@ pub fn run() -> Result<(), String> {
     apply_workspace_memory_limit(&workspace);
 
     // Decide who may use this console before binding anything. An exposed bind
-    // with no credential is an error here, not a warning: the console can run
-    // any pipeline in the workspace, so serving it to the network unauthenticated
-    // is remote code execution, and a warning in a service log is not a control.
-    let token = args
-        .token
-        .clone()
-        .or_else(|| std::env::var("DUCKLE_CONSOLE_TOKEN").ok())
-        .filter(|t| !t.trim().is_empty());
+    // with no credential does not refuse to start any more - it comes up
+    // unclaimed, so setup can be finished in a browser - but it then spends
+    // fifteen minutes accepting an administrator claim from anyone who reaches
+    // it. That is a deliberate trade, and it is only sound when "no credential"
+    // means the operator chose not to supply one.
+    //
+    // An empty value is NOT that. `DUCKLE_CONSOLE_TOKEN=` is what an unresolved
+    // secret reference looks like: the deployment believes it passed a
+    // credential, the variable exists, and its value is the empty string. Folding
+    // that into "no credential given" silently opened the claim window on a
+    // server whose operator had every reason to think it was locked. It is a
+    // misconfiguration, so it is refused rather than downgraded.
+    let supplied = args.token.clone().or_else(|| std::env::var("DUCKLE_CONSOLE_TOKEN").ok());
+    if supplied.as_deref().is_some_and(|t| t.trim().is_empty()) {
+        return Err(
+            "a console credential was supplied but is empty. Set DUCKLE_CONSOLE_TOKEN (or              --token) to a real value, or remove it entirely to set the server up from a              browser. Refusing to start rather than opening an administrator claim window."
+                .to_string(),
+        );
+    }
+    let token = supplied;
     let console = console_auth::Console::configure(&workspace, &args.host, token.as_deref())?;
     let console_open = console.is_open();
 
@@ -302,8 +315,9 @@ fn parse_web_args() -> Result<WebArgs, String> {
                     "duckle-runner web - serve the Duckle editor as a web app (spike)\n\n\
                      USAGE:\n    duckle-runner web --dist <dir> [--host <ip>] [--port <n>] [--workspace <dir>] [--token <secret>]\n\n\
                      Same accounts and roles as `duckle-runner serve`: open on 127.0.0.1\n\
-                     with no accounts, and REFUSES TO START on any other --host without a\n\
-                     credential (--token, DUCKLE_CONSOLE_TOKEN, or `console add-user`)."
+                     with no accounts, and UNCLAIMED on any other --host without a credential,\n\
+                     claimable by anyone who reaches it for 15 minutes. Supply --token,\n\
+                     DUCKLE_CONSOLE_TOKEN, or `console add-user` to skip that window)."
                 );
                 std::process::exit(0);
             }
