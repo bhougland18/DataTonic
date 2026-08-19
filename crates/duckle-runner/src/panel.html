@@ -428,7 +428,10 @@ async function signOut(){
   await fetch('/api/session', { method: 'DELETE' });
   location.reload();
 }
-function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// The single quote and backtick are escaped too. This value is interpolated into
+  // single-quoted JS strings inside inline handlers, so without them a pipeline id -
+  // which an operator chooses - closes the string and runs as script.
+  function esc(s){ return (s==null?'':String(s)).replace(/[&<>"'`]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c])); }
 function statusKey(s){ s=(s||'').toLowerCase(); if(s==='ok'||s==='successful')return 'ok'; if(s==='running')return 'run'; if(s)return 'err'; return 'none'; }
 function pill(s){ const k=statusKey(s); const t={ok:'Successful',err:'Failed',run:'Running',none:'Never run'}[k]; return `<span class="pill p-${k}">${t}</span>`; }
 function dot(s){ return `<span class="dot d-${statusKey(s)}"></span>`; }

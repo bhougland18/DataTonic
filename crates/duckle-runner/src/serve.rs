@@ -669,8 +669,25 @@ fn confine_to_workspace(workspace: &Path, path: &str) -> Result<PathBuf, String>
             .trim_end_matches('/')
             .to_lowercase()
     };
-    if !norm(&normalized).starts_with(&norm(workspace)) {
+    // A plain prefix test lets a SIBLING through: with a workspace of `/srv/duckle`,
+    // the string `/srv/duckle-backup/x` starts with it. Require the boundary to fall
+    // on a separator, or the paths to be equal.
+    let (n, w) = (norm(&normalized), norm(workspace));
+    if !(n == w || n.starts_with(&format!("{w}/"))) {
         return Err("path escapes the workspace".into());
+    }
+    // The file bridge is reachable at operator level, while the commands that touch
+    // credentials require admin. Without this, an operator reads the very things that
+    // gate protects by asking for them as files: the AES key that decrypts every
+    // stored secret, and the cached git token. Nothing legitimate fetches these over
+    // HTTP, so they are refused for every role rather than raised to admin.
+    let rel = n.strip_prefix(&w).unwrap_or("").trim_start_matches('/');
+    if rel == ".duckle/keys"
+        || rel.starts_with(".duckle/keys/")
+        || rel == ".duckle/secrets"
+        || rel.starts_with(".duckle/secrets/")
+    {
+        return Err("that path holds key material and is not reachable through the file API".into());
     }
     Ok(normalized)
 }
@@ -2970,7 +2987,7 @@ mod tests {
         deploy_target, is_public_route, load_schedules, plan_step_outcome, route_console,
         scheduler_notice, Request,
         migrate_legacy_schedules, normalize_cron, read_pipeline_file, read_request,
-        save_schedule_at, web_gate, RunGate, State, WebState, HEALTH_PATH, MAX_BODY,
+        save_schedule_at, web_gate, confine_to_workspace, RunGate, State, WebState, HEALTH_PATH, MAX_BODY,
     };
     use std::sync::Mutex;
     use duckle_duckdb_engine::schedules::{self, ScheduleKind};
@@ -3309,6 +3326,41 @@ mod tests {
     /// whose entrypoint is `duckle-runner web`.
     ///
     /// The gate is asserted here rather than through `handle_web`, which owns a
+
+    /// The file bridge sits at operator level while the connection commands require
+    /// admin. That gate is worth nothing if the same operator can ask for the key as
+    /// a file, so the key and token directories are refused outright.
+    #[test]
+    fn the_file_api_cannot_reach_key_material() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        for path in [
+            ".duckle/keys/secret.key",
+            ".duckle/keys",
+            ".duckle/secrets/git.json",
+            "pipelines/../.duckle/keys/secret.key",
+        ] {
+            assert!(
+                confine_to_workspace(&ws, path).is_err(),
+                "the file API served key material at {path}"
+            );
+        }
+        // Ordinary workspace files still resolve.
+        assert!(confine_to_workspace(&ws, "pipelines/orders.json").is_ok());
+    }
+
+    /// A prefix test on strings treats a sibling directory as inside the workspace.
+    #[test]
+    fn a_sibling_directory_is_not_inside_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let sibling = format!("{}-backup/steal.json", ws.to_string_lossy());
+        assert!(
+            confine_to_workspace(&ws, &sibling).is_err(),
+            "a sibling directory sharing the workspace name prefix was accepted"
+        );
+    }
+
     /// socket. Reverting `web_gate`'s identity check turns this red.
     #[test]
     fn the_streaming_run_route_is_not_reachable_without_credentials() {
