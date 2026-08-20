@@ -388,72 +388,33 @@ export default function PropertiesPanel({
                     workspacePath,
                     activeContext,
                     nodeProps: props,
-                    onPickConnection: (payload: ConnectionPayload, connectionId: string) => {
+                    onPickConnection: (_payload: ConnectionPayload, connectionId: string) => {
                         if (!selected) return;
-                        // #166 stage 2: Salesforce connections are ref-only.
-                        // ConnectionRefField already stored the picked id as
-                        // the node's connectionRef; the host resolves +
-                        // decrypts it at RUN time, so credentials are never
-                        // copied into the node props / pipeline JSON.
-                        if (payload.kind === 'salesforce') return;
-                        const next = { ...(selected.data.properties ?? {}) };
-                        // One update carrying the ref AND the copied fields, the same
-                        // rule onPickRoutine follows for issue #78. `onChange(id)` in
-                        // ConnectionRefField has already set connectionRef, but this
-                        // base was spread before that landed, so writing it back
-                        // reset the ref to '' - the picker filled the fields and then
-                        // showed "- pick a saved connection -" again.
-                        next.connectionRef = connectionId;
-                        const keys: (keyof ConnectionPayload)[] = [
-                            'host',
-                            'port',
-                            'database',
-                            'username',
-                            'password',
-                            'bucket',
-                            'region',
-                            'accessKey',
-                            'secretKey',
-                            'accountName',
-                            'accountKey',
-                            'brokers',
-                            'url',
-                            'endpoint',
-                            'urlStyle',
-                            // PostgreSQL advanced / libpq TLS options (#161).
-                            'sslmode',
-                            'sslrootcert',
-                            'sslcert',
-                            'sslkey',
-                            'connectTimeout',
-                            'options',
-                            'connParams',
-                        ];
-                        for (const k of keys) {
-                            const v = payload[k];
-                            if (v !== undefined && v !== '' && v !== null) {
-                                if (k === 'urlStyle' && typeof v === 'string') {
-                                    // Normalize legacy free-text URL-style values
-                                    // ('Path', 'Path (MinIO / B2)', 'Virtual host')
-                                    // to the canonical node option value so the
-                                    // node select shows the right choice (#116).
-                                    const s = v.toLowerCase();
-                                    next.urlStyle = s.startsWith('path')
-                                        ? 'path'
-                                        : s.startsWith('vhost') || s.includes('virtual')
-                                          ? 'vhost'
-                                          : '';
-                                } else {
-                                    next[k] = v as string | number;
-                                }
-                            }
-                        }
-                        // Snowflake components key the account identifier as
-                        // `account`, but the connection stores it in `host`.
-                        if (payload.kind === 'snowflake' && payload.host) {
-                            next.account = payload.host;
-                        }
-                        onUpdate(selected.id, { properties: next });
+                        // Store the REFERENCE, never the credentials.
+                        //
+                        // This used to copy host, port, database, username and
+                        // password (plus accessKey, secretKey, accountKey, ...) onto
+                        // the node. Two things were wrong with that. Pipelines live in
+                        // git, so every pick wrote a plaintext credential into a file
+                        // meant to be shared, which is exactly what SECURITY.md tells
+                        // people not to do. And the copies were never used: at run time
+                        // `merge_generic_connection` fills these fields from the
+                        // connection and lets the connection WIN over anything inline,
+                        // so the values on the node only looked like per-node overrides.
+                        //
+                        // Salesforce already worked this way. Every kind does now, so
+                        // rotating a credential is one edit in the connection rather
+                        // than one per node that uses it.
+                        //
+                        // The editor still shows what the connection will supply: the
+                        // validator treats a ref as satisfying those fields, and each
+                        // field displays the connection's value as its placeholder.
+                        onUpdate(selected.id, {
+                            properties: {
+                                ...(selected.data.properties ?? {}),
+                                connectionRef: connectionId,
+                            },
+                        });
                     },
                     onPickRoutine: (payload: RoutinePayload, routineId: string) => {
                         if (!selected) return;
