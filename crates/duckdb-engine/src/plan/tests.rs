@@ -1707,6 +1707,39 @@
     }
 
     #[test]
+    fn csv_headerless_declared_schema_names_the_columns() {
+        // A file whose rows carry a record-type discriminator in field 1 has no
+        // header, so the reader must take its column names from the declared
+        // schema. Without that the relation exposes DuckDB's positional
+        // column00..columnNN and every downstream expression fails to bind.
+        use duckle_metadata::{Column, DataType};
+        let cols = vec![
+            Column { name: "c00".into(), data_type: DataType::String, nullable: true, format: None, primary_key: None },
+            Column { name: "c01".into(), data_type: DataType::String, nullable: true, format: None, primary_key: None },
+        ];
+        let sql = build_csv_source(
+            &serde_json::json!({ "path": "d.txt", "hasHeader": false, "nullPadding": true,
+                                 "ignoreErrors": true, "delimiter": "," }),
+            Some(&cols),
+        );
+        // `types=` maps names that ALREADY exist in the file. A headerless file
+        // has none, so DuckDB keeps column00..columnNN and the declared names
+        // are silently discarded - with ignore_errors on, without even an error.
+        // The names have to come from `columns=`, which both names and types.
+        assert!(
+            sql.contains("columns = {") && sql.contains("'c00'"),
+            "a headerless declared schema must be emitted as columns=, got: {}",
+            sql
+        );
+        assert!(
+            sql.contains("auto_detect=false"),
+            "columns= must disable the sniffer, got: {}",
+            sql
+        );
+        assert!(!sql.contains("types = {"), "must not also emit types=, got: {}", sql);
+    }
+
+    #[test]
     fn csv_ignore_errors_and_null_padding() {
         // #98: first-class toggles surface read_csv ignore_errors / null_padding.
         let sql = build_csv_source(

@@ -4682,7 +4682,23 @@ pub(crate) fn build_csv_source(props: &JsonValue, declared: Option<&[duckle_meta
             // which is exactly what the reporter expects.
             return format!("SELECT * FROM read_csv_auto({})", args.join(", "));
         }
-        args.push(format!("types = {{{}}}", pairs.join(", ")));
+        // `types=` renames nothing: it maps types onto names the file already
+        // has. A headerless file has none, so the declared names were dropped
+        // and the relation exposed DuckDB's positional column00..columnNN,
+        // breaking every downstream expression. With `ignoreErrors` on it did
+        // not even raise - the read just quietly produced the wrong names.
+        // `columns=` supplies name AND type together, which is what a
+        // headerless declared schema means, and it needs the sniffer off.
+        let headerless = !props
+            .get("hasHeader")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true);
+        if headerless {
+            args.push(format!("columns = {{{}}}", pairs.join(", ")));
+            args.push("auto_detect=false".to_string());
+        } else {
+            args.push(format!("types = {{{}}}", pairs.join(", ")));
+        }
         if !replaces.is_empty() {
             return format!(
                 "SELECT * REPLACE ({}) FROM read_csv_auto({})",
