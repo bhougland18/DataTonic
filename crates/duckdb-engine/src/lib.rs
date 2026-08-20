@@ -985,6 +985,10 @@ impl DuckdbEngine {
                     && s.retry_attempts <= 1
                     && s.wait_ms.is_none()
                     && s.memory_limit_mb.is_none()
+                    // A soft stage needs the per-stage path: the batched script
+                    // runs under -bail, so the first error ends the whole
+                    // script and "carry on" has nowhere to happen.
+                    && !s.continue_on_failure
                     && !(s.sink_mode.as_deref() == Some("error")
                         && s.sink_path.as_deref().map(is_local_path).unwrap_or(false)
                         && s.sink_path
@@ -1949,6 +1953,14 @@ impl DuckdbEngine {
                         // original error - this is "side-effect" semantics.
                     }
                     overall_error.get_or_insert(format!("{}: {}", stage.label, msg));
+                    // Allowed to fail is not the same as pretended to have
+                    // worked: the stage stays recorded as failed and the run
+                    // still ends failed. It only decides whether what comes
+                    // after is attempted, which is what a job means by a step
+                    // that logs its error and carries on.
+                    if stage.continue_on_failure {
+                        continue;
+                    }
                     break;
                 }
             }
@@ -5227,6 +5239,7 @@ mod tests {
             runtime: None,
             wait_ms: None,
             retry_attempts: 0,
+            continue_on_failure: false,
             retry_backoff_ms: 0,
             memory_limit_mb: None,
             attach_view: false,

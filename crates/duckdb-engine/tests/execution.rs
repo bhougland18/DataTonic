@@ -230,6 +230,52 @@ fn per_stage_view_count_is_backfilled_from_its_parquet_sink() {
 }
 
 #[test]
+fn a_stage_marked_continue_on_failure_does_not_end_the_run() {
+    // A real sequence mixes hard and soft steps: the load must stop the run,
+    // while writing an audit row or sorting yesterday's files should not. The
+    // engine broke out of the stage loop on any error, so one housekeeping step
+    // abandoned everything after it.
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id
+1
+2
+3
+");
+    let out = out_path(tmp.path(), "after.parquet");
+    let engine = engine_or_skip!();
+
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            // Fails: no such column. Marked soft, so the run carries on.
+            node("soft", "xf.filter",
+                 json!({ "predicate": "no_such_column = 1", "continueOnFailure": true })),
+            // Reads the SOURCE, not the failed stage, exactly as a housekeeping
+            // step sits beside the flow rather than inside it.
+            node("k", "snk.parquet", json!({ "path": out })),
+        ]),
+        json!([main_edge("e1", "s", "soft"), main_edge("e2", "s", "k")]),
+    );
+
+    let r = engine.execute_pipeline(&d);
+    // The failure is reported, not hidden.
+    assert_eq!(r.status, "error", "a soft failure is still a failure");
+    assert_eq!(
+        r.nodes.get("soft").map(|n| n.status.as_str()),
+        Some("error"),
+        "the soft stage stays recorded as failed"
+    );
+    // And the work after it still ran.
+    assert_eq!(
+        r.nodes.get("k").and_then(|n| n.rows),
+        Some(3),
+        "the stage after a soft failure must still run, got {:?}",
+        r.nodes.get("k")
+    );
+    assert!(Path::new(&out).exists(), "its output should exist");
+}
+
+#[test]
 fn parquet_sink_counts_its_own_file_not_a_glob_sibling() {
     // A sink counts the Parquet file it wrote rather than re-counting its
     // upstream, and that read goes through read_parquet, which globs. Measured

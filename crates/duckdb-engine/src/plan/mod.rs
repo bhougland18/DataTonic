@@ -58,6 +58,15 @@ pub struct Stage {
     /// executor sleeps `retry_backoff_ms` (with linear scaling) between
     /// attempts and only retries on engine errors, not on cancellation.
     pub retry_attempts: u32,
+    /// This stage is allowed to fail without ending the run.
+    ///
+    /// A real sequence mixes the two: the load must stop the run, while writing
+    /// an audit row or sorting yesterday's files should not. Without a per-stage
+    /// say, a pipeline has to abandon everything on a housekeeping step.
+    ///
+    /// The stage is still recorded as failed and the run still ends failed. It
+    /// only decides whether the stages after it are attempted.
+    pub continue_on_failure: bool,
     pub retry_backoff_ms: u64,
     /// PRAGMA memory_limit prepended to the stage SQL when set. Lets a
     /// user cap a heavy aggregation without touching the whole pipeline.
@@ -797,6 +806,7 @@ fn compile_impl(pipeline: &PipelineDoc, allow_view_upgrade: bool) -> Result<Comp
                     && s.wait_ms.is_none()
                     && s.memory_limit_mb.is_none()
                     && s.sink_mode.as_deref() != Some("error")
+                    && !s.continue_on_failure
             });
         // Each attach-backed source now uses a unique alias (duckle_src_<node>),
         // so multiple duck sources can stay attached as live VIEWs at once - the
@@ -1205,6 +1215,13 @@ fn build_stage(
         .and_then(|v| v.as_u64())
         .map(|n| n.max(1) as u32)
         .unwrap_or(1);
+    let continue_on_failure = props
+        .get("continueOnFailure")
+        .and_then(|v| {
+            v.as_bool()
+                .or_else(|| v.as_str().map(|t| t.eq_ignore_ascii_case("true")))
+        })
+        .unwrap_or(false);
     let retry_backoff_ms = props
         .get("retryBackoffMs")
         .and_then(|v| v.as_u64())
@@ -5032,6 +5049,7 @@ fn build_stage(
         runtime,
         wait_ms,
         retry_attempts,
+        continue_on_failure,
         retry_backoff_ms,
         memory_limit_mb,
         attach_view,
