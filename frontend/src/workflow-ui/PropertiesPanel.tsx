@@ -388,7 +388,7 @@ export default function PropertiesPanel({
                     workspacePath,
                     activeContext,
                     nodeProps: props,
-                    onPickConnection: (payload: ConnectionPayload) => {
+                    onPickConnection: (payload: ConnectionPayload, connectionId: string) => {
                         if (!selected) return;
                         // #166 stage 2: Salesforce connections are ref-only.
                         // ConnectionRefField already stored the picked id as
@@ -397,6 +397,13 @@ export default function PropertiesPanel({
                         // copied into the node props / pipeline JSON.
                         if (payload.kind === 'salesforce') return;
                         const next = { ...(selected.data.properties ?? {}) };
+                        // One update carrying the ref AND the copied fields, the same
+                        // rule onPickRoutine follows for issue #78. `onChange(id)` in
+                        // ConnectionRefField has already set connectionRef, but this
+                        // base was spread before that landed, so writing it back
+                        // reset the ref to '' - the picker filled the fields and then
+                        // showed "- pick a saved connection -" again.
+                        next.connectionRef = connectionId;
                         const keys: (keyof ConnectionPayload)[] = [
                             'host',
                             'port',

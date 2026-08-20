@@ -19,7 +19,7 @@ export type FieldContextValue = {
     /** The selected node's current properties, so a field can read sibling
      *  values (e.g. the DuckLake snapshot picker needs the catalog `path`). */
     nodeProps?: Record<string, unknown>;
-    onPickConnection?: (payload: ConnectionPayload) => void;
+    onPickConnection?: (payload: ConnectionPayload, connectionId: string) => void;
     onPickRoutine?: (payload: RoutinePayload, routineId: string) => void;
 };
 

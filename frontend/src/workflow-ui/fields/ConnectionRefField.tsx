@@ -39,7 +39,7 @@ export function ConnectionRefField({ field, value, onChange }: Props) {
         onChange(id);
         if (id && onPickConnection) {
             const item = connections.find(c => c.id === id);
-            if (item?.payload) onPickConnection(item.payload as ConnectionPayload);
+            if (item?.payload) onPickConnection(item.payload as ConnectionPayload, id);
         }
     };
 
