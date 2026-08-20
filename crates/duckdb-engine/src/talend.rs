@@ -113,6 +113,50 @@ struct RawNode {
 /// `tDBInput`/`tDBOutput` are the modern generic forms; the concrete database
 /// comes from the node's own `TYPE` parameter, so they are resolved separately
 /// in [`map_component`].
+/// Read a value out of the `PROPERTIES` blob a generic (tcomp) Talend component
+/// carries.
+///
+/// Such a component keeps its whole configuration in one JSON document inside a
+/// single `elementParameter`, so a reader that sees only flat name/value pairs
+/// finds nothing on it at all: no account, no table, no query. On one corpus
+/// that was every node of the largest connector family.
+///
+/// A value lives at `<path>.storedValue`. That is a bare scalar for most
+/// properties, an object carrying `value` for booleans and numbers, and an
+/// object carrying `name` for enums. Reading `value` on an enum yields nothing,
+/// which silently drops exactly the settings worth importing - the
+/// authentication type, the grant type - while looking like it worked.
+fn tcomp_value(blob: &JsonValue, path: &str) -> Option<String> {
+    let mut cur = blob;
+    for seg in path.split('.') {
+        cur = cur.get(seg)?;
+    }
+    match cur.get("storedValue")? {
+        JsonValue::String(s) if !s.is_empty() => Some(s.clone()),
+        JsonValue::Bool(b) => Some(b.to_string()),
+        JsonValue::Number(n) => Some(n.to_string()),
+        // Enum before boolean: an enum object has `name` and no `value`, a
+        // boolean has `value` and no `name`, so asking for `name` first reads
+        // both correctly.
+        JsonValue::Object(o) => match o.get("name").or_else(|| o.get("value")) {
+            Some(JsonValue::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(JsonValue::Bool(b)) => Some(b.to_string()),
+            Some(JsonValue::Number(n)) => Some(n.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The parsed `PROPERTIES` blob, if this node carries one.
+fn tcomp_blob(raw: &RawNode) -> Option<JsonValue> {
+    let text = raw.params.get("PROPERTIES")?;
+    if text.len() < 2 {
+        return None;
+    }
+    serde_json::from_str(text).ok()
+}
+
 fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
     Some(match component {
         "tMysqlInput" => ("src.mysql", "source"),
@@ -130,6 +174,10 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         "tMap" => ("xf.map", "transform"),
         "tRunJob" => ("ctl.runjob", "transform"),
         "tUniqRow" => ("qa.unique", "transform"),
+        // Duckle already speaks Snowflake; these were arriving as placeholders
+        // only because their configuration is in the tcomp PROPERTIES blob.
+        "tSnowflakeInput" => ("src.snowflake", "source"),
+        "tSnowflakeOutput" => ("snk.snowflake", "sink"),
         "tParallelize" => ("ctl.parallelize", "transform"),
         "tConvertType" => ("xf.cast", "transform"),
         // Passes rows through and prints them, which is what tLogRow does.
@@ -253,6 +301,57 @@ fn properties_for(
 ) -> JsonMap<String, JsonValue> {
     let mut props = JsonMap::new();
     match component_id {
+        "src.snowflake" | "snk.snowflake" => {
+            // A shared tSnowflakeConnection is mirrored into the node's own blob
+            // under referencedComponent.reference, so read that first and fall
+            // back to the node's inline connection.
+            let blob = match tcomp_blob(raw) {
+                Some(b) => b,
+                None => {
+                    warnings.push(Warning::RepositoryConnection {
+                        node: raw.unique.clone(),
+                        component: raw.component.clone(),
+                    });
+                    JsonValue::Null
+                }
+            };
+            let pick = |leaf: &str| -> Option<String> {
+                tcomp_value(&blob, &format!("connection.referencedComponent.reference.{leaf}"))
+                    .or_else(|| tcomp_value(&blob, &format!("connection.{leaf}")))
+            };
+            for (leaf, prop) in [
+                ("account", "account"),
+                ("db", "database"),
+                ("schemaName", "schema"),
+                ("warehouse", "warehouse"),
+                ("role", "role"),
+                ("userPassword.userId", "username"),
+            ] {
+                if let Some(v) = pick(leaf) {
+                    props.insert(prop.into(), JsonValue::String(v));
+                }
+            }
+            if let Some(t) = tcomp_value(&blob, "table.tableName") {
+                props.insert("tableName".into(), JsonValue::String(unquote(&t)));
+            }
+            if let Some(q) = tcomp_value(&blob, "query") {
+                if component_id == "src.snowflake" && !q.trim().is_empty() {
+                    props.insert("query".into(), JsonValue::String(unquote(&q)));
+                }
+            }
+            // The password is Studio-encrypted and cannot be recovered here, so
+            // name it as a placeholder rather than importing a value that would
+            // fail at run time with no explanation.
+            if pick("userPassword.password").is_some() {
+                let placeholder = format!("${{ENV:{}_PASSWORD}}", raw.unique.to_uppercase());
+                props.insert("password".into(), JsonValue::String(placeholder.clone()));
+                warnings.push(Warning::EncryptedSecret {
+                    node: raw.unique.clone(),
+                    property: "password".into(),
+                    placeholder,
+                });
+            }
+        }
         "src.mysql" | "snk.mysql" | "src.postgres" | "snk.postgres" => copy_params(
             raw,
             &[
@@ -629,6 +728,57 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tcomp_reads_scalars_enums_and_booleans_from_the_properties_blob() {
+        // A generic Talend component keeps its whole configuration in one JSON
+        // document. Scalars sit at storedValue; booleans wrap it in an object
+        // with `value`; enums wrap it in an object with `name` and NO `value`.
+        // Reading `value` everywhere returns nothing for the enums, which drops
+        // the auth type while looking like it worked.
+        let blob: JsonValue = serde_json::from_str(
+            r#"{
+                "connection": {
+                    "account":  { "storedValue": "acct-1" },
+                    "db":       { "storedValue": "DB1" },
+                    "autoCommit":         { "storedValue": { "@type": "b", "value": true } },
+                    "authenticationType": { "storedValue": { "@type": "e", "name": "KEY_PAIR" } },
+                    "loginTimeout":       { "storedValue": { "@type": "n", "value": 30 } },
+                    "sharedConnectionName": { "storedValue": null },
+                    "role": { "storedValue": "" },
+                    "referencedComponent": {
+                        "reference": { "warehouse": { "storedValue": "WH_SHARED" } }
+                    }
+                },
+                "table": { "tableName": { "storedValue": "T1" } }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(tcomp_value(&blob, "connection.account").as_deref(), Some("acct-1"));
+        assert_eq!(tcomp_value(&blob, "connection.db").as_deref(), Some("DB1"));
+        assert_eq!(tcomp_value(&blob, "table.tableName").as_deref(), Some("T1"));
+        // The enum: `name`, not `value`.
+        assert_eq!(
+            tcomp_value(&blob, "connection.authenticationType").as_deref(),
+            Some("KEY_PAIR"),
+            "an enum stores its token under name; reading value loses it"
+        );
+        // The boolean and the number still come back.
+        assert_eq!(tcomp_value(&blob, "connection.autoCommit").as_deref(), Some("true"));
+        assert_eq!(tcomp_value(&blob, "connection.loginTimeout").as_deref(), Some("30"));
+        // A shared connection is mirrored under referencedComponent.reference.
+        assert_eq!(
+            tcomp_value(&blob, "connection.referencedComponent.reference.warehouse").as_deref(),
+            Some("WH_SHARED")
+        );
+        // Absent, null and empty are all "not set", not an empty string that
+        // would overwrite a default with nothing.
+        assert_eq!(tcomp_value(&blob, "connection.sharedConnectionName"), None);
+        assert_eq!(tcomp_value(&blob, "connection.role"), None);
+        assert_eq!(tcomp_value(&blob, "connection.nosuch"), None);
+        assert_eq!(tcomp_value(&blob, "nosuch.deep.path"), None);
+    }
 
     #[test]
     fn a_trigger_link_does_not_import_as_a_data_edge() {
