@@ -1109,6 +1109,13 @@ impl DuckdbEngine {
         // after a confirmed write.
         let mut satisfied_sinks: std::collections::HashSet<String> = Default::default();
 
+        // Built from compiled.stages, never from the doc: compile_partial has
+        // already dropped the sinks downstream of a partial run's target, so a
+        // target view correctly falls back to counting itself.
+        let direct_sink_sources: std::collections::HashSet<&str> =
+            direct_sink_for.keys().map(|k| k.as_str()).collect();
+        let counted_by_sink = views_counted_by_sink(&compiled.stages, &direct_sink_sources);
+
         for stage in &compiled.stages {
             if self.cancel.load(Ordering::Relaxed) {
                 was_cancelled = true;
@@ -1124,7 +1131,10 @@ impl DuckdbEngine {
                     label: stage.label.clone(),
                     kind: "sink".into(),
                 });
-                let rows = self.sink_rows(&db_path, stage.from.as_deref(), &nodes);
+                // No self-count here: this stage never ran its own COPY, the
+                // upstream source wrote the file. Guard 2 keeps that upstream
+                // counting itself, so a figure is already recorded.
+                let rows = self.sink_rows(&db_path, stage.from.as_deref(), None, &nodes);
                 nodes.insert(
                     stage.node_id.clone(),
                     NodeRunStatus {
@@ -1818,11 +1828,24 @@ impl DuckdbEngine {
                     // upstream and have no preview. A Pure SQL node creates no
                     // `<node>` relation, so there is nothing to count/preview.
                     let (rows_opt, view_preview) = match stage.kind {
-                        StageKind::Sink => {
-                            (self.sink_rows(&db_path, stage.from.as_deref(), &nodes), None)
-                        }
+                        StageKind::Sink => (
+                            self.sink_rows(
+                                &db_path,
+                                stage.from.as_deref(),
+                                sink_self_count(stage),
+                                &nodes,
+                            ),
+                            None,
+                        ),
                         StageKind::View if stage.no_output_relation => (None, None),
-                        StageKind::View => self.count_and_preview(&db_path, &stage.node_id),
+                        // A view whose rows a self-counting sink is about to
+                        // write skips its own COUNT(*) and keeps its preview;
+                        // the figure arrives when that sink reports.
+                        StageKind::View => self.count_and_preview(
+                            &db_path,
+                            &stage.node_id,
+                            !counted_by_sink.contains(stage.node_id.as_str()),
+                        ),
                     };
                     nodes.insert(
                         stage.node_id.clone(),
@@ -1847,6 +1870,37 @@ impl DuckdbEngine {
                     });
                     if let Some(p) = view_preview {
                         preview.push(p);
+                    }
+                    // The view whose rows this sink wrote skipped its own
+                    // COUNT(*), so it reported "ok" with no figure. The sink has
+                    // just counted the file, which holds the same rows. Only on
+                    // the success arm: a ctl.try fallback can write the same path
+                    // after a failure, and that file is not this view's output.
+                    let backfill = match (&stage.kind, stage.from.as_deref(), rows_opt) {
+                        (StageKind::Sink, Some(from), Some(r)) => match nodes.get_mut(from) {
+                            Some(up) if up.rows.is_none() => {
+                                up.rows = Some(r);
+                                Some((
+                                    from.to_string(),
+                                    up.kind.clone().unwrap_or_else(|| "transform".into()),
+                                    up.duration_ms.unwrap_or(0),
+                                    r,
+                                ))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((node_id, kind, duration_ms, r)) = backfill {
+                        on_event(PipelineEvent::StageFinished {
+                            node_id,
+                            kind,
+                            status: "ok".into(),
+                            rows: Some(r),
+                            duration_ms,
+                            error: None,
+                            sql: None,
+                        });
                     }
                 }
                 Err(EngineError::Cancelled) => {
@@ -2490,17 +2544,36 @@ impl DuckdbEngine {
         &self,
         db: &Path,
         from: Option<&str>,
+        self_count: Option<String>,
         nodes: &std::collections::BTreeMap<String, NodeRunStatus>,
     ) -> Option<u64> {
-        let from = from?;
-        if let Some(rows) = nodes.get(from).and_then(|n| n.rows) {
+        // Order is by cost. A figure the upstream already recorded is free; the
+        // self-count is one cheap spawn over a footer; counting the relation
+        // re-runs the whole chain. Trying the recorded figure first means this
+        // never adds a spawn to a pipeline whose view counted itself.
+        if let Some(rows) = from.and_then(|f| nodes.get(f)).and_then(|n| n.rows) {
             return Some(rows);
         }
-        self.count_rows(db, from).ok()
+        if let Some(expr) = self_count {
+            if let Ok(n) = self.count_from_expr(db, &expr) {
+                return Some(n);
+            }
+            // Reading the file back can fail where counting the relation would
+            // not - a half-written file, an extension the fresh spawn lacks. Fall
+            // through rather than losing a number we used to report.
+        }
+        self.count_rows(db, from?).ok()
     }
 
     fn count_rows(&self, db: &Path, name: &str) -> Result<u64, EngineError> {
-        let sql = format!("SELECT COUNT(*) AS n FROM {};", plan::quote_ident(name));
+        self.count_from_expr(db, &plan::quote_ident(name))
+    }
+
+    /// COUNT(*) over an arbitrary FROM-expression, not just a quoted relation.
+    /// `sink_self_count` hands back `read_parquet('...')`, which `count_rows`
+    /// would quote into an identifier.
+    fn count_from_expr(&self, db: &Path, from: &str) -> Result<u64, EngineError> {
+        let sql = format!("SELECT COUNT(*) AS n FROM {};", from);
         let rows = self.run_rows(Some(db), &sql)?;
         let n = rows
             .first()
@@ -2518,19 +2591,32 @@ impl DuckdbEngine {
     /// xf.assert nodes that never create a plain `<node>` relation) -
     /// matching the old behavior where count_rows().ok() was None and the
     /// preview was skipped.
-    fn count_and_preview(&self, db: &Path, name: &str) -> (Option<u64>, Option<NodePreview>) {
+    /// `want_count` false means a self-counting sink downstream will supply this
+    /// relation's figure, so paying a COUNT(*) here would be a second pass over
+    /// the same rows. With previews also off there is nothing left to ask for.
+    fn count_and_preview(
+        &self,
+        db: &Path,
+        name: &str,
+        want_count: bool,
+    ) -> (Option<u64>, Option<NodePreview>) {
+        if !want_count && !self.previews {
+            return (None, None);
+        }
         let q = plan::quote_ident(name);
         // Headless runs have no canvas, so the DESCRIBE and the preview SELECT
         // fetch columns and rows that are then discarded. Ask for the count alone.
-        let sql = if self.previews {
-            format!(
-                "SELECT COUNT(*) AS n FROM {q}; SELECT * FROM (DESCRIBE {q}); SELECT * FROM {q} LIMIT {lim};",
+        let mut sql = String::new();
+        if want_count {
+            sql.push_str(&format!("SELECT COUNT(*) AS n FROM {q};", q = q));
+        }
+        if self.previews {
+            sql.push_str(&format!(
+                " SELECT * FROM (DESCRIBE {q}); SELECT * FROM {q} LIMIT {lim};",
                 q = q,
                 lim = PREVIEW_ROW_LIMIT
-            )
-        } else {
-            format!("SELECT COUNT(*) AS n FROM {q};", q = q)
-        };
+            ));
+        }
         // -bail makes a missing relation fail the whole invocation; treat
         // that as "nothing to report".
         let out = match self.run(Some(db), &sql, true) {
@@ -2538,17 +2624,25 @@ impl DuckdbEngine {
             Err(_) => return (None, None),
         };
         let arrays = parse_json_arrays(&out);
-        let count = arrays
-            .first()
-            .and_then(|a| a.first())
-            .and_then(|r| r.get("n"))
-            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|x| x.max(0) as u64)));
-        let preview = arrays.get(1).map(|schema_rows| {
+        // One result array per statement. Dropping the count shifts the DESCRIBE
+        // into slot 0, so index from what was actually asked for; a fixed 0/1/2
+        // would feed schema rows to the count parser and blank every preview.
+        let base = usize::from(want_count);
+        let count = if want_count {
+            arrays
+                .first()
+                .and_then(|a| a.first())
+                .and_then(|r| r.get("n"))
+                .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|x| x.max(0) as u64)))
+        } else {
+            None
+        };
+        let preview = arrays.get(base).map(|schema_rows| {
             let schema: Vec<Column> = schema_rows.iter().filter_map(parse_describe_row).collect();
             NodePreview {
                 node_id: name.to_string(),
                 columns: schema,
-                rows: arrays.get(2).cloned().unwrap_or_default(),
+                rows: arrays.get(base + 1).cloned().unwrap_or_default(),
             }
         });
         (count, preview)
@@ -4249,6 +4343,42 @@ fn sink_self_count(stage: &plan::Stage) -> Option<String> {
     ))
 }
 
+/// Views whose row count a downstream sink will supply for free, so counting
+/// them here would be a second pass over rows the sink is about to write.
+///
+/// The batched path gets away with a simpler test (lib.rs, `counted_by_sink`)
+/// because it excludes looping and driver stages up front. This path runs them,
+/// so three extra guards are load-bearing:
+///
+/// - EXACTLY ONE consumer. With a second sink on the same relation, whichever
+///   runs first finds no recorded figure and pays the full count anyway, and
+///   stage order between siblings is not fixed.
+/// - NOT a direct-write source. There the source writes the sink's file itself
+///   and the sink stage is skipped entirely, so nothing ever self-counts and the
+///   view would keep `rows: None` forever.
+/// - The name must BE a view stage we run. A sink's `from` is routinely
+///   `<node>__reject`, `<node>__case_N` or a user alias, none of which is a node
+///   id, and suppressing a count for one of those would silence the wrong node.
+fn views_counted_by_sink<'a>(
+    stages: &'a [plan::Stage],
+    direct_sink_sources: &std::collections::HashSet<&str>,
+) -> std::collections::HashSet<&'a str> {
+    stages
+        .iter()
+        .filter(|s| sink_self_count(s).is_some())
+        .filter_map(|s| s.from.as_deref())
+        .filter(|f| !direct_sink_sources.contains(f))
+        .filter(|f| stages.iter().filter(|o| o.from.as_deref() == Some(*f)).count() == 1)
+        .filter(|f| {
+            stages.iter().any(|v| {
+                v.node_id == *f
+                    && matches!(v.kind, plan::StageKind::View)
+                    && !v.no_output_relation
+            })
+        })
+        .collect()
+}
+
 fn is_local_path(p: &str) -> bool {
     let lower = p.to_ascii_lowercase();
     !["s3://", "gs://", "gcs://", "az://", "azure://", "http://", "https://"]
@@ -5079,6 +5209,116 @@ mod tests {
         assert_eq!(mssql_numeric_to_string(0, 4), "0.0000");
     }
     use serde_json::json;
+
+    /// A bare Stage for the skip-set guard tests. Only the fields
+    /// `views_counted_by_sink` and `sink_self_count` read are ever varied.
+    fn st(node_id: &str, component_id: &str, kind: crate::plan::StageKind) -> crate::plan::Stage {
+        crate::plan::Stage {
+            node_id: node_id.into(),
+            component_id: component_id.into(),
+            label: node_id.into(),
+            sql: String::new(),
+            kind,
+            from: None,
+            sink_path: None,
+            sink_mode: None,
+            sink_compression: None,
+            sink_direct: false,
+            runtime: None,
+            wait_ms: None,
+            retry_attempts: 0,
+            retry_backoff_ms: 0,
+            memory_limit_mb: None,
+            attach_view: false,
+            alias: None,
+            no_output_relation: false,
+        }
+    }
+
+    /// view "v" -> a plain local overwrite parquet sink reading it.
+    fn view_and_parquet_sink(path: &str) -> Vec<crate::plan::Stage> {
+        let v = st("v", "xf.filter", crate::plan::StageKind::View);
+        let mut k = st("k", "snk.parquet", crate::plan::StageKind::Sink);
+        k.from = Some("v".into());
+        k.sink_path = Some(path.into());
+        vec![v, k]
+    }
+
+    fn no_direct() -> std::collections::HashSet<&'static str> {
+        Default::default()
+    }
+
+    #[test]
+    fn views_counted_by_sink_takes_a_plain_parquet_sinks_upstream() {
+        let stages = view_and_parquet_sink("C:/out/res.parquet");
+        let got = super::views_counted_by_sink(&stages, &no_direct());
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["v"]);
+    }
+
+    #[test]
+    fn views_counted_by_sink_rejects_every_unsafe_shape() {
+        // Each case must be rejected on its own: the view then counts itself,
+        // which costs a pass but is always correct. Being wrong here means
+        // reporting a row count the sink never wrote.
+        let cases: Vec<(&str, Vec<crate::plan::Stage>)> = vec![
+            ("a second consumer races for the figure", {
+                let mut v = view_and_parquet_sink("C:/out/res.parquet");
+                let mut csv = st("k2", "snk.csv", crate::plan::StageKind::Sink);
+                csv.from = Some("v".into());
+                v.push(csv);
+                v
+            }),
+            ("append also counts rows already in the file", {
+                let mut v = view_and_parquet_sink("C:/out/res.parquet");
+                v[1].sink_mode = Some("append".into());
+                v
+            }),
+            ("a partitioned write fans out into a directory", {
+                let mut v = view_and_parquet_sink("C:/out/res.parquet");
+                v[1].sql = "COPY (SELECT * FROM v) TO 'C:/out' (PARTITION_BY (a))".into();
+                v
+            }),
+            ("a remote path is not a footer read", {
+                let mut v = view_and_parquet_sink("C:/out/res.parquet");
+                v[1].sink_path = Some("s3://bucket/res.parquet".into());
+                v
+            }),
+            ("a glob would count files the sink never wrote", {
+                view_and_parquet_sink("C:/out/res[1].parquet")
+            }),
+            ("a brace path fails read_parquet outright", {
+                view_and_parquet_sink("C:/out/res{a,b}.parquet")
+            }),
+            ("a text sink has no footer to read", {
+                let mut v = view_and_parquet_sink("C:/out/res.csv");
+                v[1].component_id = "snk.csv".into();
+                v
+            }),
+            ("from names a synthetic relation, not a node we run", {
+                let mut v = view_and_parquet_sink("C:/out/res.parquet");
+                v[1].from = Some("v__reject".into());
+                v
+            }),
+            ("the upstream produces no relation to count", {
+                let mut v = view_and_parquet_sink("C:/out/res.parquet");
+                v[0].no_output_relation = true;
+                v
+            }),
+        ];
+        for (why, stages) in cases {
+            let got = super::views_counted_by_sink(&stages, &no_direct());
+            assert!(got.is_empty(), "should have been rejected: {} (got {:?})", why, got);
+        }
+    }
+
+    #[test]
+    fn views_counted_by_sink_rejects_a_direct_write_source() {
+        // The source writes the sink's file itself and the sink stage is then
+        // skipped entirely, so nothing self-counts and nothing back-fills.
+        let stages = view_and_parquet_sink("C:/out/res.parquet");
+        let direct: std::collections::HashSet<&str> = ["v"].into_iter().collect();
+        assert!(super::views_counted_by_sink(&stages, &direct).is_empty());
+    }
 
     /// Flatten MarkerState for assertions: None = Pending, Some(r) = Ready(r).
     fn marker_state(s: MarkerState) -> Option<Option<u64>> {

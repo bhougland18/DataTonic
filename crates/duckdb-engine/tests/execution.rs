@@ -152,6 +152,84 @@ fn scalar_string(sql: &str) -> String {
 }
 
 #[test]
+fn per_stage_view_count_is_backfilled_from_its_parquet_sink() {
+    // On the per-stage path each node counts itself with its own COUNT(*), and
+    // because nodes are VIEWs that re-runs the whole chain. When a Parquet sink
+    // is about to write exactly those rows, the count is a second pass for a
+    // number the sink's footer already holds. The view therefore reports "ok"
+    // with no figure and is back-filled when the sink reports - which means a
+    // SECOND StageFinished for that node, since a canvas keys stages by id.
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(
+        tmp.path(),
+        "orders.csv",
+        "order_id,status
+1,paid
+2,pending
+3,paid
+4,refunded
+",
+    );
+    let out = out_path(tmp.path(), "paid.parquet");
+
+    let engine = engine_or_skip!();
+    let d = doc(
+        json!([
+            node("s1", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            // memoryLimitMb forces the per-stage path, as at the xf.incremental
+            // test above: the batched executor refuses a per-stage override.
+            node(
+                "f1",
+                "xf.filter",
+                json!({ "predicate": "status = 'paid'", "memoryLimitMb": 512 })
+            ),
+            node("k1", "snk.parquet", json!({ "path": out })),
+        ]),
+        json!([main_edge("e1", "s1", "f1"), main_edge("e2", "f1", "k1")]),
+    );
+
+    let mut finished: Vec<(String, Option<u64>)> = Vec::new();
+    let result = engine.execute_pipeline_with_events(&d, None, None, |ev| {
+        if let duckle_duckdb_engine::PipelineEvent::StageFinished { node_id, rows, .. } = ev {
+            finished.push((node_id.clone(), rows));
+        }
+    });
+    assert_eq!(result.status, "ok", "run failed: {:?}", result.error);
+
+    // The filter is announced twice: once with no count, then with the sink's.
+    let f1: Vec<Option<u64>> = finished
+        .iter()
+        .filter(|(id, _)| id == "f1")
+        .map(|(_, r)| *r)
+        .collect();
+    assert_eq!(
+        f1,
+        vec![None, Some(2)],
+        "filter should finish with no count then be back-filled, got {:?} (all events {:?})",
+        f1,
+        finished
+    );
+
+    // And the final state carries the figure for both nodes.
+    assert_eq!(result.nodes.get("f1").and_then(|n| n.rows), Some(2));
+    assert_eq!(result.nodes.get("k1").and_then(|n| n.rows), Some(2));
+
+    // Skipping the count must not cost the node its preview: the DESCRIBE and
+    // the LIMIT still run, and their result arrays shift down a slot.
+    let pv = result
+        .preview
+        .iter()
+        .find(|p| p.node_id == "f1")
+        .expect("filter preview present");
+    assert_eq!(pv.rows.len(), 2, "preview rows");
+    assert!(
+        pv.columns.iter().any(|c| c.name == "status"),
+        "preview columns should survive the index shift, got {:?}",
+        pv.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn parquet_sink_counts_its_own_file_not_a_glob_sibling() {
     // A sink counts the Parquet file it wrote rather than re-counting its
     // upstream, and that read goes through read_parquet, which globs. Measured
