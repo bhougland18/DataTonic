@@ -1913,6 +1913,12 @@ impl DuckdbEngine {
             .collect::<Vec<_>>()
             .join(", ");
         post_stmt(format!("CREATE TABLE IF NOT EXISTS {} ({})", qualified, col_defs))?;
+        // "overwrite": the target holds this run's rows and nothing older. After
+        // the CREATE so a first run against a table that does not exist yet still
+        // works, and before the inserts so the two cannot interleave.
+        if spec.truncate_first {
+            post_stmt(format!("TRUNCATE TABLE {}", qualified))?;
+        }
 
         let mut total_inserted = 0_usize;
         for chunk in rows.chunks(spec.batch_size) {

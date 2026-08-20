@@ -928,6 +928,31 @@ fn mongo_write_mode(props: &JsonValue, component_id: &str) -> Result<String, Eng
 /// that column equals `deleteValue` are removed from the target by key instead
 /// of being upserted - this is how CDC deletes (xf.cdc.diff change_type /
 /// DuckLake CDC) flow through. Returns None outside upsert mode or when unset.
+/// snk.snowflake `writeMode`: "append" (default) inserts, "overwrite" empties the
+/// target first. "upsert" is spelled by supplying key columns, so asking for both
+/// is a contradiction rather than a precedence question, and is refused.
+fn snowflake_truncate_first(props: &JsonValue, component_id: &str) -> Result<bool, EngineError> {
+    let mode = string_prop(props, "writeMode")
+        .or_else(|| string_prop(props, "mode"))
+        .filter(|s| !s.is_empty());
+    match mode.as_deref() {
+        None | Some("append") | Some("insert") => Ok(false),
+        Some("overwrite") | Some("replace") => {
+            if !upsert_keys_from(props, component_id)?.is_empty() {
+                return Err(EngineError::Config(format!(
+                    "{}: writeMode overwrite empties the table, and upsert keys merge into                      what is already there. Choose one.",
+                    component_id
+                )));
+            }
+            Ok(true)
+        }
+        Some(other) => Err(EngineError::Config(format!(
+            "{}: unknown writeMode {:?} - expected \"append\" or \"overwrite\"",
+            component_id, other
+        ))),
+    }
+}
+
 fn delete_column_from(props: &JsonValue) -> Option<String> {
     if string_prop(props, "mode").as_deref() == Some("upsert") {
         string_prop(props, "deleteColumn").filter(|s| !s.is_empty())
@@ -1895,6 +1920,7 @@ fn build_stage(
             upsert_keys: upsert_keys_from(&props, component_id)?,
             delete_column: delete_column_from(&props),
             delete_value: delete_value_from(&props),
+            truncate_first: snowflake_truncate_first(&props, component_id)?,
         });
         (String::new(), StageKind::Sink, Some(from_view.to_string()))
     } else if component_id == "snk.salesforce" {

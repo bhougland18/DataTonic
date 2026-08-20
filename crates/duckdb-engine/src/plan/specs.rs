@@ -109,6 +109,14 @@ pub struct SnowflakeSinkSpec {
     /// / DuckLake CDC change_type='delete'). None disables it.
     pub delete_column: Option<String>,
     pub delete_value: String,
+    /// "overwrite" write mode: empty the target before inserting, so it holds
+    /// this run's rows and nothing older. TRUNCATE rather than drop-and-recreate,
+    /// which would discard the table's grants and column types.
+    ///
+    /// Only applied when there are rows to write. A run that produced nothing
+    /// leaves the target alone rather than emptying it on the strength of an
+    /// upstream that may simply have failed to produce.
+    pub truncate_first: bool,
 }
 
 /// src.snowflake: SQL API read. Sends a SELECT (either user-provided

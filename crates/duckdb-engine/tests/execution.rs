@@ -5471,6 +5471,105 @@ fn snk_snowflake_jwt_uses_account_locator_for_privatelink() {
 }
 
 #[test]
+fn snk_snowflake_overwrite_truncates_before_inserting() {
+    // writeMode "overwrite" means the table holds this run's rows and nothing
+    // older. The sink had no write mode at all: every run appended, so a
+    // reload doubled the table. TRUNCATE, not drop-and-recreate, so the
+    // table's grants and column types survive; and after the CREATE, so a
+    // first run against a table that does not exist yet still works.
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        // Three now: CREATE, TRUNCATE, INSERT.
+        for stream in listener.incoming().take(3) {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            stream.set_read_timeout(Some(Duration::from_millis(250))).ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(8192);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..16 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(buf);
+            let body = b"{\"resultSetMetaData\":{\"numRows\":2}}";
+            let resp = format!(
+                "HTTP/1.1 200 OK
+Content-Length: {}
+Connection: close
+
+",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name
+1,alice
+2,bob
+");
+    let endpoint = format!("http://127.0.0.1:{}/api/v2/statements", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("sf", "snk.snowflake", json!({
+                "account": "test-account",
+                "endpoint": endpoint,
+                "pat": "secret-pat",
+                "database": "MYDB",
+                "schema": "PUBLIC",
+                "tableName": "USERS",
+                "warehouse": "COMPUTE_WH",
+                "writeMode": "overwrite"
+            })),
+        ]),
+        json!([main_edge("e1", "s", "sf")]),
+    ));
+    assert_eq!(r.status, "ok", "snowflake sink failed: {:?}", r.error);
+
+    let req1 = rx.recv_timeout(Duration::from_secs(5)).expect("create request");
+    let req2 = rx.recv_timeout(Duration::from_secs(5)).expect("truncate request");
+    let req3 = rx.recv_timeout(Duration::from_secs(5)).expect("insert request");
+    let _ = handle.join();
+    let (b1, b2, b3) = (
+        String::from_utf8_lossy(&req1).to_string(),
+        String::from_utf8_lossy(&req2).to_string(),
+        String::from_utf8_lossy(&req3).to_string(),
+    );
+
+    assert!(
+        b1.contains(r#"CREATE TABLE IF NOT EXISTS \"MYDB\".\"PUBLIC\".\"USERS\""#),
+        "first statement should still be the auto-create: {}", b1
+    );
+    assert!(
+        b2.contains(r#"TRUNCATE TABLE \"MYDB\".\"PUBLIC\".\"USERS\""#),
+        "overwrite must empty the target before inserting: {}", b2
+    );
+    assert!(
+        b3.contains(r#"INSERT INTO \"MYDB\".\"PUBLIC\".\"USERS\""#),
+        "third statement should be the insert: {}", b3
+    );
+    // Order matters: truncating after the insert would discard the run.
+    assert!(!b2.contains("INSERT INTO"), "truncate must precede the insert: {}", b2);
+}
+
+#[test]
 fn snk_snowflake_posts_multirow_insert() {
     // Mock HTTP listener pretends to be Snowflake's /api/v2/statements.
     // Verifies the engine sends a single multi-row INSERT for both rows
