@@ -481,11 +481,28 @@ fn load_secrets_enc(workspace: &Path) -> Result<Option<HashMap<String, String>>,
     let payload = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|e| format!("decode secrets.enc: {}", e))?;
-    if payload.len() < 12 + 16 {
-        return Err("secrets.enc is corrupt (too short)".to_string());
-    }
-    let (nonce_bytes, ciphertext) = payload.split_at(12);
-    let key = Sha256::digest(passphrase.as_bytes());
+    // Two formats. A payload tagged with the magic carries a per-bundle salt and was
+    // keyed with Argon2id. An untagged one is the original scheme, whose key was an
+    // unsalted single SHA-256 of the passphrase; it is still read so bundles built
+    // before the change keep working, and it is the reason the magic exists at all.
+    let magic = crate::build::BUNDLE_MAGIC;
+    let salt_len = crate::build::BUNDLE_SALT_LEN;
+    let (key, nonce_bytes, ciphertext): (Vec<u8>, &[u8], &[u8]) = if payload.starts_with(magic) {
+        let rest = &payload[magic.len()..];
+        if rest.len() < salt_len + 12 + 16 {
+            return Err("secrets.enc is corrupt (too short)".to_string());
+        }
+        let (salt, rest) = rest.split_at(salt_len);
+        let (nonce_bytes, ciphertext) = rest.split_at(12);
+        let key = crate::build::derive_bundle_key(&passphrase, salt)?;
+        (key.to_vec(), nonce_bytes, ciphertext)
+    } else {
+        if payload.len() < 12 + 16 {
+            return Err("secrets.enc is corrupt (too short)".to_string());
+        }
+        let (nonce_bytes, ciphertext) = payload.split_at(12);
+        (Sha256::digest(passphrase.as_bytes()).to_vec(), nonce_bytes, ciphertext)
+    };
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init: {}", e))?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let plain = cipher

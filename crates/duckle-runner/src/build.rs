@@ -970,7 +970,9 @@ fn encrypt_secrets(key_map: &[(String, String)]) -> Result<String, String> {
         plain.push('\n');
     }
 
-    let key = Sha256::digest(passphrase.as_bytes());
+    let mut salt = [0u8; BUNDLE_SALT_LEN];
+    getrandom::fill(&mut salt).map_err(|e| format!("salt: {}", e))?;
+    let key = derive_bundle_key(&passphrase, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init: {}", e))?;
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut nonce_bytes).map_err(|e| format!("nonce: {}", e))?;
@@ -979,10 +981,38 @@ fn encrypt_secrets(key_map: &[(String, String)]) -> Result<String, String> {
         .encrypt(nonce, plain.as_bytes())
         .map_err(|e| format!("encrypt: {}", e))?;
 
-    let mut payload = Vec::with_capacity(12 + ciphertext.len());
+    let mut payload = Vec::with_capacity(BUNDLE_MAGIC.len() + BUNDLE_SALT_LEN + 12 + ciphertext.len());
+    payload.extend_from_slice(BUNDLE_MAGIC);
+    payload.extend_from_slice(&salt);
     payload.extend_from_slice(&nonce_bytes);
     payload.extend_from_slice(&ciphertext);
     Ok(base64::engine::general_purpose::STANDARD.encode(payload))
+}
+
+/// Marks a secrets.enc written with a salted KDF. A payload without it is the
+/// original format, whose key was an unsalted single SHA-256 of the passphrase.
+pub(crate) const BUNDLE_MAGIC: &[u8; 4] = b"DKS2";
+pub(crate) const BUNDLE_SALT_LEN: usize = 16;
+
+/// Derive the secrets.enc key from the passphrase.
+///
+/// The original scheme was `Sha256::digest(passphrase)`: no salt, one round. A
+/// passphrase is chosen by a person, and secrets.enc SHIPS INSIDE THE BUNDLE, so
+/// anyone holding the artifact could run a wordlist against it at the speed of raw
+/// SHA-256 and share one precomputed table across every bundle Duckle has ever
+/// produced. Argon2id with a random per-bundle salt removes both properties.
+///
+/// Parameters come from `Argon2::default()`, which is the crate's OWASP-aligned
+/// m=19456 KiB, t=2, p=1 - the same cost the console already uses for account
+/// tokens. The salt travels in the header, so raising them later only needs a new
+/// magic value.
+pub(crate) fn derive_bundle_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    use argon2::Argon2;
+    let mut key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| format!("derive bundle key: {}", e))?;
+    Ok(key)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1034,6 +1064,33 @@ fn render_manifest(
     serde_json::to_string_pretty(&JsonValue::Object(m)).unwrap_or_else(|_| "{}".to_string())
 }
 
+
+#[cfg(test)]
+mod bundle_key_tests {
+    use super::*;
+
+    /// secrets.enc ships inside the bundle, so whoever holds the artifact can attack
+    /// the passphrase offline. The original key was `Sha256::digest(passphrase)`: no
+    /// salt and one round, so a single precomputed table worked against every bundle
+    /// Duckle had ever produced, at raw hash speed.
+    ///
+    /// The property that fixes that is the salt. Two bundles built from the SAME
+    /// passphrase must not share a key, or the table works again.
+    #[test]
+    fn the_same_passphrase_yields_a_different_key_per_bundle() {
+        let a = derive_bundle_key("correct horse battery staple", &[7u8; BUNDLE_SALT_LEN]).unwrap();
+        let b = derive_bundle_key("correct horse battery staple", &[9u8; BUNDLE_SALT_LEN]).unwrap();
+        assert_ne!(a, b, "the key does not depend on the salt");
+
+        // Same salt and passphrase must still reproduce the key, or nothing decrypts.
+        let again = derive_bundle_key("correct horse battery staple", &[7u8; BUNDLE_SALT_LEN]).unwrap();
+        assert_eq!(a, again, "derivation is not deterministic");
+
+        // And it must not be the old unsalted digest.
+        let legacy: [u8; 32] = Sha256::digest("correct horse battery staple".as_bytes()).into();
+        assert_ne!(a, legacy, "still deriving the key the old way");
+    }
+}
 
 #[cfg(test)]
 mod duckdb_default_tests {
