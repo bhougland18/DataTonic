@@ -74,6 +74,7 @@ import {
     deleteItemPayload,
     deletePipelineFile,
     getWorkspacePath,
+    hasBackend,
     isInTauri,
     loadWorkspace,
     saveItemPayload,
@@ -709,13 +710,30 @@ export default function App() {
         return () => clearTimeout(t);
     }, [workspaceReady, workspacePathState, pipelineData]);
 
-    // Browser fallback: localStorage (unchanged).
+    // Browser fallback: localStorage.
+    //
+    // The guard used to ask `isInTauri()`, which is false in the web edition, so the
+    // web build fell through and wrote the repo to localStorage. Repo items carry
+    // connection payloads that workspace.ts has already DECRYPTED, so every stored
+    // credential ended up in the browser in clear text, readable by any script on the
+    // origin and left behind on a shared machine. `hasBackend()` is the right
+    // question: when a backend exists, Tauri or the web runner, it has already
+    // persisted this server-side and localStorage is redundant.
     useEffect(() => {
         if (!workspaceReady) return;
-        if (isInTauri() && workspacePathState) return;
+        if (hasBackend() && workspacePathState) return;
         const t = setTimeout(() => {
             savePersisted('pipelines', pipelineData);
-            savePersisted('repo', repo);
+            // Belt and braces for the no-workspace case, which still reaches this
+            // line: a decrypted connection payload must never reach localStorage.
+            savePersisted(
+                'repo',
+                repo.map(item =>
+                    item && (item as { type?: string }).type === 'connection'
+                        ? { ...item, payload: undefined }
+                        : item,
+                ),
+            );
             savePersisted('jobs', jobs);
             savePersisted('active-job', activeJobId);
             savePersisted('active-context', activeContextId);

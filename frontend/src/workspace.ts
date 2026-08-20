@@ -4,7 +4,7 @@ import { isWebBackend, webFs } from './web-fs';
 // A backend that can read/write the workspace exists in the desktop app (Tauri
 // fs) and in the web edition (HTTP fs via duckle-runner). Browser dev with no
 // server has neither, so file ops stay inert there.
-function hasBackend(): boolean {
+export function hasBackend(): boolean {
     return isTauri() || isWebBackend();
 }
 
