@@ -1458,8 +1458,56 @@ fn write_embedded_if_changed(dest: &std::path::Path, compressed: &[u8]) -> Resul
 /// (and AV-scanned) stub with that name is reused as-is, so inflation is paid at
 /// most once per build. Writes to a unique sibling then renames into place so a
 /// concurrent build never sees a half-written stub.
+/// The per-user application-data base, derived without a Tauri handle.
+///
+/// `stage_stub_bytes` is a free function reached from paths that have no `app`,
+/// so Tauri's own resolver is unavailable and the three platform rules are
+/// applied here instead.
+fn user_app_data_base() -> Option<PathBuf> {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|h| h.join(".local").join("share")))
+    };
+    base.map(|b| b.join("io.duckle.app"))
+}
+
+/// Where extracted sidecars are staged before being executed.
+///
+/// NOT the shared temp directory, which this used to be, for two reasons. On a
+/// multi-user machine the old path was predictable (`duckle-stub-<tag><len>`) and
+/// world-writable, and the caller returned it on existence alone, so another local
+/// user could put their own executable there first and have Duckle run it. And on a
+/// hardened Linux host `/tmp` is routinely mounted `noexec`, which made the exec
+/// fail with a bare "Permission denied" and no explanation - on exactly the managed
+/// fleets this product is aimed at.
+///
+/// Created 0700 at creation time on unix, so there is no window in which it is
+/// group- or world-writable. Falls back to temp only when the environment does not
+/// say where the user's data lives.
+fn staging_dir() -> PathBuf {
+    let dir = user_app_data_base()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("staging");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    dir
+}
+
 fn stage_stub_bytes(bytes: &[u8], suffix: &str, tag: &str) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir();
+    let dir = staging_dir();
     let path = dir.join(format!("duckle-stub-{}{}{}", tag, bytes.len(), suffix));
     if path.exists() {
         return Ok(path);
@@ -1850,7 +1898,9 @@ fn run_embedded_runner(
         eprintln!("{label}: this build does not bundle the runner");
         std::process::exit(1);
     }
-    let dir = std::env::temp_dir().join(temp_dir);
+    // Same reasoning as `staging_dir`: not shared temp, which is predictable on a
+    // multi-user machine and frequently mounted noexec on a hardened Linux host.
+    let dir = staging_dir().join(temp_dir);
     let _ = std::fs::create_dir_all(&dir);
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let runner = dir.join(format!("duckle-runner{suffix}"));
@@ -2270,6 +2320,35 @@ fn mcp_inject_config(app: tauri::AppHandle, client: String) -> Result<String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sidecars are extracted and then EXECUTED, so where they are staged is a
+    /// security boundary. It used to be the shared temp directory under a name
+    /// derived only from a tag and a length, and the caller returned that path on
+    /// existence alone - so another local user could place their own executable
+    /// there first. Shared temp is also mounted `noexec` on hardened Linux hosts,
+    /// which turned the exec into a bare "Permission denied".
+    #[test]
+    fn sidecars_are_not_staged_in_shared_temp() {
+        let dir = staging_dir();
+        assert_ne!(
+            dir,
+            std::env::temp_dir(),
+            "sidecars are still staged straight into shared temp"
+        );
+        assert!(
+            dir.ends_with("staging"),
+            "unexpected staging directory: {}",
+            dir.display()
+        );
+
+        // On unix it must be private from the moment it exists, not chmod'ed after.
+        #[cfg(unix)]
+        if dir.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "staging dir is group/other accessible: {mode:o}");
+        }
+    }
     use std::ffi::OsString;
     use std::path::Path;
 
