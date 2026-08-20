@@ -35,6 +35,18 @@ pub struct Step {
     /// Pipeline files, relative to the workspace. They have no order between them: that
     /// is what putting them in the same step means.
     pub pipelines: Vec<String>,
+    /// This step is allowed to fail without stopping the plan.
+    ///
+    /// `stopOnFailure` is a property of the whole plan, but a real sequence mixes the two:
+    /// the load must stop the run, while writing an audit row or sorting yesterday's files
+    /// should not. Without a per-step say, such a plan has to choose between abandoning the
+    /// run on a housekeeping step and carrying on past a failed load.
+    ///
+    /// Absent means "follow the plan". Setting it does not make the step's failure
+    /// invisible: the step is still recorded as failed and the plan still ends up failed.
+    /// It only decides whether the steps after it run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_on_failure: Option<bool>,
 }
 
 /// Several pipelines, in an order somebody chose.
@@ -207,7 +219,8 @@ where
         }
         // A failure stops the NEXT step, not the rest of this one: things in one step were
         // declared independent, so the others were always going to run anyway.
-        if plan.stop_on_failure && results.iter().any(|r| r.status == "failed") {
+        let soft = step.continue_on_failure.unwrap_or(false);
+        if plan.stop_on_failure && !soft && results.iter().any(|r| r.status == "failed") {
             stopped = true;
         }
         out.steps.push(StepOutcome {
@@ -261,9 +274,9 @@ mod tests {
             name: "Nightly load".into(),
             stop_on_failure: stop,
             steps: vec![
-                Step { name: "Extract".into(), pipelines: vec!["orders".into(), "customers".into()] },
-                Step { name: "Transform".into(), pipelines: vec!["dbt".into()] },
-                Step { name: "Publish".into(), pipelines: vec!["export".into()] },
+                Step { name: "Extract".into(), pipelines: vec!["orders".into(), "customers".into()], continue_on_failure: None },
+                Step { name: "Transform".into(), pipelines: vec!["dbt".into()], continue_on_failure: None },
+                Step { name: "Publish".into(), pipelines: vec!["export".into()], continue_on_failure: None },
             ],
         }
     }
@@ -321,6 +334,48 @@ mod tests {
     }
 
     #[test]
+    fn a_step_can_be_allowed_to_fail_without_stopping_the_plan() {
+        // A real sequence mixes the two. Here the middle step is housekeeping:
+        // its failure must not abandon the publish that follows, while a failure
+        // in either of the others still stops the plan.
+        let mut p = plan(true);
+        p.steps[1].continue_on_failure = Some(true);
+
+        let mut seen = Vec::new();
+        let out = execute(&p, |name| {
+            seen.push(name.to_string());
+            if name == "dbt" { Err("boom".into()) } else { Ok(()) }
+        });
+
+        assert_eq!(
+            seen,
+            vec!["orders", "customers", "dbt", "export"],
+            "the step after a soft failure must still run"
+        );
+        // Allowed to fail is not the same as pretended to have worked.
+        assert_eq!(out.status, "failed", "the plan still reports the failure");
+        assert_eq!(out.steps[1].pipelines[0].status, "failed");
+        assert_eq!(out.steps[2].pipelines[0].status, "ok");
+    }
+
+    #[test]
+    fn a_hard_step_still_stops_the_plan_when_another_is_soft() {
+        // The flag is per step, not a plan-wide switch by another name.
+        let mut p = plan(true);
+        p.steps[1].continue_on_failure = Some(true);
+
+        let mut seen = Vec::new();
+        let out = execute(&p, |name| {
+            seen.push(name.to_string());
+            if name == "orders" { Err("boom".into()) } else { Ok(()) }
+        });
+
+        assert!(!seen.contains(&"dbt".to_string()), "a hard failure stops what follows: {:?}", seen);
+        assert_eq!(out.status, "failed");
+        assert_eq!(out.steps[1].pipelines[0].status, "skipped");
+    }
+
+    #[test]
     fn a_plan_can_be_told_to_carry_on() {
         let mut seen = Vec::new();
         let out = execute(&plan(false), |p| {
@@ -345,7 +400,7 @@ mod tests {
             id: "x".into(),
             name: String::new(),
             stop_on_failure: true,
-            steps: vec![Step { name: "s".into(), pipelines: vec!["a".into(), "a".into()] }],
+            steps: vec![Step { name: "s".into(), pipelines: vec!["a".into(), "a".into()], continue_on_failure: None }],
         };
         assert!(
             dupe.problems().iter().any(|p| p.contains("twice")),

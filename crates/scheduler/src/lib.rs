@@ -102,6 +102,8 @@ fn work_of(workspace: &Path, s: &Schedule) -> Result<plans::Plan, String> {
             steps: vec![plans::Step {
                 name: s.name.clone(),
                 pipelines: vec![s.pipeline_id.clone()],
+                // A single-pipeline schedule has nothing after it to carry on to.
+                continue_on_failure: None,
             }],
         });
     };
@@ -1458,8 +1460,9 @@ mod tests {
                 plans::Step {
                     name: "Extract".into(),
                     pipelines: vec!["orders.json".into(), "customers.json".into()],
+                    continue_on_failure: None,
                 },
-                plans::Step { name: "Publish".into(), pipelines: vec!["export.json".into()] },
+                plans::Step { name: "Publish".into(), pipelines: vec!["export.json".into()], continue_on_failure: None },
             ],
         };
         plans::update(ws, |list| list.push(plan)).unwrap();
@@ -1606,6 +1609,7 @@ mod tests {
             steps: vec![plans::Step {
                 name: "Extract".into(),
                 pipelines: vec!["pipelines/orders.json".into()],
+                continue_on_failure: None,
             }],
         };
         plans::update(&ws, |list| list.push(plan)).unwrap();

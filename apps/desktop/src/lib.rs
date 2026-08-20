@@ -2391,8 +2391,9 @@ mod tests {
                     name: "Extract".into(),
                     // The console's spelling, because the editor writes it that way too.
                     pipelines: vec!["pipelines/orders.json".into()],
+                    continue_on_failure: None,
                 },
-                plans::Step { name: "Publish".into(), pipelines: vec!["pipelines/export.json".into()] },
+                plans::Step { name: "Publish".into(), pipelines: vec!["pipelines/export.json".into()], continue_on_failure: None },
             ],
         };
         let saved = plans_save(ws.clone(), plan.clone()).unwrap();
@@ -2411,7 +2412,7 @@ mod tests {
             id: "broken".into(),
             name: String::new(),
             stop_on_failure: true,
-            steps: vec![plans::Step { name: "Empty".into(), pipelines: vec![] }],
+            steps: vec![plans::Step { name: "Empty".into(), pipelines: vec![], continue_on_failure: None }],
         };
         let err = plans_save(ws.clone(), broken).expect_err("an empty step is not a plan");
         assert!(err.contains("no pipelines"), "unhelpful refusal: {err}");

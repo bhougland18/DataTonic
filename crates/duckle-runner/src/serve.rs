@@ -3149,10 +3149,12 @@ mod tests {
                 duckle_duckdb_engine::plans::Step {
                     name: "Extract".into(),
                     pipelines: vec!["orders.json".into()],
+                    continue_on_failure: None,
                 },
                 duckle_duckdb_engine::plans::Step {
                     name: "Publish".into(),
                     pipelines: vec!["export.json".into()],
+                    continue_on_failure: None,
                 },
             ],
         };
