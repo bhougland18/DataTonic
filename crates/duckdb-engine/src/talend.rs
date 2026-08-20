@@ -455,7 +455,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
             target_handle: Some("main".into()),
             edge_type: None,
             data: Some(EdgeData {
-                connection_type: "main".into(),
+                connection_type: connection_type_for(c.connector.as_deref()).into(),
                 label: None,
                 condition: None,
             }),
@@ -489,6 +489,33 @@ fn node_data(label: String, component_id: Option<String>, properties: Option<Jso
 struct Conn {
     source: String,
     target: String,
+    /// Talend's `connectorName`. It says whether a link carries rows or only
+    /// ordering, and dropping it turned every trigger into a data dependency.
+    connector: Option<String>,
+}
+
+/// Talend's connector name mapped to the edge vocabulary the canvas draws.
+///
+/// Talend links are not all data: most of them order the job rather than feed
+/// it. Importing them all as `main` asserted a data dependency that the job
+/// never had, which is both wrong on the canvas and wrong to the planner. The
+/// row-carrying names become `main`; the rest keep their own meaning.
+///
+/// PARALLELIZE and SYNCHRONIZE have no exact counterpart. Both mean "after
+/// this", so they import as `on-subjob-ok`: the ordering survives and the
+/// parallelism does not, which is the honest half to keep. An unrecognised
+/// name stays `main` rather than becoming a trigger nobody asked for.
+fn connection_type_for(connector: Option<&str>) -> &'static str {
+    match connector.unwrap_or("").to_ascii_uppercase().as_str() {
+        "ITERATE" => "iterate",
+        "RUN_IF" => "run-if",
+        "SUBJOB_OK" => "on-subjob-ok",
+        "SUBJOB_ERROR" => "on-subjob-error",
+        "COMPONENT_OK" => "on-component-ok",
+        "COMPONENT_ERROR" => "on-component-error",
+        "PARALLELIZE" | "SYNCHRONIZE" => "on-subjob-ok",
+        _ => "main",
+    }
 }
 
 /// Pull `<node>`, its `<elementParameter>`s, its mapper output entries, and the
@@ -562,7 +589,11 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
                     }
                     "connection" => {
                         if let (Some(s), Some(t)) = (attr("source"), attr("target")) {
-                            conns.push(Conn { source: s, target: t });
+                            conns.push(Conn {
+                                source: s,
+                                target: t,
+                                connector: attr("connectorName"),
+                            });
                         }
                     }
                     _ => {}
@@ -598,6 +629,33 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_trigger_link_does_not_import_as_a_data_edge() {
+        // Talend orders a job with links that carry no rows. Importing them as
+        // `main` asserted a data dependency the job never had: on one corpus
+        // that turned 164 ordering links and 24 iterate links into data edges.
+        assert_eq!(connection_type_for(Some("FLOW")), "main");
+        assert_eq!(connection_type_for(Some("MAIN")), "main");
+        assert_eq!(connection_type_for(Some("ITERATE")), "iterate");
+        assert_eq!(connection_type_for(Some("RUN_IF")), "run-if");
+        assert_eq!(connection_type_for(Some("SUBJOB_OK")), "on-subjob-ok");
+        assert_eq!(connection_type_for(Some("SUBJOB_ERROR")), "on-subjob-error");
+        assert_eq!(connection_type_for(Some("COMPONENT_OK")), "on-component-ok");
+        assert_eq!(connection_type_for(Some("COMPONENT_ERROR")), "on-component-error");
+        // No counterpart for these two: keep the ordering, lose the parallelism.
+        assert_eq!(connection_type_for(Some("PARALLELIZE")), "on-subjob-ok");
+        assert_eq!(connection_type_for(Some("SYNCHRONIZE")), "on-subjob-ok");
+        // A named output port still carries rows, and so does an unknown name:
+        // inventing a trigger from a name we do not recognise would silently
+        // cut the flow.
+        assert_eq!(connection_type_for(Some("OUTPUT_1")), "main");
+        assert_eq!(connection_type_for(Some("UNIQUE")), "main");
+        assert_eq!(connection_type_for(None), "main");
+        assert_eq!(connection_type_for(Some("")), "main");
+        // Talend has written these lowercase in older exports.
+        assert_eq!(connection_type_for(Some("subjob_ok")), "on-subjob-ok");
+    }
     use super::*;
 
     const JOB: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
