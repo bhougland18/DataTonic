@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { Field } from './types';
+import { connectionPlaceholder, useConnectionSupplied } from './useConnectionSupplied';
 
 type Props<T> = {
     field: Field;
@@ -16,13 +17,16 @@ function isSecretField(field: Field): boolean {
 export function TextField({ field, value, onChange }: Props<string>) {
     const secret = isSecretField(field);
     const [reveal, setReveal] = useState(false);
+    // Shown, never stored. See useConnectionSupplied.
+    const supplied = useConnectionSupplied(field.key);
+    const ph = connectionPlaceholder(supplied, field.placeholder, secret);
     if (!secret) {
         return (
             <input
                 type="text"
                 className="field-input"
                 value={value ?? ''}
-                placeholder={field.placeholder}
+                placeholder={ph}
                 onChange={e => onChange(e.target.value)}
                 spellCheck={false}
             />
@@ -34,7 +38,7 @@ export function TextField({ field, value, onChange }: Props<string>) {
                 type={reveal ? 'text' : 'password'}
                 className="field-input"
                 value={value ?? ''}
-                placeholder={field.placeholder}
+                placeholder={ph}
                 onChange={e => onChange(e.target.value)}
                 spellCheck={false}
                 autoComplete="off"
@@ -67,12 +71,14 @@ export function TextareaField({ field, value, onChange }: Props<string>) {
 }
 
 export function NumberField({ field, value, onChange }: Props<number>) {
+    const supplied = useConnectionSupplied(field.key);
+    const ph = connectionPlaceholder(supplied, field.placeholder, false);
     return (
         <input
             type="number"
             className="field-input"
             value={value ?? ''}
-            placeholder={field.placeholder}
+            placeholder={ph}
             onChange={e => {
                 const n = e.target.value === '' ? NaN : Number(e.target.value);
                 onChange(Number.isFinite(n) ? n : 0);
@@ -82,13 +88,15 @@ export function NumberField({ field, value, onChange }: Props<number>) {
 }
 
 export function IntegerField({ field, value, onChange }: Props<number>) {
+    const supplied = useConnectionSupplied(field.key);
+    const ph = connectionPlaceholder(supplied, field.placeholder, false);
     return (
         <input
             type="number"
             step={1}
             className="field-input"
             value={value ?? ''}
-            placeholder={field.placeholder}
+            placeholder={ph}
             onChange={e => {
                 const n = e.target.value === '' ? NaN : parseInt(e.target.value, 10);
                 onChange(Number.isFinite(n) ? n : 0);
