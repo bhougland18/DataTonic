@@ -237,6 +237,77 @@ fn binary_file_name(s: &EngineSpec) -> String {
     }
 }
 
+/// Marks an artifact whose SHA-256 has not been recorded yet.
+///
+/// An unpinned download proceeds with a warning rather than failing, because
+/// refusing outright would break every install until this table is filled in.
+/// Replace one of the constants below with a real digest and verification becomes
+/// mandatory for that artifact immediately: there is no second switch to remember,
+/// and no way to pin a digest without also enforcing it.
+pub(crate) const UNPINNED: &str = "UNPINNED";
+
+/// SHA-256 of every artifact Duckle downloads and then EXECUTES.
+///
+/// Until these are filled in, the only thing standing between a user and a
+/// substituted binary is TLS to the host serving it. That is not nothing, but it
+/// trusts the host, anyone who can obtain a certificate for it, and every redirect
+/// in between - and two of these fetch a MUTABLE reference (`releases/latest` and
+/// `resolve/main`), so the bytes behind the URL can change without the URL doing so.
+///
+/// To fill one in: download the exact asset the constant names, run
+/// `sha256sum <file>` (or `Get-FileHash -Algorithm SHA256`), and paste the hex.
+/// Pin the upstream reference to a tag or revision at the same time, because a
+/// digest against a moving target only turns a silent substitution into a failed
+/// install.
+pub(crate) const DUCKDB_SHA256: &str = UNPINNED;
+pub(crate) const UV_SHA256: &str = UNPINNED;
+pub(crate) const FUSION_SHA256: &str = UNPINNED;
+
+/// Per-engine digests, keyed by spec id and version so a version bump cannot keep
+/// silently matching an old pin.
+pub(crate) fn expected_engine_sha256(id: &str, version: &str) -> &'static str {
+    match (id, version) {
+        // ("llamacpp", "b1234") => "…",
+        // ("slothdb", "1.5.4") => "…",
+        _ => UNPINNED,
+    }
+}
+
+/// Per-model digest, keyed by the Hugging Face repo and file.
+pub(crate) fn expected_model_sha256(repo: &str, file: &str) -> &'static str {
+    match (repo, file) {
+        // ("Qwen/…", "…gguf") => "…",
+        _ => UNPINNED,
+    }
+}
+
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Compare a computed digest against the pinned one.
+///
+/// Fails closed: a mismatch is an error, never a warning, because the artifact is
+/// about to be executed. The caller must delete any partially written file before
+/// propagating, or the next run finds it on disk and skips the download entirely.
+pub(crate) fn verify_download(label: &str, actual_hex: &str, expected: &str) -> Result<(), String> {
+    if expected == UNPINNED {
+        eprintln!(
+            "duckle: {label} is not pinned to a checksum, so only TLS vouches for it.              See UNPINNED in engine_manager.rs."
+        );
+        return Ok(());
+    }
+    if !actual_hex.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "{label} failed checksum verification and was discarded. Expected {expected},              got {actual_hex}. Either the download was tampered with, or the pinned digest              is stale after a version bump."
+        ));
+    }
+    Ok(())
+}
+
 fn engine_dir(app_data: &Path, s: &EngineSpec) -> PathBuf {
     app_data.join("engines").join(s.id)
 }
@@ -427,6 +498,9 @@ pub fn ensure_cross_duckdb(app_data: &Path, os: &str, arch: &str) -> Result<Path
             bytes.len()
         ));
     }
+    // Before the archive is opened, let alone the binary extracted and run.
+    verify_download("the DuckDB CLI download", &hex_sha256(&bytes), DUCKDB_SHA256)?;
+
     let reader = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
     let mut extracted = false;
@@ -857,6 +931,14 @@ fn install_spec<F: FnMut(InstallProgress)>(
         on_progress(InstallProgress::Downloading { received, total });
     }
 
+    // Before extraction. llama.cpp's archive yields a server binary plus the shared
+    // libraries it dlopens, so a substituted archive is arbitrary code either way.
+    verify_download(
+        &format!("the {} download", s.name),
+        &hex_sha256(&buf),
+        expected_engine_sha256(s.id, s.version),
+    )?;
+
     let target = binary_path(app_data, s);
 
     let lower = asset.to_ascii_lowercase();
@@ -1105,12 +1187,16 @@ fn install_llama_model<F: FnMut(InstallProgress)>(
     let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     let mut chunk = [0u8; 256 * 1024];
     let mut received: u64 = 0;
+    // Hashed as it streams: the file is over a gigabyte, so it is never held in
+    // memory and cannot be hashed afterwards without reading it back.
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
     let validated = (|| -> Result<(), String> {
         loop {
             let n = resp.read(&mut chunk).map_err(|e| e.to_string())?;
             if n == 0 {
                 break;
             }
+            sha2::Digest::update(&mut hasher, &chunk[..n]);
             std::io::Write::write_all(&mut out, &chunk[..n]).map_err(|e| e.to_string())?;
             received += n as u64;
             on_progress(InstallProgress::DownloadingModel { received, total });
@@ -1136,6 +1222,18 @@ fn install_llama_model<F: FnMut(InstallProgress)>(
         if &header != b"GGUF" {
             return Err("Downloaded model is not a valid GGUF file (header mismatch)".into());
         }
+        // Inside `validated`, so a mismatch takes the existing path that deletes the
+        // partial file. Leaving it on disk would be worse than not checking at all:
+        // the next run finds the target present and skips the download entirely.
+        let digest: String = sha2::Digest::finalize(hasher)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        verify_download(
+            &format!("the {} model download", model.file),
+            &digest,
+            expected_model_sha256(model.repo, model.file),
+        )?;
         Ok(())
     })();
     drop(out); // close the handle before rename (Windows)
@@ -1144,6 +1242,49 @@ fn install_llama_model<F: FnMut(InstallProgress)>(
         return Err(e);
     }
     finalize_download(&tmp, &target)
+}
+
+#[cfg(test)]
+mod download_verification_tests {
+    use super::*;
+
+    /// A known vector, so a change to the hex formatting cannot pass unnoticed.
+    #[test]
+    fn hex_sha256_matches_a_known_vector() {
+        assert_eq!(
+            hex_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// The whole point: an artifact that does not match its pin must be refused,
+    /// because the next thing that happens to it is execution.
+    #[test]
+    fn a_mismatched_digest_is_refused() {
+        let real = hex_sha256(b"the real installer");
+        let swapped = hex_sha256(b"the attacker's installer");
+        let err = verify_download("test artifact", &swapped, &real)
+            .expect_err("a substituted artifact must be refused");
+        assert!(err.contains("failed checksum verification"), "unhelpful: {err}");
+
+        verify_download("test artifact", &real, &real).expect("the real artifact must pass");
+    }
+
+    /// Digests get pasted from tools that emit upper case.
+    #[test]
+    fn digest_comparison_ignores_case() {
+        let d = hex_sha256(b"x");
+        verify_download("test artifact", &d.to_uppercase(), &d).unwrap();
+    }
+
+    /// An unpinned artifact still installs, because refusing every download until
+    /// the table is filled in would break every install. Pinning one is what turns
+    /// enforcement on for it, with no second switch to forget.
+    #[test]
+    fn an_unpinned_artifact_warns_rather_than_failing() {
+        verify_download("test artifact", &hex_sha256(b"anything"), UNPINNED)
+            .expect("an unpinned artifact must not block the install");
+    }
 }
 
 #[cfg(test)]

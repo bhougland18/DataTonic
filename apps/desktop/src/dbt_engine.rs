@@ -134,6 +134,12 @@ pub(crate) fn ensure_uv(app_data: &Path) -> Result<PathBuf, String> {
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.bytes())
         .map_err(|e| format!("download uv: {e}"))?;
+    // Before extraction, because the archive yields an executable.
+    crate::engine_manager::verify_download(
+        "the uv download",
+        &crate::engine_manager::hex_sha256(&bytes),
+        crate::engine_manager::UV_SHA256,
+    )?;
 
     // uv archives contain the binary under `uv-<target>/uv[.exe]`; extract just it.
     if asset.ends_with(".zip") {
@@ -276,6 +282,12 @@ fn ensure_fusion(app_data: &Path) -> Result<PathBuf, String> {
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.bytes())
         .map_err(|e| format!("download dbt Fusion ({url}): {e}"))?;
+    // Before extraction, because the archive yields an executable.
+    crate::engine_manager::verify_download(
+        "the dbt Fusion download",
+        &crate::engine_manager::hex_sha256(&bytes),
+        crate::engine_manager::FUSION_SHA256,
+    )?;
 
     // The archive carries a single `dbt[.exe]`; extract just it.
     let exe_name = if cfg!(windows) { "dbt.exe" } else { "dbt" };
