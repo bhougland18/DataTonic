@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 386,
+  "componentCount": 387,
   "components": [
     {
       "id": "src.csv",
@@ -37702,6 +37702,46 @@
               "label": "branch 4",
               "type": "main",
               "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.runevents",
+      "label": "Run Events",
+      "kind": "control",
+      "availability": "available",
+      "summary": "Rows describing the stages that have already failed in this run: node_id, kind, status, message, category, duration_ms. Wire it into a mail or table sink to report failures. It reports failures the run SURVIVED, so mark the stages that may fail with Continue on failure.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.runevents",
+        "kind": "source",
+        "label": "Run Events",
+        "description": "Rows describing the stages that have already failed in this run: node_id, kind, status, message, category, duration_ms. Wire it into a mail or table sink to report failures. It reports failures the run SURVIVED, so mark the stages that may fail with Continue on failure.",
+        "schemaSource": "fixed",
+        "sections": [
+          {
+            "label": "Run Events",
+            "fields": []
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
             }
           ]
         }

@@ -1712,6 +1712,36 @@ impl DuckdbEngine {
                     Some(RuntimeSpec::WebhookSource(spec)) => {
                         self.run_webhook_source(&db_path, spec)
                     }
+                    // The stages that have already failed in this run, as rows.
+                    // Read straight off this run's results rather than a log
+                    // file, so it needs nothing to be readable mid-run and
+                    // reports exactly what happened before this node.
+                    Some(RuntimeSpec::RunEvents) => {
+                        let rows: Vec<JsonValue> = nodes
+                            .iter()
+                            .filter(|(_, n)| n.status == "error")
+                            .map(|(id, n)| {
+                                serde_json::json!({
+                                    "node_id": id,
+                                    "kind": n.kind.clone().unwrap_or_default(),
+                                    "status": n.status.clone(),
+                                    "message": n.error.clone().unwrap_or_default(),
+                                    "category": n.category.clone().unwrap_or_default(),
+                                    "duration_ms": n.duration_ms.unwrap_or(0),
+                                })
+                            })
+                            .collect();
+                        // A run with nothing wrong still has to produce the
+                        // columns, or the good path fails to bind downstream.
+                        materialize_jsonobjects_as_table_typed(
+                            &self.bin,
+                            &db_path,
+                            &stage.node_id,
+                            &rows,
+                            Some(&run_events_columns()),
+                        )
+                        .map(|_| String::new())
+                    }
                     Some(RuntimeSpec::WebSocketSource(spec)) => {
                         self.run_websocket_source(&db_path, spec)
                     }
@@ -3075,6 +3105,30 @@ fn urlencode_simple(s: &str) -> String {
 /// Materialize a Vec<JsonValue> of row objects as a DuckDB table.
 /// Variant of materialize_arrayrows_as_table for sources whose
 /// response is already object-shaped (no column zipping needed).
+/// The shape src.runevents always produces, so a clean run still binds.
+fn run_events_columns() -> Vec<Column> {
+    use duckle_metadata::DataType;
+    let text = |n: &str| Column {
+        name: n.to_string(),
+        data_type: DataType::String,
+        nullable: true,
+        primary_key: None,
+        format: None,
+    };
+    let mut cols: Vec<Column> = ["node_id", "kind", "status", "message", "category"]
+        .iter()
+        .map(|n| text(n))
+        .collect();
+    cols.push(Column {
+        name: "duration_ms".to_string(),
+        data_type: DataType::Int64,
+        nullable: true,
+        primary_key: None,
+        format: None,
+    });
+    cols
+}
+
 fn materialize_jsonobjects_as_table(
     bin: &Path,
     db: &Path,

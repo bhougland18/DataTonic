@@ -180,6 +180,21 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         // asserted a row fan-out the job never had. All three exist to anchor
         // ordering links, which is what ctl.anchor is for.
         "tPrejob" | "tPostjob" | "tParallelize" => ("ctl.anchor", "transform"),
+        // A log-catcher is a SOURCE of error rows, not a sink for them: what it
+        // emits is mailed or written to a table downstream.
+        "tLogCatcher" => ("src.runevents", "source"),
+        // Components Duckle already has; these were placeholders only because
+        // nobody had written the mapping line.
+        "tSendMail" => ("snk.email", "sink"),
+        "tLoop" => ("ctl.iterate", "transform"),
+        "tSortRow" => ("xf.sort", "transform"),
+        "tFileInputFullRow" => ("src.csv", "source"),
+        // A raw statement against the connection, whichever family it is.
+        "tDBRow" | "tSnowflakeRow" => ("code.sql", "transform"),
+        // A tJava body is arbitrary Java. Most of these print or set a variable,
+        // which is a log line; anything else needs a person, and arrives with
+        // the body preserved so the edit is located rather than lost.
+        "tJava" | "tJavaRow" => ("ctl.log", "transform"),
         // Duckle already speaks Snowflake; these were arriving as placeholders
         // only because their configuration is in the tcomp PROPERTIES blob.
         "tSnowflakeInput" => ("src.snowflake", "source"),

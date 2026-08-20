@@ -235,6 +235,11 @@ pub enum RuntimeSpec {
     EmailSource(EmailSourceSpec),
     EmailSink(EmailSinkSpec),
     WebhookSource(WebhookSourceSpec),
+    /// src.runevents: the stages that have already failed in THIS run, as rows.
+    ///
+    /// Read off the run's own results at the moment the node executes, so it
+    /// sees what happened before it and nothing after.
+    RunEvents,
     /// src.websocket / snk.websocket (issue #192): WebSocket client connectors.
     WebSocketSource(WebSocketSourceSpec),
     WebSocketSink(WebSocketSinkSpec),
@@ -1195,6 +1200,7 @@ fn build_stage(
     let mut email_source: Option<EmailSourceSpec> = None;
     let mut email_sink: Option<EmailSinkSpec> = None;
     let mut webhook_source: Option<WebhookSourceSpec> = None;
+    let mut run_events = false;
     let mut dynamodb_source: Option<DynamoDbSourceSpec> = None;
     let mut kinesis_source: Option<KinesisSourceSpec> = None;
     let mut ai_embed: Option<AiEmbedSpec> = None;
@@ -2730,6 +2736,17 @@ fn build_stage(
             .max(1) as usize;
         let sql = passthrough_view_sql(&node.id, from_view);
         (sql, StageKind::View, Some(from_view.to_string()))
+    } else if component_id == "src.runevents" {
+        // Emits the stages that have already failed in this run. A job's
+        // log-catcher is a SOURCE of error rows, not a sink for them: what it
+        // emits gets mailed or written to a table downstream.
+        //
+        // It can only see failures the run survived, which is what
+        // continueOnFailure is for. Without a soft stage ahead of it the run
+        // ends at its first error and this node never executes, so wiring one
+        // without marking anything soft reports nothing - correctly.
+        run_events = true;
+        (String::new(), StageKind::View, None)
     } else if component_id == "ctl.anchor" {
         // Does no work. It exists so ordering links have something to attach to.
         //
@@ -4992,6 +5009,7 @@ fn build_stage(
         .or_else(|| email_source.map(RuntimeSpec::EmailSource))
         .or_else(|| email_sink.map(RuntimeSpec::EmailSink))
         .or_else(|| webhook_source.map(RuntimeSpec::WebhookSource))
+        .or_else(|| run_events.then_some(RuntimeSpec::RunEvents))
         .or_else(|| dynamodb_source.map(RuntimeSpec::DynamodbSource))
         .or_else(|| kinesis_source.map(RuntimeSpec::KinesisSource))
         .or_else(|| ai_embed.map(RuntimeSpec::AiEmbed))

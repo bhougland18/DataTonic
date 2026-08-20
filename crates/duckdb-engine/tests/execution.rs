@@ -230,6 +230,57 @@ fn per_stage_view_count_is_backfilled_from_its_parquet_sink() {
 }
 
 #[test]
+fn run_events_reports_a_failure_the_run_survived() {
+    // A job's log-catcher is a source of error rows: what it emits gets mailed
+    // or written to a table. It can only report failures the run survived,
+    // which is what marking a stage continueOnFailure is for - before that
+    // existed the run ended at its first error and the catcher never ran.
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id
+1
+2
+");
+    let out = out_path(tmp.path(), "events.parquet");
+    let engine = engine_or_skip!();
+
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("soft", "xf.filter",
+                 json!({ "predicate": "no_such_column = 1", "continueOnFailure": true })),
+            node("ev", "src.runevents", json!({})),
+            node("k", "snk.parquet", json!({ "path": out })),
+        ]),
+        json!([
+            main_edge("e1", "s", "soft"),
+            // The catcher runs AFTER the failure, ordered by a trigger rather
+            // than fed by it: it reads no rows from the stage that failed.
+            { "id": "e2", "source": "soft", "target": "ev",
+              "sourceHandle": "main", "targetHandle": "main",
+              "data": { "connectionType": "on-component-error" } },
+            main_edge("e3", "ev", "k"),
+        ]),
+    );
+
+    let r = engine.execute_pipeline(&d);
+    let ev = r.nodes.get("ev").expect("the catcher should have run");
+    assert_eq!(ev.status, "ok", "the catcher itself did not fail: {:?}", ev.error);
+    assert_eq!(
+        ev.rows,
+        Some(1),
+        "the failed stage should be reported as one row, got {:?}",
+        ev.rows
+    );
+
+    // The row names the stage that failed and carries its message.
+    let n = count(&format!(
+        "(SELECT * FROM read_parquet('{}') WHERE node_id = 'soft' AND message <> '')",
+        out
+    ));
+    assert_eq!(n, 1, "the row should name the failed stage and carry its error");
+}
+
+#[test]
 fn a_stage_marked_continue_on_failure_does_not_end_the_run() {
     // A real sequence mixes hard and soft steps: the load must stop the run,
     // while writing an audit row or sorting yesterday's files should not. The
