@@ -13661,12 +13661,24 @@ fn stream_remote_xml<R: std::io::Read>(
             "xml: a zip over http/sftp can't be streamed (its directory is at the end of the file); use a .gz file or a local path".into(),
         ));
     }
-    let chained = std::io::Cursor::new(head[..n].to_vec()).chain(reader);
+    // Buffer once, here, so BOTH branches read the transport in large chunks.
+    // SftpFileReader::read is one SFTP READ round trip per call and nothing
+    // reads ahead, so the buffer size IS the request size: std's default 8 KiB
+    // caps a transfer at 8192 bytes per round trip, serially. A 1 GB document
+    // is then ~131k sequential requests. The server will serve far more per
+    // packet (russh-sftp negotiates a 256 KiB max_read_len against OpenSSH), we
+    // just have to ask for it. The bytes delivered are identical either way.
+    let chained = BufReader::with_capacity(
+        256 * 1024,
+        std::io::Cursor::new(head[..n].to_vec()).chain(reader),
+    );
     if n >= 2 && head[0] == 0x1f && head[1] == 0x8b {
         let decoder = flate2::read::MultiGzDecoder::new(chained);
         stream_xml_rows(BufReader::new(decoder), row_path, cancel, emit)
     } else {
-        stream_xml_rows(BufReader::new(chained), row_path, cancel, emit)
+        // Already a BufRead. Re-wrapping in a default BufReader here would put
+        // the 8 KiB request size straight back.
+        stream_xml_rows(chained, row_path, cancel, emit)
     }
 }
 
