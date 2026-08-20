@@ -105,9 +105,27 @@ export function validatePipeline(
 
         // Required fields populated
         const props = node.data.properties ?? {};
+        // A saved connection supplies these at run time (merge_generic_connection in
+        // duckle-secrets), and the connection WINS over any inline value, so a node
+        // carrying a connectionRef is complete even with these blank. Without this
+        // the editor reported "'Host' is required" on a pipeline that runs perfectly,
+        // and the only way to clear it was to copy the credentials back onto the node,
+        // which is the duplication the saved connection exists to remove.
+        const CONNECTION_SUPPLIED = new Set([
+            'host', 'port', 'database', 'username', 'password',
+            'bucket', 'region', 'accessKey', 'secretKey', 'sessionToken',
+            'accountName', 'accountKey', 'brokers', 'url', 'endpoint', 'urlStyle',
+            'sslmode', 'sslrootcert', 'sslcert', 'sslkey', 'connectTimeout',
+            'options', 'connParams',
+            'loginUrl', 'clientId', 'clientSecret', 'instanceUrl',
+            'accessToken', 'authToken', 'authType', 'authMode', 'account',
+        ]);
+        const ref = props['connectionRef'];
+        const hasConnection = typeof ref === 'string' && ref !== '';
         for (const section of manifest.sections) {
             for (const field of section.fields) {
                 if (!field.required) continue;
+                if (hasConnection && CONNECTION_SUPPLIED.has(field.key)) continue;
                 const v = props[field.key];
                 const empty =
                     v === undefined ||
