@@ -135,8 +135,11 @@ fn connection_ref_resolves_decrypts_and_engine_mints() {
         .to_string(),
     )
     .unwrap();
+    // Match the marker, not the version. The envelope gained a version when
+    // ciphertext started carrying the field and connection it belongs to, and
+    // pinning the old one here failed a test whose property still held.
     assert!(
-        enc.contains("enc:v1:") && !enc.contains("e2e-s3cret"),
+        enc.contains(r#""clientSecret":"enc:v"#) && !enc.contains("e2e-s3cret"),
         "clientSecret must be ciphertext at rest: {}",
         enc
     );
