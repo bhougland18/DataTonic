@@ -380,7 +380,9 @@ fn run() -> Result<bool, String> {
     });
 
     eprintln!("duckle-runner: {} (workspace {})", pipeline.display(), workspace.display());
-    let engine = DuckdbEngine::new(duckdb);
+    // No canvas here, so per-node preview rows have nobody to show them to:
+    // a headless run reads them off the wire only to drop them.
+    let engine = DuckdbEngine::new(duckdb).without_previews();
     let result = engine.execute_pipeline_named(&doc, &name);
 
     println!("status   : {}", result.status);
@@ -680,7 +682,9 @@ fn run_artifact(payload: Vec<u8>) -> ExitCode {
     context::apply_workspace_context(&mut doc, &ws_root);
 
     eprintln!("duckle-runner: {} (artifact, workspace {})", pipeline.display(), ws_root.display());
-    let engine = DuckdbEngine::new(duckdb);
+    // No canvas here, so per-node preview rows have nobody to show them to:
+    // a headless run reads them off the wire only to drop them.
+    let engine = DuckdbEngine::new(duckdb).without_previews();
     let result = engine.execute_pipeline_named(&doc, &name);
 
     println!("status   : {}", result.status);

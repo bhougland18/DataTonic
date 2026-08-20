@@ -117,6 +117,8 @@ const AI_DEDUPE_MAX_ROWS: usize = 25_000;
 pub struct DuckdbEngine {
     bin: PathBuf,
     cancel: Arc<AtomicBool>,
+    /// Whether per-node preview rows are wanted. See [`DuckdbEngine::without_previews`].
+    previews: bool,
 }
 
 impl std::fmt::Debug for DuckdbEngine {
@@ -133,9 +135,24 @@ impl DuckdbEngine {
     /// missing, and the first-run setup installs it.
     pub fn new(bin: PathBuf) -> Self {
         Self {
+            previews: true,
             bin,
             cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Stop fetching per-node preview rows.
+    ///
+    /// A preview is `SELECT * FROM <node> LIMIT n` against the node's relation.
+    /// On a view over a remote table it is a single-threaded read of every column
+    /// that runs until it has n rows, so it is cheap when matches are plentiful
+    /// and degrades toward a full scan when they are rare or absent.
+    ///
+    /// The canvas is the only consumer. A headless run reads the rows off the wire
+    /// and discards them, so the runner turns previews off.
+    pub fn without_previews(mut self) -> Self {
+        self.previews = false;
+        self
     }
 
     /// A clone of this engine carrying a FRESH, independent cancel flag, for a
@@ -148,6 +165,7 @@ impl DuckdbEngine {
         DuckdbEngine {
             bin: self.bin.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
+            previews: self.previews,
         }
     }
 
@@ -1106,10 +1124,7 @@ impl DuckdbEngine {
                     label: stage.label.clone(),
                     kind: "sink".into(),
                 });
-                let rows = stage
-                    .from
-                    .as_deref()
-                    .and_then(|f| self.count_rows(&db_path, f).ok());
+                let rows = self.sink_rows(&db_path, stage.from.as_deref(), &nodes);
                 nodes.insert(
                     stage.node_id.clone(),
                     NodeRunStatus {
@@ -1803,13 +1818,9 @@ impl DuckdbEngine {
                     // upstream and have no preview. A Pure SQL node creates no
                     // `<node>` relation, so there is nothing to count/preview.
                     let (rows_opt, view_preview) = match stage.kind {
-                        StageKind::Sink => (
-                            stage
-                                .from
-                                .as_ref()
-                                .and_then(|f| self.count_rows(&db_path, f).ok()),
-                            None,
-                        ),
+                        StageKind::Sink => {
+                            (self.sink_rows(&db_path, stage.from.as_deref(), &nodes), None)
+                        }
                         StageKind::View if stage.no_output_relation => (None, None),
                         StageKind::View => self.count_and_preview(&db_path, &stage.node_id),
                     };
@@ -2066,6 +2077,13 @@ impl DuckdbEngine {
             }
         }
 
+        // Relations this batch has already emitted a COUNT(*) for. A sink
+        // counts its UPSTREAM relation, which is normally the view the
+        // preceding stage just counted - and over a remote source that
+        // second COUNT(*) is a full extra pass across the wire for a number
+        // we already have. Count each relation once; the sink takes the
+        // upstream's figure when its marker comes back NULL.
+        let mut counted: std::collections::HashSet<String> = Default::default();
         for (i, stage) in stages.iter().enumerate() {
             batched_sql.push_str(&stage.sql);
             // Planner does not always terminate stage.sql with ';' -
@@ -2124,7 +2142,8 @@ impl DuckdbEngine {
             // users would lose it otherwise. Skip preview for components that
             // don't produce <node> and for xf.assert (where the predicate check
             // would fire here rather than at the downstream sink).
-            if matches!(stage.kind, plan::StageKind::View)
+            if self.previews
+                && matches!(stage.kind, plan::StageKind::View)
                 && stage.component_id != "ctl.switch"
                 && stage.component_id != "xf.assert"
                 && !stage.no_output_relation
@@ -2166,7 +2185,10 @@ impl DuckdbEngine {
             // column reference ..." errors. The stage's identity is
             // already in the marker FILE NAME (<i>.json), so we don't
             // need it inside the payload.
-            match count_target {
+            let repeat_count = count_target
+                .map(|t| !counted.insert(t.to_string()))
+                .unwrap_or(false);
+            match count_target.filter(|_| !repeat_count) {
                 Some(t) => batched_sql.push_str(&format!(
                     "COPY (SELECT COUNT(*) AS _duckle_r FROM {}) TO '{}' (FORMAT 'json', ARRAY false);\n",
                     plan::quote_ident(t),
@@ -2374,8 +2396,11 @@ impl DuckdbEngine {
             }
         }
 
-        // Read previews for the view stages that actually completed.
-        for (i, stage) in stages.iter().enumerate() {
+        // Read previews for the view stages that actually completed. With
+        // previews off the batch never emitted them, so there is nothing to
+        // read - iterating would push an empty NodePreview per view stage.
+        let preview_stages: &[plan::Stage] = if self.previews { stages } else { &[] };
+        for (i, stage) in preview_stages.iter().enumerate() {
             if !matches!(stage.kind, plan::StageKind::View) {
                 continue;
             }
@@ -2423,6 +2448,33 @@ impl DuckdbEngine {
     }
 
 
+    /// Rows for a sink, taken from the upstream stage that already reported them.
+    ///
+    /// A sink's `from` is the relation its upstream stage produced, and stages are
+    /// named by node id, so that stage has usually just recorded a count in
+    /// `nodes`. Counting it again is not cheap when the relation is a VIEW over a
+    /// remote table: `SELECT count(*)` re-executes the whole chain, so a
+    /// source -> filter -> sink graph scanned a 96M-row Postgres table three times
+    /// for one pass of real work, once for the filter's own count and once more
+    /// here. Reusing the number the upstream already computed removes that pass
+    /// and cannot disagree with it, because nothing between the two writes to the
+    /// upstream relation: the sink reads it.
+    ///
+    /// Falls back to counting when the upstream is not a node we ran (a raw alias,
+    /// or a stage that reported no count).
+    fn sink_rows(
+        &self,
+        db: &Path,
+        from: Option<&str>,
+        nodes: &std::collections::BTreeMap<String, NodeRunStatus>,
+    ) -> Option<u64> {
+        let from = from?;
+        if let Some(rows) = nodes.get(from).and_then(|n| n.rows) {
+            return Some(rows);
+        }
+        self.count_rows(db, from).ok()
+    }
+
     fn count_rows(&self, db: &Path, name: &str) -> Result<u64, EngineError> {
         let sql = format!("SELECT COUNT(*) AS n FROM {};", plan::quote_ident(name));
         let rows = self.run_rows(Some(db), &sql)?;
@@ -2444,11 +2496,17 @@ impl DuckdbEngine {
     /// preview was skipped.
     fn count_and_preview(&self, db: &Path, name: &str) -> (Option<u64>, Option<NodePreview>) {
         let q = plan::quote_ident(name);
-        let sql = format!(
-            "SELECT COUNT(*) AS n FROM {q}; SELECT * FROM (DESCRIBE {q}); SELECT * FROM {q} LIMIT {lim};",
-            q = q,
-            lim = PREVIEW_ROW_LIMIT
-        );
+        // Headless runs have no canvas, so the DESCRIBE and the preview SELECT
+        // fetch columns and rows that are then discarded. Ask for the count alone.
+        let sql = if self.previews {
+            format!(
+                "SELECT COUNT(*) AS n FROM {q}; SELECT * FROM (DESCRIBE {q}); SELECT * FROM {q} LIMIT {lim};",
+                q = q,
+                lim = PREVIEW_ROW_LIMIT
+            )
+        } else {
+            format!("SELECT COUNT(*) AS n FROM {q};", q = q)
+        };
         // -bail makes a missing relation fail the whole invocation; treat
         // that as "nothing to report".
         let out = match self.run(Some(db), &sql, true) {
@@ -2668,6 +2726,17 @@ fn drain_batched_markers(
             .duration_since(stage_started_at[*completed])
             .as_millis() as u64;
         let stage = &stages[*completed];
+        // NULL marker on a sink means the batch skipped its COUNT(*) because
+        // an earlier stage had already counted the same relation. Stages
+        // drain in order, so that count is in `nodes` now.
+        let rows = match rows {
+            None if matches!(stage.kind, plan::StageKind::Sink) => stage
+                .from
+                .as_deref()
+                .and_then(|f| nodes.get(f))
+                .and_then(|n| n.rows),
+            other => other,
+        };
         let kind = stage_kind_label(&stage.kind);
         nodes.insert(
             stage.node_id.clone(),
