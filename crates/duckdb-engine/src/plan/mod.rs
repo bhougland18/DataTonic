@@ -382,7 +382,17 @@ fn compile_impl(pipeline: &PipelineDoc, allow_view_upgrade: bool) -> Result<Comp
         .filter(|e| is_data_edge(e))
         .collect();
 
-    let order = topological_sort(&pipeline.nodes, &data_edges)?;
+    // Execution order honours ordering-only links as well as data ones. A
+    // trigger edge - iterate, run-if, the subjob/component ok and error links -
+    // says "after this", which constrains WHEN a node runs without claiming that
+    // rows flow along it. The inputs map below is still built from `data_edges`
+    // alone, so a trigger orders and does not wire.
+    //
+    // Sorting on data edges alone meant the canvas would draw a trigger and the
+    // planner would ignore it, so an imported job's ordering-only steps ran in
+    // whatever order the sort happened to produce.
+    let order_edges: Vec<&PipelineEdge> = pipeline.edges.iter().collect();
+    let order = topological_sort(&pipeline.nodes, &order_edges)?;
 
     // Build inputs map: node_id -> port_id -> Vec<source_node_id>
     let mut inputs: HashMap<&str, NodeInputs> = HashMap::new();
@@ -2703,6 +2713,24 @@ fn build_stage(
             .max(1) as usize;
         let sql = passthrough_view_sql(&node.id, from_view);
         (sql, StageKind::View, Some(from_view.to_string()))
+    } else if component_id == "ctl.anchor" {
+        // Does no work. It exists so ordering links have something to attach to.
+        //
+        // A visual ETL tool marks the start and end of a job, and fans subjobs
+        // out, with components that carry no data and no configuration: their
+        // whole meaning is "the things wired to me run around here". Importing
+        // one as a data component asserts a flow that does not exist, and
+        // dropping it throws the ordering away with it.
+        //
+        // Effect-only: no `<node>` relation, so nothing downstream can read rows
+        // from it, while the trigger edges into and out of it still order the
+        // run (see the sort in compile()).
+        no_output_relation = true;
+        (
+            passthrough_placeholder_sql(&node.id, "anchor"),
+            StageKind::View,
+            None,
+        )
     } else if component_id == "ctl.try" {
         // Side-effect fallback installer: pass through upstream
         // unchanged; on any subsequent stage failure, the engine

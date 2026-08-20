@@ -1707,6 +1707,49 @@
     }
 
     #[test]
+    fn a_trigger_edge_orders_a_stage_without_wiring_it() {
+        // A trigger says "after this". It constrains when a node runs; it does
+        // not claim rows flow along it. Sorting on data edges alone meant the
+        // canvas drew the link and the planner ignored it, so the two ends ran
+        // in whatever order the sort happened to produce.
+        let doc: super::PipelineDoc = serde_json::from_str(
+            r#"{
+              "nodes": [
+                {"id":"a","type":"source","position":{"x":0,"y":0},
+                 "data":{"label":"a","componentId":"code.sql",
+                         "properties":{"sql":"CREATE OR REPLACE TABLE t1 AS SELECT 1 AS x"}}},
+                {"id":"b","type":"transform","position":{"x":200,"y":0},
+                 "data":{"label":"b","componentId":"code.sql",
+                         "properties":{"sql":"CREATE OR REPLACE TABLE t2 AS SELECT 2 AS x"}}}
+              ],
+              "edges": [
+                {"id":"e1","source":"a","target":"b",
+                 "data":{"connectionType":"on-subjob-ok"}}
+              ]
+            }"#,
+        )
+        .expect("doc parses");
+
+        let c = super::compile(&doc).expect("compiles");
+        let order: Vec<&str> = c.stages.iter().map(|s| s.node_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["a", "b"],
+            "the trigger's target must be sequenced after its source, got {:?}",
+            order
+        );
+
+        // Ordered, not wired: `b` reads no upstream relation, so the trigger did
+        // not quietly become a data dependency.
+        let b = c.stages.iter().find(|s| s.node_id == "b").expect("stage b");
+        assert!(
+            b.from.is_none(),
+            "a trigger must not wire an input, got from={:?}",
+            b.from
+        );
+    }
+
+    #[test]
     fn csv_headerless_declared_schema_names_the_columns() {
         // A file whose rows carry a record-type discriminator in field 1 has no
         // header, so the reader must take its column names from the declared

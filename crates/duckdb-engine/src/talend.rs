@@ -174,11 +174,16 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         "tMap" => ("xf.map", "transform"),
         "tRunJob" => ("ctl.runjob", "transform"),
         "tUniqRow" => ("qa.unique", "transform"),
+        // Markers, not work. Pre-job and post-job bracket a job, and Talend's
+        // parallelize FANS SUBJOBS OUT rather than splitting rows - which is a
+        // different thing from Duckle's ctl.parallelize, so mapping it there
+        // asserted a row fan-out the job never had. All three exist to anchor
+        // ordering links, which is what ctl.anchor is for.
+        "tPrejob" | "tPostjob" | "tParallelize" => ("ctl.anchor", "transform"),
         // Duckle already speaks Snowflake; these were arriving as placeholders
         // only because their configuration is in the tcomp PROPERTIES blob.
         "tSnowflakeInput" => ("src.snowflake", "source"),
         "tSnowflakeOutput" => ("snk.snowflake", "sink"),
-        "tParallelize" => ("ctl.parallelize", "transform"),
         "tConvertType" => ("xf.cast", "transform"),
         // Passes rows through and prints them, which is what tLogRow does.
         "tLogRow" => ("xf.log", "transform"),
