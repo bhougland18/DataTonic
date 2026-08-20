@@ -178,6 +178,19 @@ fn csv_filter_parquet_end_to_end() {
     let sink = result.nodes.get("k1").expect("sink status present");
     assert_eq!(sink.rows, Some(2), "sink should report 2 rows");
 
+    // The filter feeds a Parquet sink that owns its whole file, so the batch
+    // skips the filter's own COUNT(*) and takes the figure from the file the
+    // sink counted - one pass over the source instead of two. The filter must
+    // still report it: over a remote source that second count is a full extra
+    // scan, and dropping it must not cost the node its row count.
+    let filt = result.nodes.get("f1").expect("filter status present");
+    assert_eq!(
+        filt.rows,
+        Some(2),
+        "filter should report 2 rows, back-filled from the sink, got {:?}",
+        filt.rows
+    );
+
     // The Parquet file exists and, read back independently, has exactly
     // the 2 paid rows.
     assert!(Path::new(&out).exists(), "parquet file should exist");
