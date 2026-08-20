@@ -2594,7 +2594,10 @@ fn execute_one(
     // Per-run input parameters from the dashboard (issue #127) override the
     // static workspace context for this run; applied before the context pass so a
     // supplied value wins and any unset ${KEY} still resolves from the context.
-    duckle_duckdb_engine::context::apply_params(&mut doc, params);
+    // Refused rather than substituted when a parameter would inject shell syntax
+    // into an executed property: /api/run needs only operator, and quietly allowing
+    // that would hand an operator the execution /api/deploy reserves for admin.
+    duckle_duckdb_engine::context::apply_params(&mut doc, params)?;
     // Match the web cmd paths and headless `duckle-runner --pipeline`: resolve
     // ${workspace}/${projectroot} and workspace-relative file paths before run,
     // so file-loaded pipelines (manual /api/run + scheduled runs) work too.

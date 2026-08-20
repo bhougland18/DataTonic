@@ -301,26 +301,115 @@ pub fn apply_workspace_context(doc: &mut PipelineDoc, workspace: &Path) {
 /// value wins over the static context default, while any `${KEY}` left unset
 /// falls through to the normal context resolution. An unknown `${...}` is left
 /// verbatim.
-pub fn apply_params(doc: &mut PipelineDoc, params: &HashMap<String, String>) {
+/// Properties whose value is EXECUTED rather than read.
+///
+/// `code.shell` takes its command from `code`, falling back to `command`
+/// (plan/mod.rs), and hands it to an interpreter. A parameter reaching one of
+/// these is not data, it is program text.
+const EXECUTED_PROPS: [&str; 6] = ["code", "command", "script", "shell", "args", "workingDir"];
+
+/// Characters that end one shell word and begin something else. Conservative on
+/// purpose: a parameter is meant to be a VALUE, so anything that could restructure
+/// the command is refused rather than escaped, because escaping correctly differs
+/// per interpreter and this code does not know which one will run it.
+const SHELL_METACHARACTERS: [char; 13] = [
+    ';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r', '{', '}',
+];
+
+fn is_reserved_param(name: &str) -> bool {
+    // Exactly what discover_parameters refuses to offer. A caller supplying one of
+    // these is not filling in a parameter, it is redefining a builtin: overriding
+    // ${workspace} or ${projectroot} repoints every path the pipeline reads and
+    // writes, and ${ENV:...} is meant to come from secrets, never from the request.
+    name.starts_with("ENV:") || name == "workspace" || name == "projectroot" || is_time_builtin(name)
+}
+
+/// Substitute caller-supplied `${KEY}` values into node properties.
+///
+/// Called AFTER [`apply_time_builtins`] and BEFORE [`apply_workspace_context`] so a
+/// supplied value wins over the static context default, while any `${KEY}` left
+/// unset falls through to normal context resolution. An unknown `${...}` is left
+/// verbatim.
+///
+/// Returns Err when a parameter would inject shell syntax into an executed
+/// property. `POST /api/run` needs only the operator role while `POST /api/deploy`
+/// needs admin, so silently substituting there would hand an operator the code
+/// execution the authorization table reserves for an administrator.
+pub fn apply_params(
+    doc: &mut PipelineDoc,
+    params: &HashMap<String, String>,
+) -> Result<(), String> {
     if params.is_empty() {
-        return;
+        return Ok(());
     }
     let re = match regex::Regex::new(r"\$\{([^}]+)\}") {
         Ok(re) => re,
-        Err(_) => return,
-    };
-    let replace = |s: &str| -> String {
-        re.replace_all(s, |caps: &regex::Captures| match params.get(caps[1].trim()) {
-            Some(v) => v.clone(),
-            None => caps[0].to_string(),
-        })
-        .into_owned()
+        Err(_) => return Ok(()),
     };
     for node in &mut doc.nodes {
         if let Some(props) = node.data.properties.as_mut() {
-            substitute_deep(props, &replace);
+            substitute_params_deep(props, None, params, &re, &node.id)?;
         }
     }
+    Ok(())
+}
+
+/// Key-aware walk. `substitute_deep` discards the property name, which is exactly
+/// the information needed to tell a SQL predicate from a shell command, so this
+/// carries it down. An array inherits its parent's key, because `args: ["${x}"]`
+/// is still the args property.
+fn substitute_params_deep(
+    value: &mut JsonValue,
+    key: Option<&str>,
+    params: &HashMap<String, String>,
+    re: &regex::Regex,
+    node_id: &str,
+) -> Result<(), String> {
+    match value {
+        JsonValue::String(s) => {
+            let executed = key.is_some_and(|k| EXECUTED_PROPS.contains(&k));
+            let mut failure: Option<String> = None;
+            let out = re
+                .replace_all(s, |caps: &regex::Captures| {
+                    let name = caps[1].trim();
+                    if is_reserved_param(name) {
+                        return caps[0].to_string();
+                    }
+                    match params.get(name) {
+                        Some(v) => {
+                            if executed && v.contains(SHELL_METACHARACTERS) {
+                                failure.get_or_insert_with(|| {
+                                    format!(
+                                        "node {node_id}: parameter '{name}' contains shell syntax                                          and the '{}' property is executed, so it is refused. Pass                                          a plain value, or move the command into the pipeline.",
+                                        key.unwrap_or("?")
+                                    )
+                                });
+                                return caps[0].to_string();
+                            }
+                            v.clone()
+                        }
+                        None => caps[0].to_string(),
+                    }
+                })
+                .into_owned();
+            if let Some(msg) = failure {
+                return Err(msg);
+            }
+            *s = out;
+        }
+        JsonValue::Array(a) => {
+            for v in a {
+                substitute_params_deep(v, key, params, re, node_id)?;
+            }
+        }
+        JsonValue::Object(m) => {
+            for (k, v) in m.iter_mut() {
+                substitute_params_deep(v, Some(k.as_str()), params, re, node_id)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// List the overridable `${...}` parameter names referenced anywhere in the
@@ -905,6 +994,59 @@ mod tests {
             serde_json::json!(format!("{}/out.parquet", root)),
             "${{projectroot}} alias must resolve to the workspace root"
         );
+    }
+
+
+    use super::super::PipelineDoc;
+    use std::collections::HashMap;
+
+    fn doc_with(props: &str) -> PipelineDoc {
+        serde_json::from_str(&format!(
+            r#"{{"nodes":[{{"id":"n1","position":{{"x":0,"y":0}},"data":{{"label":"X","componentId":"code.shell","properties":{props}}}}}],"edges":[]}}"#
+        ))
+        .unwrap()
+    }
+
+    /// POST /api/run needs only the operator role; POST /api/deploy needs admin.
+    /// A parameter substituted into an EXECUTED property is program text, not data,
+    /// so allowing shell syntax there hands an operator the execution the
+    /// authorization table reserves for an administrator.
+    #[test]
+    fn a_parameter_cannot_inject_shell_syntax_into_an_executed_property() {
+        let mut doc = doc_with(r#"{"code":"echo ${greeting}"}"#);
+        let params = HashMap::from([("greeting".to_string(), "hi; rm -rf /".to_string())]);
+        let err = super::apply_params(&mut doc, &params)
+            .expect_err("shell syntax in an executed property must be refused");
+        assert!(err.contains("greeting") && err.contains("code"), "unhelpful error: {err}");
+    }
+
+    /// The restriction must not break the feature. A parameter in SQL is the ordinary
+    /// documented use, and a plain value in a command is fine.
+    #[test]
+    fn ordinary_parameter_use_still_works() {
+        let mut doc = doc_with(r#"{"sql":"select * from t where m = '${month}'","code":"echo ${month}"}"#);
+        let params = HashMap::from([("month".to_string(), "2026-08".to_string())]);
+        super::apply_params(&mut doc, &params).expect("a plain value must substitute");
+        let props = doc.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(props["sql"], serde_json::json!("select * from t where m = '2026-08'"));
+        assert_eq!(props["code"], serde_json::json!("echo 2026-08"));
+    }
+
+    /// `discover_parameters` never offers the builtins, so a request naming one is not
+    /// filling a parameter in - it is redefining where the pipeline reads and writes.
+    #[test]
+    fn a_request_cannot_redefine_the_path_builtins_or_env_secrets() {
+        let mut doc = doc_with(r#"{"path":"${workspace}/a.csv","alt":"${projectroot}/b","tok":"${ENV:TOKEN}"}"#);
+        let params = HashMap::from([
+            ("workspace".to_string(), "/tmp/attacker".to_string()),
+            ("projectroot".to_string(), "/tmp/attacker".to_string()),
+            ("ENV:TOKEN".to_string(), "stolen".to_string()),
+        ]);
+        super::apply_params(&mut doc, &params).unwrap();
+        let props = doc.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(props["path"], serde_json::json!("${workspace}/a.csv"));
+        assert_eq!(props["alt"], serde_json::json!("${projectroot}/b"));
+        assert_eq!(props["tok"], serde_json::json!("${ENV:TOKEN}"));
     }
 
     #[test]
