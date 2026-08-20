@@ -12,14 +12,22 @@ pub(crate) use duckle_secrets::{decrypt_value, encrypt_value, is_encrypted, work
 /// Encrypt the sensitive fields of a connection payload JSON before it is
 /// written to disk.
 #[tauri::command]
-pub fn connection_encrypt_payload(workspace: String, payload_json: String) -> Result<String, String> {
-    duckle_secrets::encrypt_payload_json(Path::new(&workspace), &payload_json)
+pub fn connection_encrypt_payload(
+    workspace: String,
+    connection_id: String,
+    payload_json: String,
+) -> Result<String, String> {
+    duckle_secrets::encrypt_payload_json(Path::new(&workspace), &connection_id, &payload_json)
 }
 
 /// Decrypt the sensitive fields of a connection payload JSON after it is read
 /// from disk. If the workspace key is missing, the payload is returned
 /// unchanged so plaintext / legacy values still load.
 #[tauri::command]
-pub fn connection_decrypt_payload(workspace: String, payload_json: String) -> Result<String, String> {
-    duckle_secrets::decrypt_payload_json(Path::new(&workspace), &payload_json)
+pub fn connection_decrypt_payload(
+    workspace: String,
+    connection_id: String,
+    payload_json: String,
+) -> Result<String, String> {
+    duckle_secrets::decrypt_payload_json(Path::new(&workspace), &connection_id, &payload_json)
 }

@@ -698,10 +698,16 @@ fn confine_to_workspace(workspace: &Path, path: &str) -> Result<PathBuf, String>
 fn connection_secret_cmd(workspace: &Path, cmd: &str, body: &[u8]) -> Result<String, String> {
     let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let payload = args.get("payloadJson").and_then(|v| v.as_str()).unwrap_or("null");
+    // The id binds each ciphertext to the connection it belongs to, so a blob
+    // cannot be transplanted into another connection and decrypted there.
+    let connection_id = args
+        .get("connectionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if cmd == "connection_encrypt_payload" {
-        duckle_secrets::encrypt_payload_json(workspace, payload)
+        duckle_secrets::encrypt_payload_json(workspace, connection_id, payload)
     } else {
-        duckle_secrets::decrypt_payload_json(workspace, payload)
+        duckle_secrets::decrypt_payload_json(workspace, connection_id, payload)
     }
 }
 
@@ -3682,7 +3688,14 @@ mod tests {
             !stored.contains("hunter2"),
             "password reached disk in clear text: {stored}"
         );
-        assert!(stored.contains("enc:v1:"), "no ciphertext marker: {stored}");
+        // Version-agnostic: the test cares THAT the value is sealed, not which
+        // format version sealed it.
+        assert!(
+            duckle_secrets::is_encrypted(
+                stored.split('"').find(|s| duckle_secrets::is_encrypted(s)).unwrap_or("")
+            ),
+            "no ciphertext marker: {stored}"
+        );
         // Non-secret fields stay readable so the connection list still renders.
         assert!(stored.contains("db.internal"), "host should not be encrypted");
 

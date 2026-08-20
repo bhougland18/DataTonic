@@ -128,11 +128,16 @@ async function fs(): Promise<FsLib> {
 // `.duckle/keys/`. On any error we fall back to the original payload so a save
 // never loses data and a load never blocks. `${...}` placeholders and
 // non-secret fields are left untouched by the command.
-async function encryptConnectionPayload(workspace: string, payload: unknown): Promise<unknown> {
+async function encryptConnectionPayload(
+    workspace: string,
+    connectionId: string,
+    payload: unknown,
+): Promise<unknown> {
     try {
         const { invoke } = await import('@tauri-apps/api/core');
         const enc = await invoke<string>('connection_encrypt_payload', {
             workspace,
+            connectionId,
             payloadJson: JSON.stringify(payload),
         });
         return JSON.parse(enc);
@@ -142,11 +147,16 @@ async function encryptConnectionPayload(workspace: string, payload: unknown): Pr
     }
 }
 
-async function decryptConnectionPayload(workspace: string, payload: unknown): Promise<unknown> {
+async function decryptConnectionPayload(
+    workspace: string,
+    connectionId: string,
+    payload: unknown,
+): Promise<unknown> {
     try {
         const { invoke } = await import('@tauri-apps/api/core');
         const dec = await invoke<string>('connection_decrypt_payload', {
             workspace,
+            connectionId,
             payloadJson: JSON.stringify(payload),
         });
         return JSON.parse(dec);
@@ -259,7 +269,9 @@ async function loadV2(path: string): Promise<WorkspaceState | null> {
             const payload = await readJsonIfExists(file);
             if (payload !== null) {
                 (item as { payload: unknown }).payload =
-                    itype === 'connection' ? await decryptConnectionPayload(path, payload) : payload;
+                    itype === 'connection'
+                        ? await decryptConnectionPayload(path, String((item as { id?: unknown }).id ?? ''), payload)
+                        : payload;
             }
         } catch (err) {
             if (err instanceof WorkspaceLoadError) corruptFiles.push(err.file);
@@ -431,7 +443,7 @@ export async function saveItemPayload(
         // stripping, or a pipeline saved through here keeps live source rows.
         const toWrite =
             itemType === 'connection'
-                ? await encryptConnectionPayload(path, payload)
+                ? await encryptConnectionPayload(path, itemId, payload)
                 : itemType === 'pipeline'
                   ? stripPreviewRows(payload)
                   : payload;

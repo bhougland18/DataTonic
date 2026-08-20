@@ -123,6 +123,8 @@ fn connection_ref_resolves_decrypts_and_engine_mints() {
     let login = format!("http://127.0.0.1:{}", port);
     let enc = duckle_secrets::encrypt_payload_json(
         ws.path(),
+        // Must match the file this is written to below: the ciphertext is bound to it.
+        "sf-e2e",
         &json!({
             "kind": "salesforce",
             "authMode": "clientCredentials",

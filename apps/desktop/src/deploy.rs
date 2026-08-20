@@ -85,7 +85,10 @@ pub fn save_target(workspace: &Path, name: &str, url: &str, key: &str) -> Result
         return Err("a target needs an API key from that server".into());
     }
     let wk = duckle_secrets::workspace_key(workspace, true)?;
-    let key_enc = duckle_secrets::encrypt_value(&wk, key.trim())?;
+    // Bound to this target's name: a key sealed for one server must not open for
+    // another, so an edited targets file cannot redirect a credential.
+    let key_enc =
+        duckle_secrets::encrypt_value(&wk, &duckle_secrets::aad_for("deploy-target", name), key.trim())?;
 
     let mut targets = read_targets(workspace)?;
     targets.retain(|t| t.name != name);
@@ -119,7 +122,11 @@ fn target_credential(workspace: &Path, name: &str) -> Result<(String, String), S
         .find(|t| t.name == name)
         .ok_or_else(|| format!("no deployment target called '{name}'"))?;
     let wk = duckle_secrets::workspace_key(workspace, false)?;
-    let key = duckle_secrets::decrypt_value(&wk, &target.key_enc)
+    let key = duckle_secrets::decrypt_value(
+        &wk,
+        &duckle_secrets::aad_for("deploy-target", name),
+        &target.key_enc,
+    )
         .map_err(|e| format!("could not read the key for '{name}': {e}"))?;
     Ok((target.url, key))
 }

@@ -15,7 +15,7 @@
 //! auth fields injected in memory - the engine stays credential-agnostic and
 //! secrets never land in the pipeline file.
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use duckle_metadata::PipelineNode;
@@ -23,6 +23,8 @@ use serde_json::Value as JsonValue;
 use std::path::{Path, PathBuf};
 
 pub const ENC_PREFIX: &str = "enc:v1:";
+/// Ciphertext bound to its field via AES-GCM associated data. See [`aad_for`].
+pub const ENC_PREFIX_V2: &str = "enc:v2:";
 
 /// Connection-payload fields (by name) that hold a secret and get encrypted.
 pub const SENSITIVE_KEYS: &[&str] = &[
@@ -89,32 +91,61 @@ pub fn workspace_key(workspace: &Path, create: bool) -> Result<[u8; 32], String>
 }
 
 pub fn is_encrypted(s: &str) -> bool {
-    s.starts_with(ENC_PREFIX)
+    s.starts_with(ENC_PREFIX) || s.starts_with(ENC_PREFIX_V2)
 }
 
-/// Encrypt plaintext into an `enc:v1:<base64(nonce || ciphertext)>` token.
-pub fn encrypt_value(key: &[u8; 32], plaintext: &str) -> Result<String, String> {
+/// Bind a ciphertext to the place it belongs.
+///
+/// AES-GCM authenticates its associated data, so a value sealed under one context
+/// fails to open under another. Without it every ciphertext under a workspace key
+/// is interchangeable: the same blob decrypts in ANY field of ANY connection, so
+/// anyone able to write a connection file could move a production password into a
+/// connection pointing at a host they control and have the engine send it there.
+///
+/// The unit separator is not valid inside an id or a field name, so `a` + `b.c`
+/// and `a.b` + `c` cannot produce the same associated data.
+pub fn aad_for(context: &str, field: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(context.len() + field.len() + 1);
+    v.extend_from_slice(context.as_bytes());
+    v.push(0x1f);
+    v.extend_from_slice(field.as_bytes());
+    v
+}
+
+/// Encrypt plaintext into an `enc:v2:<base64(nonce || ciphertext)>` token, bound to
+/// `aad` (see [`aad_for`]). The same value sealed for a different field, or a
+/// different connection, will not decrypt here.
+pub fn encrypt_value(key: &[u8; 32], aad: &[u8], plaintext: &str) -> Result<String, String> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init: {}", e))?;
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut nonce_bytes).map_err(|e| format!("nonce rng: {}", e))?;
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload { msg: plaintext.as_bytes(), aad },
+        )
         .map_err(|e| format!("encrypt: {}", e))?;
     let mut payload = Vec::with_capacity(12 + ciphertext.len());
     payload.extend_from_slice(&nonce_bytes);
     payload.extend_from_slice(&ciphertext);
     Ok(format!(
         "{}{}",
-        ENC_PREFIX,
+        ENC_PREFIX_V2,
         base64::engine::general_purpose::STANDARD.encode(payload)
     ))
 }
 
-/// Decrypt an `enc:v1:` token back to plaintext.
-pub fn decrypt_value(key: &[u8; 32], blob: &str) -> Result<String, String> {
-    let b64 = blob
-        .strip_prefix(ENC_PREFIX)
-        .ok_or("not an encrypted value")?;
+/// Decrypt an `enc:v2:` token, checking it was sealed for this `aad`.
+///
+/// An `enc:v1:` token predates the binding and carries no associated data, so it is
+/// decrypted without one. That path exists purely so secrets stored before the
+/// change keep opening; it is the weakness v2 closes, and a value is upgraded to v2
+/// the next time its connection is saved.
+pub fn decrypt_value(key: &[u8; 32], aad: &[u8], blob: &str) -> Result<String, String> {
+    let (b64, bound) = match blob.strip_prefix(ENC_PREFIX_V2) {
+        Some(rest) => (rest, true),
+        None => (blob.strip_prefix(ENC_PREFIX).ok_or("not an encrypted value")?, false),
+    };
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| format!("base64: {}", e))?;
@@ -123,15 +154,30 @@ pub fn decrypt_value(key: &[u8; 32], blob: &str) -> Result<String, String> {
     }
     let (nonce_bytes, ciphertext) = raw.split_at(12);
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init: {}", e))?;
-    let plain = cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
-        .map_err(|e| format!("decrypt: {}", e))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plain = if bound {
+        cipher
+            .decrypt(nonce, Payload { msg: ciphertext, aad })
+            .map_err(|_| SEALED_ELSEWHERE.to_string())?
+    } else {
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("decrypt: {}", e))?
+    };
     String::from_utf8(plain).map_err(|e| format!("utf8: {}", e))
 }
 
+const SEALED_ELSEWHERE: &str =
+    "decrypt: this value was not sealed for this field, so it cannot be moved between fields or between connections";
+
 /// Walk a JSON value, encrypting or decrypting the sensitive string fields in
 /// place. Already-encrypted values and `${...}` placeholders are left alone.
-fn transform(value: &mut JsonValue, key: &[u8; 32], encrypting: bool) -> Result<(), String> {
+fn transform(
+    value: &mut JsonValue,
+    key: &[u8; 32],
+    context: &str,
+    encrypting: bool,
+) -> Result<(), String> {
     match value {
         JsonValue::Object(map) => {
             for (k, v) in map.iter_mut() {
@@ -144,24 +190,24 @@ fn transform(value: &mut JsonValue, key: &[u8; 32], encrypting: bool) -> Result<
                         {
                             // Propagate: never silently leave a secret in
                             // plaintext (the file is meant to hold ciphertext).
-                            let enc = encrypt_value(key, s)?;
+                            let enc = encrypt_value(key, &aad_for(context, k), s)?;
                             *v = JsonValue::String(enc);
                         }
                     } else if is_encrypted(s) {
                         // Decrypt stays lenient: a missing/legacy value loads
                         // unchanged rather than failing the read.
-                        if let Ok(dec) = decrypt_value(key, s) {
+                        if let Ok(dec) = decrypt_value(key, &aad_for(context, k), s) {
                             *v = JsonValue::String(dec);
                         }
                     }
                 } else {
-                    transform(v, key, encrypting)?;
+                    transform(v, key, context, encrypting)?;
                 }
             }
         }
         JsonValue::Array(arr) => {
             for v in arr.iter_mut() {
-                transform(v, key, encrypting)?;
+                transform(v, key, context, encrypting)?;
             }
         }
         _ => {}
@@ -171,11 +217,15 @@ fn transform(value: &mut JsonValue, key: &[u8; 32], encrypting: bool) -> Result<
 
 /// Encrypt the sensitive fields of a connection payload JSON before it is
 /// written to disk. Creates the workspace key on first use.
-pub fn encrypt_payload_json(workspace: &Path, payload_json: &str) -> Result<String, String> {
+pub fn encrypt_payload_json(
+    workspace: &Path,
+    connection_id: &str,
+    payload_json: &str,
+) -> Result<String, String> {
     let key = workspace_key(workspace, true)?;
     let mut v: JsonValue =
         serde_json::from_str(payload_json).map_err(|e| format!("json: {}", e))?;
-    transform(&mut v, &key, true)?;
+    transform(&mut v, &key, connection_id, true)?;
     serde_json::to_string(&v).map_err(|e| format!("json: {}", e))
 }
 
@@ -185,14 +235,18 @@ pub fn encrypt_payload_json(workspace: &Path, payload_json: &str) -> Result<Stri
 /// deliberately LENIENT - the run-time path is [`load_connection`], which is
 /// strict, because executing with `enc:v1:` ciphertext as a credential is a
 /// confusing downstream auth failure.)
-pub fn decrypt_payload_json(workspace: &Path, payload_json: &str) -> Result<String, String> {
+pub fn decrypt_payload_json(
+    workspace: &Path,
+    connection_id: &str,
+    payload_json: &str,
+) -> Result<String, String> {
     let key = match workspace_key(workspace, false) {
         Ok(k) => k,
         Err(_) => return Ok(payload_json.to_string()),
     };
     let mut v: JsonValue =
         serde_json::from_str(payload_json).map_err(|e| format!("json: {}", e))?;
-    transform(&mut v, &key, false)?;
+    transform(&mut v, &key, connection_id, false)?;
     serde_json::to_string(&v).map_err(|e| format!("json: {}", e))
 }
 
@@ -231,7 +285,7 @@ pub fn load_connection(workspace: &Path, id: &str) -> Result<JsonValue, String> 
                 key_path(workspace).display()
             )
         })?;
-        transform(&mut v, &key, false)?;
+        transform(&mut v, &key, id, false)?;
         if any_encrypted(&v) {
             return Err(format!(
                 "connection '{}' could not be decrypted with the workspace key \
@@ -565,6 +619,65 @@ mod tests {
         dir
     }
 
+
+    /// The property the binding exists for.
+    ///
+    /// Under one workspace key every ciphertext used to be interchangeable, so the
+    /// same blob decrypted in ANY field of ANY connection. Anyone able to write a
+    /// connection file could copy a production password into a connection pointing
+    /// at a host they control and have the engine send it there. Binding the
+    /// ciphertext to (connection, field) makes that fail to authenticate.
+    #[test]
+    fn a_secret_cannot_be_moved_between_fields_or_connections() {
+        let key = [7u8; 32];
+        let sealed = encrypt_value(&key, &aad_for("prod-db", "password"), "hunter2").unwrap();
+
+        assert_eq!(
+            decrypt_value(&key, &aad_for("prod-db", "password"), &sealed).unwrap(),
+            "hunter2",
+            "it must still open where it belongs"
+        );
+
+        let moved_connection = decrypt_value(&key, &aad_for("attacker-db", "password"), &sealed);
+        assert!(
+            moved_connection.is_err(),
+            "a password was transplanted into another connection and decrypted"
+        );
+
+        let moved_field = decrypt_value(&key, &aad_for("prod-db", "accessKey"), &sealed);
+        assert!(
+            moved_field.is_err(),
+            "a password was transplanted into another field and decrypted"
+        );
+    }
+
+    /// Secrets written before the binding must keep opening, or upgrading Duckle
+    /// would lock people out of their own connections.
+    #[test]
+    fn a_v1_value_still_decrypts() {
+        use aes_gcm::aead::Aead;
+        let key = [9u8; 32];
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = [3u8; 12];
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), "legacy".as_bytes())
+            .unwrap();
+        let mut payload = nonce.to_vec();
+        payload.extend_from_slice(&ct);
+        let blob = format!(
+            "{}{}",
+            ENC_PREFIX,
+            base64::engine::general_purpose::STANDARD.encode(payload)
+        );
+
+        // The aad is ignored for a v1 blob, which is exactly the weakness v2 closes.
+        assert_eq!(
+            decrypt_value(&key, &aad_for("anything", "at-all"), &blob).unwrap(),
+            "legacy"
+        );
+        assert!(is_encrypted(&blob), "v1 must still be recognised as encrypted");
+    }
+
     fn write_connection(ws: &Path, id: &str, payload: &str) {
         let dir = ws.join("connections");
         let _ = std::fs::create_dir_all(&dir);
@@ -589,7 +702,7 @@ mod tests {
         let ws = temp_ws("rt");
 
         let payload = r#"{"kind":"postgres","host":"db.local","username":"u","password":"s3cr3t","port":5432}"#;
-        let enc = encrypt_payload_json(&ws, payload).unwrap();
+        let enc = encrypt_payload_json(&ws, "test-conn", payload).unwrap();
         // Non-secret fields stay readable; the password becomes ciphertext.
         assert!(
             enc.contains("\"host\":\"db.local\""),
@@ -602,13 +715,13 @@ mod tests {
             enc
         );
         assert!(
-            enc.contains("enc:v1:"),
+            (enc.contains(ENC_PREFIX) || enc.contains(ENC_PREFIX_V2)),
             "password should be encrypted: {}",
             enc
         );
         assert!(!enc.contains("s3cr3t"), "plaintext secret leaked: {}", enc);
 
-        let dec = decrypt_payload_json(&ws, &enc).unwrap();
+        let dec = decrypt_payload_json(&ws, "test-conn", &enc).unwrap();
         let v: JsonValue = serde_json::from_str(&dec).unwrap();
         assert_eq!(v["password"], "s3cr3t");
         assert_eq!(v["host"], "db.local");
@@ -619,7 +732,7 @@ mod tests {
     fn env_placeholders_are_not_encrypted() {
         let ws = temp_ws("env");
         let payload = r#"{"password":"${ENV:PGPASSWORD}"}"#;
-        let enc = encrypt_payload_json(&ws, payload).unwrap();
+        let enc = encrypt_payload_json(&ws, "sf-prod", payload).unwrap();
         assert!(
             enc.contains("${ENV:PGPASSWORD}"),
             "placeholder must survive: {}",
@@ -632,7 +745,7 @@ mod tests {
     fn salesforce_secret_fields_are_encrypted() {
         let ws = temp_ws("sfenc");
         let payload = r#"{"kind":"salesforce","authMode":"clientCredentials","clientId":"cid","clientSecret":"csecret","accessToken":"atok"}"#;
-        let enc = encrypt_payload_json(&ws, payload).unwrap();
+        let enc = encrypt_payload_json(&ws, "sf-prod", payload).unwrap();
         assert!(!enc.contains("csecret"), "clientSecret leaked: {}", enc);
         assert!(!enc.contains("atok"), "accessToken leaked: {}", enc);
         assert!(
@@ -647,7 +760,7 @@ mod tests {
     fn resolve_client_credentials_on_source() {
         let ws = temp_ws("cc_src");
         let enc = encrypt_payload_json(
-            &ws,
+            &ws, "sf-prod",
             r#"{"kind":"salesforce","authMode":"clientCredentials","loginUrl":"https://acme.my.salesforce.com","clientId":"cid","clientSecret":"csecret"}"#,
         )
         .unwrap();
@@ -673,7 +786,7 @@ mod tests {
     fn resolve_bearer_on_sink_and_source() {
         let ws = temp_ws("bearer");
         let enc = encrypt_payload_json(
-            &ws,
+            &ws, "sf-b",
             r#"{"kind":"salesforce","authMode":"bearer","instanceUrl":"https://acme.my.salesforce.com","accessToken":"tok123"}"#,
         )
         .unwrap();
@@ -709,7 +822,7 @@ mod tests {
     fn resolve_bulk_nodes_use_the_sink_key_shape() {
         let ws = temp_ws("bulk");
         let enc = encrypt_payload_json(
-            &ws,
+            &ws, "sf-bulk",
             r#"{"kind":"salesforce","authMode":"clientCredentials","instanceUrl":"https://acme.my.salesforce.com","loginUrl":"https://acme.my.salesforce.com","clientId":"cid","clientSecret":"csecret"}"#,
         )
         .unwrap();
@@ -740,7 +853,7 @@ mod tests {
     fn bulk_node_rejects_a_non_salesforce_connection() {
         let ws = temp_ws("bulk_kind");
         let enc =
-            encrypt_payload_json(&ws, r#"{"kind":"s3","accessKey":"ak","secretKey":"sk"}"#).unwrap();
+            encrypt_payload_json(&ws, "s3-conn", r#"{"kind":"s3","accessKey":"ak","secretKey":"sk"}"#).unwrap();
         write_connection(&ws, "s3-conn", &enc);
         let mut node = sf_node(
             "snk.salesforce.bulk",
@@ -755,7 +868,7 @@ mod tests {
     fn env_placeholder_in_connection_survives_resolution() {
         let ws = temp_ws("cc_env");
         let enc = encrypt_payload_json(
-            &ws,
+            &ws, "sf-env",
             r#"{"kind":"salesforce","authMode":"clientCredentials","loginUrl":"https://a.my.salesforce.com","clientId":"cid","clientSecret":"${ENV:SF_CLIENT_SECRET}"}"#,
         )
         .unwrap();
@@ -791,7 +904,7 @@ mod tests {
     fn missing_key_is_strict_at_run_time_but_lenient_in_editor() {
         let ws = temp_ws("strict");
         let enc = encrypt_payload_json(
-            &ws,
+            &ws, "sf-s",
             r#"{"kind":"salesforce","authMode":"clientCredentials","clientId":"cid","clientSecret":"csecret"}"#,
         )
         .unwrap();
@@ -806,9 +919,9 @@ mod tests {
             err
         );
         // Editor load stays lenient: ciphertext passes through unchanged.
-        let out = decrypt_payload_json(&ws, &enc).unwrap();
+        let out = decrypt_payload_json(&ws, "sf-s", &enc).unwrap();
         assert!(
-            out.contains("enc:v1:"),
+            (out.contains(ENC_PREFIX) || out.contains(ENC_PREFIX_V2)),
             "editor load stays lenient: {}",
             out
         );

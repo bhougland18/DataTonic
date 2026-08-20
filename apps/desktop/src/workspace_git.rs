@@ -390,7 +390,10 @@ pub fn save_pat(workspace: &Path, token: &str) -> GitResult<()> {
     // failure - surface the error so the caller knows the token was not
     // stored rather than persisting a credential in the clear.
     let key = crate::secrets::workspace_key(workspace, true)?;
-    let stored = crate::secrets::encrypt_value(&key, token)?;
+    // One PAT per workspace, so a fixed context is enough to stop this ciphertext
+    // being reused as a connection field.
+    let stored =
+        crate::secrets::encrypt_value(&key, &duckle_secrets::aad_for("git", "pat"), token)?;
     let body = serde_json::to_string_pretty(&StoredPat { pat: stored }).map_err(|e| e.to_string())?;
     write_owner_only(&path, body.as_bytes())?;
     write_gitignore_safety(workspace);
@@ -437,7 +440,7 @@ pub fn load_pat(workspace: &Path) -> GitResult<String> {
              (.duckle/keys/secret.key); re-enter the token to re-save it"
                 .to_string()
         })?;
-        return crate::secrets::decrypt_value(&key, &parsed.pat)
+        return crate::secrets::decrypt_value(&key, &duckle_secrets::aad_for("git", "pat"), &parsed.pat)
             .map_err(|e| format!("decrypt git token: {}", e));
     }
     // A token written before encryption existed. Accepting it forever leaves a credential
