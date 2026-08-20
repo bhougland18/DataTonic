@@ -47,6 +47,7 @@
 
 - [Where Duckle runs](#where-duckle-runs)
 - [What is Duckle?](#what-is-duckle)
+- [What's new in v0.7.0](#whats-new-in-v070)
 - [What's new in v0.6.1](#whats-new-in-v061)
 - [What's new in v0.6.0](#whats-new-in-v060)
 - [Quickstart (60 s)](#quickstart-60-seconds)
@@ -204,7 +205,7 @@ That's a real, native ETL pipeline built and run in under a minute. CSV is just 
 
 ## Download / Install
 
-Pick the binary for your OS from the [latest release](https://github.com/slothflowlabs/duckle/releases/tag/v0.6.1):
+Pick the binary for your OS from the [latest release](https://github.com/slothflowlabs/duckle/releases/tag/v0.7.0):
 
 | OS | Asset | How to run |
 |---|---|---|
@@ -1608,7 +1609,7 @@ No - Duckle downloads it for you on first launch. The download is ~30 MB and inc
 <details>
 <summary><b>How big is the binary, exactly?</b></summary>
 
-73 to 110 MB, depending on platform. As of v0.6.1: macOS 73 (x64) to 88 (arm64), Linux 74 (arm64) to 100 (x64), Windows 98 (arm64) to 110 (x64). It embeds the headless runner and the MCP server, and the headless runner on its own is 27 MB. The engines aren't statically linked - DuckDB (~50 MB with extensions) and the Duckie LLM (~1.1 GB for the Qwen GGUF) both download on first launch with a guided installer into your app-data folder, so they update independently of the app.
+73 to 110 MB, depending on platform. As of v0.7.0: macOS 73 (x64) to 88 (arm64), Linux 74 (arm64) to 100 (x64), Windows 98 (arm64) to 110 (x64). It embeds the headless runner and the MCP server, and the headless runner on its own is 27 MB. The engines aren't statically linked - DuckDB (~50 MB with extensions) and the Duckie LLM (~1.1 GB for the Qwen GGUF) both download on first launch with a guided installer into your app-data folder, so they update independently of the app.
 
 </details>
 
@@ -1737,6 +1738,25 @@ git push origin main vX.Y.Z
 # GitHub gets the binaries uploaded; un-draft + mark Latest with:
 gh release edit vX.Y.Z --draft=false --latest
 ```
+
+---
+
+## What's new in v0.7.0
+
+A server somebody can set up in a browser, an ordered plan of pipelines, a
+catalog of the whole workspace, and a run that stopped reading the source
+three times to answer one question.
+
+- **Set a server up without a terminal.** The console used to assume whoever deployed it would also configure it over SSH. It now answers a first visit with a setup page: pick where the server runs, claim it, and the administrator token is shown once. Claiming is the whole setup. A liveness probe at `/healthz` means an orchestrator can tell a starting server from a wedged one, and a schedule that stops working now says so instead of failing quietly.
+- **Sign-in, roles and an audit log.** Accounts and machine credentials live in SQLite rather than a file two processes could erase for each other. People are managed from a **People** tab instead of a deployment task, machines get their own API keys, and sessions survive a restart, expire, and travel marked. Roles are enforced in one place per surface, so a route cannot be reached by forgetting to check it at the call site. The audit log records who did what, including refusals, and can be read back from the console.
+- **Plans: several pipelines, in an order somebody chose.** A plan is a list of pipelines that run in sequence. Plans are authored in the desktop app and in the console, share one `plans.json`, and can be scheduled like a single pipeline. A plan whose pipelines failed no longer reports that it worked.
+- **A Data Catalog across pipelines, not inside one.** The workspace graph now spans pipelines: which asset feeds which, what is orphaned, who owns it, and how fresh it is, because every run records what it touched. Columns, descriptions, tags and a glossary are editable in a **Data Catalog** screen, exposed to the console and to agents through MCP, and a saved graph can tell you when the pipelines have moved on.
+- **Queued work, and a worker that claims it.** A ForEach can dispatch its items as a batch rather than running them here. A worker claims queued items, the console shows what is queued and lets you retry what failed, and the queue says whether items can safely run at once. Each sub-pipeline runs under its own name and keeps its own watermark.
+- **Runs stopped scanning the source three times.** Every node's row count was a separate `SELECT COUNT(*)`, and since nodes are views, each one re-ran the whole chain. A source to filter to sink pipeline read a 96M-row Postgres table three times to do one pass of work. Each relation is now counted once, and a sink takes its count from the Parquet footer of the file it just wrote, which is a metadata read: 0.06s against 16.7s for the equivalent count over the source. Measured on that pipeline, baseline against this release, interleaved on one machine: 56.3s to 18.8s, and 288,159,946 tuples scanned down to 96,011,803. That puts it level with a hand-written DuckDB `COPY` doing the same work, at 1.02x. A remote XML stream over SFTP was reading 8 KiB per round trip and now reads 256 KiB: 75 MB and 700,000 rows went from 17.0s to 10.0s.
+- **Security fixes, two of them serious.** The streaming run route accepted work without authentication, and the in-app updater pointed at a GitHub organisation nobody had registered, so whoever claimed the name could have served the next update. Both are closed. Beyond those: connection secrets are bound to the field and connection they belong to, so a ciphertext cannot be moved between fields; bundle keys are derived with Argon2id and a per-bundle salt instead of an unsalted hash; downloaded engines and models are verified against a pinned checksum; run parameters can no longer redefine builtins or inject shell syntax; sidecars stage in a private directory instead of shared temp; decrypted connection secrets stay out of browser storage; a cached git token is re-encrypted and never written world-readable; and a deploy refuses to send a pipeline carrying a credential in plain text.
+- **Saved connections are a reference, not a copy.** Picking a saved connection used to copy its values onto the node, so the credential was duplicated into the pipeline file and a later edit to the connection did not reach it. The node now stores only the reference and resolves it at run time. The editor shows what the connection will supply rather than the manifest's default, so a node pointing at a connection on a non-standard port stops displaying the standard one, and a secret says only that it is covered.
+- **Home is a launcher, and the tour goes first.** The app opens on three tiles rather than dropping you into a canvas, modules are one level in, and a first run walks every capability once instead of showing the tour and Home at the same time. Settings can ask again.
+- **Deploying is documented, including the uncomfortable parts.** A deployment guide for AWS, Azure and Google Cloud, the client and server architecture, promoting from CI, driving Duckle from another orchestrator, and a walkthrough of the whole server flow. The docs now say plainly that a failed run still answers 200, before somebody trusts it.
 
 ---
 
