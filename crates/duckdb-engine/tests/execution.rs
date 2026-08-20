@@ -152,6 +152,71 @@ fn scalar_string(sql: &str) -> String {
 }
 
 #[test]
+fn parquet_sink_counts_its_own_file_not_a_glob_sibling() {
+    // A sink counts the Parquet file it wrote rather than re-counting its
+    // upstream, and that read goes through read_parquet, which globs. Measured
+    // on DuckDB 1.5.4: a bracket pattern falls back to the literal path when it
+    // matches nothing, but as soon as a SIBLING matches it wins - so a sink
+    // writing "res[1].parquet" next to an unrelated "res1.parquet" reports the
+    // sibling's row count, silently and with no error. The path came from the
+    // user, so a glob character in it must send the count back to the relation.
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = engine_or_skip!();
+
+    // The decoy: five rows at a path the bracket pattern matches.
+    let wide = write_file(tmp.path(), "wide.csv", "a
+1
+2
+3
+4
+5
+");
+    let decoy = out_path(tmp.path(), "res1.parquet");
+    let d0 = doc(
+        json!([
+            node("s0", "src.csv", json!({ "path": wide, "hasHeader": true })),
+            node("k0", "snk.parquet", json!({ "path": decoy })),
+        ]),
+        json!([main_edge("e0", "s0", "k0")]),
+    );
+    assert_eq!(engine.execute_pipeline(&d0).status, "ok", "decoy write failed");
+
+    // The sink under test writes two rows to a literal name holding "[1]".
+    let csv = write_file(
+        tmp.path(),
+        "orders.csv",
+        "order_id,status
+1,paid
+2,pending
+3,paid
+",
+    );
+    let out = out_path(tmp.path(), "res[1].parquet");
+    let d = doc(
+        json!([
+            node("s1", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("f1", "xf.filter", json!({ "predicate": "status = 'paid'" })),
+            node("k1", "snk.parquet", json!({ "path": out })),
+        ]),
+        json!([main_edge("e1", "s1", "f1"), main_edge("e2", "f1", "k1")]),
+    );
+
+    let result = engine.execute_pipeline(&d);
+    assert_eq!(result.status, "ok", "run failed: {:?}", result.error);
+    assert!(Path::new(&out).exists(), "the literal file should exist");
+    assert_eq!(count(&format!("read_parquet('{}')", decoy)), 5, "decoy intact");
+
+    let sink = result.nodes.get("k1").expect("sink status present");
+    assert_eq!(
+        sink.rows,
+        Some(2),
+        "sink must report the 2 rows it wrote, not the decoy's 5"
+    );
+    let filt = result.nodes.get("f1").expect("filter status present");
+    assert_eq!(filt.rows, Some(2), "filter should report 2 rows");
+}
+
+#[test]
 fn csv_filter_parquet_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let csv = write_file(

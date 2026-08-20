@@ -4233,7 +4233,14 @@ fn sink_self_count(stage: &plan::Stage) -> Option<String> {
         return None;
     }
     let path = stage.sink_path.as_deref()?;
-    if !is_local_path(path) || path.contains('*') || path.contains('?') {
+    // read_parquet globs, and the sink wrote ONE literal file. Measured against
+    // DuckDB 1.5.4: `o[12].parquet` expands and counts files this sink never
+    // wrote, and `o{1,2}.parquet` raises "No files found that match the
+    // pattern" - which in the batched path fails the marker COPY and, under
+    // -bail, aborts a run whose write had already succeeded. Both are worse
+    // than the pass this helper exists to avoid, so hand any glob character
+    // back to the caller and let it count the relation instead.
+    if !is_local_path(path) || path.contains(['*', '?', '[', '{']) {
         return None;
     }
     Some(format!(
