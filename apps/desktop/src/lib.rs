@@ -427,6 +427,7 @@ async fn run_pipeline(
     let mut pipeline = pipeline;
     resolve_saved_connections(&mut pipeline, &workspace_path)?;
     duckle_duckdb_engine::context::apply_env(&mut pipeline);
+    duckle_duckdb_engine::context::apply_vault(&mut pipeline);
     ensure_pixeltable_if_used(&app, &pipeline);
     let name = pipeline_name.clone();
     let joined = tokio::task::spawn_blocking(move || {
@@ -497,6 +498,7 @@ async fn run_pipeline_partial(
     let mut pipeline = pipeline;
     resolve_saved_connections(&mut pipeline, &workspace_path)?;
     duckle_duckdb_engine::context::apply_env(&mut pipeline);
+    duckle_duckdb_engine::context::apply_vault(&mut pipeline);
     ensure_pixeltable_if_used(&app, &pipeline);
     let target = target_node_id;
     let name = pipeline_name.clone();

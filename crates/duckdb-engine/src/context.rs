@@ -218,6 +218,91 @@ pub fn apply_time_builtins(doc: &mut PipelineDoc) {
     }
 }
 
+/// Resolve `${VAULT:NAME}` placeholders by asking an external secret store.
+///
+/// Organisations that keep credentials in a vault do not want them copied into
+/// a workspace, an environment variable or an image layer. This fetches each
+/// one at run time and holds it only for the run.
+///
+/// The command comes from `DUCKLE_VAULT_COMMAND`, which the operator sets on
+/// the host - NEVER from the pipeline. A pipeline that could name its own
+/// command would be remote code execution by anyone allowed to author one, and
+/// authoring is not meant to be shell access. The pipeline supplies only the
+/// object name.
+///
+/// The template is split into arguments and run directly, without a shell, so a
+/// name cannot inject a second command. `{name}` is replaced inside whichever
+/// argument holds it, and the secret is whatever the command prints on stdout,
+/// trimmed of its trailing newline.
+///
+/// Example, for a vault whose CLI takes a query string:
+///   DUCKLE_VAULT_COMMAND=CLIPasswordSDK GetPassword -p Query=Object={name} -o Password
+///
+/// A name that does not resolve is left verbatim, exactly like the other
+/// passes, so a missing secret fails where it is used and says which one.
+pub fn apply_vault(doc: &mut PipelineDoc) {
+    let template = match std::env::var("DUCKLE_VAULT_COMMAND") {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => return,
+    };
+    let re = match regex::Regex::new(r"\$\{VAULT:([^}]+)\}") {
+        Ok(re) => re,
+        Err(_) => return,
+    };
+    let argv: Vec<String> = template.split_whitespace().map(str::to_string).collect();
+    if argv.is_empty() {
+        return;
+    }
+    // One fetch per distinct name per run: a credential is usually referenced by
+    // several nodes and a vault call is neither free nor silent.
+    let cache: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(Default::default());
+    let replace = |s: &str| -> String {
+        re.replace_all(s, |caps: &regex::Captures| {
+            let name = caps[1].trim();
+            // A name is an identifier in someone else's system. Anything that
+            // could carry a newline or a NUL into an argument is refused rather
+            // than passed on.
+            if name.is_empty() || name.chars().any(|c| c.is_control()) {
+                return caps[0].to_string();
+            }
+            if let Some(v) = cache.borrow().get(name) {
+                return v.clone();
+            }
+            let args: Vec<String> = argv[1..]
+                .iter()
+                .map(|a| a.replace("{name}", name))
+                .collect();
+            let mut cmd = std::process::Command::new(&argv[0]);
+            cmd.args(&args);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            match cmd.output() {
+                Ok(out) if out.status.success() => {
+                    let v = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+                    if v.is_empty() {
+                        return caps[0].to_string();
+                    }
+                    cache.borrow_mut().insert(name.to_string(), v.clone());
+                    v
+                }
+                // Deliberately no stderr in the message: a vault client often
+                // echoes the query, and the query names the secret.
+                _ => caps[0].to_string(),
+            }
+        })
+        .into_owned()
+    };
+    for node in &mut doc.nodes {
+        if let Some(props) = node.data.properties.as_mut() {
+            substitute_deep(props, &replace);
+        }
+    }
+}
+
 /// Resolve `${ENV:NAME}` placeholders from the process environment, in place.
 /// This is the run-time env pass shared by the desktop interactive run, the
 /// desktop scheduler, and the headless runner so a pipeline can reference OS
@@ -814,6 +899,58 @@ fn resolve_workspace_impl(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// DUCKLE_VAULT_COMMAND is process-wide, so these tests must not overlap.
+    static VAULT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn vault_placeholders_resolve_and_refuse_what_they_should() {
+        let _g = VAULT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let doc = |v: &str| -> PipelineDoc {
+            serde_json::from_str(&format!(
+                r#"{{"nodes":[{{"id":"n","type":"source","position":{{"x":0,"y":0}},
+                   "data":{{"label":"n","componentId":"src.inline",
+                            "properties":{{"columns":[{{"key":"c","value":"{}"}}]}}}}}}],"edges":[]}}"#,
+                v
+            ))
+            .unwrap()
+        };
+        let value_of = |d: &PipelineDoc| -> String {
+            d.nodes[0].data.properties.as_ref().unwrap()["columns"][0]["value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // With no command configured the placeholder is left alone: an operator
+        // who has not opted in must not have pipelines silently change meaning.
+        std::env::remove_var("DUCKLE_VAULT_COMMAND");
+        let mut d = doc("${VAULT:ANY}");
+        apply_vault(&mut d);
+        assert_eq!(value_of(&d), "${VAULT:ANY}");
+
+        // Echo the name back: enough to prove the substitution happened and
+        // that {name} landed in the right argument.
+        #[cfg(windows)]
+        std::env::set_var("DUCKLE_VAULT_COMMAND", "cmd /c echo {name}");
+        #[cfg(not(windows))]
+        std::env::set_var("DUCKLE_VAULT_COMMAND", "echo {name}");
+        let mut d = doc("${VAULT:ORDERS}");
+        apply_vault(&mut d);
+        assert_eq!(value_of(&d), "ORDERS", "the fetched value replaces the placeholder");
+
+        // A name carrying a control character is refused rather than passed
+        // into an argument list.
+        let mut d = doc("${VAULT:bad\\u0007name}");
+        apply_vault(&mut d);
+        assert!(
+            value_of(&d).starts_with("${VAULT:"),
+            "a control character must not reach the command, got {}",
+            value_of(&d)
+        );
+        std::env::remove_var("DUCKLE_VAULT_COMMAND");
+    }
     use super::{resolve_workspace, resolve_workspace_portable};
     use std::fs;
 

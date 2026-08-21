@@ -524,6 +524,9 @@ fn load_secrets_enc(workspace: &Path) -> Result<Option<HashMap<String, String>>,
 /// next to the exe / in CWD WITHOUT copying that plaintext file into the
 /// shared, persistent extraction cache.
 fn apply_env_pass(doc: &mut PipelineDoc, workspace: &Path, env_path: &Path) -> Result<(), String> {
+    // Secrets held in an external vault are fetched first, so a value that
+    // came from the vault is in place before anything reads the properties.
+    duckle_duckdb_engine::context::apply_vault(doc);
     // File/enc map: secrets.env first, secrets.enc overlaying. Real env is
     // checked first at lookup time so it always wins.
     let mut file_map: HashMap<String, String> = HashMap::new();

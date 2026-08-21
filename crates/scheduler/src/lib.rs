@@ -182,6 +182,7 @@ fn run_one_blocking(
     duckle_duckdb_engine::context::apply_time_builtins(&mut pipeline);
     duckle_secrets::resolve_connection_refs(workspace, &mut pipeline.nodes)?;
     duckle_duckdb_engine::context::apply_env(&mut pipeline);
+    duckle_duckdb_engine::context::apply_vault(&mut pipeline);
     // A fresh cancel scope per pipeline, so one step of a plan cannot cancel the next.
     Ok(engine.for_new_run().execute_pipeline_named(&pipeline, pipeline_id))
 }
@@ -468,6 +469,7 @@ impl Scheduler {
         // Resolve ${ENV:NAME} from the process environment so scheduled runs see
         // OS env vars just like the headless runner does (issue #137).
         duckle_duckdb_engine::context::apply_env(&mut pipeline);
+    duckle_duckdb_engine::context::apply_vault(&mut pipeline);
         // A fresh per-run cancel scope so concurrent scheduled runs (and the
         // interactive run) don't share or reset each other's cancellation.
         let engine = self.engine.for_new_run();

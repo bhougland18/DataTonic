@@ -450,15 +450,19 @@ fn properties_for(
             // The password is Studio-encrypted and cannot be recovered here, so
             // name it as a placeholder rather than importing a value that would
             // fail at run time with no explanation.
-            if pick("userPassword.password").is_some() {
-                let placeholder = format!("${{ENV:{}_PASSWORD}}", raw.unique.to_uppercase());
-                props.insert("password".into(), JsonValue::String(placeholder.clone()));
-                warnings.push(Warning::EncryptedSecret {
-                    node: raw.unique.clone(),
-                    property: "password".into(),
-                    placeholder,
-                });
-            }
+            // The legacy component signs in with a user name and a password.
+            // Duckle reaches Snowflake over the SQL API, which takes a token or
+            // a key pair and has no password mode, so a password cannot be
+            // carried across even if it were recoverable - and it is not, being
+            // encrypted with a Studio key. Name the token the connection needs
+            // and say why, rather than emitting a node that cannot authenticate.
+            let placeholder = format!("${{ENV:{}_TOKEN}}", raw.unique.to_uppercase());
+            props.insert("pat".into(), JsonValue::String(placeholder.clone()));
+            warnings.push(Warning::EncryptedSecret {
+                node: raw.unique.clone(),
+                property: "pat".into(),
+                placeholder,
+            });
         }
         "src.mysql" | "snk.mysql" | "src.postgres" | "snk.postgres" => copy_params(
             raw,
@@ -648,6 +652,26 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
     }
 
     let known: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    // A join takes a second row-carrying input on its LOOKUP port, not a second
+    // main. Sending both to `main` reads as two upstreams feeding one input,
+    // which the planner refuses. Only the first row link into a node is main;
+    // the rest are lookups, in the order the file lists them.
+    let mut seen_main: std::collections::HashSet<&str> = Default::default();
+    let mut target_port: std::collections::HashMap<usize, &'static str> = Default::default();
+    for (i, c) in connections.iter().enumerate() {
+        if connection_type_for(c.connector.as_deref()) != "main" {
+            continue;
+        }
+        if !known.contains(c.source.as_str()) || !known.contains(c.target.as_str()) {
+            continue;
+        }
+        let port = if seen_main.insert(c.target.as_str()) {
+            "main"
+        } else {
+            "lookup"
+        };
+        target_port.insert(i, port);
+    }
     let edges = connections
         .iter()
         .enumerate()
@@ -659,7 +683,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
             source: c.source.clone(),
             target: c.target.clone(),
             source_handle: Some("main".into()),
-            target_handle: Some("main".into()),
+            target_handle: Some(target_port.get(&i).copied().unwrap_or("main").into()),
             edge_type: None,
             data: Some(EdgeData {
                 connection_type: connection_type_for(c.connector.as_deref()).into(),
