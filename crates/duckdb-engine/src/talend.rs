@@ -235,10 +235,17 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         "tFileInputFullRow" => ("src.csv", "source"),
         // A raw statement against the connection, whichever family it is.
         "tDBRow" | "tSnowflakeRow" => ("code.sql", "transform"),
-        // A tJava body is arbitrary Java. Most of these print or set a variable,
-        // which is a log line; anything else needs a person, and arrives with
-        // the body preserved so the edit is located rather than lost.
-        "tJava" | "tJavaRow" => ("ctl.log", "transform"),
+        // A Java body is business logic, and Duckle runs SQL. It cannot be
+        // translated here - the proven reference implementation for this corpus
+        // wrote a generic Java-to-SQL translator and abandoned it in favour of
+        // porting the rules by hand.
+        //
+        // It maps to a custom-SQL node with NO sql, which fails validation and
+        // says so. Mapping it to something that compiles - a log line, a
+        // passthrough - would produce a pipeline that runs happily and silently
+        // omits the rules, which is the worst outcome available: the shape looks
+        // migrated and the numbers are wrong.
+        "tJava" | "tJavaRow" => ("code.sql", "transform"),
         // Duckle already speaks Snowflake; these were arriving as placeholders
         // only because their configuration is in the tcomp PROPERTIES blob.
         "tSnowflakeInput" => ("src.snowflake", "source"),
@@ -383,6 +390,24 @@ fn properties_for(
 ) -> JsonMap<String, JsonValue> {
     let mut props = JsonMap::new();
     match component_id {
+        "code.sql" if raw.component.starts_with("tJava") => {
+            // Keep the Java on the node so whoever writes the SQL can see what
+            // it has to do, and leave `sql` empty so the node cannot be mistaken
+            // for one that works.
+            if let Some(code) = raw
+                .params
+                .get("CODE")
+                .filter(|c| !c.trim().is_empty())
+                .map(|c| unquote(c))
+            {
+                props.insert("untranslatedSource".into(), JsonValue::String(code));
+            }
+            warnings.push(Warning::JavaExpression {
+                node: raw.unique.clone(),
+                column: "(whole component)".into(),
+                expression: "Java body - rewrite as SQL before running".into(),
+            });
+        }
         "code.sql" => {
             // The statement lives in the tcomp blob for a generic component and
             // in a flat parameter for a family-specific one, so try both before
