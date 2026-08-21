@@ -3134,6 +3134,30 @@ fn run_file_op(spec: &FileOpSpec) -> Result<String, EngineError> {
                     .map(|_| format!("deleted {}", spec.source))
                     .map_err(|e| format!("delete {}: {}", spec.source, e))
             }
+            "archive" => {
+                // Zip the source into the destination. Retiring a processed file
+                // into an archive is the last step of a great many batch jobs,
+                // and doing it with a shell command means one pipeline per
+                // platform.
+                let f = std::fs::File::create(dst)
+                    .map_err(|e| format!("create {}: {}", spec.destination, e))?;
+                let mut zip = zip::ZipWriter::new(f);
+                let name = src
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".into());
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                zip.start_file(name, opts)
+                    .map_err(|e| format!("zip entry: {}", e))?;
+                let bytes = std::fs::read(src)
+                    .map_err(|e| format!("read {}: {}", spec.source, e))?;
+                use std::io::Write;
+                zip.write_all(&bytes)
+                    .map_err(|e| format!("zip write: {}", e))?;
+                zip.finish().map_err(|e| format!("zip finish: {}", e))?;
+                Ok(format!("archived {} bytes to {}", bytes.len(), spec.destination))
+            }
             op => {
                 if dst.exists() && !spec.overwrite {
                     return Err(format!("destination exists: {}", spec.destination));

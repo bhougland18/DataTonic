@@ -2786,9 +2786,9 @@ fn build_stage(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "copy".into())
             .to_ascii_lowercase();
-        if !matches!(op.as_str(), "copy" | "move" | "delete") {
+        if !matches!(op.as_str(), "copy" | "move" | "delete" | "archive") {
             return Err(EngineError::Config(format!(
-                "{}: unknown op {:?} - expected \"copy\", \"move\" or \"delete\"",
+                "{}: unknown op {:?} - expected \"copy\", \"move\", \"delete\" or \"archive\"",
                 component_id, op
             )));
         }
@@ -2798,7 +2798,7 @@ fn build_stage(
         let destination = string_prop(&props, "destination")
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
-        if op != "delete" && destination.is_empty() {
+        if !matches!(op.as_str(), "delete") && destination.is_empty() {
             return Err(EngineError::Config(format!(
                 "{}: destination required for {}",
                 component_id, op

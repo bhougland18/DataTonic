@@ -214,12 +214,14 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         // Turning a flow into an iteration IS the ForEach: each row becomes one
         // pass, and the row's fields are exposed to the child as ${ITER_ITEM_*}.
         "tFlowToIterate" => ("ctl.foreach", "transform"),
-        "tFileCopy" | "tFileDelete" => ("ctl.file", "transform"),
+        "tFileCopy" | "tFileDelete" | "tFileArchive" => ("ctl.file", "transform"),
         // Components Duckle already has; these were placeholders only because
         // nobody had written the mapping line.
         "tSendMail" => ("snk.email", "sink"),
         "tLoop" => ("ctl.iterate", "transform"),
         "tSortRow" => ("xf.sort", "transform"),
+        // Splitting one delimited column into named columns is Text to Columns.
+        "tExtractDelimitedFields" => ("xf.text.tocolumns", "transform"),
         "tFileInputFullRow" => ("src.csv", "source"),
         // A raw statement against the connection, whichever family it is.
         "tDBRow" | "tSnowflakeRow" => ("code.sql", "transform"),
@@ -389,6 +391,12 @@ fn properties_for(
                 }),
             }
         }
+        "xf.text.tocolumns" => copy_params(
+            raw,
+            &[("FIELD", "column"), ("FIELDSEPARATOR", "delimiter")],
+            &mut props,
+            warnings,
+        ),
         "qa.unique" => {
             // The key columns are a TABLE parameter: one row per column, with a
             // flag saying whether it takes part in the key. Reading only flat
@@ -450,7 +458,9 @@ fn properties_for(
                 .get("REMOVE_FILE")
                 .map(|v| v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            let op = if raw.component == "tFileDelete" {
+            let op = if raw.component == "tFileArchive" {
+                "archive"
+            } else if raw.component == "tFileDelete" {
                 "delete"
             } else if removing {
                 "move"
@@ -465,6 +475,10 @@ fn properties_for(
                     ("DESTINATION", "destination"),
                     ("REPLACE_FILE", "overwrite"),
                     ("FAILON", "failOnError"),
+                    // The archive component spells the same two differently.
+                    ("SOURCE_FILE", "source"),
+                    ("TARGET", "destination"),
+                    ("OVERWRITE", "overwrite"),
                 ],
                 &mut props,
                 warnings,
@@ -879,7 +893,49 @@ fn extract_loop_bodies(
             continue;
         }
 
-        // Refuse if anything in the body is also fed from outside it.
+        // A join inside the loop reads its reference table from a source that
+        // sits outside it. That source is part of the body's work, not of the
+        // main flow, so pull it in - along with whatever feeds it - rather than
+        // refusing a loop whose only sin is having a lookup.
+        loop {
+            let pull: Vec<String> = edges
+                .iter()
+                .filter(|e| body.contains(&e.target) && e.source != loop_id)
+                .filter(|e| !body.contains(&e.source))
+                .filter(|e| {
+                    e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("lookup")
+                        || e.target_handle.as_deref() == Some("lookup")
+                })
+                .map(|e| e.source.clone())
+                .collect();
+            // Only if nothing outside the body still reads it: moving a source
+            // the main flow also uses would cut the parent.
+            let safe: Vec<String> = pull
+                .into_iter()
+                .filter(|src| {
+                    !edges.iter().any(|e| {
+                        e.source == *src && !body.contains(&e.target) && e.target != loop_id
+                    })
+                })
+                .collect();
+            if safe.is_empty() {
+                break;
+            }
+            for id in safe {
+                let mut q = vec![id];
+                while let Some(x) = q.pop() {
+                    if x == loop_id || !body.insert(x.clone()) {
+                        continue;
+                    }
+                    for e in edges.iter().filter(|e| e.target == x) {
+                        q.push(e.source.clone());
+                    }
+                }
+            }
+        }
+
+        // Refuse if anything in the body is still fed from outside it: that is a
+        // step the main flow shares, and moving it would cut the parent.
         let fed_from_outside = edges.iter().any(|e| {
             body.contains(&e.target) && e.source != loop_id && !body.contains(&e.source)
         });
@@ -892,16 +948,21 @@ fn extract_loop_bodies(
         }
 
         let child_name = format!("{}__{}", parent_name, loop_id);
-        let child_nodes: Vec<PipelineNode> = nodes
+        let mut child_nodes: Vec<PipelineNode> = nodes
             .iter()
             .filter(|n| body.contains(&n.id))
             .cloned()
             .collect();
-        let child_edges: Vec<PipelineEdge> = edges
+        let mut child_edges: Vec<PipelineEdge> = edges
             .iter()
             .filter(|e| body.contains(&e.source) && body.contains(&e.target))
             .cloned()
             .collect();
+
+        // A body can contain a loop of its own. Lift those too, and hand them
+        // back alongside this one: names carry their whole ancestry, so they
+        // stay distinct however deeply they nest.
+        let nested = extract_loop_bodies(&child_name, &mut child_nodes, &mut child_edges, warnings);
 
         // The parent keeps the loop and loses the body.
         nodes.retain(|n| !body.contains(&n.id));
@@ -921,6 +982,7 @@ fn extract_loop_bodies(
             }
         }
 
+        children.extend(nested);
         children.push(Import {
             name: child_name,
             nodes: child_nodes,
@@ -1134,6 +1196,51 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(r, format!("{}.json", kid.name));
+    }
+
+    #[test]
+    fn a_lookup_feeding_the_loop_body_travels_with_it() {
+        // A join inside a loop reads its reference table from a source outside
+        // it. That source is part of the body's work, not the main flow's, so
+        // refusing to lift the loop over it would strand a whole job.
+        let mut nodes = vec![
+            imported_node("loop", "ctl.foreach", 0.0, 0.0),
+            imported_node("join", "xf.map", 1.0, 0.0),
+            imported_node("ref", "src.snowflake", 2.0, 0.0),
+        ];
+        let mut edges = vec![
+            test_edge("e1", "loop", "join", "iterate"),
+            test_edge("e2", "ref", "join", "lookup"),
+        ];
+        let mut warnings = Vec::new();
+        let kids = extract_loop_bodies("job", &mut nodes, &mut edges, &mut warnings);
+
+        assert_eq!(kids.len(), 1, "the loop should still lift");
+        let ids: Vec<&str> = kids[0].nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"join") && ids.contains(&"ref"),
+                "the lookup source travels with the body, got {:?}", ids);
+        assert_eq!(nodes.len(), 1, "only the loop stays behind");
+    }
+
+    #[test]
+    fn a_lookup_the_main_flow_also_reads_is_left_where_it_is() {
+        // Moving a source the parent still reads would cut the parent, so the
+        // loop is refused rather than the reference stolen from under it.
+        let mut nodes = vec![
+            imported_node("loop", "ctl.foreach", 0.0, 0.0),
+            imported_node("join", "xf.map", 1.0, 0.0),
+            imported_node("ref", "src.snowflake", 2.0, 0.0),
+            imported_node("other", "snk.csv", 3.0, 0.0),
+        ];
+        let mut edges = vec![
+            test_edge("e1", "loop", "join", "iterate"),
+            test_edge("e2", "ref", "join", "lookup"),
+            test_edge("e3", "ref", "other", "main"),
+        ];
+        let mut warnings = Vec::new();
+        let kids = extract_loop_bodies("job", &mut nodes, &mut edges, &mut warnings);
+        assert!(kids.is_empty(), "nothing should have been lifted");
+        assert_eq!(nodes.len(), 4, "the parent is untouched");
     }
 
     #[test]
