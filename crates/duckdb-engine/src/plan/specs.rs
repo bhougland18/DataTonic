@@ -818,6 +818,26 @@ pub struct EmailSourceSpec {
 /// snk.email: per-row SMTP send via lettre. Per-row to/subject/body
 /// columns let one stage send N personalized messages.
 #[derive(Debug, Clone)]
+/// ctl.file: one typed filesystem operation, staged around a run.
+///
+/// The only filesystem-capable component before this ran a shell command, which
+/// meant one authored pipeline could not serve both platforms (cmd.exe on one,
+/// /bin/sh on the other) and returned an exit code rather than doing a named
+/// thing. Staging a file is ordinary batch work and deserves to be typed.
+pub struct FileOpSpec {
+    /// "copy", "move" or "delete".
+    pub op: String,
+    pub source: String,
+    /// Empty for "delete".
+    pub destination: String,
+    /// Overwrite an existing destination. Off means an existing file is an error.
+    pub overwrite: bool,
+    /// Off means a missing source (or a failed operation) is reported and the
+    /// stage still succeeds, which is what housekeeping usually wants.
+    pub fail_on_error: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct EmailSinkSpec {
     /// The relation whose rows become one email each. Empty in notification
     /// mode, where there is no upstream and `fixed` carries the whole message.

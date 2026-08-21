@@ -240,6 +240,8 @@ pub enum RuntimeSpec {
     /// Read off the run's own results at the moment the node executes, so it
     /// sees what happened before it and nothing after.
     RunEvents,
+    /// ctl.file: one typed filesystem operation.
+    FileOp(FileOpSpec),
     /// src.websocket / snk.websocket (issue #192): WebSocket client connectors.
     WebSocketSource(WebSocketSourceSpec),
     WebSocketSink(WebSocketSinkSpec),
@@ -1201,6 +1203,7 @@ fn build_stage(
     let mut email_sink: Option<EmailSinkSpec> = None;
     let mut webhook_source: Option<WebhookSourceSpec> = None;
     let mut run_events = false;
+    let mut file_op: Option<FileOpSpec> = None;
     let mut dynamodb_source: Option<DynamoDbSourceSpec> = None;
     let mut kinesis_source: Option<KinesisSourceSpec> = None;
     let mut ai_embed: Option<AiEmbedSpec> = None;
@@ -2768,6 +2771,46 @@ fn build_stage(
         // ends at its first error and this node never executes, so wiring one
         // without marking anything soft reports nothing - correctly.
         run_events = true;
+        (String::new(), StageKind::View, None)
+    } else if component_id == "ctl.file" {
+        // A typed filesystem operation, so staging a file does not require an
+        // authored shell command that only runs on one platform.
+        let op = string_prop(&props, "op")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "copy".into())
+            .to_ascii_lowercase();
+        if !matches!(op.as_str(), "copy" | "move" | "delete") {
+            return Err(EngineError::Config(format!(
+                "{}: unknown op {:?} - expected \"copy\", \"move\" or \"delete\"",
+                component_id, op
+            )));
+        }
+        let source = string_prop(&props, "source")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: source required", component_id)))?;
+        let destination = string_prop(&props, "destination")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        if op != "delete" && destination.is_empty() {
+            return Err(EngineError::Config(format!(
+                "{}: destination required for {}",
+                component_id, op
+            )));
+        }
+        file_op = Some(FileOpSpec {
+            op,
+            source,
+            destination,
+            overwrite: props
+                .get("overwrite")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
+            fail_on_error: props
+                .get("failOnError")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+        });
+        no_output_relation = true;
         (String::new(), StageKind::View, None)
     } else if component_id == "ctl.anchor" {
         // Does no work. It exists so ordering links have something to attach to.
@@ -5032,6 +5075,7 @@ fn build_stage(
         .or_else(|| email_sink.map(RuntimeSpec::EmailSink))
         .or_else(|| webhook_source.map(RuntimeSpec::WebhookSource))
         .or_else(|| run_events.then_some(RuntimeSpec::RunEvents))
+        .or_else(|| file_op.map(RuntimeSpec::FileOp))
         .or_else(|| dynamodb_source.map(RuntimeSpec::DynamodbSource))
         .or_else(|| kinesis_source.map(RuntimeSpec::KinesisSource))
         .or_else(|| ai_embed.map(RuntimeSpec::AiEmbed))

@@ -69,6 +69,7 @@ use plan::{
     RabbitSourceSpec, RedisSinkSpec,
     RedisSourceSpec, RestPagination, RestResponseFormat, RestSourceSpec, RuntimeSpec, ShellSpec,
     Dhis2SinkSpec, SalesforceBulkSinkSpec, SalesforceBulkSourceSpec, SalesforceSinkSpec, SftpSinkSpec, SftpSourceSpec, SnowflakeAuth,
+    FileOpSpec,
     SnowflakeSinkSpec,
     SnowflakeSourceSpec,
     SqlServerSinkSpec,
@@ -1716,6 +1717,7 @@ impl DuckdbEngine {
                     // Read straight off this run's results rather than a log
                     // file, so it needs nothing to be readable mid-run and
                     // reports exactly what happened before this node.
+                    Some(RuntimeSpec::FileOp(spec)) => run_file_op(spec),
                     Some(RuntimeSpec::RunEvents) => {
                         let rows: Vec<JsonValue> = nodes
                             .iter()
@@ -3105,6 +3107,74 @@ fn urlencode_simple(s: &str) -> String {
 /// Materialize a Vec<JsonValue> of row objects as a DuckDB table.
 /// Variant of materialize_arrayrows_as_table for sources whose
 /// response is already object-shaped (no column zipping needed).
+/// ctl.file: perform one typed filesystem operation.
+///
+/// `move` is a rename first and a copy-then-remove second, because a rename
+/// across volumes fails and staging a file between a landing area and a
+/// working area routinely crosses one.
+///
+/// A missing source is reported rather than raised unless `fail_on_error` is
+/// set: staging is usually housekeeping, and a job that has nothing to move
+/// has not gone wrong.
+fn run_file_op(spec: &FileOpSpec) -> Result<String, EngineError> {
+    use std::path::Path as P;
+    let src = P::new(&spec.source);
+    let dst = P::new(&spec.destination);
+
+    let outcome: Result<String, String> = (|| {
+        if spec.op != "delete" && !src.exists() {
+            return Err(format!("source does not exist: {}", spec.source));
+        }
+        match spec.op.as_str() {
+            "delete" => {
+                if !src.exists() {
+                    return Ok(format!("nothing to delete at {}", spec.source));
+                }
+                std::fs::remove_file(src)
+                    .map(|_| format!("deleted {}", spec.source))
+                    .map_err(|e| format!("delete {}: {}", spec.source, e))
+            }
+            op => {
+                if dst.exists() && !spec.overwrite {
+                    return Err(format!("destination exists: {}", spec.destination));
+                }
+                if let Some(parent) = dst.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
+                    }
+                }
+                // Windows will not rename over an existing file, so clear it
+                // first when overwriting was asked for.
+                if dst.exists() && spec.overwrite {
+                    let _ = std::fs::remove_file(dst);
+                }
+                if op == "move" {
+                    if std::fs::rename(src, dst).is_ok() {
+                        return Ok(format!("moved to {}", spec.destination));
+                    }
+                    // Cross-volume rename fails; fall back to copy and remove.
+                    std::fs::copy(src, dst)
+                        .map_err(|e| format!("copy {}: {}", spec.source, e))?;
+                    std::fs::remove_file(src)
+                        .map_err(|e| format!("remove {}: {}", spec.source, e))?;
+                    Ok(format!("moved to {} (across volumes)", spec.destination))
+                } else {
+                    std::fs::copy(src, dst)
+                        .map(|n| format!("copied {} bytes to {}", n, spec.destination))
+                        .map_err(|e| format!("copy {}: {}", spec.source, e))
+                }
+            }
+        }
+    })();
+
+    match outcome {
+        Ok(msg) => Ok(msg),
+        Err(e) if spec.fail_on_error => Err(EngineError::Query(format!("ctl.file: {}", e))),
+        Err(e) => Ok(format!("ctl.file: {} (continuing, failOnError is off)", e)),
+    }
+}
+
 /// The shape src.runevents always produces, so a clean run still binds.
 fn run_events_columns() -> Vec<Column> {
     use duckle_metadata::DataType;

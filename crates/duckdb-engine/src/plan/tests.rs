@@ -1764,6 +1764,47 @@
     }
 
     #[test]
+    fn a_file_list_pointed_at_one_path_is_an_existence_test() {
+        // Pointed at a single file the listing yields one row, or none. That is
+        // what a job's file-exists check needs, and it needs no second component.
+        let one = build_filelist_source(&serde_json::json!({ "path": "/data/in/today.csv" }));
+        assert!(one.contains("glob('/data/in/today.csv')"), "got: {one}");
+        // An explicit path wins over directory + pattern rather than being
+        // silently combined with them into a path that names nothing.
+        let both = build_filelist_source(&serde_json::json!({
+            "path": "/data/in/today.csv", "directory": "/elsewhere", "pattern": "*.txt"
+        }));
+        assert!(both.contains("glob('/data/in/today.csv')"), "got: {both}");
+        assert!(!both.contains("/elsewhere"), "got: {both}");
+    }
+
+    #[test]
+    fn a_file_operation_refuses_what_it_cannot_do() {
+        let node = |props: serde_json::Value| {
+            let doc: super::PipelineDoc = serde_json::from_str(&format!(
+                r#"{{"nodes":[{{"id":"f","type":"transform","position":{{"x":0,"y":0}},
+                     "data":{{"label":"f","componentId":"ctl.file","properties":{}}}}}],"edges":[]}}"#,
+                props
+            ))
+            .expect("parses");
+            super::compile(&doc)
+        };
+        // A copy with nowhere to put it is refused, not quietly turned into a
+        // no-op that reports success.
+        let e = node(serde_json::json!({ "op": "copy", "source": "/a/x" }))
+            .expect_err("copy without a destination must be refused");
+        assert!(format!("{e}").contains("destination required"), "got: {e}");
+        // Delete needs no destination.
+        node(serde_json::json!({ "op": "delete", "source": "/a/x" }))
+            .expect("delete needs only a source");
+        // An unknown operation is refused rather than defaulting to something
+        // that touches the filesystem.
+        let e = node(serde_json::json!({ "op": "shred", "source": "/a/x", "destination": "/b/y" }))
+            .expect_err("an unknown op must be refused");
+        assert!(format!("{e}").contains("unknown op"), "got: {e}");
+    }
+
+    #[test]
     fn a_file_list_globs_the_directory_and_names_each_file() {
         let flat = build_filelist_source(&serde_json::json!({
             "directory": "/data/in/", "pattern": "*.csv"

@@ -191,8 +191,16 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         // A log-catcher is a SOURCE of error rows, not a sink for them: what it
         // emits is mailed or written to a table downstream.
         "tLogCatcher" => ("src.runevents", "source"),
-        "tFixedFlowInput" => ("src.inline", "source"),
+        // Both turn values into a row: one from constants, the other from the
+        // iteration's current item, which ForEach exposes as ${ITER_ITEM_*}.
+        "tFixedFlowInput" | "tIterateToFlow" => ("src.inline", "source"),
         "tFileList" => ("src.filelist", "source"),
+        // A file-existence check is a listing of one path: one row, or none.
+        "tFileExist" => ("src.filelist", "source"),
+        // Turning a flow into an iteration IS the ForEach: each row becomes one
+        // pass, and the row's fields are exposed to the child as ${ITER_ITEM_*}.
+        "tFlowToIterate" => ("ctl.foreach", "transform"),
+        "tFileCopy" | "tFileDelete" => ("ctl.file", "transform"),
         // Components Duckle already has; these were placeholders only because
         // nobody had written the mapping line.
         "tSendMail" => ("snk.email", "sink"),
@@ -349,9 +357,40 @@ fn properties_for(
                 }),
             }
         }
+        "ctl.file" => {
+            // Talend spells a move as "copy, then remove the source".
+            let removing = raw
+                .params
+                .get("REMOVE_FILE")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let op = if raw.component == "tFileDelete" {
+                "delete"
+            } else if removing {
+                "move"
+            } else {
+                "copy"
+            };
+            props.insert("op".into(), JsonValue::String(op.into()));
+            copy_params(
+                raw,
+                &[
+                    ("FILENAME", "source"),
+                    ("DESTINATION", "destination"),
+                    ("REPLACE_FILE", "overwrite"),
+                    ("FAILON", "failOnError"),
+                ],
+                &mut props,
+                warnings,
+            );
+        }
         "src.filelist" => copy_params(
             raw,
-            &[("DIRECTORY", "directory"), ("EXCLUDEFILEMASK", "exclude")],
+            &[
+                ("DIRECTORY", "directory"),
+                ("EXCLUDEFILEMASK", "exclude"),
+                ("FILE_NAME", "path"),
+            ],
             &mut props,
             warnings,
         ),

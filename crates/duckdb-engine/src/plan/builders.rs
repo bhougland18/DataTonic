@@ -8041,6 +8041,15 @@ pub(crate) fn build_inline_source(props: &JsonValue) -> String {
 /// The nearest thing before this was an FTP listing, so "process every file in
 /// this folder" - the most ordinary batch shape there is - had no local answer.
 pub(crate) fn build_filelist_source(props: &JsonValue) -> String {
+    // An explicit `path` is used verbatim, which makes the component double as
+    // an existence test: pointed at one file it yields one row, or none. That
+    // is what a job's file-exists check needs, and it needs no second component.
+    if let Some(path) = string_prop(props, "path").filter(|s| !s.trim().is_empty()) {
+        return format!(
+            "SELECT file, parse_filename(file) AS filename FROM glob('{}')",
+            sql_escape(path.trim())
+        );
+    }
     let dir = string_prop(props, "directory").unwrap_or_default();
     let pattern = string_prop(props, "pattern")
         .filter(|s| !s.is_empty())

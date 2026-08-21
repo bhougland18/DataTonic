@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 389,
+  "componentCount": 390,
   "components": [
     {
       "id": "src.csv",
@@ -37855,6 +37855,76 @@
             }
           ]
         }
+      }
+    },
+    {
+      "id": "ctl.file",
+      "label": "File Operation",
+      "kind": "control",
+      "availability": "available",
+      "summary": "One typed filesystem operation: copy, move or delete a file. Staging a file between a landing area and a working area is ordinary batch work; before this the only filesystem-capable component ran a shell command, which cannot serve both platforms from one authored pipeline.",
+      "ports": {
+        "inputs": [],
+        "outputs": []
+      },
+      "manifest": {
+        "id": "ctl.file",
+        "kind": "transform",
+        "label": "File Operation",
+        "description": "One typed filesystem operation: copy, move or delete a file. Staging a file between a landing area and a working area is ordinary batch work; before this the only filesystem-capable component ran a shell command, which cannot serve both platforms from one authored pipeline.",
+        "schemaSource": "none",
+        "ports": {
+          "inputs": [],
+          "outputs": []
+        },
+        "sections": [
+          {
+            "label": "File Operation",
+            "fields": [
+              {
+                "key": "op",
+                "label": "Operation",
+                "kind": "select",
+                "required": true,
+                "options": [
+                  {
+                    "value": "copy",
+                    "label": "Copy"
+                  },
+                  {
+                    "value": "move",
+                    "label": "Move"
+                  },
+                  {
+                    "value": "delete",
+                    "label": "Delete"
+                  }
+                ]
+              },
+              {
+                "key": "source",
+                "label": "Source path",
+                "kind": "open-path",
+                "required": true
+              },
+              {
+                "key": "destination",
+                "label": "Destination path",
+                "kind": "save-path"
+              },
+              {
+                "key": "overwrite",
+                "label": "Overwrite destination",
+                "kind": "toggle"
+              },
+              {
+                "key": "failOnError",
+                "label": "Fail the run on error",
+                "kind": "toggle"
+              }
+            ]
+          }
+        ]
       }
     },
     {
