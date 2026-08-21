@@ -20,6 +20,8 @@ pub fn source_select_for_format(format: &str, props: &JsonValue) -> Option<Strin
         "duckdb" => build_duckdb_source(props),
         "excel" => build_excel_source(props, None),
         "avro" => build_avro_source(props),
+        "inline" => build_inline_source(props),
+        "filelist" => build_filelist_source(props),
         "iceberg" => build_iceberg_source(props),
         "delta" => build_delta_source(props),
         "spatial" => build_spatial_source(props),
@@ -219,6 +221,8 @@ pub(crate) fn build_view_sql(
         | "src.redshift" | "src.bigquery" | "src.quack" => build_relational_source(component_id, props),
         "src.avro" => Ok(build_avro_source(props)),
         "src.excel" => Ok(build_excel_source(props, declared)),
+        "src.inline" => Ok(build_inline_source(props)),
+        "src.filelist" => Ok(build_filelist_source(props)),
         "src.iceberg" => Ok(build_iceberg_source(props)),
         "src.delta" => Ok(build_delta_source(props)),
         "src.spatial" => Ok(build_spatial_source(props)),
@@ -8002,6 +8006,61 @@ pub(crate) fn build_fixedwidth_source(props: &JsonValue) -> Result<String, Strin
         sql_escape(&path),
         projections.join(", ")
     ))
+}
+
+/// src.inline: rows written into the pipeline rather than read from anywhere.
+///
+/// Every other source names an external system, so a control row, an audit
+/// stamp or a fixed lookup had nowhere to come from: the workaround was a
+/// throwaway file, or a custom-SQL node whose required input port stayed
+/// unwired. `columns` is a list of {name, value}; `rowCount` repeats the row.
+pub(crate) fn build_inline_source(props: &JsonValue) -> String {
+    let cols = kv_pairs(props, "columns");
+    if cols.is_empty() {
+        return "SELECT NULL WHERE false".to_string();
+    }
+    let n = props
+        .get("rowCount")
+        .and_then(JsonValue::as_u64)
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    // Values are written as literals, not identifiers: an inline row is data
+    // the author typed, and quoting it as SQL would let a stray name resolve
+    // against a table that happens to exist.
+    let projection = cols
+        .iter()
+        .map(|(k, v)| format!("'{}' AS {}", sql_escape(v.trim()), quote_ident(k.trim())))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {} FROM range({})", projection, n)
+}
+
+/// src.filelist: one row per file in a directory, so a pipeline can iterate a
+/// folder. `file` is the full path; `filename` is the last segment.
+///
+/// The nearest thing before this was an FTP listing, so "process every file in
+/// this folder" - the most ordinary batch shape there is - had no local answer.
+pub(crate) fn build_filelist_source(props: &JsonValue) -> String {
+    let dir = string_prop(props, "directory").unwrap_or_default();
+    let pattern = string_prop(props, "pattern")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "*".into());
+    let recursive = props
+        .get("recursive")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let dir = dir.trim_end_matches(['/', '\\']);
+    let glob = if recursive {
+        format!("{}/**/{}", dir, pattern)
+    } else {
+        format!("{}/{}", dir, pattern)
+    };
+    // parse_filename rather than a regex: the separator differs per platform,
+    // and the glob above may have been written with either.
+    format!(
+        "SELECT file, parse_filename(file) AS filename FROM glob('{}')",
+        sql_escape(&glob)
+    )
 }
 
 /// Iceberg source via the DuckDB iceberg extension's `iceberg_scan`.

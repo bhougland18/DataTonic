@@ -191,6 +191,8 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         // A log-catcher is a SOURCE of error rows, not a sink for them: what it
         // emits is mailed or written to a table downstream.
         "tLogCatcher" => ("src.runevents", "source"),
+        "tFixedFlowInput" => ("src.inline", "source"),
+        "tFileList" => ("src.filelist", "source"),
         // Components Duckle already has; these were placeholders only because
         // nobody had written the mapping line.
         "tSendMail" => ("snk.email", "sink"),
@@ -347,6 +349,12 @@ fn properties_for(
                 }),
             }
         }
+        "src.filelist" => copy_params(
+            raw,
+            &[("DIRECTORY", "directory"), ("EXCLUDEFILEMASK", "exclude")],
+            &mut props,
+            warnings,
+        ),
         "snk.email" => copy_params(
             raw,
             &[

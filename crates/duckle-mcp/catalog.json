@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 387,
+  "componentCount": 389,
   "components": [
     {
       "id": "src.csv",
@@ -1997,6 +1997,116 @@
               "label": "reject",
               "type": "reject",
               "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.inline",
+      "label": "Inline Rows",
+      "kind": "source",
+      "availability": "available",
+      "summary": "Rows you write here rather than read from anywhere: a control row, an audit stamp, a fixed lookup. Give each column a name and a value; rowCount repeats the row. Every other source names an external system, so this was previously a throwaway file.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.inline",
+        "kind": "source",
+        "label": "Inline Rows",
+        "description": "Rows you write here rather than read from anywhere: a control row, an audit stamp, a fixed lookup. Give each column a name and a value; rowCount repeats the row. Every other source names an external system, so this was previously a throwaway file.",
+        "schemaSource": "infer",
+        "sections": [
+          {
+            "label": "Inline Rows",
+            "fields": [
+              {
+                "key": "columns",
+                "label": "Columns",
+                "kind": "keyvalue",
+                "required": true
+              },
+              {
+                "key": "rowCount",
+                "label": "Row count",
+                "kind": "number"
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.filelist",
+      "label": "File List",
+      "kind": "source",
+      "availability": "available",
+      "summary": "One row per file in a directory - file (full path) and filename - so a pipeline can iterate a folder. Set a glob pattern and optionally recurse. Pair it with ForEach to process every file.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.filelist",
+        "kind": "source",
+        "label": "File List",
+        "description": "One row per file in a directory - file (full path) and filename - so a pipeline can iterate a folder. Set a glob pattern and optionally recurse. Pair it with ForEach to process every file.",
+        "schemaSource": "infer",
+        "sections": [
+          {
+            "label": "File List",
+            "fields": [
+              {
+                "key": "directory",
+                "label": "Directory",
+                "kind": "open-path",
+                "required": true
+              },
+              {
+                "key": "pattern",
+                "label": "Pattern",
+                "kind": "text",
+                "placeholder": "*"
+              },
+              {
+                "key": "recursive",
+                "label": "Include subfolders",
+                "kind": "toggle"
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
             }
           ]
         }

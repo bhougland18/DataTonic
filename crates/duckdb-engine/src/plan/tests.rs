@@ -1742,6 +1742,45 @@
     }
 
     #[test]
+    fn inline_rows_are_literals_not_identifiers() {
+        // An inline row is data somebody typed. Emitting the values as
+        // identifiers would let a stray one resolve against a table that
+        // happens to exist, so they are written as literals and the NAMES are
+        // the only part quoted as identifiers.
+        let sql = build_inline_source(&serde_json::json!({
+            "columns": [{ "key": "job", "value": "nightly" }, { "key": "n", "value": "1" }],
+            "rowCount": 3
+        }));
+        assert!(sql.contains("'nightly' AS \"job\""), "got: {sql}");
+        assert!(sql.contains("'1' AS \"n\""), "got: {sql}");
+        assert!(sql.contains("FROM range(3)"), "rowCount repeats the row: {sql}");
+        // A value carrying a quote must not end the literal.
+        let hostile = build_inline_source(&serde_json::json!({
+            "columns": [{ "key": "c", "value": "it's" }]
+        }));
+        assert!(hostile.contains("'it''s'"), "quote must be escaped: {hostile}");
+        // Nothing declared yields no rows rather than a broken statement.
+        assert!(build_inline_source(&serde_json::json!({})).contains("WHERE false"));
+    }
+
+    #[test]
+    fn a_file_list_globs_the_directory_and_names_each_file() {
+        let flat = build_filelist_source(&serde_json::json!({
+            "directory": "/data/in/", "pattern": "*.csv"
+        }));
+        // The trailing separator must not double up.
+        assert!(flat.contains("glob('/data/in/*.csv')"), "got: {flat}");
+        assert!(flat.contains("parse_filename(file) AS filename"), "got: {flat}");
+        let deep = build_filelist_source(&serde_json::json!({
+            "directory": "/data/in", "pattern": "*.csv", "recursive": true
+        }));
+        assert!(deep.contains("glob('/data/in/**/*.csv')"), "got: {deep}");
+        // No pattern lists everything rather than nothing.
+        let all = build_filelist_source(&serde_json::json!({ "directory": "/data/in" }));
+        assert!(all.contains("glob('/data/in/*')"), "got: {all}");
+    }
+
+    #[test]
     fn a_trigger_edge_orders_a_stage_without_wiring_it() {
         // A trigger says "after this". It constrains when a node runs; it does
         // not claim rows flow along it. Sorting on data edges alone meant the
