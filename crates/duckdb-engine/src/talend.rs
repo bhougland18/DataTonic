@@ -116,6 +116,12 @@ struct RawNode {
     /// component unconfigured and failing validation for a setting that IS in
     /// the file.
     tables: BTreeMap<String, Vec<BTreeMap<String, String>>>,
+    /// Column names the node declares on its main output.
+    ///
+    /// Some components take their output shape from the schema rather than from
+    /// a parameter, so a reader that skips the metadata cannot configure them
+    /// at all - the names are in the file, just not where parameters live.
+    columns: Vec<String>,
     /// Mapper output expressions, keyed by output column.
     mapper_out: Vec<(String, String)>,
     x: f64,
@@ -198,6 +204,10 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         // node resolves its own connection when it runs, so these mark a point
         // in the sequence and nothing else. Keeping them as anchors preserves
         // the ordering the job expressed through them.
+        // A stopwatch measures how long a stretch of the job took. Duckle
+        // records a duration for every stage already, so these mark a point in
+        // the sequence and nothing else.
+        "tChronometerStart" | "tChronometerStop" => ("ctl.anchor", "transform"),
         "tDBConnection" | "tDBClose" | "tSnowflakeConnection" | "tSnowflakeClose"
         | "tMysqlConnection" | "tMysqlClose" | "tOracleConnection" | "tOracleClose"
         | "tPostgresqlConnection" | "tPostgresqlClose" | "tMSSqlConnection"
@@ -391,12 +401,22 @@ fn properties_for(
                 }),
             }
         }
-        "xf.text.tocolumns" => copy_params(
-            raw,
-            &[("FIELD", "column"), ("FIELDSEPARATOR", "delimiter")],
-            &mut props,
-            warnings,
-        ),
+        "xf.text.tocolumns" => {
+            copy_params(
+                raw,
+                &[("FIELD", "column"), ("FIELDSEPARATOR", "delimiter")],
+                &mut props,
+                warnings,
+            );
+            // The output names come from the node's declared schema rather than
+            // a parameter: the split produces one column per declared field.
+            if !raw.columns.is_empty() {
+                props.insert(
+                    "outputColumns".into(),
+                    JsonValue::String(raw.columns.join(",")),
+                );
+            }
+        }
         "qa.unique" => {
             // The key columns are a TABLE parameter: one row per column, with a
             // flag saying whether it takes part in the key. Reading only flat
@@ -1032,6 +1052,7 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
     let mut in_output_table = false;
     // The TABLE parameter whose rows we are currently collecting, if any.
     let mut table_param: Option<String> = None;
+    let mut in_flow_metadata = false;
     let mut buf = Vec::new();
 
     loop {
@@ -1063,6 +1084,7 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
                         cur = Some(RawNode {
                             component: attr("componentName").unwrap_or_default(),
                             unique: String::new(),
+                            columns: Vec::new(),
                             tables: BTreeMap::new(),
                             params: BTreeMap::new(),
                             mapper_out: Vec::new(),
@@ -1104,6 +1126,19 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
                                 if let Some(r) = rows.last_mut() {
                                     r.insert(field, v);
                                 }
+                            }
+                        }
+                    }
+                    // A node declares one schema per connector; the main output
+                    // is the FLOW one. Reject and other connectors describe
+                    // different shapes and must not be mixed into it.
+                    "metadata" => {
+                        in_flow_metadata = attr("connector").as_deref() == Some("FLOW");
+                    }
+                    "column" => {
+                        if in_flow_metadata {
+                            if let (Some(n), Some(c)) = (cur.as_mut(), attr("name")) {
+                                n.columns.push(c);
                             }
                         }
                     }
