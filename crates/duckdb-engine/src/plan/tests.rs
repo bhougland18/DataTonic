@@ -1707,6 +1707,41 @@
     }
 
     #[test]
+    fn an_email_sink_with_nothing_wired_in_sends_one_fixed_message() {
+        // A notification is not a row. Wiring an ordering link into a mail step
+        // to say "tell someone we got here" is ordinary, and the sink used to
+        // demand a main input, so it could only be reached by inventing a
+        // one-row table to carry three constants.
+        let base = r#"{
+          "nodes": [
+            {"id":"m","type":"sink","position":{"x":0,"y":0},
+             "data":{"label":"m","componentId":"snk.email","properties":{
+               "host":"smtp.example.com","fromAddress":"a@example.com"PROPS}}}
+          ],
+          "edges": []
+        }"#;
+
+        let with_to = base.replace(
+            "PROPS",
+            r#","to":"ops@example.com","subject":"done","body":"the load finished""#,
+        );
+        let doc: super::PipelineDoc = serde_json::from_str(&with_to).expect("parses");
+        let c = super::compile(&doc).expect("a fixed message needs no upstream");
+        assert_eq!(c.stages.len(), 1);
+
+        // Without a recipient there is nothing to send and no rows to take one
+        // from, so it is refused rather than silently sending nowhere.
+        let without_to: super::PipelineDoc =
+            serde_json::from_str(&base.replace("PROPS", "")).expect("parses");
+        let err = super::compile(&without_to).expect_err("no recipient must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`to` is required"),
+            "the error should say what is missing, got: {msg}"
+        );
+    }
+
+    #[test]
     fn a_trigger_edge_orders_a_stage_without_wiring_it() {
         // A trigger says "after this". It constrains when a node runs; it does
         // not claim rows flow along it. Sorting on data edges alone meant the

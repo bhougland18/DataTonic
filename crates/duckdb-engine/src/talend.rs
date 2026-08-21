@@ -180,6 +180,14 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         // asserted a row fan-out the job never had. All three exist to anchor
         // ordering links, which is what ctl.anchor is for.
         "tPrejob" | "tPostjob" | "tParallelize" => ("ctl.anchor", "transform"),
+        // Opening and closing a shared connection is not work Duckle does: a
+        // node resolves its own connection when it runs, so these mark a point
+        // in the sequence and nothing else. Keeping them as anchors preserves
+        // the ordering the job expressed through them.
+        "tDBConnection" | "tDBClose" | "tSnowflakeConnection" | "tSnowflakeClose"
+        | "tMysqlConnection" | "tMysqlClose" | "tOracleConnection" | "tOracleClose"
+        | "tPostgresqlConnection" | "tPostgresqlClose" | "tMSSqlConnection"
+        | "tMSSqlClose" => ("ctl.anchor", "transform"),
         // A log-catcher is a SOURCE of error rows, not a sink for them: what it
         // emits is mailed or written to a table downstream.
         "tLogCatcher" => ("src.runevents", "source"),
@@ -321,6 +329,39 @@ fn properties_for(
 ) -> JsonMap<String, JsonValue> {
     let mut props = JsonMap::new();
     match component_id {
+        "code.sql" => {
+            // The statement lives in the tcomp blob for a generic component and
+            // in a flat parameter for a family-specific one, so try both before
+            // giving up. Left unquoted: it is SQL, not a Java string literal.
+            let sql = tcomp_blob(raw)
+                .and_then(|b| tcomp_value(&b, "query"))
+                .or_else(|| raw.params.get("QUERY").map(|v| unquote(v)))
+                .or_else(|| raw.params.get("SQLQUERY").map(|v| unquote(v)));
+            match sql.filter(|q| !q.trim().is_empty()) {
+                Some(q) => {
+                    props.insert("sql".into(), JsonValue::String(q));
+                }
+                None => warnings.push(Warning::RepositoryConnection {
+                    node: raw.unique.clone(),
+                    component: raw.component.clone(),
+                }),
+            }
+        }
+        "snk.email" => copy_params(
+            raw,
+            &[
+                ("SMTP_HOST", "host"),
+                ("SMTP_PORT", "port"),
+                ("FROM", "fromAddress"),
+                ("TO", "to"),
+                ("SUBJECT", "subject"),
+                ("MESSAGE", "body"),
+                ("AUTH_USERNAME", "user"),
+                ("AUTH_PASSWORD", "password"),
+            ],
+            &mut props,
+            warnings,
+        ),
         "src.snowflake" | "snk.snowflake" => {
             // A shared tSnowflakeConnection is mirrored into the node's own blob
             // under referencedComponent.reference, so read that first and fall

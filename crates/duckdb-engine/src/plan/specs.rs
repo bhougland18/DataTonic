@@ -819,6 +819,8 @@ pub struct EmailSourceSpec {
 /// columns let one stage send N personalized messages.
 #[derive(Debug, Clone)]
 pub struct EmailSinkSpec {
+    /// The relation whose rows become one email each. Empty in notification
+    /// mode, where there is no upstream and `fixed` carries the whole message.
     pub from_view: String,
     pub host: String,
     pub port: u16,
@@ -828,6 +830,13 @@ pub struct EmailSinkSpec {
     pub to_column: String,
     pub subject_column: String,
     pub body_column: String,
+    /// Set when the node has no upstream: send exactly one message with this
+    /// (to, subject, body) instead of reading columns.
+    ///
+    /// A notification is not a row. Wiring an ordering link into a mail step to
+    /// say "tell someone we got here" is ordinary, and requiring rows for it
+    /// meant inventing a one-row table just to carry three constants.
+    pub fixed: Option<(String, String, String)>,
 }
 
 /// src.dynamodb: DynamoDB Scan via direct HTTP + SigV4 signing.

@@ -2257,7 +2257,28 @@ fn build_stage(
         // optional (for relay servers that don't require auth).
         // to/subject/body all from per-row columns so one stage can
         // send N personalized messages.
-        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        // No upstream means notification mode: one message from `to` / `subject`
+        // / `body` rather than one per row. An ordering link into a mail step to
+        // say "tell someone we got here" is ordinary, and requiring rows for it
+        // meant inventing a one-row table to carry three constants.
+        let fixed = if inputs.main().is_none() {
+            let to = string_prop(&props, "to")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    EngineError::Config(format!(
+                        "{}: with nothing wired in, `to` is required - either feed it rows or give it a message to send",
+                        component_id
+                    ))
+                })?;
+            Some((
+                to,
+                string_prop(&props, "subject").unwrap_or_default(),
+                string_prop(&props, "body").unwrap_or_default(),
+            ))
+        } else {
+            None
+        };
+        let from_view = inputs.main().unwrap_or("");
         let host = string_prop(&props, "host")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| EngineError::Config(format!("{}: host required", component_id)))?;
@@ -2265,6 +2286,7 @@ fn build_stage(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| EngineError::Config(format!("{}: fromAddress required", component_id)))?;
         email_sink = Some(EmailSinkSpec {
+            fixed,
             from_view: from_view.to_string(),
             host,
             port: props

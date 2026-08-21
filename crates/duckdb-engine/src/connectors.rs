@@ -7426,12 +7426,21 @@ impl DuckdbEngine {
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{SmtpTransport, Transport};
         self.check_cancelled()?;
-        let rows = self.run_rows(
-            Some(db),
-            &format!("SELECT * FROM {};", quote_ident(&spec.from_view)),
-        )?;
+        // Notification mode: nothing upstream, so the message is the spec's own
+        // (to, subject, body) rather than a row's columns.
+        let rows = match &spec.fixed {
+            Some((to, subject, body)) => vec![serde_json::json!({
+                spec.to_column.clone(): to,
+                spec.subject_column.clone(): subject,
+                spec.body_column.clone(): body,
+            })],
+            None => self.run_rows(
+                Some(db),
+                &format!("SELECT * FROM {};", quote_ident(&spec.from_view)),
+            )?,
+        };
         if rows.is_empty() {
-            return Ok(format!("email sink: 0 upstream rows"));
+            return Ok("email sink: 0 upstream rows".to_string());
         }
         // Build the SMTP transport once per stage.
         let mut builder = SmtpTransport::relay(&spec.host)
