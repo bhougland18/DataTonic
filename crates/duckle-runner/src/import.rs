@@ -296,8 +296,27 @@ fn convert_one(file: &Path, rel: &Path, name: &str, out: &Path) -> JobOutcome {
         }
     };
     match std::fs::write(&target, body) {
-        Ok(()) => outcome.written = Some(target),
+        Ok(()) => outcome.written = Some(target.clone()),
         Err(e) => outcome.error = Some(format!("write {}: {e}", target.display())),
+    }
+    // A loop's body was lifted into a pipeline of its own, and the loop names it
+    // by file. Write it beside the parent so the reference resolves; a loop
+    // pointing at a file that was never written is worse than no extraction.
+    if outcome.error.is_none() {
+        for child in &import.children {
+            let child_path = target.with_file_name(format!("{}.json", child.name));
+            let child_body = match serde_json::to_string_pretty(&child.to_pipeline_json()) {
+                Ok(b) => b,
+                Err(e) => {
+                    outcome.error = Some(format!("serialise {}: {e}", child.name));
+                    break;
+                }
+            };
+            if let Err(e) = std::fs::write(&child_path, child_body) {
+                outcome.error = Some(format!("write {}: {e}", child_path.display()));
+                break;
+            }
+        }
     }
     outcome
 }

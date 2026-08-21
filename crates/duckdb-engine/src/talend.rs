@@ -81,6 +81,12 @@ pub struct Import {
     pub warnings: Vec<Warning>,
     /// Talend component name -> how many of them were seen.
     pub components: BTreeMap<String, usize>,
+    /// Loop bodies lifted out of this job into pipelines of their own.
+    ///
+    /// A legacy job writes a loop's body inline, as the subjob hanging off the
+    /// loop's iterate link. Duckle points a loop at a child pipeline instead, so
+    /// the body has to become a file and the loop has to name it.
+    pub children: Vec<Import>,
 }
 
 impl Import {
@@ -693,12 +699,20 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         })
         .collect();
 
+    // A loop's body is inline in the source job; Duckle runs a child pipeline by
+    // reference, so lift each body out and point its loop at the new file.
+    let mut nodes = nodes;
+    let mut edges = edges;
+    let mut warnings = warnings;
+    let children = extract_loop_bodies(job_name, &mut nodes, &mut edges, &mut warnings);
+
     Ok(Import {
         name: job_name.to_string(),
         nodes,
         edges,
         warnings,
         components,
+        children,
     })
 }
 
@@ -723,6 +737,120 @@ struct Conn {
     /// Talend's `connectorName`. It says whether a link carries rows or only
     /// ordering, and dropping it turned every trigger into a data dependency.
     connector: Option<String>,
+}
+
+/// Lift each loop's body out into a pipeline of its own and point the loop at it.
+///
+/// A legacy job expresses a loop by hanging its body off an iterate link inside
+/// the same job. Duckle's loop components run a child pipeline by reference, so
+/// an imported loop had no body to run and refused to compile for want of one.
+///
+/// Only a body that belongs solely to the loop is lifted. If any node in it is
+/// also fed from outside the loop, moving it would silently cut the main flow,
+/// so the loop is left alone and the job says so instead. Extracting the wrong
+/// subgraph is worse than not extracting it.
+fn extract_loop_bodies(
+    parent_name: &str,
+    nodes: &mut Vec<PipelineNode>,
+    edges: &mut Vec<PipelineEdge>,
+    warnings: &mut Vec<Warning>,
+) -> Vec<Import> {
+    let loops: Vec<String> = nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.data.component_id.as_deref(),
+                Some("ctl.foreach") | Some("ctl.iterate")
+            )
+        })
+        .map(|n| n.id.clone())
+        .collect();
+
+    let mut children = Vec::new();
+    for loop_id in loops {
+        // The body starts at whatever the loop's iterate link points to.
+        let entries: Vec<String> = edges
+            .iter()
+            .filter(|e| {
+                e.source == loop_id
+                    && e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("iterate")
+            })
+            .map(|e| e.target.clone())
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+
+        // Everything reachable from those entries, not passing back through the
+        // loop itself.
+        let mut body: std::collections::HashSet<String> = Default::default();
+        let mut queue = entries.clone();
+        while let Some(id) = queue.pop() {
+            if id == loop_id || !body.insert(id.clone()) {
+                continue;
+            }
+            for e in edges.iter().filter(|e| e.source == id) {
+                if e.target != loop_id {
+                    queue.push(e.target.clone());
+                }
+            }
+        }
+        if body.is_empty() {
+            continue;
+        }
+
+        // Refuse if anything in the body is also fed from outside it.
+        let fed_from_outside = edges.iter().any(|e| {
+            body.contains(&e.target) && e.source != loop_id && !body.contains(&e.source)
+        });
+        if fed_from_outside {
+            warnings.push(Warning::RepositoryConnection {
+                node: loop_id.clone(),
+                component: "loop body shared with the main flow".into(),
+            });
+            continue;
+        }
+
+        let child_name = format!("{}__{}", parent_name, loop_id);
+        let child_nodes: Vec<PipelineNode> = nodes
+            .iter()
+            .filter(|n| body.contains(&n.id))
+            .cloned()
+            .collect();
+        let child_edges: Vec<PipelineEdge> = edges
+            .iter()
+            .filter(|e| body.contains(&e.source) && body.contains(&e.target))
+            .cloned()
+            .collect();
+
+        // The parent keeps the loop and loses the body.
+        nodes.retain(|n| !body.contains(&n.id));
+        edges.retain(|e| !body.contains(&e.source) && !body.contains(&e.target));
+
+        // Point the loop at the file the body is about to become.
+        if let Some(l) = nodes.iter_mut().find(|n| n.id == loop_id) {
+            let props = l
+                .data
+                .properties
+                .get_or_insert_with(|| JsonValue::Object(Default::default()));
+            if let Some(map) = props.as_object_mut() {
+                map.insert(
+                    "pipelineRef".into(),
+                    JsonValue::String(format!("{}.json", child_name)),
+                );
+            }
+        }
+
+        children.push(Import {
+            name: child_name,
+            nodes: child_nodes,
+            edges: child_edges,
+            warnings: Vec::new(),
+            components: BTreeMap::new(),
+            children: Vec::new(),
+        });
+    }
+    children
 }
 
 /// Talend's connector name mapped to the edge vocabulary the canvas draws.
@@ -860,6 +988,93 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_loop_body_moves_into_its_own_pipeline_and_the_loop_names_it() {
+        // A legacy job writes a loop's body inline. Duckle runs a child pipeline
+        // by reference, so the body has to become a file and the loop has to
+        // name it, or the loop compiles to nothing to run.
+        let mut nodes = vec![
+            imported_node("root", "src.csv", 0.0, 0.0),
+            imported_node("loop", "ctl.foreach", 1.0, 0.0),
+            imported_node("body1", "xf.filter", 2.0, 0.0),
+            imported_node("body2", "snk.parquet", 3.0, 0.0),
+        ];
+        let mut edges = vec![
+            test_edge("e1", "root", "loop", "main"),
+            test_edge("e2", "loop", "body1", "iterate"),
+            test_edge("e3", "body1", "body2", "main"),
+        ];
+        let mut warnings = Vec::new();
+        let kids = extract_loop_bodies("job", &mut nodes, &mut edges, &mut warnings);
+
+        assert_eq!(kids.len(), 1, "one loop, one body");
+        let kid = &kids[0];
+        assert_eq!(kid.nodes.len(), 2, "the body moved wholesale");
+        assert_eq!(kid.edges.len(), 1, "and kept its internal wiring");
+
+        // The parent keeps the loop and loses the body.
+        let left: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(left, vec!["root", "loop"]);
+        assert_eq!(edges.len(), 1, "only the link into the loop remains");
+
+        // And the loop names the file the body became.
+        let r = nodes[1].data.properties.as_ref().unwrap()["pipelineRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(r, format!("{}.json", kid.name));
+    }
+
+    #[test]
+    fn a_loop_body_shared_with_the_main_flow_is_left_alone() {
+        // Moving a node that the main flow also feeds would silently cut the
+        // parent. Refusing and saying so beats extracting the wrong subgraph.
+        let mut nodes = vec![
+            imported_node("root", "src.csv", 0.0, 0.0),
+            imported_node("loop", "ctl.foreach", 1.0, 0.0),
+            imported_node("shared", "xf.filter", 2.0, 0.0),
+        ];
+        let mut edges = vec![
+            test_edge("e1", "loop", "shared", "iterate"),
+            test_edge("e2", "root", "shared", "main"),
+        ];
+        let mut warnings = Vec::new();
+        let kids = extract_loop_bodies("job", &mut nodes, &mut edges, &mut warnings);
+
+        assert!(kids.is_empty(), "nothing should have been lifted");
+        assert_eq!(nodes.len(), 3, "the parent is untouched");
+        assert_eq!(warnings.len(), 1, "and the job says why");
+        assert!(
+            nodes[1].data.properties.as_ref().map_or(true, |p| p.get("pipelineRef").is_none()),
+            "a loop with no lifted body must not name a file that was never written"
+        );
+    }
+
+    fn imported_node(id: &str, component: &str, x: f64, y: f64) -> PipelineNode {
+        PipelineNode {
+            id: id.into(),
+            flow_type: Some("transform".into()),
+            position: Position { x, y },
+            data: node_data(id.into(), Some(component.into()), None),
+        }
+    }
+
+    fn test_edge(id: &str, from: &str, to: &str, kind: &str) -> PipelineEdge {
+        PipelineEdge {
+            id: id.into(),
+            source: from.into(),
+            target: to.into(),
+            source_handle: Some("main".into()),
+            target_handle: Some("main".into()),
+            edge_type: None,
+            data: Some(EdgeData {
+                connection_type: kind.into(),
+                label: None,
+                condition: None,
+            }),
+        }
+    }
 
     #[test]
     fn tcomp_reads_scalars_enums_and_booleans_from_the_properties_blob() {
