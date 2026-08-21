@@ -108,6 +108,14 @@ struct RawNode {
     /// `<connection>` elements.
     unique: String,
     params: BTreeMap<String, String>,
+    /// Multi-row settings: parameter name -> rows, each row a field->value map.
+    ///
+    /// A `TABLE` parameter holds a list rather than a value - the key columns of
+    /// a de-duplicate, a sort's criteria, a file mask list - and a reader that
+    /// only sees flat name/value pairs finds nothing on them, which leaves the
+    /// component unconfigured and failing validation for a setting that IS in
+    /// the file.
+    tables: BTreeMap<String, Vec<BTreeMap<String, String>>>,
     /// Mapper output expressions, keyed by output column.
     mapper_out: Vec<(String, String)>,
     x: f64,
@@ -230,8 +238,26 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         "tMysqlRow" | "tOracleRow" | "tMSSqlRow" | "tPostgresqlRow" => ("code.sql", "transform"),
         // Talend's SCD components write a type-2 dimension.
         "tMysqlSCD" | "tOracleSCD" | "tMSSqlSCD" | "tPostgresqlSCD" => ("xf.cdc.scd2", "transform"),
+        // A reusable sub-flow, invoked by name. Every built-in is spelled t
+        // followed by a capital, so a name that is not is the project's own
+        // sub-flow rather than a component nobody mapped - and calling another
+        // pipeline is exactly what the run-job component does.
+        other if is_subflow_name(other) => ("ctl.runjob", "transform"),
         _ => return None,
     })
+}
+
+/// True for a name that is not one of the built-in components.
+///
+/// The built-ins are all `t` followed by a capital letter. The port pseudo-nodes
+/// a sub-flow's boundary produces are not invocations and must not be treated as
+/// one, or a sub-flow would try to call itself.
+fn is_subflow_name(name: &str) -> bool {
+    if matches!(name, "INPUT" | "OUTPUT") {
+        return false;
+    }
+    let mut c = name.chars();
+    !matches!((c.next(), c.next()), (Some('t'), Some(second)) if second.is_ascii_uppercase())
 }
 
 /// Resolve the generic `tDBInput` / `tDBOutput` via the node's `TYPE` value.
@@ -361,6 +387,60 @@ fn properties_for(
                     node: raw.unique.clone(),
                     component: raw.component.clone(),
                 }),
+            }
+        }
+        "qa.unique" => {
+            // The key columns are a TABLE parameter: one row per column, with a
+            // flag saying whether it takes part in the key. Reading only flat
+            // parameters left this unset, so the node failed validation for a
+            // setting that was in the file all along.
+            let keys: Vec<JsonValue> = raw
+                .tables
+                .get("UNIQUE_KEY")
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|r| {
+                            r.get("KEY_ATTRIBUTE")
+                                .map(|v| v.eq_ignore_ascii_case("true"))
+                                .unwrap_or(false)
+                        })
+                        .filter_map(|r| r.get("SCHEMA_COLUMN"))
+                        .map(|c| JsonValue::String(unquote(c)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !keys.is_empty() {
+                props.insert("columns".into(), JsonValue::Array(keys));
+            }
+        }
+        "ctl.iterate" => {
+            // A counted loop runs from FROM to TO inclusive. Either bound may be
+            // a context reference rather than a number, and a reference cannot
+            // be turned into a count here, so it is passed through for the run
+            // to resolve rather than guessed at.
+            let num = |k: &str| -> Option<i64> {
+                raw.params.get(k).and_then(|v| unquote(v).trim().parse().ok())
+            };
+            match (num("FROM"), num("TO")) {
+                (Some(from), Some(to)) if to >= from => {
+                    let step = num("STEP").filter(|s| *s > 0).unwrap_or(1);
+                    let count = ((to - from) / step) + 1;
+                    props.insert("count".into(), JsonValue::from(count));
+                }
+                _ => {
+                    if let Some(to) = raw.params.get("TO") {
+                        let name = unquote(to);
+                        let name = name.strip_prefix("context.").unwrap_or(&name);
+                        props.insert(
+                            "count".into(),
+                            JsonValue::String(format!("${{{}}}", name)),
+                        );
+                    }
+                    warnings.push(Warning::RepositoryConnection {
+                        node: raw.unique.clone(),
+                        component: "loop bound is a context value, not a number".into(),
+                    });
+                }
             }
         }
         "ctl.file" => {
@@ -536,16 +616,16 @@ fn properties_for(
         "src.excel" | "snk.excel" => {
             copy_params(raw, &[("FILENAME", "path")], &mut props, warnings);
         }
-        "code.sql" => {
-            copy_params(raw, &[("QUERY", "sql")], &mut props, warnings);
-        }
         "ctl.runjob" => {
             copy_params(raw, &[("PROCESS", "pipelineRef")], &mut props, warnings);
-        }
-        "qa.unique" => {
-            // Talend lists the key columns in a table parameter we do not walk
-            // here; leaving `columns` unset makes validate fail loudly, which
-            // is the right outcome for a value we cannot infer.
+            // A sub-flow carries no PROCESS parameter: it IS the name, and the
+            // importer writes it out under that name.
+            if !props.contains_key("pipelineRef") && is_subflow_name(&raw.component) {
+                props.insert(
+                    "pipelineRef".into(),
+                    JsonValue::String(format!("{}.json", raw.component)),
+                );
+            }
         }
         _ => {}
     }
@@ -888,6 +968,8 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
     let mut cur: Option<RawNode> = None;
     // Mapper entries are only outputs when we are inside <outputTables>.
     let mut in_output_table = false;
+    // The TABLE parameter whose rows we are currently collecting, if any.
+    let mut table_param: Option<String> = None;
     let mut buf = Vec::new();
 
     loop {
@@ -919,6 +1001,7 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
                         cur = Some(RawNode {
                             component: attr("componentName").unwrap_or_default(),
                             unique: String::new(),
+                            tables: BTreeMap::new(),
                             params: BTreeMap::new(),
                             mapper_out: Vec::new(),
                             x: attr("posX").and_then(|v| v.parse().ok()).unwrap_or(0.0),
@@ -932,7 +1015,34 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
                             if k == "UNIQUE_NAME" {
                                 n.unique = v.clone();
                             }
+                            // A TABLE parameter carries its rows as the
+                            // elementValue children that follow it.
+                            if attr("field").as_deref() == Some("TABLE") {
+                                table_param = Some(k.clone());
+                                n.tables.entry(k.clone()).or_default();
+                            } else {
+                                table_param = None;
+                            }
                             n.params.insert(k, v);
+                        }
+                    }
+                    // One row per repeat of the first field seen: the ids run
+                    // straight through the whole table rather than restarting.
+                    "elementValue" => {
+                        if let (Some(n), Some(tp)) = (cur.as_mut(), table_param.clone()) {
+                            if let (Some(field), Some(v)) = (attr("elementRef"), attr("value")) {
+                                let rows = n.tables.entry(tp).or_default();
+                                let start_new = rows
+                                    .last()
+                                    .map(|r| r.contains_key(&field))
+                                    .unwrap_or(true);
+                                if start_new {
+                                    rows.push(BTreeMap::new());
+                                }
+                                if let Some(r) = rows.last_mut() {
+                                    r.insert(field, v);
+                                }
+                            }
                         }
                     }
                     "outputTables" => in_output_table = true,

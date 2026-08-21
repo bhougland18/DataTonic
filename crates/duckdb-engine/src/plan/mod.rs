@@ -2715,10 +2715,17 @@ fn build_stage(
             .or_else(|| string_prop(&props, "iteratePipelineRef"))
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| EngineError::Config(format!("{}: pipelineRef required", component_id)))?;
+        // Accept a numeric string as well as a number: context substitution
+        // rewrites values in place and everything it produces is a string, so a
+        // count supplied as ${...} arrived as "15" and failed to parse as a
+        // number it plainly was.
         let count = props
             .get("count")
             .or_else(|| props.get("iterations"))
-            .and_then(|v| v.as_u64())
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            })
             .filter(|n| *n > 0)
             .ok_or_else(|| EngineError::Config(format!("{}: count (positive integer) required", component_id)))?;
         iterate_pipeline_path = Some(path);
