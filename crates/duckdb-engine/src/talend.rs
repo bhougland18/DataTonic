@@ -386,6 +386,7 @@ fn copy_params(
 fn properties_for(
     raw: &RawNode,
     component_id: &str,
+    context: &BTreeMap<String, String>,
     warnings: &mut Vec<Warning>,
 ) -> JsonMap<String, JsonValue> {
     let mut props = JsonMap::new();
@@ -483,11 +484,21 @@ fn properties_for(
                 _ => {
                     if let Some(to) = raw.params.get("TO") {
                         let name = unquote(to);
-                        let name = name.strip_prefix("context.").unwrap_or(&name);
-                        props.insert(
-                            "count".into(),
-                            JsonValue::String(format!("${{{}}}", name)),
-                        );
+                        let name = name.strip_prefix("context.").unwrap_or(&name).to_string();
+                        // The job carries its own context, so a bound written as
+                        // context.NAME is resolvable here. Falling back to a
+                        // placeholder leaves a pipeline that cannot run alone.
+                        match context.get(&name).map(|v| unquote(v)) {
+                            Some(v) if v.trim().parse::<i64>().is_ok() => {
+                                props.insert("count".into(), JsonValue::String(v.trim().to_string()));
+                            }
+                            _ => {
+                                props.insert(
+                                    "count".into(),
+                                    JsonValue::String(format!("${{{}}}", name)),
+                                );
+                            }
+                        }
                     }
                     warnings.push(Warning::RepositoryConnection {
                         node: raw.unique.clone(),
@@ -741,7 +752,7 @@ fn mapper_expressions(raw: &RawNode, warnings: &mut Vec<Warning>) -> JsonValue {
 
 /// Read one Talend `.item` file.
 pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
-    let (raw_nodes, connections) = parse(xml)?;
+    let (raw_nodes, connections, context) = parse(xml)?;
 
     let mut components: BTreeMap<String, usize> = BTreeMap::new();
     for n in &raw_nodes {
@@ -779,7 +790,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
             }
         };
 
-        let mut props = properties_for(raw, component_id, &mut warnings);
+        let mut props = properties_for(raw, component_id, &context, &mut warnings);
         if component_id == "xf.map" {
             props.insert("expressions".into(), mapper_expressions(raw, &mut warnings));
         }
@@ -1066,7 +1077,7 @@ fn connection_type_for(connector: Option<&str>) -> &'static str {
 
 /// Pull `<node>`, its `<elementParameter>`s, its mapper output entries, and the
 /// `<connection>` list out of the job XML.
-fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
+fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>), String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -1078,6 +1089,10 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
     // The TABLE parameter whose rows we are currently collecting, if any.
     let mut table_param: Option<String> = None;
     let mut in_flow_metadata = false;
+    // The job's own context parameters. A bound or a table name written as
+    // context.NAME is resolvable from here, and leaving it unresolved is what
+    // stopped an imported loop from compiling on its own.
+    let mut context: BTreeMap<String, String> = BTreeMap::new();
     let mut buf = Vec::new();
 
     loop {
@@ -1157,6 +1172,13 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
                     // A node declares one schema per connector; the main output
                     // is the FLOW one. Reject and other connectors describe
                     // different shapes and must not be mixed into it.
+                    "contextParameter" => {
+                        if let (Some(k), Some(v)) = (attr("name"), attr("value")) {
+                            // First definition wins: a job repeats its context
+                            // once per environment and the default comes first.
+                            context.entry(k).or_insert(v);
+                        }
+                    }
                     "metadata" => {
                         in_flow_metadata = attr("connector").as_deref() == Some("FLOW");
                     }
@@ -1215,7 +1237,7 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>), String> {
             n.unique = format!("{}_{}", n.component, i + 1);
         }
     }
-    Ok((nodes, conns))
+    Ok((nodes, conns, context))
 }
 
 #[cfg(test)]
