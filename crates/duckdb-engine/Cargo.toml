@@ -38,7 +38,7 @@ rustls-pemfile = "2"
 # derives the public-key fingerprint, and signs the standard
 # Snowflake claims (iss / sub / iat / exp). PAT bearer auth is also
 # supported and doesn't pull these in.
-jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.10"
 # HMAC-SHA256 for AWS SigV4 signing in src.dynamodb (and any future
