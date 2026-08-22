@@ -41,6 +41,12 @@ pub enum Warning {
     EncryptedSecret { node: String, property: String, placeholder: String },
     /// A mapper output expression that is Java, not a column reference.
     JavaExpression { node: String, column: String, expression: String },
+    /// A Java body on a tJava/tJavaRow, which has to be ported by hand.
+    ///
+    /// `only_prints` when every statement is a print, so the body carries no rules. It
+    /// still arrives with no SQL and still fails: the flag is there to triage a long
+    /// list, not to let anything run.
+    JavaBody { node: String, only_prints: bool },
 }
 
 impl std::fmt::Display for Warning {
@@ -65,6 +71,15 @@ impl std::fmt::Display for Warning {
                 f,
                 "{node}: output column {column} is computed by Java (`{expression}`), which does \
                  not translate. Rewrite it as a SQL expression"
+            ),
+            Warning::JavaBody { node, only_prints: true } => write!(
+                f,
+                "{node}: the Java body only prints, so it carries no rules to port. Drop the \
+                 node, or replace it with a log"
+            ),
+            Warning::JavaBody { node, only_prints: false } => write!(
+                f,
+                "{node}: the Java body has to be rewritten as SQL before this job runs"
             ),
         }
     }
@@ -392,6 +407,7 @@ fn properties_for(
     let mut props = JsonMap::new();
     match component_id {
         "code.sql" if raw.component.starts_with("tJava") => {
+            let mut only_prints = false;
             // Keep the Java on the node so whoever writes the SQL can see what
             // it has to do, and leave `sql` empty so the node cannot be mistaken
             // for one that works.
@@ -401,13 +417,10 @@ fn properties_for(
                 .filter(|c| !c.trim().is_empty())
                 .map(|c| unquote(c))
             {
+                only_prints = java_body_only_prints(&code);
                 props.insert("untranslatedSource".into(), JsonValue::String(code));
             }
-            warnings.push(Warning::JavaExpression {
-                node: raw.unique.clone(),
-                column: "(whole component)".into(),
-                expression: "Java body - rewrite as SQL before running".into(),
-            });
+            warnings.push(Warning::JavaBody { node: raw.unique.clone(), only_prints });
         }
         "code.sql" => {
             // The statement lives in the tcomp blob for a generic component and
@@ -771,6 +784,39 @@ fn call_args<'a>(e: &'a str, name: &str) -> Option<Vec<&'a str>> {
     }
     out.push(&inner[start..]);
     Some(out)
+}
+
+/// Does every statement in a Java body just print?
+///
+/// Such a body has no effect on the data, so it carries no rules to port. Anything else -
+/// an assignment, a context write, a call - counts as a rule, because treating one as
+/// harmless is how a pipeline ends up running happily while omitting the logic.
+fn java_body_only_prints(code: &str) -> bool {
+    let without_block_comments = {
+        let mut out = String::with_capacity(code.len());
+        let mut rest = code;
+        while let Some(start) = rest.find("/*") {
+            out.push_str(&rest[..start]);
+            match rest[start + 2..].find("*/") {
+                Some(end) => rest = &rest[start + 2 + end + 2..],
+                None => return false,
+            }
+        }
+        out.push_str(rest);
+        out
+    };
+    let source: String = without_block_comments
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("
+");
+    let statements: Vec<&str> =
+        source.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
+    !statements.is_empty()
+        && statements
+            .iter()
+            .all(|s| s.starts_with("System.out.print") || s.starts_with("System.err.print"))
 }
 
 /// An optionally signed decimal number, written out in full.
@@ -1843,6 +1889,59 @@ mod tests {
         assert_eq!(sql("StringHandling.LEFT(row1.NID,row1.N)"), None);
         assert_eq!(sql("StringHandling.LEFT(row1.NID)"), None, "wrong arity");
         assert_eq!(sql("StringHandling.SUBSTR(row1.CODE,1)"), None, "wrong arity");
+    }
+
+    #[test]
+    fn a_java_body_that_only_prints_says_so() {
+        // 73 bodies in one corpus is a long triage list, and 21 of them turned out to
+        // carry no rules at all. Saying which is which costs nothing and does not make
+        // any of them compile.
+        let body = |code: &str| {
+            let xml = format!(
+                r#"<talendfile:ProcessType xmlns:talendfile="x">
+                  <node componentName="tJava">
+                    <elementParameter name="UNIQUE_NAME" value="j_1"/>
+                    <elementParameter name="CODE" value="{code}"/>
+                  </node></talendfile:ProcessType>"#
+            );
+            import_item(&xml, "j").unwrap().warnings
+        };
+
+        let prints = body("System.out.println(&quot;starting&quot;);");
+        assert_eq!(prints.len(), 1);
+        assert!(
+            matches!(&prints[0], Warning::JavaBody { only_prints: true, .. }),
+            "a body of prints carries no rules, got {:?}",
+            prints[0]
+        );
+
+        let rules = body("output_row.total = input_row.a + input_row.b;");
+        assert!(
+            matches!(&rules[0], Warning::JavaBody { only_prints: false, .. }),
+            "a body that assigns must not be called harmless, got {:?}",
+            rules[0]
+        );
+
+        // a print AND an assignment is not a printing body
+        let mixed = body("System.out.println(&quot;x&quot;); context.n = 1;");
+        assert!(matches!(&mixed[0], Warning::JavaBody { only_prints: false, .. }));
+    }
+
+    #[test]
+    fn a_printing_body_still_fails_to_compile() {
+        // The whole point of the loud failure is that a body cannot quietly become a
+        // pipeline that runs and omits the rules. Saying a body only prints must not
+        // change that: it still arrives with no sql.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tJava">
+            <elementParameter name="UNIQUE_NAME" value="j_1"/>
+            <elementParameter name="CODE" value="System.out.println(&quot;hi&quot;);"/>
+          </node></talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert_eq!(im.nodes[0].data.component_id.as_deref(), Some("code.sql"));
+        let props = im.nodes[0].data.properties.as_ref().unwrap();
+        assert!(props.get("sql").is_none(), "no sql, so it cannot run");
+        assert!(props.get("untranslatedSource").is_some(), "the body is kept");
     }
 
     #[test]
