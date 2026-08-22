@@ -773,6 +773,32 @@ fn call_args<'a>(e: &'a str, name: &str) -> Option<Vec<&'a str>> {
     Some(out)
 }
 
+/// An optionally signed decimal number, written out in full.
+fn is_number(s: &str) -> bool {
+    let t = s.strip_prefix('-').unwrap_or(s);
+    !t.is_empty()
+        && t.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && t.bytes().filter(|b| *b == b'.').count() <= 1
+        && t.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// Split `<receiver>.name(<args>)` when the whole expression is that one method call.
+fn method_call<'a>(e: &'a str, name: &str) -> Option<(&'a str, Vec<&'a str>)> {
+    let open = format!(".{name}(");
+    let (mut depth, mut at) = (0i32, None);
+    for (i, c) in e.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '.' if depth == 0 && e[i..].starts_with(&open) => at = Some(i),
+            _ => {}
+        }
+    }
+    let i = at?;
+    let args = call_args(&e[i + 1..], name)?;
+    Some((&e[..i], args))
+}
+
 /// The sole argument of `name(...)`, when the whole expression is that one call.
 fn single_arg<'a>(e: &'a str, name: &str) -> Option<&'a str> {
     let args = call_args(e, name)?;
@@ -792,6 +818,9 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
     if e == "null" {
         return Some("NULL".to_string());
     }
+    if is_number(e) {
+        return Some(e.to_string());
+    }
     if let Some(inner) = e.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         // An escape would need Java's rules, so leave those to a human.
         if !inner.contains('"') && !inner.contains('\\') {
@@ -810,12 +839,21 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
         return Some(format!("TRY_CAST({} AS DOUBLE)", java_expr_to_sql(arg)?));
     }
     if let Some(arg) = single_arg(e, "new BigDecimal") {
-        // Only the double-valued form. `new BigDecimal("0")` is an exact decimal, and
-        // `new BigDecimal(column)` keeps that column's own scale; both would be a guess.
-        return single_arg(arg.trim(), "Double.valueOf")
-            .is_some()
-            .then(|| java_expr_to_sql(arg))
-            .flatten();
+        let inner = arg.trim();
+        // The double-valued form goes through a double in Java, so DOUBLE is faithful.
+        if single_arg(inner, "Double.valueOf").is_some() {
+            return java_expr_to_sql(inner);
+        }
+        // A quoted number is an exact decimal, and the literal already carries its own
+        // scale, so writing it through keeps that rather than inventing a cast.
+        if let Some(lit) = inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            if is_number(lit) {
+                return Some(lit.to_string());
+            }
+        }
+        // `new BigDecimal(reference)` reads as an exact decimal or a double depending on
+        // the reference's Java type, which the job file does not record.
+        return None;
     }
     if let Some(arg) = single_arg(e, "StringHandling.TRIM") {
         return Some(format!("trim({})", java_expr_to_sql(arg)?));
@@ -842,6 +880,20 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
             })
             .collect::<Option<Vec<_>>>()?;
         return Some(format!("{sql_fn}({subject}, {})", counts.join(", ")));
+    }
+    // Sign-changing arithmetic on an exact decimal, which SQL does the same way.
+    if let Some(recv) = e.strip_suffix(".negate()") {
+        return Some(format!("-({})", java_expr_to_sql(recv)?));
+    }
+    if let Some((recv, args)) = method_call(e, "multiply") {
+        if args.len() == 1 {
+            return Some(format!(
+                "({}) * ({})",
+                java_expr_to_sql(recv)?,
+                java_expr_to_sql(args[0])?
+            ));
+        }
+        return None;
     }
     // `Table.Column`, the only bare form that reads one way.
     let (table, column) = e.split_once('.')?;
@@ -1794,16 +1846,44 @@ mod tests {
     }
 
     #[test]
+    fn numeric_literals_and_exact_decimals_become_sql() {
+        let sql = |e: &str| java_expr_to_sql(e);
+        // A bare number is a number.
+        assert_eq!(sql("0").as_deref(), Some("0"));
+        assert_eq!(sql("-1").as_deref(), Some("-1"));
+        assert_eq!(
+            sql("new BigDecimal(Double.valueOf(0))").as_deref(),
+            Some("TRY_CAST(0 AS DOUBLE)")
+        );
+        // new BigDecimal("0.00") is an exact decimal, and the literal already carries the
+        // scale, so writing it through keeps that without inventing a cast.
+        assert_eq!(sql(r#"new BigDecimal("0")"#).as_deref(), Some("0"));
+        assert_eq!(sql(r#"new BigDecimal("-1")"#).as_deref(), Some("-1"));
+        assert_eq!(sql(r#"new BigDecimal("0.00")"#).as_deref(), Some("0.00"));
+    }
+
+    #[test]
+    fn sign_changing_arithmetic_becomes_sql() {
+        let sql = |e: &str| java_expr_to_sql(e);
+        assert_eq!(sql("row6.AMT.negate()").as_deref(), Some("-(AMT)"));
+        assert_eq!(
+            sql(r#"row6.AMT.multiply(new BigDecimal("-1"))"#).as_deref(),
+            Some("(AMT) * (-1)")
+        );
+        // an operand we cannot read keeps the whole expression reported
+        assert_eq!(sql("row6.AMT.multiply(somethingOdd(1,2))"), None);
+    }
+
+    #[test]
     fn a_mapper_expression_needing_judgement_is_still_reported() {
         // The point of translating the easy ones is that what remains is worth reading.
         // Anything with branching, arithmetic or an unverified index must keep warning:
         // guessing one of these wrong is a silent wrong number, not a failure.
         let sql = |e: &str| java_expr_to_sql(e);
         assert_eq!(sql("jobName"), None, "a bare identifier is not a column");
-        assert_eq!(sql(r#"new BigDecimal("0")"#), None, "exact decimal, not a double");
         assert_eq!(sql("new BigDecimal(Var.ID)"), None, "exact decimal, not a double");
         assert_eq!(sql("row6.A.subtract(row6.B)"), None, "arithmetic");
-        assert_eq!(sql("row6.A.negate()"), None, "arithmetic");
+        assert_eq!(sql("new BigDecimal(row1.AMT)"), None, "exact decimal or double, unrecorded");
         assert_eq!(sql(r#"a.equals("1")?"I":"O""#), None, "branching");
         assert_eq!(sql(r#"TalendDate.parseDate("ddMMyyyy",Var.D)"#), None);
         assert_eq!(sql("f(a) + g(b)"), None, "not a single call");
