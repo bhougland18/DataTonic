@@ -86,7 +86,7 @@ impl std::fmt::Display for Warning {
 }
 
 /// The result of reading one `.item` file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Import {
     /// Job name, taken from the file stem.
     pub name: String,
@@ -741,6 +741,134 @@ fn properties_for(
         }
     }
     props
+}
+
+
+impl Import {
+    /// A reusable body a job calls into, rather than a job of its own.
+    ///
+    /// Its ports are wiring, not work, so it is meant to be spliced into its callers and
+    /// is not runnable by itself.
+    pub fn is_subflow_body(&self) -> bool {
+        self.nodes.iter().any(|n| boundary_port(n).is_some())
+    }
+}
+
+/// Is this node one of a body's boundary ports rather than work it does?
+///
+/// A port has no Duckle equivalent of its own, so it imports unmapped and keeps the
+/// component name in its label.
+fn boundary_port(node: &PipelineNode) -> Option<&'static str> {
+    if node.data.component_id.is_some() {
+        return None;
+    }
+    let label = node.data.label.as_str();
+    if label.starts_with("INPUT") {
+        Some("input")
+    } else if label.starts_with("OUTPUT") {
+        Some("output")
+    } else {
+        None
+    }
+}
+
+/// Splice a reusable body into the job that calls it, replacing the call.
+///
+/// A child pipeline runs for its side effects and is handed no rows, so a call to a body
+/// that takes an input could never work by reference. Inlining is also what the source
+/// tool does when it generates the job, so the result is the shape the original had.
+///
+/// The body's nodes are prefixed with the call's id, because one job may call the same
+/// body more than once and the second copy must not land on the first.
+pub fn inline_subflow(parent: &mut Import, call_id: &str, body: &Import) -> Result<(), String> {
+    if !parent.nodes.iter().any(|n| n.id == call_id) {
+        return Err(format!("{call_id} is not a node in {}", parent.name));
+    }
+    let prefixed = |id: &str| format!("{call_id}__{id}");
+
+    let ports: BTreeMap<&str, &'static str> = body
+        .nodes
+        .iter()
+        .filter_map(|n| boundary_port(n).map(|kind| (n.id.as_str(), kind)))
+        .collect();
+
+    // Where the body starts, and which node feeds each named output.
+    let mut entries: Vec<String> = Vec::new();
+    let mut exits: BTreeMap<String, String> = BTreeMap::new();
+    for e in &body.edges {
+        match (ports.get(e.source.as_str()), ports.get(e.target.as_str())) {
+            (Some(&"input"), None) => entries.push(prefixed(&e.target)),
+            (None, Some(&"output")) => {
+                exits.insert(e.target.clone(), prefixed(&e.source));
+            }
+            _ => {}
+        }
+    }
+
+    // The body's own work, and the links between it.
+    for n in body.nodes.iter().filter(|n| boundary_port(n).is_none()) {
+        let mut copy = n.clone();
+        copy.id = prefixed(&n.id);
+        copy.data.label = copy.id.clone();
+        parent.nodes.push(copy);
+    }
+    let mut next_edge = parent.edges.len();
+    for e in body
+        .edges
+        .iter()
+        .filter(|e| !ports.contains_key(e.source.as_str()) && !ports.contains_key(e.target.as_str()))
+    {
+        next_edge += 1;
+        let mut copy = e.clone();
+        copy.id = format!("e{next_edge}");
+        copy.source = prefixed(&e.source);
+        copy.target = prefixed(&e.target);
+        parent.edges.push(copy);
+    }
+
+    // Re-point the caller's own links at the body, then drop the call itself.
+    let single_exit = (exits.len() == 1).then(|| exits.values().next().cloned().unwrap());
+    let mut rewired: Vec<PipelineEdge> = Vec::new();
+    for e in std::mem::take(&mut parent.edges) {
+        if e.target == call_id {
+            for entry in &entries {
+                let mut copy = e.clone();
+                next_edge += 1;
+                copy.id = format!("e{next_edge}");
+                copy.target = entry.clone();
+                rewired.push(copy);
+            }
+        } else if e.source == call_id {
+            // The label names which output this link left by. With one output there is
+            // nothing to choose between, so an unlabelled link still resolves.
+            let port = e.data.as_ref().and_then(|d| d.label.clone());
+            let from = port.and_then(|p| exits.get(&p).cloned()).or_else(|| single_exit.clone());
+            let Some(from) = from else { continue };
+            let mut copy = e.clone();
+            copy.source = from;
+            if let Some(d) = copy.data.as_mut() {
+                d.label = None;
+            }
+            rewired.push(copy);
+        } else {
+            rewired.push(e);
+        }
+    }
+    parent.edges = rewired;
+    parent.nodes.retain(|n| n.id != call_id);
+    for (component, n) in &body.components {
+        *parent.components.entry(component.clone()).or_insert(0) += n;
+    }
+    // The ports were wiring and the splice resolved them, so reporting them as having no
+    // equivalent would now be false. Everything else the body needs still needs it.
+    parent.warnings.extend(
+        body
+            .warnings
+            .iter()
+            .filter(|w| !matches!(w, Warning::UnmappedComponent { node, .. } if ports.contains_key(node.as_str())))
+            .cloned(),
+    );
+    Ok(())
 }
 
 /// Is every parenthesis in `s` closed in order?
@@ -2157,6 +2285,109 @@ mod tests {
         );
         assert_eq!(sql(r#"TalendDate.parseDate("ddMMyyyy",Var.D)"#), None);
         assert_eq!(sql("f(a) + g(b)"), None, "not a single call");
+    }
+
+    fn caller_and_body() -> (Import, Import) {
+        let caller = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="MY_BODY" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="MY_BODY_1"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="240" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="sink_a"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="240" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="sink_b"/>
+            <elementParameter name="FILENAME" value="&quot;/data/b.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="MY_BODY_1"/>
+          <connection connectorName="OUTPUT_1" source="MY_BODY_1" target="sink_a"/>
+          <connection connectorName="OUTPUT_2" source="MY_BODY_1" target="sink_b"/>
+        </talendfile:ProcessType>"#;
+        let body = r#"<xmi:XMI xmlns:xmi="x" xmlns:model="y"><model:JobletProcess>
+          <jobletNodes componentName="INPUT" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="INPUT_1"/>
+          </jobletNodes>
+          <node componentName="tSortRow" posX="100" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="mid_1"/>
+          </node>
+          <jobletNodes componentName="OUTPUT" posX="200" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="OUTPUT_1"/>
+          </jobletNodes>
+          <jobletNodes componentName="OUTPUT" posX="200" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="OUTPUT_2"/>
+          </jobletNodes>
+          <connection connectorName="FLOW" source="INPUT_1" target="mid_1"/>
+          <connection connectorName="OUTPUT_1" source="mid_1" target="OUTPUT_1"/>
+          <connection connectorName="OUTPUT_2" source="mid_1" target="OUTPUT_2"/>
+        </model:JobletProcess></xmi:XMI>"#;
+        (import_item(caller, "caller").unwrap(), import_item(body, "MY_BODY").unwrap())
+    }
+
+    #[test]
+    fn a_body_is_spliced_into_the_job_that_calls_it() {
+        // A child pipeline runs for its side effects and is handed no rows, so a call to a
+        // body that takes an input could never work. The body is inlined instead, which is
+        // also what the source tool does when it generates the job.
+        let (mut caller, body) = caller_and_body();
+        inline_subflow(&mut caller, "MY_BODY_1", &body).expect("splices");
+
+        let ids: Vec<&str> = caller.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(!ids.contains(&"MY_BODY_1"), "the call is replaced, not kept");
+        assert!(!ids.iter().any(|i| i.contains("INPUT_1") || i.contains("OUTPUT_")),
+                "the ports are wiring, not work: {ids:?}");
+        assert!(ids.contains(&"MY_BODY_1__mid_1"), "the body's work arrives, got {ids:?}");
+
+        let link = |from: &str, to: &str| {
+            caller.edges.iter().any(|e| e.source == from && e.target == to)
+        };
+        assert!(link("in_1", "MY_BODY_1__mid_1"), "the caller's input drives the body");
+        assert!(link("MY_BODY_1__mid_1", "sink_a"), "OUTPUT_1 reaches the sink it fed");
+        assert!(link("MY_BODY_1__mid_1", "sink_b"), "and OUTPUT_2 reaches its own");
+        assert!(
+            !caller.warnings.iter().any(|w| matches!(
+                w,
+                Warning::UnmappedComponent { component, .. } if component == "INPUT" || component == "OUTPUT"
+            )),
+            "the splice resolved the ports, so reporting them would be false: {:?}",
+            caller.warnings
+        );
+        assert_eq!(caller.edges.len(), 3, "no edge left dangling: {:?}",
+                   caller.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>());
+        assert!(caller.edges.iter().all(|e| {
+            let ids: Vec<&str> = caller.nodes.iter().map(|n| n.id.as_str()).collect();
+            ids.contains(&e.source.as_str()) && ids.contains(&e.target.as_str())
+        }), "every edge names a node that exists");
+    }
+
+    #[test]
+    fn splicing_the_same_body_twice_keeps_them_apart() {
+        // Two calls to one body must not collide, or the second would silently land on the
+        // first one's nodes.
+        let (mut caller, body) = caller_and_body();
+        let extra = PipelineNode {
+            id: "MY_BODY_2".into(),
+            flow_type: Some("transform".into()),
+            position: Position { x: 120.0, y: 200.0 },
+            data: node_data("MY_BODY_2".into(), Some("ctl.runjob".into()), None),
+        };
+        caller.nodes.push(extra);
+        inline_subflow(&mut caller, "MY_BODY_1", &body).unwrap();
+        inline_subflow(&mut caller, "MY_BODY_2", &body).unwrap();
+
+        let ids: Vec<&str> = caller.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"MY_BODY_1__mid_1") && ids.contains(&"MY_BODY_2__mid_1"),
+                "each call gets its own copy, got {ids:?}");
+    }
+
+    #[test]
+    fn splicing_a_body_that_is_not_called_is_an_error() {
+        let (mut caller, body) = caller_and_body();
+        assert!(inline_subflow(&mut caller, "nope_1", &body).is_err());
     }
 
     #[test]

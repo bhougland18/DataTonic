@@ -218,6 +218,10 @@ pub fn import_tree(src: &Path, out: &Path) -> Result<BulkReport, String> {
 
     let mut report = BulkReport::default();
     let mut taken: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Parse everything before writing anything: a body has to be in hand before the job
+    // that calls it can be written with the body spliced in, and the file order says
+    // nothing about which comes first.
+    let mut parsed: Vec<(PathBuf, JobOutcome, Option<talend::Import>)> = Vec::new();
     for file in files {
         let rel = file.strip_prefix(src).unwrap_or(&file).to_path_buf();
         let stem = file
@@ -236,7 +240,44 @@ pub fn import_tree(src: &Path, out: &Path) -> Result<BulkReport, String> {
                 (stem, rel)
             }
         };
-        report.jobs.push(convert_one(&file, &rel, &name, out));
+        let (outcome, import) = parse_one(&file, &name);
+        parsed.push((rel, outcome, import));
+    }
+
+    // A reusable body takes its rows from whoever calls it, and a child pipeline is handed
+    // none, so a call by reference could never work. Splice each body into its callers
+    // instead, which is what the source tool does when it generates the job.
+    let bodies: BTreeMap<String, talend::Import> = parsed
+        .iter()
+        .filter_map(|(_, _, im)| im.as_ref())
+        .filter(|im| im.is_subflow_body())
+        .map(|im| (format!("{}.json", im.name), (*im).clone()))
+        .collect();
+    let mut spliced: std::collections::HashSet<String> = Default::default();
+    for (_, _, import) in parsed.iter_mut() {
+        let Some(import) = import.as_mut() else { continue };
+        loop {
+            let call = import.nodes.iter().find_map(|n| {
+                let props = n.data.properties.as_ref()?;
+                let r = props.get("pipelineRef")?.as_str()?;
+                bodies.contains_key(r).then(|| (n.id.clone(), r.to_string()))
+            });
+            let Some((call_id, reference)) = call else { break };
+            let body = &bodies[&reference];
+            if talend::inline_subflow(import, &call_id, body).is_err() {
+                break;
+            }
+            spliced.insert(reference);
+        }
+    }
+
+    for (rel, outcome, import) in parsed {
+        match import {
+            // A body that was spliced into its callers is not a pipeline of its own.
+            Some(im) if spliced.contains(&format!("{}.json", im.name)) => {}
+            Some(im) => report.jobs.push(write_one(outcome, &im, &rel, out)),
+            None => report.jobs.push(outcome),
+        }
     }
     Ok(report)
 }
@@ -256,7 +297,7 @@ fn strip_version(stem: &str) -> String {
 
 /// Convert one file. A failure here is recorded, never propagated: one unreadable file in
 /// a corpus of hundreds must not end the migration.
-fn convert_one(file: &Path, rel: &Path, name: &str, out: &Path) -> JobOutcome {
+fn parse_one(file: &Path, name: &str) -> (JobOutcome, Option<talend::Import>) {
     let mut outcome = JobOutcome {
         source: file.to_path_buf(),
         name: name.to_string(),
@@ -271,7 +312,7 @@ fn convert_one(file: &Path, rel: &Path, name: &str, out: &Path) -> JobOutcome {
         Ok(x) => x,
         Err(e) => {
             outcome.error = Some(format!("read: {e}"));
-            return outcome;
+            return (outcome, None);
         }
     };
     // A job declares itself a process. Routines are Java source that merely shares the
@@ -283,14 +324,14 @@ fn convert_one(file: &Path, rel: &Path, name: &str, out: &Path) -> JobOutcome {
     // skipping it leaves every caller pointing at nothing.
     if !xml.contains("ProcessType") && !xml.contains("JobletProcess") {
         outcome.skipped = Some("not a job (no process declaration)".into());
-        return outcome;
+        return (outcome, None);
     }
 
     let import = match talend::import_item(&xml, name) {
         Ok(i) => i,
         Err(e) => {
             outcome.error = Some(e);
-            return outcome;
+            return (outcome, None);
         }
     };
 
@@ -299,9 +340,22 @@ fn convert_one(file: &Path, rel: &Path, name: &str, out: &Path) -> JobOutcome {
     // nothing, and counting it as converted would inflate the only number anyone reads.
     if import.nodes.is_empty() {
         outcome.skipped = Some("holds no job (routine, context or metadata)".into());
-        return outcome;
+        return (outcome, None);
     }
 
+    (outcome, Some(import))
+}
+
+/// Record what still needs a person, then write the pipeline out.
+///
+/// Warnings are read here rather than at parse time because a body's warnings become its
+/// caller's once it is spliced in.
+fn write_one(
+    mut outcome: JobOutcome,
+    import: &talend::Import,
+    rel: &Path,
+    out: &Path,
+) -> JobOutcome {
     for w in &import.warnings {
         outcome.warnings.push(w.to_string());
         if let Warning::UnmappedComponent { component, .. } = w {
@@ -619,6 +673,68 @@ mod tests {
             out.path().join("BODY_0.2.json").exists(),
             "the second version must not overwrite the first"
         );
+    }
+
+    #[test]
+    fn a_called_body_is_spliced_into_its_caller() {
+        // A body is not runnable on its own: it takes its rows from whoever calls it, and
+        // a child pipeline is handed none. Converting the call by reference would leave a
+        // job that cannot work, so the body is inlined and not written beside it.
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write(
+            src.path(),
+            "CALLER_0.1.item",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<talendfile:ProcessType xmlns:talendfile="platform:/resource/org.talend.model/model/TalendFile.xsd">
+  <node componentName="tFileInputDelimited" posX="10" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="in_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+  </node>
+  <node componentName="MY_BODY" posX="120" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="MY_BODY_1"/>
+  </node>
+  <node componentName="tFileOutputDelimited" posX="240" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="sink_a"/>
+    <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+  </node>
+  <connection connectorName="FLOW" source="in_1" target="MY_BODY_1"/>
+  <connection connectorName="OUTPUT_1" source="MY_BODY_1" target="sink_a"/>
+</talendfile:ProcessType>
+"#,
+        );
+        write(
+            src.path(),
+            "MY_BODY_0.1.item",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xmi:XMI xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:model="platform:/resource/org.talend.model/model/Joblet.xsd">
+  <model:JobletProcess>
+    <jobletNodes componentName="INPUT" posX="10" posY="10">
+      <elementParameter name="UNIQUE_NAME" value="INPUT_1"/>
+    </jobletNodes>
+    <node componentName="tSortRow" posX="100" posY="10">
+      <elementParameter name="UNIQUE_NAME" value="mid_1"/>
+    </node>
+    <jobletNodes componentName="OUTPUT" posX="200" posY="10">
+      <elementParameter name="UNIQUE_NAME" value="OUTPUT_1"/>
+    </jobletNodes>
+    <connection connectorName="FLOW" source="INPUT_1" target="mid_1"/>
+    <connection connectorName="OUTPUT_1" source="mid_1" target="OUTPUT_1"/>
+  </model:JobletProcess>
+</xmi:XMI>
+"#,
+        );
+
+        let report = import_tree(src.path(), out.path()).unwrap();
+
+        let caller = std::fs::read_to_string(out.path().join("CALLER.json")).unwrap();
+        assert!(caller.contains("MY_BODY_1__mid_1"), "the body's work is in the caller");
+        assert!(!caller.contains("ctl.runjob"), "and the call by reference is gone");
+        assert!(
+            !out.path().join("MY_BODY.json").exists(),
+            "a spliced body is not a pipeline of its own"
+        );
+        assert_eq!(report.failed(), 0);
     }
 
     #[test]
