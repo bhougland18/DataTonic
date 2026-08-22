@@ -4289,7 +4289,7 @@ impl DuckdbEngine {
             .map_err(|e| EngineError::Query(format!("cassandra: tokio rt: {}", e)))?;
         let total = rt
             .block_on(async {
-                let mut builder = scylla::SessionBuilder::new();
+                let mut builder = scylla::client::session_builder::SessionBuilder::new();
                 for cp in spec.contact_points.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                     builder = builder.known_node(cp);
                 }
@@ -4322,7 +4322,7 @@ impl DuckdbEngine {
                         vals.join(", ")
                     );
                     session
-                        .query(stmt, &[])
+                        .query_unpaged(stmt, &[])
                         .await
                         .map_err(|e| format!("insert: {}", e))?;
                     total += 1;
@@ -4360,7 +4360,7 @@ impl DuckdbEngine {
         let count: usize = rt
             .block_on(async move {
                 let mut writer = writer;
-                let mut builder = scylla::SessionBuilder::new();
+                let mut builder = scylla::client::session_builder::SessionBuilder::new();
                 for cp in spec.contact_points.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                     builder = builder.known_node(cp);
                 }
@@ -4375,17 +4375,25 @@ impl DuckdbEngine {
                     .await
                     .map_err(|e| format!("connect: {}", e))?;
                 let result = session
-                    .query(spec.query.clone(), &[])
+                    .query_unpaged(spec.query.clone(), &[])
                     .await
                     .map_err(|e| format!("query: {}", e))?;
+                // The result arrives undeserialised: the column specs and the rows both
+                // come from the row view rather than off the result itself.
+                let result = result
+                    .into_rows_result()
+                    .map_err(|e| format!("query: {}", e))?;
                 let cols: Vec<String> = result
-                    .col_specs
+                    .column_specs()
                     .iter()
-                    .map(|c| c.name.clone())
+                    .map(|c| c.name().to_string())
                     .collect();
-                let rows = result.rows.unwrap_or_default();
+                let rows = result
+                    .rows::<scylla::value::Row>()
+                    .map_err(|e| format!("query: {}", e))?;
                 let mut count = 0usize;
                 for row in rows {
+                    let row = row.map_err(|e| format!("row: {}", e))?;
                     let mut obj = serde_json::Map::new();
                     for (i, name) in cols.iter().enumerate() {
                         let v = row
@@ -8010,41 +8018,36 @@ impl DuckdbEngine {
     /// value. Row count is preserved 1:1 - the output stream folds into the
     /// output column as one value (1 result), a JSON array (>1) or null (0).
     pub(crate) fn run_jq(&self, db: &Path, spec: &JqSpec) -> Result<String, EngineError> {
-        use jaq_interpret::{Ctx, FilterT, ParseCtx, RcIter, Val};
+        use jaq_core::load::{Arena, File, Loader};
+        use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
+        use jaq_json::Val;
         self.check_cancelled()?;
 
         // Compile the filter ONCE, up front, so a bad program fails the stage
         // immediately instead of once per row.
-        let mut defs = ParseCtx::new(Vec::new());
-        defs.insert_natives(jaq_core::core());
-        defs.insert_defs(jaq_std::std());
-        let (parsed, parse_errs) = jaq_parse::parse(&spec.filter, jaq_parse::main());
-        if !parse_errs.is_empty() {
-            let msg = parse_errs
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(EngineError::Config(format!(
-                "xf.jq: could not parse filter `{}`: {}",
-                spec.filter, msg
-            )));
-        }
-        let parsed = parsed
-            .ok_or_else(|| EngineError::Config("xf.jq: empty jq filter".into()))?;
-        let filter = defs.compile(parsed);
-        if !defs.errs.is_empty() {
-            let msg = defs
-                .errs
-                .iter()
-                .map(|(e, _)| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(EngineError::Config(format!(
-                "xf.jq: could not compile filter `{}`: {}",
-                spec.filter, msg
-            )));
-        }
+        let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs());
+        let funs = jaq_core::funs().chain(jaq_std::funs()).chain(jaq_json::funs());
+        let loader = Loader::new(defs);
+        let arena = Arena::default();
+        let modules = loader
+            .load(&arena, File { code: spec.filter.as_str(), path: () })
+            .map_err(|errs| {
+                EngineError::Config(format!(
+                    "xf.jq: could not parse filter `{}`: {}",
+                    spec.filter,
+                    errs.len()
+                ))
+            })?;
+        let filter = Compiler::default()
+            .with_funs(funs)
+            .compile(modules)
+            .map_err(|errs| {
+                EngineError::Config(format!(
+                    "xf.jq: could not compile filter `{}`: {}",
+                    spec.filter,
+                    errs.len()
+                ))
+            })?;
 
         let rows = self.run_rows(
             Some(db),
@@ -8071,12 +8074,18 @@ impl DuckdbEngine {
                 None => JsonValue::Null,
             };
 
-            let inputs = RcIter::new(core::iter::empty());
             let mut results: Vec<JsonValue> = Vec::new();
             let mut row_err: Option<String> = None;
-            for r in filter.run((Ctx::new(Vec::new(), &inputs), Val::from(input))) {
+            // The value type is the jq engine's own, so a row crosses in through serde and
+            // back out through its JSON rendering.
+            let input_val = jaq_json::read::parse_single(input.to_string().as_bytes())
+                .unwrap_or_default();
+            let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
+            for r in filter.id.run((ctx, input_val)).map(unwrap_valr) {
                 match r {
-                    Ok(v) => results.push(JsonValue::from(v)),
+                    Ok(v) => results.push(
+                        serde_json::from_str(&v.to_string()).unwrap_or(JsonValue::Null),
+                    ),
                     Err(e) => {
                         row_err = Some(e.to_string());
                         break;

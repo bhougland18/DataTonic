@@ -3507,6 +3507,80 @@ fn geo_measurements_are_crs_aware() {
 }
 
 #[test]
+fn jq_folds_many_and_no_results_and_reports_a_bad_row() {
+    // The interpreter is a third-party engine and its API has changed under us before, so
+    // pin the three shapes the fold actually has to get right: several results become an
+    // array, none becomes null, and a filter that cannot apply to a row is an error.
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(
+        tmp.path(),
+        "in.csv",
+        "id,payload
+1,\"[1,2,3]\"
+2,\"[]\"
+",
+    );
+
+    // .[] over a 3-element array yields 3 results; over an empty array, none.
+    let out = out_path(tmp.path(), "many.csv");
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("j", "xf.jq", json!({ "column": "payload", "filter": ".[]", "outputColumn": "r" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "j"), main_edge("e2", "j", "k")]),
+    );
+    let r = engine.execute_pipeline(&d);
+    assert_eq!(r.status, "ok", "jq failed: {:?}", r.error);
+    let vals = scalar_string(&format!(
+        "SELECT string_agg(coalesce(CAST(r AS VARCHAR), 'NULL'), '|' ORDER BY id) FROM read_csv_auto('{}')",
+        out
+    ));
+    assert_eq!(vals, "[1, 2, 3]|NULL", "several results fold to an array, none to null");
+
+    // A filter that cannot apply to the row's value is a failure, not a silent null.
+    let bad = out_path(tmp.path(), "bad.csv");
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("j", "xf.jq", json!({ "column": "payload", "filter": ".missing", "outputColumn": "r" })),
+            node("k", "snk.csv", json!({ "path": bad, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "j"), main_edge("e2", "j", "k")]),
+    );
+    let r = engine.execute_pipeline(&d);
+    assert_eq!(r.status, "error", "indexing an array by name must not pass silently");
+}
+
+#[test]
+fn jq_rejects_a_filter_it_cannot_compile() {
+    // A bad program fails the stage once, up front, rather than once per row.
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,payload
+1,\"{}\"
+");
+    let out = out_path(tmp.path(), "never.csv");
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("j", "xf.jq", json!({ "column": "payload", "filter": ".[", "outputColumn": "r" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "j"), main_edge("e2", "j", "k")]),
+    );
+    let r = engine.execute_pipeline(&d);
+    assert_eq!(r.status, "error", "an unparseable filter must fail the stage");
+    assert!(
+        r.error.as_deref().unwrap_or("").contains("xf.jq"),
+        "and say which node: {:?}",
+        r.error
+    );
+}
+
+#[test]
 fn jq_transform_applies_filter() {
     // Issue #173: xf.jq runs a jq filter over a JSON column per row via the
     // pure-Rust jaq engine (no external jq). One result -> scalar, several ->

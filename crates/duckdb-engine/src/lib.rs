@@ -3960,8 +3960,8 @@ fn cql_decimal_to_string(bytes: &[u8], scale: i32) -> String {
 /// and list/set/map/tuple/UDT recurse into JSON arrays/objects. Earlier this
 /// fell through to Rust `{:?}` Debug for every non-scalar, corrupting
 /// timestamps, decimals, collections, etc.
-fn cql_value_to_json(v: &scylla::frame::response::result::CqlValue) -> JsonValue {
-    use scylla::frame::response::result::CqlValue;
+fn cql_value_to_json(v: &scylla::value::CqlValue) -> JsonValue {
+    use scylla::value::CqlValue;
     match v {
         CqlValue::Boolean(b) => JsonValue::Bool(*b),
         CqlValue::TinyInt(n) => JsonValue::from(*n as i64),
@@ -4056,6 +4056,10 @@ fn cql_value_to_json(v: &scylla::frame::response::result::CqlValue) -> JsonValue
             }
             JsonValue::Object(obj)
         }
+        // The set of CQL types is open, so a driver upgrade can add one. Rendering an
+        // unknown value as its debug form keeps the row readable and says plainly that
+        // this type has no mapping yet, rather than dropping the column silently.
+        other => JsonValue::String(format!("{other:?}")),
     }
 }
 
@@ -4083,8 +4087,8 @@ mod snowflake_jwt_tests {
 #[cfg(test)]
 mod cql_value_tests {
     use super::{cql_be_twos_complement_to_decimal, cql_decimal_to_string, cql_value_to_json};
-    use scylla::frame::response::result::CqlValue;
-    use scylla::frame::value::{
+    use scylla::value::CqlValue;
+    use scylla::value::{
         CqlDate, CqlDecimal, CqlDuration, CqlTime, CqlTimestamp, CqlVarint,
     };
     use serde_json::json;
@@ -4168,7 +4172,7 @@ mod cql_value_tests {
         assert_eq!(
             cql_value_to_json(&CqlValue::UserDefinedType {
                 keyspace: "ks".into(),
-                type_name: "t".into(),
+                name: "t".into(),
                 fields: vec![("x".into(), Some(CqlValue::Int(5)))],
             }),
             json!({ "x": 5 })

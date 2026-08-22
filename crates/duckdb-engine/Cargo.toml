@@ -61,7 +61,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Cassandra / ScyllaDB via the pure-Rust scylla driver (also speaks
 # CQL to Cassandra). Async; same block_on pattern as mongo + sqlserver.
-scylla = "0.13"
+scylla = "1.8"
 # Oracle support. The `oracle` crate uses ODPI-C (statically compiled
 # from C source at build time) which dynamically loads Oracle Instant
 # Client at RUNTIME via dlopen. Build is self-contained on every OS;
@@ -153,10 +153,9 @@ boa_engine = "0.21"
 # no subprocess: the user's jq filter is parsed and interpreted in-process, then
 # applied per row to a JSON column. This is exactly the "no subprocess overhead"
 # path the issue asks for. Pinned to the 1.x interpret API.
-jaq-interpret = "1.5"
-jaq-parse = "1.0"
-jaq-core = "1.5"
-jaq-std = "1.5"
+jaq-core = "3.1"
+jaq-std = "3.0"
+jaq-json = "2.0"
 # Used by xf.ai.pii for regex-based PII detection (emails, phones,
 # SSNs, credit cards). Already in our dep graph transitively but
 # pinned explicitly here so it's stable across upstream churn.
