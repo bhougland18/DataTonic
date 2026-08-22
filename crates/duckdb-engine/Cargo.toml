@@ -38,7 +38,7 @@ rustls-pemfile = "2"
 # derives the public-key fingerprint, and signs the standard
 # Snowflake claims (iss / sub / iat / exp). PAT bearer auth is also
 # supported and doesn't pull these in.
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.10"
 # HMAC-SHA256 for AWS SigV4 signing in src.dynamodb (and any future
@@ -101,7 +101,7 @@ rskafka = "0.5"
 # .avro / .ocf files that exporters drop on object storage.
 apache-avro = "0.17"
 # NATS / JetStream. Pure-Rust client by the NATS team.
-async-nats = "0.37"
+async-nats = "0.50"
 # XML reader/writer. Used by src.xml (walks a row path, emits each
 # match as a JSON object) and snk.xml (wraps rows in row elements).
 # Pure Rust.
@@ -130,7 +130,7 @@ suppaftp = { version = "8", default-features = false, features = ["rustls-ring"]
 # async; run_sftp_source wraps it in block_on like the mongo / tiberius
 # sources to stay synchronous. Host-key/fingerprint is enforced in russh's
 # check_server_key callback.
-russh = { version = "0.60", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2.3"
 # System clipboard reader (src.clipboard). Text-only - image-data is
 # off because we never round-trip images through pipelines. arboard
@@ -148,7 +148,7 @@ wasmi = "0.40"
 # fs. The user supplies a transform(row) -> object function and the
 # engine calls it per row, marshalling JSON in / out via the boa
 # JsValue<->serde_json bridge.
-boa_engine = "0.19"
+boa_engine = "0.21"
 # Pure-Rust jq for xf.jq (GitHub #173). jaq is a jq clone with no C libjq and
 # no subprocess: the user's jq filter is parsed and interpreted in-process, then
 # applied per row to a JSON column. This is exactly the "no subprocess overhead"

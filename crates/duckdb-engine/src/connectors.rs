@@ -7951,7 +7951,7 @@ impl DuckdbEngine {
                 .as_callable()
                 .ok_or_else(|| EngineError::Query("js: marshaller missing".into()))?
                 .call(
-                    &boa_engine::JsValue::Undefined,
+                    &boa_engine::JsValue::undefined(),
                     &[boa_engine::JsValue::from(js_string!(s.as_str()))],
                     &mut ctx,
                 )
@@ -7959,7 +7959,7 @@ impl DuckdbEngine {
             let result = transform
                 .as_callable()
                 .ok_or_else(|| EngineError::Query("js: transform not callable".into()))?
-                .call(&boa_engine::JsValue::Undefined, &[js_in], &mut ctx)
+                .call(&boa_engine::JsValue::undefined(), &[js_in], &mut ctx)
                 .map_err(|e| EngineError::Query(format!("js: transform call: {}", e)))?;
             // Guard the value's shape BEFORE serializing: a transform that
             // returns nothing (undefined) or null is a programming error.
@@ -7973,7 +7973,7 @@ impl DuckdbEngine {
             let ser = ser_fn
                 .as_callable()
                 .ok_or_else(|| EngineError::Query("js: marshaller missing".into()))?
-                .call(&boa_engine::JsValue::Undefined, &[result], &mut ctx)
+                .call(&boa_engine::JsValue::undefined(), &[result], &mut ctx)
                 .map_err(|e| EngineError::Query(format!("js: result -> JSON: {}", e)))?;
             let json_out = match ser.as_string() {
                 Some(js) => {
