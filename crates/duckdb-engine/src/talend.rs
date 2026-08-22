@@ -41,6 +41,8 @@ pub enum Warning {
     EncryptedSecret { node: String, property: String, placeholder: String },
     /// A mapper output expression that is Java, not a column reference.
     JavaExpression { node: String, column: String, expression: String },
+    /// A call whose child handed rows back to it, which a child pipeline cannot do.
+    ChildReturnsRows { node: String },
     /// A Java body on a tJava/tJavaRow, which has to be ported by hand.
     ///
     /// `only_prints` when every statement is a print, so the body carries no rules. It
@@ -71,6 +73,13 @@ impl std::fmt::Display for Warning {
                 f,
                 "{node}: output column {column} is computed by Java (`{expression}`), which does \
                  not translate. Rewrite it as a SQL expression"
+            ),
+            Warning::ChildReturnsRows { node } => write!(
+                f,
+                "{node}: the job it calls hands rows back to this one. A child pipeline \
+                 runs for its side effects and returns nothing, so this node would stand \
+                 in an empty relation. Have the child write a table this job reads, or \
+                 fold the child's work in here"
             ),
             Warning::JavaBody { node, only_prints: true } => write!(
                 f,
@@ -856,6 +865,10 @@ pub fn inline_subflow(parent: &mut Import, call_id: &str, body: &Import) -> Resu
     }
     parent.edges = rewired;
     parent.nodes.retain(|n| n.id != call_id);
+    // The splice folded the body in, so this call no longer stands in an empty relation.
+    parent
+        .warnings
+        .retain(|w| !matches!(w, Warning::ChildReturnsRows { node } if node == call_id));
     for (component, n) in &body.components {
         *parent.components.entry(component.clone()).or_insert(0) += n;
     }
@@ -1273,7 +1286,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         };
         target_port.insert(i, port);
     }
-    let edges = connections
+    let edges: Vec<PipelineEdge> = connections
         .iter()
         .enumerate()
         // Drop dangling links rather than emit an edge to a node that is not
@@ -1296,6 +1309,21 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
             }),
         })
         .collect();
+
+    // A child pipeline is handed no rows and returns none, so a row link leaving a call
+    // is a data path the source tool had and this one does not.
+    for n in &nodes {
+        if n.data.component_id.as_deref() != Some("ctl.runjob") {
+            continue;
+        }
+        let returns_rows = edges.iter().any(|e| {
+            e.source == n.id
+                && e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("main")
+        });
+        if returns_rows {
+            warnings.push(Warning::ChildReturnsRows { node: n.id.clone() });
+        }
+    }
 
     // A loop's body is inline in the source job; Duckle runs a child pipeline by
     // reference, so lift each body out and point its loop at the new file.
@@ -2329,6 +2357,54 @@ mod tests {
     }
 
     #[test]
+    fn a_call_that_hands_rows_back_is_reported() {
+        // A child pipeline runs for its side effects, so it cannot return rows. A call
+        // with a row link leaving it did return them in the source tool, and the node
+        // would quietly stand in an empty relation instead.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tRunJob" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="call_1"/>
+            <elementParameter name="PROCESS" value="CHILD"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="200" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="call_1" target="out_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert!(
+            im.warnings.iter().any(|w| matches!(
+                w, Warning::ChildReturnsRows { node } if node == "call_1"
+            )),
+            "got {:?}",
+            im.warnings
+        );
+    }
+
+    #[test]
+    fn a_call_used_only_for_ordering_is_not_reported() {
+        // Chaining jobs is the ordinary way to build a master job and carries no rows.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tRunJob" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="call_1"/>
+            <elementParameter name="PROCESS" value="CHILD_A"/>
+          </node>
+          <node componentName="tRunJob" posX="200" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="call_2"/>
+            <elementParameter name="PROCESS" value="CHILD_B"/>
+          </node>
+          <connection connectorName="SUBJOB_OK" source="call_1" target="call_2"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert!(
+            !im.warnings.iter().any(|w| matches!(w, Warning::ChildReturnsRows { .. })),
+            "ordering is not a data return: {:?}",
+            im.warnings
+        );
+    }
+
+    #[test]
     fn a_body_is_spliced_into_the_job_that_calls_it() {
         // A child pipeline runs for its side effects and is handed no rows, so a call to a
         // body that takes an input could never work. The body is inlined instead, which is
@@ -2348,6 +2424,10 @@ mod tests {
         assert!(link("in_1", "MY_BODY_1__mid_1"), "the caller's input drives the body");
         assert!(link("MY_BODY_1__mid_1", "sink_a"), "OUTPUT_1 reaches the sink it fed");
         assert!(link("MY_BODY_1__mid_1", "sink_b"), "and OUTPUT_2 reaches its own");
+        assert!(
+            !caller.warnings.iter().any(|w| matches!(w, Warning::ChildReturnsRows { .. })),
+            "the splice folded the body in, so the call no longer stands in an empty relation"
+        );
         assert!(
             !caller.warnings.iter().any(|w| matches!(
                 w,
