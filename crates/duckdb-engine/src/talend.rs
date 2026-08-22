@@ -730,8 +730,80 @@ fn properties_for(
     props
 }
 
-/// Translate mapper output expressions. `Table.Column` becomes the column;
-/// anything else is reported rather than guessed at.
+/// Is every parenthesis in `s` closed in order?
+fn balanced(s: &str) -> bool {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// The sole argument of `name(...)`, when the whole expression is that one call.
+fn single_arg<'a>(e: &'a str, name: &str) -> Option<&'a str> {
+    let rest = e.strip_prefix(name)?.trim_start();
+    let inner = rest.strip_prefix('(')?.strip_suffix(')')?;
+    (balanced(inner) && !inner.contains(',')).then_some(inner)
+}
+
+/// Translate one mapper output expression to SQL, or `None` when it needs a human.
+///
+/// Only forms with a single faithful SQL reading are translated. Arithmetic, branching
+/// and anything whose index base is not established stay reported: guessing one of those
+/// wrong produces a silently wrong number instead of a failure.
+fn java_expr_to_sql(expr: &str) -> Option<String> {
+    let e = expr.trim();
+    if e.is_empty() {
+        return None;
+    }
+    if e == "null" {
+        return Some("NULL".to_string());
+    }
+    if let Some(inner) = e.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        // An escape would need Java's rules, so leave those to a human.
+        if !inner.contains('"') && !inner.contains('\\') {
+            return Some(format!("'{}'", inner.replace('\'', "''")));
+        }
+    }
+    if let Some(inner) = e.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        if balanced(inner) {
+            return java_expr_to_sql(inner);
+        }
+    }
+    if let Some(head) = e.strip_suffix(".toString()") {
+        return java_expr_to_sql(head);
+    }
+    if let Some(arg) = single_arg(e, "Double.valueOf") {
+        return Some(format!("TRY_CAST({} AS DOUBLE)", java_expr_to_sql(arg)?));
+    }
+    if let Some(arg) = single_arg(e, "new BigDecimal") {
+        // Only the double-valued form. `new BigDecimal("0")` is an exact decimal, and
+        // `new BigDecimal(column)` keeps that column's own scale; both would be a guess.
+        return single_arg(arg.trim(), "Double.valueOf")
+            .is_some()
+            .then(|| java_expr_to_sql(arg))
+            .flatten();
+    }
+    if let Some(arg) = single_arg(e, "StringHandling.TRIM") {
+        return Some(format!("trim({})", java_expr_to_sql(arg)?));
+    }
+    // `Table.Column`, the only bare form that reads one way.
+    let (table, column) = e.split_once('.')?;
+    let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_');
+    (ident(table) && ident(column)).then(|| column.to_string())
+}
+
+/// Translate mapper output expressions. Anything without one faithful SQL reading is
+/// reported rather than guessed at.
 fn mapper_expressions(raw: &RawNode, warnings: &mut Vec<Warning>) -> JsonValue {
     let mut out = JsonMap::new();
     for (col, expr) in &raw.mapper_out {
@@ -739,16 +811,7 @@ fn mapper_expressions(raw: &RawNode, warnings: &mut Vec<Warning>) -> JsonValue {
         if e.is_empty() {
             continue;
         }
-        let simple = e
-            .split_once('.')
-            .filter(|(t, c)| {
-                !t.is_empty()
-                    && !c.is_empty()
-                    && t.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-                    && c.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-            })
-            .map(|(_, c)| c.to_string());
-        match simple {
+        match java_expr_to_sql(e) {
             Some(c) => {
                 out.insert(col.clone(), JsonValue::String(c));
             }
@@ -1623,6 +1686,52 @@ mod tests {
         );
         println!("  unmapped kinds  : {unmapped:?}");
         assert_eq!(failed, 0, "every job in the corpus must at least parse");
+    }
+
+    #[test]
+    fn plain_mapper_expressions_become_sql() {
+        // Measured on a real corpus: 278 mapper expressions were reported as needing a
+        // human, and the largest groups are a literal, a null, or a cast. Those have one
+        // faithful SQL form each, so reporting them buries the ones that genuinely need
+        // judgement.
+        let sql = |e: &str| java_expr_to_sql(e);
+        assert_eq!(sql("null").as_deref(), Some("NULL"));
+        assert_eq!(sql(r#""""#).as_deref(), Some("''"));
+        assert_eq!(sql(r#""S""#).as_deref(), Some("'S'"));
+        assert_eq!(sql("row1.AMOUNT").as_deref(), Some("AMOUNT"));
+        assert_eq!(sql("row1.SPARE.toString()").as_deref(), Some("SPARE"));
+        assert_eq!(sql("StringHandling.TRIM(row1.NAME)").as_deref(), Some("trim(NAME)"));
+        // new BigDecimal(Double.valueOf(x)) goes through a double in Java, so DOUBLE is
+        // the faithful intermediate rather than a guess at a decimal scale.
+        assert_eq!(
+            sql("new BigDecimal(Double.valueOf(Var.RATE))").as_deref(),
+            Some("TRY_CAST(RATE AS DOUBLE)")
+        );
+        assert_eq!(
+            sql("new BigDecimal(Double.valueOf((Var.RATE)))").as_deref(),
+            Some("TRY_CAST(RATE AS DOUBLE)")
+        );
+    }
+
+    #[test]
+    fn a_mapper_expression_needing_judgement_is_still_reported() {
+        // The point of translating the easy ones is that what remains is worth reading.
+        // Anything with branching, arithmetic or an unverified index must keep warning:
+        // guessing one of these wrong is a silent wrong number, not a failure.
+        let sql = |e: &str| java_expr_to_sql(e);
+        assert_eq!(sql("jobName"), None, "a bare identifier is not a column");
+        assert_eq!(sql(r#"new BigDecimal("0")"#), None, "exact decimal, not a double");
+        assert_eq!(sql("new BigDecimal(Var.ID)"), None, "exact decimal, not a double");
+        assert_eq!(sql("row6.A.subtract(row6.B)"), None, "arithmetic");
+        assert_eq!(sql("row6.A.negate()"), None, "arithmetic");
+        assert_eq!(sql(r#"a.equals("1")?"I":"O""#), None, "branching");
+        assert_eq!(
+            sql("StringHandling.SUBSTR(row1.CODE,1,4)"),
+            None,
+            "index base is not verified, so it must not be guessed"
+        );
+        assert_eq!(sql(r#"TalendDate.parseDate("ddMMyyyy",Var.D)"#), None);
+        assert_eq!(sql("f(a) + g(b)"), None, "not a single call");
     }
 
     #[test]
