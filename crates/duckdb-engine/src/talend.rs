@@ -819,6 +819,84 @@ fn java_body_only_prints(code: &str) -> bool {
             .all(|s| s.starts_with("System.out.print") || s.starts_with("System.err.print"))
 }
 
+/// Split a Java conditional `cond ? a : b` at its own `?` and matching `:`.
+///
+/// A chain is right-associative, so the matching colon is the one that balances the
+/// question marks after it rather than simply the next one.
+fn split_ternary(e: &str) -> Option<(&str, &str, &str)> {
+    let bytes = e.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut q = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'"' => in_string = !in_string,
+            _ if in_string => {}
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'?' if depth == 0 => {
+                q = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let q = q?;
+    let (mut depth, mut pending, mut in_string) = (0i32, 0i32, false);
+    for (i, &c) in bytes.iter().enumerate().skip(q + 1) {
+        match c {
+            b'"' => in_string = !in_string,
+            _ if in_string => {}
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'?' if depth == 0 => pending += 1,
+            b':' if depth == 0 => {
+                if pending == 0 {
+                    return Some((&e[..q], &e[q + 1..i], &e[i + 1..]));
+                }
+                pending -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Translate a Java boolean to SQL. Only equality is read: an ordering would need its
+/// sign checked against the comparison's contract, which is a guess we do not make.
+fn java_condition_to_sql(cond: &str) -> Option<String> {
+    let c = cond.trim();
+    if let Some(inner) = c.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        if balanced(inner) {
+            return java_condition_to_sql(inner);
+        }
+    }
+    for (token, op) in [("==", "="), ("!=", "<>")] {
+        let Some((lhs, rhs)) = c.split_once(token) else { continue };
+        if !rhs.trim().eq("0") {
+            continue;
+        }
+        let (recv, args) = method_call(lhs.trim(), "compareTo")?;
+        if args.len() != 1 {
+            return None;
+        }
+        return Some(format!(
+            "{} {op} {}",
+            java_expr_to_sql(recv)?,
+            java_expr_to_sql(args[0])?
+        ));
+    }
+    let (recv, args) = method_call(c, "equals")?;
+    if args.len() != 1 {
+        return None;
+    }
+    Some(format!(
+        "{} = {}",
+        java_expr_to_sql(recv)?,
+        java_expr_to_sql(args[0])?
+    ))
+}
+
 /// An optionally signed decimal number, written out in full.
 fn is_number(s: &str) -> bool {
     let t = s.strip_prefix('-').unwrap_or(s);
@@ -864,8 +942,23 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
     if e == "null" {
         return Some("NULL".to_string());
     }
+    if e == "BigDecimal.ZERO" {
+        return Some("0".to_string());
+    }
+    if e == "BigDecimal.ONE" {
+        return Some("1".to_string());
+    }
     if is_number(e) {
         return Some(e.to_string());
+    }
+    // A choice reads as a CASE, and a chain of them nests.
+    if let Some((cond, yes, no)) = split_ternary(e) {
+        return Some(format!(
+            "CASE WHEN {} THEN {} ELSE {} END",
+            java_condition_to_sql(cond)?,
+            java_expr_to_sql(yes)?,
+            java_expr_to_sql(no)?
+        ));
     }
     if let Some(inner) = e.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         // An escape would need Java's rules, so leave those to a human.
@@ -931,15 +1024,19 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
     if let Some(recv) = e.strip_suffix(".negate()") {
         return Some(format!("-({})", java_expr_to_sql(recv)?));
     }
-    if let Some((recv, args)) = method_call(e, "multiply") {
-        if args.len() == 1 {
-            return Some(format!(
-                "({}) * ({})",
-                java_expr_to_sql(recv)?,
-                java_expr_to_sql(args[0])?
-            ));
+    for (name, op) in [("multiply", "*"), ("subtract", "-"), ("add", "+")] {
+        let Some((recv, args)) = method_call(e, name) else { continue };
+        if args.len() != 1 {
+            return None;
         }
-        return None;
+        return Some(format!(
+            "({}) {op} ({})",
+            java_expr_to_sql(recv)?,
+            java_expr_to_sql(args[0])?
+        ));
+    }
+    if let Some(arg) = single_arg(e, "String.valueOf") {
+        return Some(format!("CAST({} AS VARCHAR)", java_expr_to_sql(arg)?));
     }
     // `Table.Column`, the only bare form that reads one way.
     let (table, column) = e.split_once('.')?;
@@ -1945,6 +2042,47 @@ mod tests {
     }
 
     #[test]
+    fn a_choice_becomes_a_case_expression() {
+        let sql = |e: &str| java_expr_to_sql(e);
+        // compareTo(x) == 0 is numeric equality ignoring scale, which is what SQL = does.
+        assert_eq!(
+            sql(r#"row6.PCT.compareTo(new BigDecimal("100")) == 0 ? row6.A : row6.B"#).as_deref(),
+            Some("CASE WHEN PCT = 100 THEN A ELSE B END")
+        );
+        assert_eq!(
+            sql(r#"row7.PCT.compareTo(BigDecimal.ZERO) == 0? new BigDecimal("0.00"): row7.A"#).as_deref(),
+            Some("CASE WHEN PCT = 0 THEN 0.00 ELSE A END")
+        );
+        // equals on a string is the same comparison, and a chain nests
+        assert_eq!(
+            sql(r#"m.d.equals("1")?"I":m.d.equals("2")?"O":"P""#).as_deref(),
+            Some("CASE WHEN d = '1' THEN 'I' ELSE CASE WHEN d = '2' THEN 'O' ELSE 'P' END END")
+        );
+        // subtract, and a choice nested inside one
+        assert_eq!(sql("row6.A.subtract(row6.B)").as_deref(), Some("(A) - (B)"));
+        assert_eq!(
+            sql(r#"row6.T.subtract(row6.PCT.compareTo(new BigDecimal("100")) == 0 ? row6.A : row6.B)"#).as_deref(),
+            Some("(T) - (CASE WHEN PCT = 100 THEN A ELSE B END)")
+        );
+        assert_eq!(
+            sql("String.valueOf(row6.A)").as_deref(),
+            Some("CAST(A AS VARCHAR)")
+        );
+    }
+
+    #[test]
+    fn a_choice_we_cannot_read_is_still_reported() {
+        let sql = |e: &str| java_expr_to_sql(e);
+        assert_eq!(sql("a ? b : c"), None, "operands are not readable");
+        assert_eq!(
+            sql("row6.PCT.compareTo(row6.X) > 0 ? row6.A : row6.B"),
+            None,
+            "only equality is translated; an ordering needs its sign checked"
+        );
+        assert_eq!(sql("row6.A.compareTo(row6.B) == 1"), None, "not a boolean shape");
+    }
+
+    #[test]
     fn numeric_literals_and_exact_decimals_become_sql() {
         let sql = |e: &str| java_expr_to_sql(e);
         // A bare number is a number.
@@ -1981,9 +2119,12 @@ mod tests {
         let sql = |e: &str| java_expr_to_sql(e);
         assert_eq!(sql("jobName"), None, "a bare identifier is not a column");
         assert_eq!(sql("new BigDecimal(Var.ID)"), None, "exact decimal, not a double");
-        assert_eq!(sql("row6.A.subtract(row6.B)"), None, "arithmetic");
         assert_eq!(sql("new BigDecimal(row1.AMT)"), None, "exact decimal or double, unrecorded");
-        assert_eq!(sql(r#"a.equals("1")?"I":"O""#), None, "branching");
+        assert_eq!(
+            sql(r#"a.equals("1")?"I":"O""#),
+            None,
+            "the choice reads, but a bare `a` is not a column"
+        );
         assert_eq!(sql(r#"TalendDate.parseDate("ddMMyyyy",Var.D)"#), None);
         assert_eq!(sql("f(a) + g(b)"), None, "not a single call");
     }
