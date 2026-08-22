@@ -1160,7 +1160,10 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
             edge_type: None,
             data: Some(EdgeData {
                 connection_type: connection_type_for(c.connector.as_deref()).into(),
-                label: None,
+                // A component with several outputs names each port, and every one of them
+                // is row-carrying, so every one types as main. Keep the name or three
+                // different outputs arrive as three identical edges.
+                label: c.connector.as_deref().and_then(named_port),
                 condition: None,
             }),
         })
@@ -1379,6 +1382,30 @@ fn extract_loop_bodies(
 /// this", so they import as `on-subjob-ok`: the ordering survives and the
 /// parallelism does not, which is the honest half to keep. An unrecognised
 /// name stays `main` rather than becoming a trigger nobody asked for.
+/// The port's own name, when the connector carries one rather than a link type.
+///
+/// `FLOW` and `MAIN` are the ordinary single output and say nothing worth showing. The
+/// rest of the recognised names become a connection type, which already carries their
+/// meaning. A name like `OUTPUT_2` or `UNIQUE` is the one thing telling two row links out
+/// of the same component apart.
+fn named_port(connector: &str) -> Option<String> {
+    let upper = connector.to_ascii_uppercase();
+    let is_link_type = matches!(
+        upper.as_str(),
+        "FLOW"
+            | "MAIN"
+            | "ITERATE"
+            | "RUN_IF"
+            | "SUBJOB_OK"
+            | "SUBJOB_ERROR"
+            | "COMPONENT_OK"
+            | "COMPONENT_ERROR"
+            | "PARALLELIZE"
+            | "SYNCHRONIZE"
+    );
+    (!is_link_type && !connector.trim().is_empty()).then(|| connector.to_string())
+}
+
 fn connection_type_for(connector: Option<&str>) -> &'static str {
     match connector.unwrap_or("").to_ascii_uppercase().as_str() {
         "ITERATE" => "iterate",
@@ -2130,6 +2157,69 @@ mod tests {
         );
         assert_eq!(sql(r#"TalendDate.parseDate("ddMMyyyy",Var.D)"#), None);
         assert_eq!(sql("f(a) + g(b)"), None, "not a single call");
+    }
+
+    #[test]
+    fn a_named_output_port_keeps_its_name() {
+        // A body with several outputs links each one under its own port name. All of them
+        // are row-carrying, so all of them type as main, and without the name three
+        // different outputs arrive as three identical edges.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="200" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="200" posY="80">
+            <elementParameter name="UNIQUE_NAME" value="out_2"/>
+            <elementParameter name="FILENAME" value="&quot;/data/b.csv&quot;"/>
+          </node>
+          <connection connectorName="OUTPUT_1" source="in_1" target="out_1"/>
+          <connection connectorName="OUTPUT_2" source="in_1" target="out_2"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+
+        let label = |t: &str| {
+            im.edges
+                .iter()
+                .find(|e| e.target == t)
+                .and_then(|e| e.data.as_ref())
+                .and_then(|d| d.label.clone())
+        };
+        assert_eq!(label("out_1").as_deref(), Some("OUTPUT_1"));
+        assert_eq!(label("out_2").as_deref(), Some("OUTPUT_2"));
+
+        // a port that already has a meaning is not relabelled with its own type
+        let plain = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="200" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="out_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(plain, "j").unwrap();
+        assert_eq!(
+            im.edges[0].data.as_ref().and_then(|d| d.label.clone()),
+            None,
+            "FLOW is the ordinary case and needs no label"
+        );
+        assert_eq!(
+            named_port("MAIN"),
+            None,
+            "MAIN is the ordinary row link too, and labelling it is noise"
+        );
+        assert_eq!(
+            named_port("UNIQUE").as_deref(),
+            Some("UNIQUE"),
+            "but a port that says which of two row outputs this is must be kept"
+        );
     }
 
     #[test]
