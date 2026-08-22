@@ -3679,8 +3679,8 @@ impl DuckdbEngine {
         db: &Path,
         spec: &plan::AdbcSourceSpec,
     ) -> Result<String, EngineError> {
+        use adbc_driver_manager::ManagedDriver;
         use adbc_core::{
-            driver_manager::ManagedDriver,
             options::{AdbcVersion, OptionDatabase, OptionValue},
             Connection, Database, Driver, Statement,
         };
@@ -3851,8 +3851,8 @@ impl DuckdbEngine {
         db: &Path,
         spec: &plan::AdbcSinkSpec,
     ) -> Result<String, EngineError> {
+        use adbc_driver_manager::ManagedDriver;
         use adbc_core::{
-            driver_manager::ManagedDriver,
             options::{AdbcVersion, IngestMode, OptionDatabase, OptionStatement, OptionValue},
             Connection, Database, Driver, Optionable, Statement,
         };

@@ -180,7 +180,8 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 # workspace arrow/parquet pins so the driver's RecordBatch and the parquet
 # writer share one arrow version. The driver .dll/.so/.dylib is bundled
 # per-OS (conda-forge) and located at runtime; absent driver -> clear error.
-adbc_core = { version = "0.16", features = ["driver_manager"] }
+adbc_core = "0.24"
+adbc_driver_manager = "0.24"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 parquet = { workspace = true }
@@ -191,8 +192,8 @@ parquet = { workspace = true }
 # build against chrono >= 0.4.42, which russh-sftp pins us above). arrow-flight 53
 # unifies with the workspace arrow pins; do_get RecordBatches stream to a Parquet
 # temp file + materialize via DuckDB read_parquet, like the ADBC source.
-arrow-flight = { version = "53", features = ["tls"] }
-tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+arrow-flight = "59"
+tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-native-roots"] }
 prost = "0.13"
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 
