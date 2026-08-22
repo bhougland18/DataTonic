@@ -748,11 +748,35 @@ fn balanced(s: &str) -> bool {
     depth == 0
 }
 
-/// The sole argument of `name(...)`, when the whole expression is that one call.
-fn single_arg<'a>(e: &'a str, name: &str) -> Option<&'a str> {
+/// The arguments of `name(...)`, split on top-level commas, when the whole expression is
+/// that one call.
+fn call_args<'a>(e: &'a str, name: &str) -> Option<Vec<&'a str>> {
     let rest = e.strip_prefix(name)?.trim_start();
     let inner = rest.strip_prefix('(')?.strip_suffix(')')?;
-    (balanced(inner) && !inner.contains(',')).then_some(inner)
+    if !balanced(inner) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (i, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&inner[start..]);
+    Some(out)
+}
+
+/// The sole argument of `name(...)`, when the whole expression is that one call.
+fn single_arg<'a>(e: &'a str, name: &str) -> Option<&'a str> {
+    let args = call_args(e, name)?;
+    (args.len() == 1).then(|| args[0])
 }
 
 /// Translate one mapper output expression to SQL, or `None` when it needs a human.
@@ -795,6 +819,29 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
     }
     if let Some(arg) = single_arg(e, "StringHandling.TRIM") {
         return Some(format!("trim({})", java_expr_to_sql(arg)?));
+    }
+    // The character helpers. SUBSTR takes a start and a length counted from 1, the same
+    // as SQL, rather than Java's begin/end: a reference migration of this dialect renders
+    // it verbatim as SUBSTR and its output matches the SQL reading on every row. The
+    // counts must be plain integers, since a computed one would be a Java expression.
+    for (name, sql_fn, arity) in [
+        ("StringHandling.LEFT", "left", 2),
+        ("StringHandling.RIGHT", "right", 2),
+        ("StringHandling.SUBSTR", "substr", 3),
+    ] {
+        let Some(args) = call_args(e, name) else { continue };
+        if args.len() != arity {
+            return None;
+        }
+        let subject = java_expr_to_sql(args[0])?;
+        let counts = args[1..]
+            .iter()
+            .map(|a| {
+                let t = a.trim();
+                (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())).then_some(t)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some(format!("{sql_fn}({subject}, {})", counts.join(", ")));
     }
     // `Table.Column`, the only bare form that reads one way.
     let (table, column) = e.split_once('.')?;
@@ -1714,6 +1761,39 @@ mod tests {
     }
 
     #[test]
+    fn the_string_helpers_become_their_sql_equivalents() {
+        let sql = |e: &str| java_expr_to_sql(e);
+        assert_eq!(sql("StringHandling.LEFT(row1.NID,2)").as_deref(), Some("left(NID, 2)"));
+        assert_eq!(sql("StringHandling.RIGHT(row1.NID,2)").as_deref(), Some("right(NID, 2)"));
+        // SUBSTR takes a start and a length from 1, matching SQL, rather than Java's
+        // begin/end. Confirmed against a reference migration that renders it verbatim
+        // as SUBSTR and whose output matches the SQL reading on every row.
+        assert_eq!(
+            sql("StringHandling.SUBSTR(row1.CODE,1,4)").as_deref(),
+            Some("substr(CODE, 1, 4)")
+        );
+        // and they compose with the cast, which is how they appear in practice
+        assert_eq!(
+            sql("new BigDecimal(Double.valueOf(StringHandling.LEFT(Var.D,4)))").as_deref(),
+            Some("TRY_CAST(left(D, 4) AS DOUBLE)")
+        );
+        assert_eq!(
+            sql("new BigDecimal(Double.valueOf(StringHandling.RIGHT(StringHandling.LEFT(Var.D,6),2)))").as_deref(),
+            Some("TRY_CAST(right(left(D, 6), 2) AS DOUBLE)")
+        );
+    }
+
+    #[test]
+    fn a_string_helper_with_a_computed_length_is_still_reported() {
+        // The count argument has to be a plain integer. Anything else could be a Java
+        // expression whose value we would be guessing at.
+        let sql = |e: &str| java_expr_to_sql(e);
+        assert_eq!(sql("StringHandling.LEFT(row1.NID,row1.N)"), None);
+        assert_eq!(sql("StringHandling.LEFT(row1.NID)"), None, "wrong arity");
+        assert_eq!(sql("StringHandling.SUBSTR(row1.CODE,1)"), None, "wrong arity");
+    }
+
+    #[test]
     fn a_mapper_expression_needing_judgement_is_still_reported() {
         // The point of translating the easy ones is that what remains is worth reading.
         // Anything with branching, arithmetic or an unverified index must keep warning:
@@ -1725,11 +1805,6 @@ mod tests {
         assert_eq!(sql("row6.A.subtract(row6.B)"), None, "arithmetic");
         assert_eq!(sql("row6.A.negate()"), None, "arithmetic");
         assert_eq!(sql(r#"a.equals("1")?"I":"O""#), None, "branching");
-        assert_eq!(
-            sql("StringHandling.SUBSTR(row1.CODE,1,4)"),
-            None,
-            "index base is not verified, so it must not be guessed"
-        );
         assert_eq!(sql(r#"TalendDate.parseDate("ddMMyyyy",Var.D)"#), None);
         assert_eq!(sql("f(a) + g(b)"), None, "not a single call");
     }
