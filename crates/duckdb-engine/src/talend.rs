@@ -1434,7 +1434,10 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>
                     })
                 };
                 match tag.as_str() {
-                    "node" => {
+                    // A joblet writes its boundary ports as `jobletNodes`. They carry a
+                    // component and a name like any other node and connections reference
+                    // them, so reading only `node` drops the port and the link with it.
+                    "node" | "jobletNodes" => {
                         if let Some(done) = cur.take() {
                             nodes.push(done);
                         }
@@ -1531,7 +1534,7 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>
             }
             Event::End(ref e) => {
                 let name = e.local_name();
-                if name.as_ref() == b"node" {
+                if name.as_ref() == b"node" || name.as_ref() == b"jobletNodes" {
                     if let Some(done) = cur.take() {
                         nodes.push(done);
                     }
@@ -2127,6 +2130,40 @@ mod tests {
         );
         assert_eq!(sql(r#"TalendDate.parseDate("ddMMyyyy",Var.D)"#), None);
         assert_eq!(sql("f(a) + g(b)"), None, "not a single call");
+    }
+
+    #[test]
+    fn a_joblets_boundary_port_is_kept() {
+        // A joblet writes its ports as <jobletNodes>, not <node>. Reading only <node>
+        // dropped the port, and with it the link into the first component, which then
+        // failed as "missing main input" and named the wrong node.
+        let xml = r#"<xmi:XMI xmlns:xmi="x" xmlns:model="y">
+          <model:JobletProcess>
+            <jobletNodes componentName="INPUT" posX="10" posY="10">
+              <elementParameter name="UNIQUE_NAME" value="INPUT_1"/>
+            </jobletNodes>
+            <node componentName="tFileOutputDelimited" posX="100" posY="10">
+              <elementParameter name="UNIQUE_NAME" value="out_1"/>
+              <elementParameter name="FILENAME" value="&quot;/data/out.csv&quot;"/>
+            </node>
+            <connection connectorName="FLOW" source="INPUT_1" target="out_1"/>
+          </model:JobletProcess>
+        </xmi:XMI>"#;
+        let im = import_item(xml, "body").unwrap();
+
+        assert!(
+            im.nodes.iter().any(|n| n.id == "INPUT_1"),
+            "the port must survive, got {:?}",
+            im.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+        assert_eq!(im.edges.len(), 1, "and so must the link it carries");
+        assert!(
+            im.warnings.iter().any(|w| matches!(
+                w,
+                Warning::UnmappedComponent { component, .. } if component == "INPUT"
+            )),
+            "a port Duckle cannot yet drive has to be reported, not dropped"
+        );
     }
 
     #[test]
