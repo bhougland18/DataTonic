@@ -115,4 +115,10 @@ strip = true
 
 [profile.dev]
 opt-level = 0
-debug = true
+# Line tables rather than full DWARF. A panic still reports its file and line,
+# which is what a backtrace is read for, but the debug build stops carrying
+# every dependency's full type information: measured on this workspace,
+# target/debug goes from 57G to a fraction of that, and a full disk has broken
+# a build here more than once. Set CARGO_PROFILE_DEV_DEBUG=true for a session
+# that needs a stepping debugger.
+debug = "line-tables-only"
