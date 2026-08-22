@@ -10709,7 +10709,16 @@ impl DuckdbEngine {
         // it reaches the engine, but a child read raw from disk here is not, so
         // its context placeholders would otherwise pass through literally. Per-
         // row ITER substitutions win on any key collision.
-        content = substitute_into_child(&content, subs);
+        // What this job was handed flows on to whatever it runs, so a value named by a
+        // caller still reaches a body lifted out further down. The call's own variables
+        // win on a collision, since they are the more specific of the two.
+        let merged: std::collections::HashMap<String, String> = {
+            let inherited = self.inherited_subs.lock().unwrap_or_else(|e| e.into_inner());
+            inherited.iter().map(|(k, v)| (k.clone(), v.clone())).chain(
+                subs.iter().map(|(k, v)| (k.clone(), v.clone()))
+            ).collect()
+        };
+        content = substitute_into_child(&content, &merged);
         let sub_doc: plan::PipelineDoc = serde_json::from_str(&content).map_err(|e| {
             EngineError::Config(format!("sub-pipeline: parse '{}': {}", path, e))
         })?;
@@ -10727,10 +10736,19 @@ impl DuckdbEngine {
         // at - keying on ITER_INDEX would tie a watermark to a row's position
         // in the driving query, which changes when that query is reordered.
         let child_name = child_run_name(&resolved, item);
+        // In scope only for this child's own run, so a sibling call does not inherit it.
+        let previous = {
+            let mut slot = self.inherited_subs.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *slot, merged)
+        };
         let result = match &child_name {
             Some(name) => self.execute_pipeline_named(&sub_doc, name),
             None => self.execute_pipeline(&sub_doc),
         };
+        {
+            let mut slot = self.inherited_subs.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = previous;
+        }
         if result.status == "ok" {
             Ok(())
         } else {

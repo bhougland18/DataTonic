@@ -120,6 +120,13 @@ pub struct DuckdbEngine {
     cancel: Arc<AtomicBool>,
     /// Whether per-node preview rows are wanted. See [`DuckdbEngine::without_previews`].
     previews: bool,
+    /// Substitutions a job passes to everything it runs, however deep.
+    ///
+    /// A job's return file is named by whoever called it, but the rows may be written from
+    /// a body lifted out of that job, which is one hop further down. Ordinary context
+    /// variables reach the child only, so a value that has to survive the whole descent
+    /// travels here instead.
+    pub(crate) inherited_subs: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for DuckdbEngine {
@@ -138,6 +145,7 @@ impl DuckdbEngine {
         Self {
             previews: true,
             bin,
+            inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             cancel: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -167,6 +175,9 @@ impl DuckdbEngine {
             bin: self.bin.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             previews: self.previews,
+            // A new top-level run inherits nothing: what a previous run handed down
+            // belonged to that run's call chain.
+            inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 

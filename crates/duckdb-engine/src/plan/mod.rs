@@ -2876,10 +2876,46 @@ fn build_stage(
         if vars.is_empty() {
             vars = kv_pairs(&props, "parameters");
         }
+        // A child normally hands nothing back. When the parent says it wants the child's
+        // rows, both sides agree on a handoff file: the parent names it, passes it down as
+        // ${DUCKLE_RETURN} like any other context variable, and reads it once the child has
+        // run. The process id keeps two concurrent runs of one pipeline apart.
+        let returns_rows = props
+            .get("returnsRows")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let handoff = returns_rows.then(|| {
+            let safe: String = node
+                .id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            // A counter as well as the process id: two runs of one pipeline in the same
+            // process share a node id and would otherwise race on the same file.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::env::temp_dir()
+                .join(format!(
+                    "duckle-return-{}-{}-{}.parquet",
+                    std::process::id(),
+                    seq,
+                    safe
+                ))
+                .to_string_lossy()
+                .replace('\\', "/")
+        });
+        if let Some(file) = &handoff {
+            vars.push(("DUCKLE_RETURN".to_string(), file.clone()));
+        }
         run_job = Some((path, vars));
-        let sql = match inputs.main() {
-            Some(from_view) => passthrough_view_sql(&node.id, from_view),
-            None => passthrough_placeholder_sql(&node.id, "triggered"),
+        let sql = match (&handoff, inputs.main()) {
+            (Some(file), _) => format!(
+                "CREATE OR REPLACE VIEW {} AS SELECT * FROM read_parquet('{}')",
+                quote_ident(&node.id),
+                file.replace('\'', "''")
+            ),
+            (None, Some(from_view)) => passthrough_view_sql(&node.id, from_view),
+            (None, None) => passthrough_placeholder_sql(&node.id, "triggered"),
         };
         (sql, StageKind::View, None)
     } else if component_id == "ctl.parallelize" {

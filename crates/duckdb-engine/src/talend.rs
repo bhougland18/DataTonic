@@ -270,6 +270,9 @@ fn static_map(component: &str) -> Option<(&'static str, &'static str)> {
         // omits the rules, which is the worst outcome available: the shape looks
         // migrated and the numbers are wrong.
         "tJava" | "tJavaRow" => ("code.sql", "transform"),
+        // A buffer exists to hand rows to whoever called this job, so it writes the file
+        // the caller reads rather than a destination of its own.
+        "tBufferOutput" => ("snk.parquet", "sink"),
         // Duckle already speaks Snowflake; these were arriving as placeholders
         // only because their configuration is in the tcomp PROPERTIES blob.
         "tSnowflakeInput" => ("src.snowflake", "source"),
@@ -415,6 +418,10 @@ fn properties_for(
 ) -> JsonMap<String, JsonValue> {
     let mut props = JsonMap::new();
     match component_id {
+        "snk.parquet" if raw.component == "tBufferOutput" => {
+            props.insert("path".into(), JsonValue::String(RETURN_FILE.into()));
+            props.insert("mode".into(), JsonValue::String("overwrite".into()));
+        }
         "code.sql" if raw.component.starts_with("tJava") => {
             let mut only_prints = false;
             // Keep the Java on the node so whoever writes the SQL can see what
@@ -753,7 +760,36 @@ fn properties_for(
 }
 
 
+/// The file a job writes its return rows to, and the calling job reads.
+///
+/// It travels to the child as an ordinary context substitution, so the child names it
+/// without knowing where the parent put it.
+pub const RETURN_FILE: &str = "${DUCKLE_RETURN}";
+
 impl Import {
+    /// Does this job hand rows back to whoever calls it?
+    ///
+    /// A lifted loop body counts: the rows still leave the job, just from further in.
+    pub fn returns_rows(&self) -> bool {
+        self.nodes.iter().any(|n| {
+            n.data
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("path"))
+                .and_then(|v| v.as_str())
+                == Some(RETURN_FILE)
+        }) || self.children.iter().any(Import::returns_rows)
+    }
+
+    /// Every node in this job and in the bodies lifted out of it.
+    pub fn all_nodes(&self) -> Vec<&PipelineNode> {
+        let mut out: Vec<&PipelineNode> = self.nodes.iter().collect();
+        for c in &self.children {
+            out.extend(c.all_nodes());
+        }
+        out
+    }
+
     /// A reusable body a job calls into, rather than a job of its own.
     ///
     /// Its ports are wiring, not work, so it is meant to be spliced into its callers and
@@ -1312,6 +1348,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
 
     // A child pipeline is handed no rows and returns none, so a row link leaving a call
     // is a data path the source tool had and this one does not.
+    let mut wants_rows: Vec<String> = Vec::new();
     for n in &nodes {
         if n.data.component_id.as_deref() != Some("ctl.runjob") {
             continue;
@@ -1321,13 +1358,22 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
                 && e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("main")
         });
         if returns_rows {
-            warnings.push(Warning::ChildReturnsRows { node: n.id.clone() });
+            wants_rows.push(n.id.clone());
+        }
+    }
+
+    let mut nodes = nodes;
+    for id in &wants_rows {
+        if let Some(n) = nodes.iter_mut().find(|n| &n.id == id) {
+            let props = n.data.properties.get_or_insert_with(|| JsonValue::Object(JsonMap::new()));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("returnsRows".into(), JsonValue::Bool(true));
+            }
         }
     }
 
     // A loop's body is inline in the source job; Duckle runs a child pipeline by
     // reference, so lift each body out and point its loop at the new file.
-    let mut nodes = nodes;
     let mut edges = edges;
     let mut warnings = warnings;
     let children = extract_loop_bodies(job_name, &mut nodes, &mut edges, &mut warnings);
@@ -2357,10 +2403,38 @@ mod tests {
     }
 
     #[test]
-    fn a_call_that_hands_rows_back_is_reported() {
-        // A child pipeline runs for its side effects, so it cannot return rows. A call
-        // with a row link leaving it did return them in the source tool, and the node
-        // would quietly stand in an empty relation instead.
+    fn a_buffer_returns_its_rows_to_the_calling_job() {
+        // A buffer exists to hand rows to whoever called this job. It becomes the return
+        // sink, and the caller reads the same file.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tBufferOutput" posX="200" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="buf_1"/>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="buf_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "child").unwrap();
+        let buf = im.nodes.iter().find(|n| n.id == "buf_1").expect("kept");
+        assert_eq!(buf.data.component_id.as_deref(), Some("snk.parquet"));
+        assert_eq!(
+            buf.data.properties.as_ref().and_then(|p| p.get("path")).and_then(|v| v.as_str()),
+            Some("${DUCKLE_RETURN}")
+        );
+        assert!(im.returns_rows(), "and the job says it returns rows");
+        assert!(
+            !im.warnings.iter().any(|w| matches!(
+                w, Warning::UnmappedComponent { component, .. } if component == "tBufferOutput"
+            )),
+            "it has an equivalent now: {:?}",
+            im.warnings
+        );
+    }
+
+    #[test]
+    fn a_call_that_wants_rows_says_so() {
         let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
           <node componentName="tRunJob" posX="10" posY="10">
             <elementParameter name="UNIQUE_NAME" value="call_1"/>
@@ -2373,13 +2447,30 @@ mod tests {
           <connection connectorName="FLOW" source="call_1" target="out_1"/>
         </talendfile:ProcessType>"#;
         let im = import_item(xml, "j").unwrap();
-        assert!(
-            im.warnings.iter().any(|w| matches!(
-                w, Warning::ChildReturnsRows { node } if node == "call_1"
-            )),
-            "got {:?}",
-            im.warnings
+        let call = im.nodes.iter().find(|n| n.id == "call_1").unwrap();
+        assert_eq!(
+            call.data.properties.as_ref().and_then(|p| p.get("returnsRows")).and_then(|v| v.as_bool()),
+            Some(true)
         );
+    }
+
+    #[test]
+    fn a_call_that_wants_rows_raises_nothing_on_its_own() {
+        // Reading one file cannot say whether the child returns rows: that needs the child.
+        // The call records what it wants and the bulk import checks the pair.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tRunJob" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="call_1"/>
+            <elementParameter name="PROCESS" value="CHILD"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="200" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="call_1" target="out_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert!(!im.warnings.iter().any(|w| matches!(w, Warning::ChildReturnsRows { .. })));
     }
 
     #[test]

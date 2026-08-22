@@ -11417,6 +11417,102 @@ fn runjob_passes_context_vars_to_child() {
 }
 
 #[test]
+fn runjob_reads_the_rows_its_child_returns() {
+    // A child normally runs for its side effects and hands nothing back, so a parent that
+    // wanted the child's rows got an empty relation. With returnsRows the parent names a
+    // handoff file, passes it to the child as ${DUCKLE_RETURN}, and reads it afterwards.
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name
+1,alice
+2,bob
+3,carol
+");
+    let child_val = json!({
+        "nodes": [
+            node("cs", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("ck", "snk.parquet", json!({ "path": "${DUCKLE_RETURN}", "mode": "overwrite" })),
+        ],
+        "edges": [ main_edge("ce", "cs", "ck") ]
+    });
+    let child_path = write_file(
+        tmp.path(),
+        "child.json",
+        &serde_json::to_string(&child_val).unwrap(),
+    );
+
+    let engine = engine_or_skip!();
+    let out = out_path(tmp.path(), "parent_out.csv");
+    let parent = doc(
+        json!([
+            node(
+                "rj",
+                "ctl.runjob",
+                json!({ "pipelineRef": child_path, "returnsRows": true })
+            ),
+            node("snk", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "rj", "snk")]),
+    );
+    let result = engine.execute_pipeline(&parent);
+    assert_eq!(result.status, "ok", "runjob failed: {:?}", result.error);
+    assert!(Path::new(&out).exists(), "the parent wrote nothing");
+    assert_eq!(
+        count(&format!("read_csv_auto('{}')", out)),
+        3,
+        "the parent should see the three rows its child returned"
+    );
+}
+
+#[test]
+fn a_returned_row_path_reaches_a_grandchild() {
+    // The rows a job returns can be written from a body lifted out of it, so the return
+    // file has to survive one more hop than the direct case.
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name
+1,alice
+2,bob
+");
+    let grandchild = json!({
+        "nodes": [
+            node("gs", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("gk", "snk.parquet", json!({ "path": "${DUCKLE_RETURN}", "mode": "overwrite" })),
+        ],
+        "edges": [ main_edge("ge", "gs", "gk") ]
+    });
+    let gc_path = write_file(
+        tmp.path(),
+        "grandchild.json",
+        &serde_json::to_string(&grandchild).unwrap(),
+    );
+    let child = json!({
+        "nodes": [ node("cr", "ctl.runjob", json!({ "pipelineRef": gc_path })) ],
+        "edges": []
+    });
+    let child_path = write_file(
+        tmp.path(),
+        "child.json",
+        &serde_json::to_string(&child).unwrap(),
+    );
+
+    let engine = engine_or_skip!();
+    let out = out_path(tmp.path(), "grand_out.csv");
+    let parent = doc(
+        json!([
+            node("rj", "ctl.runjob", json!({ "pipelineRef": child_path, "returnsRows": true })),
+            node("snk", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "rj", "snk")]),
+    );
+    let result = engine.execute_pipeline(&parent);
+    assert_eq!(result.status, "ok", "runjob failed: {:?}", result.error);
+    assert_eq!(
+        count(&format!("read_csv_auto('{}')", out)),
+        2,
+        "the rows written by the grandchild should reach the parent"
+    );
+}
+
+#[test]
 fn runjob_resolves_bare_pipeline_id_via_workspace_env() {
     // A Run Job stored by the workspace picker carries a bare pipeline id
     // (not a path). Headless runs (scheduler) execute the saved file

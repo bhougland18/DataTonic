@@ -271,6 +271,43 @@ pub fn import_tree(src: &Path, out: &Path) -> Result<BulkReport, String> {
         }
     }
 
+    // A caller that wants its child's rows and a child that never writes any is a pair
+    // that only reads together: the caller would read a file nobody wrote. Neither file
+    // can see the problem on its own.
+    let converted: std::collections::HashSet<String> = parsed
+        .iter()
+        .filter_map(|(_, _, im)| im.as_ref())
+        .map(|im| format!("{}.json", im.name))
+        .collect();
+    let returning: std::collections::HashSet<String> = parsed
+        .iter()
+        .filter_map(|(_, _, im)| im.as_ref())
+        .filter(|im| im.returns_rows())
+        .map(|im| format!("{}.json", im.name))
+        .collect();
+    for (_, _, import) in parsed.iter_mut() {
+        let Some(import) = import.as_mut() else { continue };
+        let mismatched: Vec<String> = import
+            .all_nodes()
+            .into_iter()
+            .filter(|n| {
+                let Some(props) = n.data.properties.as_ref() else { return false };
+                if props.get("returnsRows").and_then(|v| v.as_bool()) != Some(true) {
+                    return false;
+                }
+                match props.get("pipelineRef").and_then(|v| v.as_str()) {
+                    // An unresolved reference is already reported as its own problem.
+                    Some(r) => converted.contains(r) && !returning.contains(r),
+                    None => false,
+                }
+            })
+            .map(|n| n.id.clone())
+            .collect();
+        for node in mismatched {
+            import.warnings.push(talend::Warning::ChildReturnsRows { node });
+        }
+    }
+
     for (rel, outcome, import) in parsed {
         match import {
             // A body that was spliced into its callers is not a pipeline of its own.
@@ -672,6 +709,40 @@ mod tests {
         assert!(
             out.path().join("BODY_0.2.json").exists(),
             "the second version must not overwrite the first"
+        );
+    }
+
+    #[test]
+    fn a_call_wanting_rows_from_a_child_that_returns_none_is_reported() {
+        // The pair is the only place this can be decided: the caller wants rows and the
+        // child never writes any, so the caller would read a file nobody wrote.
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write(
+            src.path(),
+            "PARENT_0.1.item",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<talendfile:ProcessType xmlns:talendfile="platform:/resource/org.talend.model/model/TalendFile.xsd">
+  <node componentName="tRunJob" posX="10" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="call_1"/>
+    <elementParameter name="PROCESS" value="CHILD"/>
+  </node>
+  <node componentName="tFileOutputDelimited" posX="200" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="out_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+  </node>
+  <connection connectorName="FLOW" source="call_1" target="out_1"/>
+</talendfile:ProcessType>
+"#,
+        );
+        write(src.path(), "CHILD_0.1.item", &job_xml("tSomethingOdd"));
+
+        let report = import_tree(src.path(), out.path()).unwrap();
+        let parent = report.jobs.iter().find(|j| j.name == "PARENT").unwrap();
+        assert!(
+            parent.warnings.iter().any(|w| w.contains("hands rows back")),
+            "got {:?}",
+            parent.warnings
         );
     }
 
