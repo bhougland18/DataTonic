@@ -595,13 +595,34 @@ routinely share a name and flattening would silently drop one. Files that are no
 routines, contexts, SQL templates - are reported separately rather than counted as
 conversions, and no empty pipeline is written for them.
 
+Reusable job bodies convert alongside jobs, and a job's children resolve to the files they
+became, so the master/child/joblet graph survives the move rather than arriving as a set of
+disconnected pipelines. A loop or iterate body is lifted into its own pipeline that the
+parent calls, which is why the file count comes out higher than the job count.
+
 The closing tally is the number to decide on. It says how many jobs came across clean, how
 many need a person, and which components have no equivalent yet, sorted by how often they
 appear. On a real 125-file corpus that list had a single entry, a site-specific custom
 component: coverage is the head of the distribution, so a corpus usually converts far
-better than a raw component count suggests. What remains is almost always credentials that
-were never in the job files - encrypted passwords become `${ENV:...}` placeholders and
-connections defined outside the job are named so you can point them at a saved connection.
+better than a raw component count suggests.
+
+What remains is credentials and Java. Credentials were never in the job files: encrypted
+passwords become `${ENV:...}` placeholders and connections defined outside the job are
+named so you can point them at a saved connection. Java is the part that needs a person,
+and the report separates it so you can see how much there is:
+
+- A mapper expression is translated when it has one faithful SQL reading: a literal, a
+  cast, a character function, a comparison, a choice, arithmetic. Anything whose meaning
+  depends on a Java type the job file does not record stays reported, because guessing
+  there produces a silently wrong number rather than a failure.
+- A Java body is never turned into something that compiles. It imports with no SQL and
+  fails, since a pipeline that runs while omitting the rules is worse than one that stops.
+  A body whose every statement is a print carries no rules and is called out separately, so
+  a long list sorts into what can be deleted and what has to be ported.
+
+A component with no equivalent is imported as a named placeholder and reported. That
+includes a job body's input and output ports: a child pipeline runs for its side effects,
+so it does not yet take rows from its caller or hand them back.
 
 ### Workspace catalog (what reads and writes what)
 
