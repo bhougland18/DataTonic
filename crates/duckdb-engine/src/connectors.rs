@@ -8657,9 +8657,10 @@ impl DuckdbEngine {
     > {
         let mut store = wasmi::Store::new(engine, ());
         let linker = wasmi::Linker::new(engine);
+        // 1.x folds the start function into instantiation rather than handing back a
+        // pre-instance to start separately.
         let instance = linker
-            .instantiate(&mut store, module)
-            .and_then(|p| p.start(&mut store))
+            .instantiate_and_start(&mut store, module)
             .map_err(|e| EngineError::Query(format!("wasm: instantiate: {}", e)))?;
         let memory = instance
             .get_memory(&store, "memory")

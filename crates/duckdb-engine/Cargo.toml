@@ -40,11 +40,11 @@ rustls-pemfile = "2"
 # supported and doesn't pull these in.
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # HMAC-SHA256 for AWS SigV4 signing in src.dynamodb (and any future
 # AWS services we add via direct HTTP). Avoids the aws-sdk-rust
 # dep tree (300+ services we don't need).
-hmac = "0.12"
+hmac = "0.13"
 base64 = "0.22"
 # MongoDB. The official driver is async-only; we use a minimal tokio
 # rt feature and call .block_on() from the synchronous executor.
@@ -142,7 +142,7 @@ arboard = { version = "3", default-features = false }
 # no cranelift - far smaller than wasmtime. Trade-off: slower
 # execution, but per-row ETL transforms aren't throughput-critical.
 # The wasm module runs in a sandbox - no fs, no network, no env vars.
-wasmi = "0.40"
+wasmi = "1.1"
 # Pure-Rust JavaScript engine for code.javascript. Boa is an
 # interpreter (no JIT), sandboxed by default - no DOM, no fetch, no
 # fs. The user supplies a transform(row) -> object function and the

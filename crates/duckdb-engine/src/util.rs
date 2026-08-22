@@ -778,7 +778,7 @@ pub(crate) fn aws_sigv4_sign(
     secret_access_key: &str,
     session_token: Option<&str>,
 ) -> SigV4Signed {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::{Digest, Sha256};
     type HmacSha256 = Hmac<Sha256>;
     fn hex(b: &[u8]) -> String {
