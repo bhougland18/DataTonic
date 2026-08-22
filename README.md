@@ -964,7 +964,7 @@ Database sinks support an optional **dead-letter (validate-before-insert)** step
 | **Checkpoint** | Pass rows through and also write a parquet snapshot to a path |
 | **Dead Letter Queue** | Terminal sink for rejected rows (JSON / CSV / Parquet) |
 | **Run Pipeline** | Inline-execute another pipeline file (`ctl.runpipeline`) |
-| **Run Job** | Call a child pipeline (picked from the workspace) passing parent context variables; chain several to build a Master Job (`ctl.runjob`) |
+| **Run Job** | Call a child pipeline (picked from the workspace) passing parent context variables; chain several to build a Master Job (`ctl.runjob`). The child runs for its side effects: it gets its own temporary database and its output is not composed back into the parent, so a child cannot yet return rows to its caller |
 | **Parallelize** | Run the downstream branches wired to its outputs concurrently; branches are unlimited (`ctl.parallelize`) |
 | **Iterate** | Run a sub-pipeline N times with `${ITER_INDEX}` substitution |
 | **For Each** | Run a sub-pipeline once per input row with `${ITER_ITEM_<FIELD>}` substitution; an optional item key column names each run so per-row watermarks stay separate |
