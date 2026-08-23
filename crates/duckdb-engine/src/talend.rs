@@ -171,6 +171,13 @@ struct RawNode {
 /// which silently drops exactly the settings worth importing - the
 /// authentication type, the grant type - while looking like it worked.
 fn tcomp_value(blob: &JsonValue, path: &str) -> Option<String> {
+    // A value stored here is a context reference just as often as a literal, so it gets
+    // the same rewrite a flat parameter does. Without it a connection's account and
+    // warehouse arrive as the literal text "context.…" and nothing can resolve them.
+    tcomp_stored(blob, path).map(|v| rewrite_context(&v).unwrap_or(v))
+}
+
+fn tcomp_stored(blob: &JsonValue, path: &str) -> Option<String> {
     let mut cur = blob;
     for seg in path.split('.') {
         cur = cur.get(seg)?;
@@ -361,6 +368,48 @@ fn rewrite_context(v: &str) -> Option<String> {
         if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Some(format!("${{{name}}}"));
         }
+    }
+    // A path or a query is usually assembled from context values and literals joined with
+    // +. It only reads one way when EVERY part is a literal or a context name; a row
+    // reference or a call means the value is computed and must not be guessed at.
+    if t.contains('+') {
+        let mut out = String::new();
+        let (mut depth, mut in_string, mut start) = (0i32, false, 0usize);
+        let mut parts: Vec<&str> = Vec::new();
+        for (i, c) in t.char_indices() {
+            match c {
+                '"' => in_string = !in_string,
+                _ if in_string => {}
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                '+' if depth == 0 => {
+                    parts.push(&t[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&t[start..]);
+        if parts.len() < 2 {
+            return None;
+        }
+        for part in parts {
+            let p = part.trim();
+            if let Some(lit) = p.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+                if lit.contains('"') || lit.contains('\\') {
+                    return None;
+                }
+                out.push_str(lit);
+            } else if let Some(name) = p.strip_prefix("context.") {
+                if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return None;
+                }
+                out.push_str(&format!("${{{name}}}"));
+            } else {
+                return None;
+            }
+        }
+        return Some(out);
     }
     None
 }
@@ -2559,6 +2608,48 @@ mod tests {
     fn splicing_a_body_that_is_not_called_is_an_error() {
         let (mut caller, body) = caller_and_body();
         assert!(inline_subflow(&mut caller, "nope_1", &body).is_err());
+    }
+
+    #[test]
+    fn a_path_built_by_concatenation_becomes_one_string() {
+        // A path or a query is usually assembled from context values and literals joined
+        // with +. Carried across verbatim it is Java, not a value, so the run has nothing
+        // to resolve. Every part being a literal or a context name makes it one string.
+        let j = |v: &str| rewrite_context(v);
+        assert_eq!(j(r#"context.Root+context.grp+"/""#).as_deref(), Some("${Root}${grp}/"));
+        assert_eq!(j(r#""/data/"+context.grp"#).as_deref(), Some("/data/${grp}"));
+        assert_eq!(j("context.A").as_deref(), Some("${A}"), "the bare form still works");
+        assert_eq!(
+            j(r#""SELECT * FROM "+context.Entry_tablename+" WHERE x=1""#).as_deref(),
+            Some("SELECT * FROM ${Entry_tablename} WHERE x=1")
+        );
+        // anything that is not a literal or a context name is left alone: a row reference
+        // or a call means the value is computed, and guessing it would be wrong
+        assert_eq!(j(r#""x"+row1.COL"#), None);
+        assert_eq!(j(r#"context.A.substring(1)"#), None);
+        assert_eq!(j(r#""a"+someMethod()"#), None);
+    }
+
+    #[test]
+    fn a_context_reference_in_the_tcomp_blob_resolves() {
+        // A component whose configuration lives in the tcomp blob carries its connection
+        // details as context references, exactly as a flat parameter does. Leaving them
+        // raw meant the account, warehouse and schema arrived as the literal text
+        // "context.connection_..." instead of a value the run could resolve.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tSnowflakeOutput" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="PROPERTIES" value="{&quot;connection&quot;:{&quot;account&quot;:{&quot;storedValue&quot;:&quot;context.conn_account&quot;},&quot;warehouse&quot;:{&quot;storedValue&quot;:&quot;context.conn_wh&quot;}},&quot;table&quot;:{&quot;tableName&quot;:{&quot;storedValue&quot;:&quot;T&quot;}}}"/>
+          </node></talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(p.get("account").and_then(|v| v.as_str()), Some("${conn_account}"));
+        assert_eq!(p.get("warehouse").and_then(|v| v.as_str()), Some("${conn_wh}"));
+        assert_eq!(
+            p.get("tableName").or_else(|| p.get("table")).and_then(|v| v.as_str()),
+            Some("T"),
+            "a plain value is untouched"
+        );
     }
 
     #[test]
