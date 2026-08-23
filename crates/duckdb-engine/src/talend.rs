@@ -1954,6 +1954,15 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if single_arg(inner, "Double.valueOf").is_some() {
             return java_expr_to_sql(inner, types);
         }
+        // Wrapping something already computed is a change of type, not of value: what it
+        // wraps decides the number, and the wrapper only says how it is held. A bare
+        // column is the exception below - there the wrapper is the only thing that would
+        // say which reading was meant, and it does not say enough.
+        if inner.contains('(') {
+            if let Some(sql) = java_expr_to_sql(inner, types) {
+                return Some(format!("CAST({sql} AS DECIMAL(38,4))"));
+            }
+        }
         // A column whose declared type is a string goes through BigDecimal(String), the
         // exact constructor, so reading it as a fixed-point number is faithful rather
         // than a guess. The file records the type; it was only ever unavailable to a
@@ -2032,6 +2041,51 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
             ));
         }
         return None;
+    }
+    // A value the loop put aside, used inside a larger expression rather than standing
+    // alone. Alone it is handled where settings are; here it is one operand among others.
+    if let Some(column) = loop_row_column(e) {
+        return Some(format!("${{ITER_ITEM_{}}}", column.to_uppercase()));
+    }
+    // Dates. The tool writes its formats the Java way and SQL writes them another, so the
+    // format is translated too rather than passed through to mean something else.
+    if let Some(args) = call_args(e, "TalendDate.getCurrentDate") {
+        if args.iter().all(|a| a.trim().is_empty()) {
+            return Some("now()".into());
+        }
+    }
+    if let Some(args) = call_args(e, "TalendDate.formatDate") {
+        if args.len() == 2 {
+            return Some(format!(
+                "strftime({}, '{}')",
+                java_expr_to_sql(args[1], types)?,
+                date_format_to_strftime(args[0])?
+            ));
+        }
+    }
+    if let Some(args) = call_args(e, "TalendDate.parseDate") {
+        if args.len() == 2 {
+            return Some(format!(
+                "strptime({}, '{}')",
+                java_expr_to_sql(args[1], types)?,
+                date_format_to_strftime(args[0])?
+            ));
+        }
+    }
+    if let Some(args) = call_args(e, "TalendDate.getDate") {
+        if args.len() == 1 {
+            return Some(format!("strftime(now(), '{}')", date_format_to_strftime(args[0])?));
+        }
+    }
+    // A counter that starts somewhere and steps. It numbers the rows it is asked about,
+    // which is what it does per run; the name it is given is the tool's way of keeping
+    // two counters apart and has nothing to answer to here.
+    if let Some(args) = call_args(e, "Numeric.sequence") {
+        if args.len() == 3 {
+            let start = java_expr_to_sql(args[1], types)?;
+            let step = java_expr_to_sql(args[2], types)?;
+            return Some(format!("({start} + (row_number() OVER () - 1) * {step})"));
+        }
     }
     // The routines the tool ships, each with one reading in SQL.
     for (name, sql_fn) in [
@@ -2248,6 +2302,12 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         // Quoted, because it stands where a value stands. The run puts the setting in as
         // text, so unquoted it would read as the name of a column instead.
         return rewrite_context(e).map(|v| format!("'{v}'"));
+    }
+    // A mapper's own named value, still standing after the pass that puts those values
+    // in place, was never defined. Reading it as a column of that name is the silent
+    // wrong answer the pass exists to avoid, so it stops here.
+    if e.starts_with("Var.") {
+        return None;
     }
     // `Table.Column`, the only bare form that reads one way.
     let (table, column) = e.split_once('.')?;
@@ -3008,6 +3068,47 @@ fn yields_number(e: &str, types: &ColTypes) -> bool {
 fn column_type<'a>(e: &str, types: &'a ColTypes) -> Option<&'a String> {
     let t = e.trim();
     types.get(t).or_else(|| types.get(t.split_once('.').map(|(_, c)| c).unwrap_or(t)))
+}
+
+/// A date format written the Java way, as SQL writes it.
+///
+/// Passed through unchanged it would mean something else entirely - `%` is a literal in
+/// one and an escape in the other - so only the pieces with one reading are translated
+/// and anything else refuses, rather than producing a format that silently parses wrong.
+fn date_format_to_strftime(literal: &str) -> Option<String> {
+    let t = literal.trim();
+    let pattern = t.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(pattern.len());
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let run = chars[i..].iter().take_while(|x| **x == c).count();
+        let code = match (c, run) {
+            ('y', 4) => Some("%Y"),
+            ('y', 2) => Some("%y"),
+            ('M', 2) => Some("%m"),
+            ('M', 3) => Some("%b"),
+            ('d', 2) => Some("%d"),
+            ('H', 2) => Some("%H"),
+            ('m', 2) => Some("%M"),
+            ('s', 2) => Some("%S"),
+            ('S', 3) => Some("%f"),
+            _ => None,
+        };
+        match code {
+            Some(c) => out.push_str(c),
+            None if !c.is_ascii_alphanumeric() && c != '%' => {
+                // A separator stands for itself.
+                out.extend(std::iter::repeat(c).take(run));
+            }
+            // A letter with no single reading, or a percent that would be read as an
+            // escape: refuse rather than guess at the whole format.
+            None => return None,
+        }
+        i += run;
+    }
+    Some(out)
 }
 
 /// A Java string literal as a SQL one. Anything else is refused: a pattern assembled at
@@ -3868,6 +3969,7 @@ mod tests {
     <outputTables name="dim_location">
       <mapperTableEntries name="LocationID" expression="Location.LocationID"/>
       <mapperTableEntries name="DI_Created_Date" expression="TalendDate.getCurrentDate()"/>
+      <mapperTableEntries name="DI_Checksum" expression="Location.LocationID.hashCode()"/>
     </outputTables>
   </node>
   <node componentName="tSomethingExotic" posX="500" posY="50">
@@ -3929,10 +4031,13 @@ mod tests {
         let map = im.nodes.iter().find(|n| n.id == "tMap_1").unwrap();
         let exprs = &map.data.properties.as_ref().unwrap()["expressions"];
         assert_eq!(exprs["LocationID"], "LocationID");
-        // The Java call must not be silently carried across as if it worked.
-        assert!(exprs.get("DI_Created_Date").is_none());
+        // Asking for the current time has one reading and now has it.
+        assert_eq!(exprs["DI_Created_Date"], "now()");
+        // A call with no such reading must not be silently carried across as if it
+        // worked: the column is left out and the reason is reported.
+        assert!(exprs.get("DI_Checksum").is_none());
         assert!(im.warnings.iter().any(
-            |w| matches!(w, Warning::JavaExpression { column, .. } if column == "DI_Created_Date")
+            |w| matches!(w, Warning::JavaExpression { column, .. } if column == "DI_Checksum")
         ));
     }
 
@@ -4024,13 +4129,15 @@ mod tests {
         assert_eq!(sql("row1.SPARE.toString()").as_deref(), Some("SPARE"));
         assert_eq!(sql("StringHandling.TRIM(row1.NAME)").as_deref(), Some("trim(NAME)"));
         // new BigDecimal(Double.valueOf(x)) goes through a double in Java, so DOUBLE is
-        // the faithful intermediate rather than a guess at a decimal scale.
+        // the faithful intermediate rather than a guess at a decimal scale. The operand
+        // is a row reference: a mapper's own named value is put in place before an
+        // expression is read, so one still standing here was never defined.
         assert_eq!(
-            sql("new BigDecimal(Double.valueOf(Var.RATE))").as_deref(),
+            sql("new BigDecimal(Double.valueOf(row1.RATE))").as_deref(),
             Some("TRY_CAST(RATE AS DOUBLE)")
         );
         assert_eq!(
-            sql("new BigDecimal(Double.valueOf((Var.RATE)))").as_deref(),
+            sql("new BigDecimal(Double.valueOf((row1.RATE)))").as_deref(),
             Some("TRY_CAST(RATE AS DOUBLE)")
         );
     }
@@ -4049,11 +4156,11 @@ mod tests {
         );
         // and they compose with the cast, which is how they appear in practice
         assert_eq!(
-            sql("new BigDecimal(Double.valueOf(StringHandling.LEFT(Var.D,4)))").as_deref(),
+            sql("new BigDecimal(Double.valueOf(StringHandling.LEFT(row1.D,4)))").as_deref(),
             Some("TRY_CAST(left(D, 4) AS DOUBLE)")
         );
         assert_eq!(
-            sql("new BigDecimal(Double.valueOf(StringHandling.RIGHT(StringHandling.LEFT(Var.D,6),2)))").as_deref(),
+            sql("new BigDecimal(Double.valueOf(StringHandling.RIGHT(StringHandling.LEFT(row1.D,6),2)))").as_deref(),
             Some("TRY_CAST(right(left(D, 6), 2) AS DOUBLE)")
         );
     }
@@ -5291,6 +5398,39 @@ mod tests {
         assert_eq!(
             sql(r#"row1.A.isEmpty() ? 1 : 0"#).as_deref(),
             Some("CASE WHEN A = '' THEN 1 ELSE 0 END")
+        );
+    }
+
+    #[test]
+    fn the_remaining_routines_read_as_sql() {
+        let types = ColTypes::new();
+        let sql = |e: &str| java_expr_to_sql(e, &types);
+
+        // A value the loop put aside, used inside a larger expression rather than alone.
+        assert_eq!(
+            sql(r#"StringHandling.RIGHT(((String)globalMap.get("out1.File_Name")),5)"#).as_deref(),
+            Some("right(${ITER_ITEM_FILE_NAME}, 5)")
+        );
+        // Wrapping a number in an exact decimal is a change of type, not of value, so it
+        // reads whenever what it wraps does.
+        assert_eq!(
+            sql(r#"new BigDecimal(String.valueOf(Mathematical.SMUL("-1",row1.AMT)))"#).as_deref(),
+            Some("CAST(CAST(TRY_CAST('-1' AS DOUBLE) * TRY_CAST(AMT AS DOUBLE) AS VARCHAR) AS DECIMAL(38,4))")
+        );
+        // Dates.
+        assert_eq!(sql("TalendDate.getCurrentDate()").as_deref(), Some("now()"));
+        assert_eq!(
+            sql(r#"TalendDate.formatDate("yyyyMMddHHmmss", TalendDate.getCurrentDate())"#).as_deref(),
+            Some("strftime(now(), '%Y%m%d%H%M%S')")
+        );
+        assert_eq!(
+            sql(r#"TalendDate.parseDate("ddMMyyyy", row1.D)"#).as_deref(),
+            Some("strptime(D, '%d%m%Y')")
+        );
+        // A counter that starts somewhere and steps.
+        assert_eq!(
+            sql(r#"Numeric.sequence("s1",1,1)"#).as_deref(),
+            Some("(1 + (row_number() OVER () - 1) * 1)")
         );
     }
 
