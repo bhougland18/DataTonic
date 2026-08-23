@@ -4091,7 +4091,15 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
             .iter()
             .zip(l.right_keys.iter())
             .map(|(lk, rk)| {
-                format!("{}.{} = {}.{}", main_alias, quote_ident(lk), look_alias, quote_ident(rk))
+                // A key is usually a column, and is qualified and quoted as one. It is
+                // sometimes an expression - matching on a trimmed value, say - and then
+                // it already says which input it reads and is used as written. Taking
+                // the column out of it instead would quietly match on something else.
+                let side = |k: &str, alias: &str| match is_plain_column(k) {
+                    true => format!("{}.{}", alias, quote_ident(k)),
+                    false => qualify_port_refs(k, &aliases),
+                };
+                format!("{} = {}", side(lk, &main_alias), side(rk, &look_alias))
             })
             .collect::<Vec<_>>()
             .join(" AND ");
@@ -4367,6 +4375,12 @@ pub(crate) fn split_leading_token(s: &str) -> (&str, &str) {
 /// Parse a key string into a list of column names. Accepts a single
 /// column (`"id"`) or comma-separated composite keys (`"customer_id,
 /// order_date"`). Whitespace around commas is stripped.
+/// Whether a join key is a plain column name rather than something computed.
+pub(crate) fn is_plain_column(k: &str) -> bool {
+    let t = k.trim();
+    !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
 pub(crate) fn parse_key_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim())

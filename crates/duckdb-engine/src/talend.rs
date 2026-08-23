@@ -2619,12 +2619,30 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
                 .skip(1)
                 .filter(|(_, t)| !t.keys.is_empty())
                 .map(|(at, t)| {
+                    // The main side of a match is an expression like any other - often a
+                    // plain column, sometimes a trimmed one - so it is translated rather
+                    // than cut out of the text. Cutting left the bracket of a call stuck
+                    // to the column name, and matching on the column instead of the
+                    // trimmed column is a different match.
+                    let ports: PortMap = raw
+                        .mapper_inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(at, t)| {
+                            let port =
+                                if at == 0 { "main".to_string() } else { format!("lookup_{at}") };
+                            (t.name.clone(), port)
+                        })
+                        .collect();
                     let left: Vec<String> = t
                         .keys
                         .iter()
                         .map(|(_, expr)| {
-                            let e = expr.trim();
-                            e.rsplit_once('.').map(|(_, c)| c).unwrap_or(e).to_string()
+                            java_expr_to_sql(expr.trim(), &raw.mapper_types, &ports)
+                                .unwrap_or_else(|| {
+                                    let e = expr.trim();
+                                    e.rsplit_once('.').map(|(_, c)| c).unwrap_or(e).to_string()
+                                })
                         })
                         .collect();
                     let right: Vec<String> =
@@ -5796,7 +5814,9 @@ mod tests {
         let lookups = n.data.properties.as_ref().unwrap()["lookups"].as_array().unwrap();
         assert_eq!(lookups.len(), 2, "one entry per input that is looked up");
         assert_eq!(lookups[0]["port"], "lookup_1");
-        assert_eq!(lookups[0]["leftKey"], "CODE");
+        // The main side says which input it reads, because with a lookup joined there is
+        // more than one place a column of that name could come from.
+        assert_eq!(lookups[0]["leftKey"], "main.CODE");
         assert_eq!(lookups[0]["rightKey"], "CODE");
         assert_eq!(lookups[0]["joinType"], "inner", "the file says this one is an inner join");
         assert_eq!(lookups[1]["port"], "lookup_2");
