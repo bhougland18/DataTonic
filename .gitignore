@@ -87,3 +87,6 @@ scripts/cg.py
 # Portable working kit for other projects. Local only: it is method rather than
 # product, it is mine rather than this project's, and nothing in it ships.
 dev-kit/
+
+# local remediation script, never committed
+scrub-history.sh
