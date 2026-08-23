@@ -187,6 +187,11 @@ struct RawNode {
     /// Flattened across every output the mapper writes, which is what a single-output
     /// mapper needs. [`mapper_outs`] keeps them apart for the rest.
     mapper_out: Vec<(String, String)>,
+    /// Intermediate values the mapper names, in the order it computes them.
+    ///
+    /// They belong to the mapper: nothing outside it knows the name, so an output that
+    /// uses one has to be given the value rather than the name.
+    mapper_vars: Vec<(String, String)>,
     /// Talend type of each column the mapper reads, keyed by `Table.Column` and `Column`.
     mapper_types: ColTypes,
     /// The same expressions, grouped by the output that declares them, in file order.
@@ -1906,6 +1911,60 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         }
         return None;
     }
+    // The ordinary things a mapper does to a field. Each has one reading in SQL, so
+    // leaving them out only meant the whole expression around them went unread.
+    for (name, sql_fn) in [
+        ("toUpperCase", "upper"),
+        ("toLowerCase", "lower"),
+        ("length", "length"),
+        ("trim", "trim"),
+    ] {
+        if let Some((recv, args)) = method_call(e, name) {
+            // A call with no arguments still yields one, empty.
+            if args.iter().all(|a| a.trim().is_empty()) {
+                return Some(format!("{}({})", sql_fn, java_expr_to_sql(recv, types)?));
+            }
+        }
+    }
+    // Java replaces on a regular expression and replaces every match.
+    if let Some((recv, args)) = method_call(e, "replaceAll") {
+        if args.len() == 2 {
+            return Some(format!(
+                "regexp_replace({}, {}, {}, 'g')",
+                java_expr_to_sql(recv, types)?,
+                java_string_to_sql(args[0])?,
+                java_string_to_sql(args[1])?
+            ));
+        }
+    }
+    // A static call, not a method on a value.
+    if let Some(args) = call_args(e, "StringHandling.EREPLACE") {
+        if args.len() == 3 {
+            return Some(format!(
+                "regexp_replace({}, {}, {}, 'g')",
+                java_expr_to_sql(args[0], types)?,
+                java_string_to_sql(args[1])?,
+                java_string_to_sql(args[2])?
+            ));
+        }
+    }
+    // Java counts from zero and takes an end position; SQL counts from one and takes a
+    // length. Written out rather than folded, so a bound that is itself an expression
+    // still reads.
+    if let Some((recv, args)) = method_call(e, "substring") {
+        let subject = java_expr_to_sql(recv, types)?;
+        return match args.len() {
+            1 => Some(format!("substr({}, {} + 1)", subject, java_expr_to_sql(args[0], types)?)),
+            2 => Some(format!(
+                "substr({}, {} + 1, {} - {})",
+                subject,
+                java_expr_to_sql(args[0], types)?,
+                java_expr_to_sql(args[1], types)?,
+                java_expr_to_sql(args[0], types)?
+            )),
+            _ => None,
+        };
+    }
     for (name, op) in [("multiply", "*"), ("subtract", "-"), ("add", "+")] {
         let Some((recv, args)) = method_call(e, name) else { continue };
         if args.len() != 1 {
@@ -1926,6 +1985,44 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     (ident(table) && ident(column)).then(|| column.to_string())
 }
 
+/// Put the value a mapper's named intermediate stands for in place of the name.
+///
+/// Textual, and in order, which is how the mapper computes them: each one may use the
+/// ones before it. A name with no definition is left alone so it is reported as the
+/// unreadable expression it is rather than quietly becoming a column reference.
+fn inline_mapper_vars(expr: &str, vars: &[(String, String)]) -> String {
+    if !expr.contains("Var.") {
+        return expr.to_string();
+    }
+    let mut out = expr.to_string();
+    // Later definitions first: a name can be a prefix of a longer one.
+    for (name, body) in vars.iter().rev() {
+        let needle = format!("Var.{name}");
+        if !out.contains(&needle) {
+            continue;
+        }
+        let mut rebuilt = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(at) = rest.find(&needle) {
+            let after = &rest[at + needle.len()..];
+            // `Var.AB` must not match inside `Var.ABC`.
+            let bounded = !after.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+            rebuilt.push_str(&rest[..at]);
+            if bounded {
+                rebuilt.push('(');
+                rebuilt.push_str(body);
+                rebuilt.push(')');
+            } else {
+                rebuilt.push_str(&needle);
+            }
+            rest = after;
+        }
+        rebuilt.push_str(rest);
+        out = rebuilt;
+    }
+    out
+}
+
 /// Translate mapper output expressions. Anything without one faithful SQL reading is
 /// reported rather than guessed at.
 fn mapper_expressions(raw: &RawNode, warnings: &mut Vec<Warning>) -> JsonValue {
@@ -1940,8 +2037,16 @@ fn mapper_expressions_of(
     warnings: &mut Vec<Warning>,
 ) -> JsonValue {
     let mut out = JsonMap::new();
+    // A mapper's own named values are resolved into the expressions that use them, in the
+    // order the mapper computes them, so a name that stands for another name resolves too.
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for (name, body) in &raw.mapper_vars {
+        let resolved = inline_mapper_vars(body, &vars);
+        vars.push((name.clone(), resolved));
+    }
     for (col, expr) in entries {
-        let e = expr.trim();
+        let e = inline_mapper_vars(expr.trim(), &vars);
+        let e = e.trim();
         if e.is_empty() {
             continue;
         }
@@ -2546,6 +2651,16 @@ fn would_cycle(edges: &[PipelineEdge], source: &str, target: &str) -> bool {
     false
 }
 
+/// A Java string literal as a SQL one. Anything else is refused: a pattern assembled at
+/// run time is not a pattern this side of the move.
+fn java_string_to_sql(arg: &str) -> Option<String> {
+    let t = arg.trim();
+    let inner = t.strip_prefix('"')?.strip_suffix('"')?;
+    // Java's own escapes for a quote and a backslash, then SQL's for a quote.
+    let unescaped = inner.replace("\\\"", "\"").replace("\\\\", "\\");
+    Some(format!("'{}'", unescaped.replace('\'', "''")))
+}
+
 /// The verb of a SQL statement that changes the database, if this is one.
 ///
 /// Only the leading word is read, and only the handful that a job actually carries. A
@@ -2840,6 +2955,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
     let mut cur: Option<RawNode> = None;
     // Mapper entries are only outputs when we are inside <outputTables>.
     let mut in_output_table = false;
+    let mut in_var_table = false;
     let mut input_table: Option<String> = None;
     let mut in_subjob = false;
     let mut subjob_heads: Vec<String> = Vec::new();
@@ -2891,6 +3007,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             mapper_out: Vec::new(),
                             mapper_outs: Vec::new(),
                             mapper_types: Default::default(),
+                            mapper_vars: Vec::new(),
                             x: attr("posX").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                             y: attr("posY").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                         });
@@ -2967,6 +3084,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                     }
                     "inputTables" => {
                         in_output_table = false;
+                        in_var_table = false;
                         if let Some(n) = cur.as_mut() {
                             input_table = attr("name");
                             let _ = &n.mapper_types;
@@ -2974,6 +3092,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                     }
                     "outputTables" => {
                         in_output_table = true;
+                        in_var_table = false;
                         input_table = None;
                         if let Some(n) = cur.as_mut() {
                             let name = attr("name").unwrap_or_else(|| {
@@ -2984,6 +3103,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                     }
                     "varTables" => {
                         in_output_table = false;
+                        in_var_table = true;
                         input_table = None;
                     }
                     "mapperTableEntries" => {
@@ -2998,6 +3118,13 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                                     n.mapper_types.insert(format!("{t}.{col}"), ty.clone());
                                 }
                                 n.mapper_types.entry(col).or_insert(ty);
+                            }
+                        }
+                        if in_var_table {
+                            if let (Some(n), Some(col), Some(expr)) =
+                                (cur.as_mut(), attr("name"), attr("expression"))
+                            {
+                                n.mapper_vars.push((col, expr));
                             }
                         }
                         if in_output_table {
@@ -4467,6 +4594,69 @@ mod tests {
         );
         // A component's own statistic is not a row column and is left alone.
         assert_eq!(j(r#"((String)globalMap.get("tFileList_1_CURRENT_FILE"))"#), None);
+    }
+
+    #[test]
+    fn a_mapper_variable_is_worked_into_the_outputs_that_use_it() {
+        // A mapper can name an intermediate value and use it in several outputs. The name
+        // belongs to the mapper and nothing outside it knows the name, so an output that
+        // used one referred to a column that does not exist - and the whole step failed
+        // to bind, on a mapper that was otherwise translated.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/d/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <varTables name="Var">
+              <mapperTableEntries name="TRIMMED" expression="StringHandling.TRIM(row1.CODE)"/>
+              <mapperTableEntries name="DOUBLED" expression="Var.TRIMMED"/>
+            </varTables>
+            <outputTables name="out">
+              <mapperTableEntries name="CODE" expression="Var.TRIMMED"/>
+              <mapperTableEntries name="ALSO" expression="Var.DOUBLED"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let ex = &im.nodes.iter().find(|n| n.id == "m_1").unwrap()
+            .data.properties.as_ref().unwrap()["expressions"];
+        assert_eq!(
+            ex["CODE"].as_str(),
+            Some("trim(CODE)"),
+            "the value the name stood for is worked into the output"
+        );
+        assert_eq!(
+            ex["ALSO"].as_str(),
+            Some("trim(CODE)"),
+            "including through a name that stands for another name"
+        );
+    }
+
+    #[test]
+    fn the_ordinary_string_operations_read_as_sql() {
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        // Stripping quotes out of a field is the commonest thing a mapper does to a
+        // delimited file, and it stopped the whole expression from being read.
+        assert_eq!(
+            sql(r#"row1.CODE.replaceAll("x","y")"#).as_deref(),
+            Some("regexp_replace(CODE, 'x', 'y', 'g')")
+        );
+        assert_eq!(
+            sql(r#"StringHandling.EREPLACE(row1.CODE,"x","y")"#).as_deref(),
+            Some("regexp_replace(CODE, 'x', 'y', 'g')")
+        );
+        assert_eq!(sql("row1.NAME.toUpperCase()").as_deref(), Some("upper(NAME)"));
+        assert_eq!(sql("row1.NAME.toLowerCase()").as_deref(), Some("lower(NAME)"));
+        assert_eq!(sql("row1.NAME.length()").as_deref(), Some("length(NAME)"));
+        // Java counts from zero and takes an end; SQL counts from one and takes a length.
+        assert_eq!(sql("row1.NAME.substring(2)").as_deref(), Some("substr(NAME, 2 + 1)"));
+        assert_eq!(
+            sql("row1.NAME.substring(2,5)").as_deref(),
+            Some("substr(NAME, 2 + 1, 5 - 2)")
+        );
     }
 
     #[test]
