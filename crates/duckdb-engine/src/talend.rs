@@ -1179,9 +1179,10 @@ pub fn route_reads_to_local_mirror(imports: &mut [&mut Import]) -> usize {
     // as often inside one of those as it is in the job itself, so both passes walk the
     // whole tree rather than the top level.
     let mut written: std::collections::BTreeSet<String> = Default::default();
+    let mut writers: std::collections::BTreeMap<String, usize> = Default::default();
     let mut reads: Vec<Vec<String>> = Vec::new();
     for im in imports.iter() {
-        survey(im, &mut written, &mut reads);
+        survey(im, &mut written, &mut writers, &mut reads);
     }
     if written.is_empty() {
         return 0;
@@ -1192,10 +1193,20 @@ pub fn route_reads_to_local_mirror(imports: &mut [&mut Import]) -> usize {
     // would still go to the warehouse and would then be the only reader of a table the
     // rest of the project had stopped treating as remote. Dropping one table can strand
     // another read, so this settles rather than deciding in one pass.
+    // The mirror is created by whichever write reaches it first and takes its shape from
+    // that one. Where several steps write the same table they rarely carry the same
+    // columns - one adds a field the others do not - and the next write then has nowhere
+    // to put it. The warehouse table was made once, with room for all of them; a mirror
+    // made from one write is not the same table, so it is not made.
+    let written_twice: std::collections::BTreeSet<String> = written
+        .iter()
+        .filter(|t| writers.get(*t).copied().unwrap_or(0) > 1)
+        .cloned()
+        .collect();
     let mut local: std::collections::BTreeSet<String> = reads
         .iter()
         .flatten()
-        .filter(|t| written.contains(*t))
+        .filter(|t| written.contains(*t) && !written_twice.contains(*t))
         .cloned()
         .collect();
     loop {
@@ -1225,12 +1236,14 @@ pub fn route_reads_to_local_mirror(imports: &mut [&mut Import]) -> usize {
 fn survey(
     im: &Import,
     written: &mut std::collections::BTreeSet<String>,
+    writers: &mut std::collections::BTreeMap<String, usize>,
     reads: &mut Vec<Vec<String>>,
 ) {
     for n in &im.nodes {
         match n.data.component_id.as_deref() {
             Some("snk.snowflake") => {
                 if let Some(t) = node_table(n) {
+                    *writers.entry(t.clone()).or_insert(0) += 1;
                     written.insert(t);
                 }
             }
@@ -1244,7 +1257,7 @@ fn survey(
         }
     }
     for c in &im.children {
-        survey(c, written, reads);
+        survey(c, written, writers, reads);
     }
 }
 

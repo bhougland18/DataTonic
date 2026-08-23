@@ -1074,6 +1074,77 @@ mod tests {
     }
 
     #[test]
+    fn a_table_several_steps_write_is_not_mirrored() {
+        // The mirror is created by whichever write reaches it first and takes its shape
+        // from that one. Where several steps write the same table they rarely carry the
+        // same columns - one adds a field the others do not - and the next write then has
+        // nowhere to put it. The warehouse table was made once, with room for all of
+        // them; a mirror made from one write is not the same table, so it is not made.
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let attr =
+            |v: serde_json::Value| v.to_string().replace('&', "&amp;").replace('"', "&quot;");
+        let sink = |name: &str, table: &str| {
+            let blob = attr(serde_json::json!({
+                "outputAction": {"storedValue": "INSERT"},
+                "table": {"tableName": {"storedValue": table}},
+            }));
+            format!(
+                r#"<node componentName="tSnowflakeOutput" posX="10" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="{name}"/>
+    <elementParameter name="PROPERTIES" value="{blob}"/>
+  </node>"#
+            )
+        };
+        let read = attr(serde_json::json!({
+            "query": {"storedValue": "SELECT * FROM STAGE_T"}
+        }));
+        write(
+            src.path(),
+            "J_0.1.item",
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<talendfile:ProcessType xmlns:talendfile="platform:/resource/org.talend.model/model/TalendFile.xsd">
+  <node componentName="tFileInputDelimited" posX="10" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="src_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+  </node>
+  {w1}
+  {w2}
+  <node componentName="tSnowflakeInput" posX="300" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="r_1"/>
+    <elementParameter name="PROPERTIES" value="{read}"/>
+  </node>
+  <connection connectorName="FLOW" source="src_1" target="w_1"/>
+  <connection connectorName="FLOW" source="src_1" target="w_2"/>
+  <connection connectorName="SUBJOB_OK" source="w_1" target="r_1"/>
+  <connection connectorName="SUBJOB_OK" source="w_2" target="r_1"/>
+</talendfile:ProcessType>
+"#,
+                w1 = sink("w_1", "STAGE_T"),
+                w2 = sink("w_2", "STAGE_T"),
+                read = read,
+            ),
+        );
+
+        let report = import_tree(src.path(), out.path()).unwrap();
+        assert_eq!(report.failed(), 0);
+        let j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.path().join("J.json")).unwrap())
+                .unwrap();
+        let nodes = j["nodes"].as_array().unwrap();
+        assert!(
+            !nodes.iter().any(|n| n["id"].as_str().unwrap_or("").ends_with("__local")),
+            "no mirror is made for a table more than one step writes"
+        );
+        assert_eq!(
+            nodes.iter().find(|n| n["id"] == "r_1").unwrap()["data"]["componentId"],
+            "src.snowflake",
+            "so the read stays where the table really is"
+        );
+    }
+
+    #[test]
     fn a_called_body_is_spliced_into_its_caller() {
         // A body is not runnable on its own: it takes its rows from whoever calls it, and
         // a child pipeline is handed none. Converting the call by reference would leave a
