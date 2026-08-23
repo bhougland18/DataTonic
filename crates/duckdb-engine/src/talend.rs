@@ -941,6 +941,17 @@ fn properties_for(
             if let Some(sep) = value_for(raw, "FIELDSEPARATOR", warnings) {
                 props.insert("delimiter".into(), sep);
             }
+            // The whole-line component hands on each line as it stands - one field,
+            // separators and all, for something further down to pick apart. Read as an
+            // ordinary delimited file it is split on whatever the line happens to
+            // contain, which is both the wrong shape and, against its single declared
+            // column, a failure to read the file at all. So it is read with a separator
+            // and a quote the text cannot hold.
+            if raw.component == "tFileInputFullRow" {
+                let never = "\u{7}".to_string();
+                props.insert("delimiter".into(), JsonValue::String(never.clone()));
+                props.insert("quote".into(), JsonValue::String(never));
+            }
             // The component counts header ROWS to skip and names its columns itself.
             // Read as "the first line is the header", the names come from whatever that
             // line happens to hold, so every column is renamed to a piece of data and
@@ -1971,13 +1982,42 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
             return None;
         }
         return Some(format!(
-            "({}) {op} ({})",
-            java_expr_to_sql(recv, types)?,
-            java_expr_to_sql(args[0], types)?
+            "{} {op} {}",
+            numeric_operand(recv, types)?,
+            numeric_operand(args[0], types)?
         ));
     }
     if let Some(arg) = single_arg(e, "String.valueOf") {
         return Some(format!("CAST({} AS VARCHAR)", java_expr_to_sql(arg, types)?));
+    }
+    // Java writes joining text and adding numbers the same way. SQL does not, and reads
+    // the one written for text as arithmetic on it, which it refuses - so an expression
+    // that only glues two fields together stops the whole step. Which was meant is
+    // decided from what the pieces are: the file records the type of every column the
+    // mapper reads, and a literal or a call that yields text says so itself. Where
+    // nothing says, it is left to a person rather than guessed at.
+    let parts = split_top_level_plus(e);
+    if parts.len() > 1 {
+        let textual = parts.iter().any(|p| yields_text(p, types));
+        let numeric = parts.iter().all(|p| yields_number(p, types));
+        if !textual && !numeric {
+            return None;
+        }
+        let rendered = parts
+            .iter()
+            .map(|p| match textual {
+                true => Some(format!("({})", java_expr_to_sql(p, types)?)),
+                false => numeric_operand(p, types),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let op = if textual { "||" } else { "+" };
+        return Some(rendered.join(&format!(" {op} ")));
+    }
+    // A context value is written the same way a column is. Read as a column it becomes a
+    // reference to one of that name: where none exists the step fails, and where one does
+    // it quietly answers with the row's own value instead of the setting.
+    if e.starts_with("context.") {
+        return rewrite_context(e);
     }
     // `Table.Column`, the only bare form that reads one way.
     let (table, column) = e.split_once('.')?;
@@ -2670,6 +2710,92 @@ fn would_cycle(edges: &[PipelineEdge], source: &str, target: &str) -> bool {
         stack.extend(edges.iter().filter(|e| e.source == node).map(|e| e.target.clone()));
     }
     false
+}
+
+/// One side of an arithmetic expression, as a number.
+///
+/// A delimited file arrives as text and the numbers in it are numbers by declaration, not
+/// by storage, so arithmetic on one says so. Tolerant on purpose: a field that does not
+/// parse becomes NULL rather than ending the run, which is what the rest of the read
+/// already does.
+fn numeric_operand(e: &str, types: &ColTypes) -> Option<String> {
+    let sql = java_expr_to_sql(e, types)?;
+    let declared = column_type(e, types).is_some() && !is_number(e.trim());
+    Some(match declared {
+        true => format!("(TRY_CAST({sql} AS DECIMAL(38,4)))"),
+        false => format!("({sql})"),
+    })
+}
+
+/// Split on `+` at the top level, outside any string or bracket.
+fn split_top_level_plus(e: &str) -> Vec<&str> {
+    let (mut depth, mut in_string, mut start) = (0i32, false, 0usize);
+    let mut parts = Vec::new();
+    let bytes = e.as_bytes();
+    for (i, c) in e.char_indices() {
+        match c {
+            '"' if !(i > 0 && bytes[i - 1] == b'\\') => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => depth -= 1,
+            '+' if !in_string && depth == 0 => {
+                parts.push(&e[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        return vec![e];
+    }
+    parts.push(&e[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
+}
+
+/// Whether a piece is text: a literal, a column the file records as one, or a call that
+/// produces text whatever it was given.
+fn yields_text(e: &str, types: &ColTypes) -> bool {
+    let t = e.trim();
+    if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+        return true;
+    }
+    for marker in [
+        "StringHandling.",
+        ".replaceAll(",
+        ".toUpperCase(",
+        ".toLowerCase(",
+        ".substring(",
+        ".toString(",
+        "String.valueOf(",
+        ".trim(",
+    ] {
+        if t.contains(marker) {
+            return true;
+        }
+    }
+    // A setting arrives as text unless something says otherwise.
+    if t.starts_with("context.") {
+        return true;
+    }
+    column_type(t, types).is_some_and(|k| k.eq_ignore_ascii_case("id_String"))
+}
+
+/// Whether a piece is a number: a literal, or a column the file records as one.
+fn yields_number(e: &str, types: &ColTypes) -> bool {
+    let t = e.trim();
+    if is_number(t) {
+        return true;
+    }
+    column_type(t, types).is_some_and(|k| {
+        ["id_BigDecimal", "id_Integer", "id_Long", "id_Short", "id_Double", "id_Float"]
+            .iter()
+            .any(|n| k.eq_ignore_ascii_case(n))
+    })
+}
+
+/// The recorded type of a bare or table-qualified column reference.
+fn column_type<'a>(e: &str, types: &'a ColTypes) -> Option<&'a String> {
+    let t = e.trim();
+    types.get(t).or_else(|| types.get(t.split_once('.').map(|(_, c)| c).unwrap_or(t)))
 }
 
 /// A Java string literal as a SQL one. Anything else is refused: a pattern assembled at
@@ -4827,6 +4953,92 @@ mod tests {
             .filter(|e| e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("on-subjob-ok"))
             .map(|e| (e.source.clone(), e.target.clone()))
             .collect()
+    }
+
+    #[test]
+    fn a_whole_line_input_keeps_the_line_whole() {
+        // This component hands on each line as it stands - one field, separators and all,
+        // for something further down to pick apart. Read as an ordinary delimited file it
+        // was split on whatever the line happened to contain, which is both the wrong
+        // shape and, against a declared single column, a failure to read the file at all.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputFullRow" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="raw_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.txt&quot;"/>
+            <elementParameter name="HEADER" value="1"/>
+            <metadata connector="FLOW" name="raw_1">
+              <column name="line" type="id_String" nullable="true"/>
+            </metadata>
+          </node></talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes[0].data.properties.as_ref().unwrap();
+        let sep = p["delimiter"].as_str().unwrap();
+        assert!(
+            sep.chars().all(|c| c.is_control()),
+            "the separator is one the text cannot contain, got {sep:?}"
+        );
+        assert_eq!(
+            p["quote"].as_str(),
+            Some(sep),
+            "and quoting is off too, or a line starting with a quote is taken apart"
+        );
+        assert_eq!(p["hasHeader"], false);
+        assert_eq!(p["skipLines"], 1);
+    }
+
+    #[test]
+    fn joining_two_pieces_of_text_reads_as_joining_not_adding() {
+        // Java writes joining text and adding numbers the same way. SQL does not, and
+        // reads the one written for text as arithmetic on it, which it refuses - so an
+        // expression that only glued two fields together stopped the whole step.
+        let mut types = ColTypes::new();
+        types.insert("A".into(), "id_String".into());
+        types.insert("B".into(), "id_String".into());
+        types.insert("N".into(), "id_BigDecimal".into());
+        let sql = |e: &str| java_expr_to_sql(e, &types);
+
+        assert_eq!(sql("row1.A + row1.B").as_deref(), Some("(A) || (B)"));
+        assert_eq!(
+            sql(r#"row1.A + "-" + row1.B"#).as_deref(),
+            Some("(A) || ('-') || (B)"),
+            "and a literal in the middle is text too"
+        );
+        assert_eq!(
+            sql("StringHandling.TRIM(row1.A) + row1.B").as_deref(),
+            Some("(trim(A)) || (B)"),
+            "including when a piece has been worked on"
+        );
+        // Numbers are still added.
+        assert_eq!(
+            sql("row1.N + 1").as_deref(),
+            Some("(TRY_CAST(N AS DECIMAL(38,4))) + (1)"),
+            "a number read out of text says so before it is added"
+        );
+        // And where nothing says which it is, it is left to a person.
+        let unknown = ColTypes::new();
+        assert_eq!(java_expr_to_sql("row1.X + row1.Y", &unknown), None);
+    }
+
+    #[test]
+    fn a_context_value_in_a_mapper_stays_a_context_value() {
+        // A mapper expression reads columns as `<flow>.<column>`, and a context value is
+        // written the same way. Read as a column it becomes a reference to one of that
+        // name: where none exists the step fails, and where one does it quietly answers
+        // with the row's own value instead of the setting - which is worse.
+        let types = ColTypes::new();
+        let sql = |e: &str| java_expr_to_sql(e, &types);
+        assert_eq!(sql("context.REGION_CODE").as_deref(), Some("${REGION_CODE}"));
+        assert_eq!(
+            sql(r#"context.getProperty("batch_no")"#).as_deref(),
+            Some("${batch_no}")
+        );
+        assert_eq!(
+            sql(r#""grp" + context.batch_no"#).as_deref(),
+            Some("('grp') || (${batch_no})"),
+            "and it joins with text like anything else"
+        );
+        // An ordinary column reference is still a column reference.
+        assert_eq!(sql("row1.REGION_CODE").as_deref(), Some("REGION_CODE"));
     }
 
     #[test]
