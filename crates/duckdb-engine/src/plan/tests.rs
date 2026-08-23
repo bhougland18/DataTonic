@@ -4675,3 +4675,33 @@
         );
         compile(&doc).expect("an upsert spelled the documented way compiles");
     }
+
+    #[test]
+    fn a_mapper_written_as_name_to_expression_actually_maps() {
+        // The Map form writes its outputs either as a list of pairs or as one object from
+        // output name to expression. Only the list was read, and a mapper whose outputs
+        // did not parse falls back to passing its input straight through - so the object
+        // form compiled to SELECT *, silently, and every expression in it was dropped
+        // while the node still reported rows and still looked like it had run.
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{"label":"in","componentId":"src.csv","properties":{"path":"/tmp/in.csv","hasHeader":true}}},
+                {"id":"m","position":{"x":1,"y":0},"data":{"label":"Map","componentId":"xf.map","properties":{
+                  "expressions": {"TOTAL": "AMT * 2", "NAME": "upper(N)"}}}},
+                {"id":"k","position":{"x":2,"y":0},"data":{"label":"out","componentId":"snk.parquet","properties":{"path":"/tmp/o.parquet"}}}
+              ],
+              "edges": [
+                {"id":"e1","source":"s","target":"m","data":{"connectionType":"main"}},
+                {"id":"e2","source":"m","target":"k","data":{"connectionType":"main"}}
+              ]
+            }"#,
+        );
+        let sql = map_sql(&doc);
+        assert!(sql.contains("AMT * 2"), "the expression is applied: {sql}");
+        assert!(sql.contains("upper(N)"), "all of them: {sql}");
+        assert!(
+            !sql.trim_start().to_uppercase().starts_with("SELECT * FROM"),
+            "not a passthrough: {sql}"
+        );
+    }

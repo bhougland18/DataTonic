@@ -3908,6 +3908,19 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
             }
         }
     }
+    // The other spelling of the same thing: one object from output name to expression.
+    // It was described here but never read, and a mapper whose outputs do not parse
+    // passes its input straight through - so this form compiled to SELECT *, silently,
+    // while the node still reported rows and still looked like it had run. Key order is
+    // insertion order, so the outputs keep the order they were written in.
+    if let Some(map) = props.get("expressions").and_then(JsonValue::as_object) {
+        for (name, expr) in map {
+            let expr = expr.as_str().unwrap_or("").trim();
+            if !name.trim().is_empty() && !expr.is_empty() {
+                outputs.push((name.trim().to_string(), expr.to_string()));
+            }
+        }
+    }
     if outputs.is_empty() {
         if let Some(outs) = props.get("mapper").and_then(|m| m.get("outputs")).and_then(JsonValue::as_array) {
             for o in outs {
