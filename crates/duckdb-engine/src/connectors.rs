@@ -12741,22 +12741,74 @@ fn workspace_context_vars() -> std::collections::HashMap<String, String> {
 }
 
 fn resolve_subpipeline_ref(reference: &str) -> String {
-    let looks_like_path =
-        reference.contains('/') || reference.contains('\\') || reference.ends_with(".json");
-    if looks_like_path {
+    // Already a path that exists: an absolute one, or one relative to where the run was
+    // started. Nothing to look for.
+    if std::path::Path::new(reference).is_file() {
         return reference.to_string();
     }
-    if let Ok(ws) = std::env::var("DUCKLE_WORKSPACE") {
-        if !ws.is_empty() {
-            let candidate = std::path::Path::new(&ws)
-                .join("pipelines")
-                .join(format!("{}.json", reference));
-            if candidate.exists() {
-                return candidate.display().to_string();
+    let Some(ws) = std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.is_empty()) else {
+        return reference.to_string();
+    };
+    resolve_subpipeline_in(reference, std::path::Path::new(&ws))
+}
+
+/// The same, against a named workspace. Split out so it can be exercised without an
+/// environment variable, which every test in the process would otherwise share.
+fn resolve_subpipeline_in(reference: &str, root: &std::path::Path) -> String {
+
+    // A reference is written the way the job wrote it - usually the child's bare name,
+    // sometimes with an extension, occasionally a path. Try the arrangements a workspace
+    // actually uses before going looking.
+    let file = format!(
+        "{}.json",
+        std::path::Path::new(reference)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| reference.to_string())
+    );
+    for candidate in [root.join(reference), root.join("pipelines").join(&file)] {
+        if candidate.is_file() {
+            return candidate.display().to_string();
+        }
+    }
+
+    // A converted repository keeps the folder layout it came from rather than flattening
+    // it, because two jobs in different folders routinely share a name. A job calls its
+    // children by name and knows nothing about where the conversion put them, so the
+    // workspace is searched for the file. Names are unique across a conversion - the
+    // first to claim a bare name keeps it - so a match is the match.
+    let mut found: Vec<std::path::PathBuf> = Vec::new();
+    let mut queue = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = queue.pop() {
+        // A workspace holds run logs and outputs as well as pipelines, and a big one
+        // should not turn every child call into a full disk walk.
+        visited += 1;
+        if visited > 4096 || found.len() > 1 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !matches!(name.as_ref(), ".duckle" | "logs" | "runs" | "out" | "target")
+                    && !name.starts_with('.')
+                {
+                    queue.push(path);
+                }
+            } else if name == file.as_str() {
+                found.push(path);
             }
         }
     }
-    reference.to_string()
+    match found.len() {
+        1 => found[0].display().to_string(),
+        // Nothing found, or more than one: hand back what was asked for so the caller
+        // reports the name the job actually used rather than a guess at which it meant.
+        _ => reference.to_string(),
+    }
 }
 
 /// Coerce a column name into a legal XML element name: the first char must be a
@@ -13296,6 +13348,32 @@ mod salesforce_results_tests {
 #[cfg(test)]
 mod context_var_tests {
     use super::context_vars_for_workspace;
+
+    #[test]
+    fn a_child_job_is_found_wherever_the_conversion_put_it() {
+        // A converted repository keeps the folder layout it came from, and a job calls
+        // its children by name: the caller knows nothing about the folder the child
+        // landed in, and the two are routinely in different ones. Resolved only against
+        // the working directory, every master job failed on its first child.
+        let ws = tempfile::tempdir().unwrap();
+        let nested = ws.path().join("process").join("UNIFIED_PORTAL").join("LOAD");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("CHILD_JOB.json"), "{}").unwrap();
+
+        let hit = super::resolve_subpipeline_in("CHILD_JOB.json", ws.path());
+        let bare = super::resolve_subpipeline_in("CHILD_JOB", ws.path());
+        let miss = super::resolve_subpipeline_in("NOT_THERE.json", ws.path());
+
+        assert!(
+            std::path::Path::new(&hit).is_file(),
+            "found by name, wherever it sits: {hit}"
+        );
+        assert_eq!(bare, hit, "with or without the extension the job wrote");
+        assert_eq!(
+            miss, "NOT_THERE.json",
+            "and a name that is nowhere comes back as asked, so the error names it"
+        );
+    }
 
     #[test]
     fn loads_workspace_context_vars_for_sub_pipelines() {
