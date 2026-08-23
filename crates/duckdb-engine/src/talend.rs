@@ -2001,12 +2001,12 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
             return None;
         }
         let subject = java_expr_to_sql(args[0], types)?;
+        // How far to take is as often worked out as written down. Both count from the
+        // same place in either language, so a count that is itself an expression reads
+        // like any other; refusing those took the whole column with them.
         let counts = args[1..]
             .iter()
-            .map(|a| {
-                let t = a.trim();
-                (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())).then_some(t)
-            })
+            .map(|a| java_expr_to_sql(a, types))
             .collect::<Option<Vec<_>>>()?;
         return Some(format!("{sql_fn}({subject}, {})", counts.join(", ")));
     }
@@ -4154,6 +4154,16 @@ mod tests {
             sql("StringHandling.SUBSTR(row1.CODE,1,4)").as_deref(),
             Some("substr(CODE, 1, 4)")
         );
+        // How far to take is as often worked out as written down, and refusing the whole
+        // expression for that took the column with it.
+        assert_eq!(
+            sql("StringHandling.SUBSTR(row1.CODE,2,StringHandling.LEN(row1.CODE))").as_deref(),
+            Some("substr(CODE, 2, length(CODE))")
+        );
+        assert_eq!(
+            sql("StringHandling.LEFT(row1.CODE,StringHandling.LEN(row1.NID))").as_deref(),
+            Some("left(CODE, length(NID))")
+        );
         // and they compose with the cast, which is how they appear in practice
         assert_eq!(
             sql("new BigDecimal(Double.valueOf(StringHandling.LEFT(row1.D,4)))").as_deref(),
@@ -4167,10 +4177,21 @@ mod tests {
 
     #[test]
     fn a_string_helper_with_a_computed_length_is_still_reported() {
-        // The count argument has to be a plain integer. Anything else could be a Java
-        // expression whose value we would be guessing at.
+        // The count used to have to be a plain integer, on the grounds that anything else
+        // could be a Java expression whose value we would be guessing at. It is only used
+        // now when it has a faithful reading of its own, and where it has none the whole
+        // expression still refuses - so the guess never happens either way, and a count
+        // that is worked out rather than written down no longer costs the column.
         let sql = |e: &str| java_expr_to_sql(e, &Default::default());
-        assert_eq!(sql("StringHandling.LEFT(row1.NID,row1.N)"), None);
+        assert_eq!(
+            sql("StringHandling.LEFT(row1.NID,row1.N)").as_deref(),
+            Some("left(NID, N)")
+        );
+        assert_eq!(
+            sql("StringHandling.LEFT(row1.NID,row1.N.hashCode())"),
+            None,
+            "a count with no reading of its own still takes the expression with it"
+        );
         assert_eq!(sql("StringHandling.LEFT(row1.NID)"), None, "wrong arity");
         assert_eq!(sql("StringHandling.SUBSTR(row1.CODE,1)"), None, "wrong arity");
     }
