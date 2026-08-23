@@ -2382,8 +2382,8 @@ fn inline_mapper_vars(expr: &str, vars: &[(String, String)]) -> String {
 
 /// Translate mapper output expressions. Anything without one faithful SQL reading is
 /// reported rather than guessed at.
-fn mapper_expressions(raw: &RawNode, warnings: &mut Vec<Warning>) -> JsonValue {
-    mapper_expressions_of(raw, &raw.mapper_out, warnings)
+fn mapper_expressions(raw: &RawNode, job: &str, warnings: &mut Vec<Warning>) -> JsonValue {
+    mapper_expressions_of(raw, &raw.mapper_out, job, warnings)
 }
 
 /// Translate one output's expressions. Anything without one faithful SQL reading is
@@ -2391,6 +2391,7 @@ fn mapper_expressions(raw: &RawNode, warnings: &mut Vec<Warning>) -> JsonValue {
 fn mapper_expressions_of(
     raw: &RawNode,
     entries: &[(String, String)],
+    job: &str,
     warnings: &mut Vec<Warning>,
 ) -> JsonValue {
     let mut out = JsonMap::new();
@@ -2402,9 +2403,12 @@ fn mapper_expressions_of(
         vars.push((name.clone(), resolved));
     }
     for (col, expr) in entries {
-        let e = inline_mapper_vars(expr.trim(), &vars);
+        // The job's own name is a value the tool supplies, and it is this one.
+        let e = inline_mapper_vars(expr.trim(), &vars).replace("jobName", &format!("\"{job}\""));
         let e = e.trim();
-        if e.is_empty() {
+        // An expression of nothing but empty brackets says nothing; it is not a reading
+        // we failed to find, so it is passed over rather than reported.
+        if e.is_empty() || e.chars().all(|c| matches!(c, '(' | ')' | ' ')) {
             continue;
         }
         match java_expr_to_sql(e, &raw.mapper_types) {
@@ -2463,7 +2467,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
 
         let mut props = properties_for(raw, component_id, &context, &mut warnings);
         if component_id == "xf.map" {
-            props.insert("expressions".into(), mapper_expressions(raw, &mut warnings));
+            props.insert("expressions".into(), mapper_expressions(raw, job_name, &mut warnings));
         }
 
         let mut data = node_data(
@@ -2527,7 +2531,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         .collect();
 
     let (nodes, edges) =
-        split_multi_output_mappers(nodes, edges, &raw_nodes, &connections, &mut warnings);
+        split_multi_output_mappers(nodes, edges, &raw_nodes, &connections, job_name, &mut warnings);
     let (nodes, edges) = read_loop_rows_from_their_list(nodes, edges, &raw_nodes);
     let edges = rewire_parallel_joins(edges, &connections);
     let edges = anchor_subjob_links_at_their_end(edges);
@@ -2834,6 +2838,7 @@ fn split_multi_output_mappers(
     mut edges: Vec<PipelineEdge>,
     raw_nodes: &[RawNode],
     connections: &[Conn],
+    job: &str,
     warnings: &mut Vec<Warning>,
 ) -> (Vec<PipelineNode>, Vec<PipelineEdge>) {
     // The name a link carries is not the port it leaves by: a joblet's boundary is found
@@ -2859,7 +2864,7 @@ fn split_multi_output_mappers(
             if let Some(props) = copy.data.properties.as_mut().and_then(|p| p.as_object_mut()) {
                 props.insert(
                     "expressions".into(),
-                    mapper_expressions_of(raw, entries, warnings),
+                    mapper_expressions_of(raw, entries, job, warnings),
                 );
             }
             copy.position.y += 70.0 * made.len() as f64;
