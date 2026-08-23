@@ -201,7 +201,7 @@ struct RawNode {
     ///
     /// Flattened across every output the mapper writes, which is what a single-output
     /// mapper needs. [`mapper_outs`] keeps them apart for the rest.
-    mapper_out: Vec<(String, String)>,
+    mapper_out: Vec<(String, String, String)>,
     /// The mapper's inputs, in the order the file lists them: the first carries the rows
     /// and the rest are looked up. Each keeps the columns it is matched on and whether
     /// the match is required.
@@ -218,7 +218,7 @@ struct RawNode {
     /// A mapper writes one relation per output and they are not variations on a theme:
     /// the two halves of a decision routinely share a column name and give it different
     /// expressions, so merging them silently answers one branch with the other's number.
-    mapper_outs: Vec<(String, Vec<(String, String)>)>,
+    mapper_outs: Vec<(String, Vec<(String, String, String)>)>,
     x: f64,
     y: f64,
 }
@@ -2401,6 +2401,27 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes, ports: &PortMap) -> Option<Str
     })
 }
 
+/// An output as the type the mapper says it is.
+///
+/// A delimited file arrives as text, so a column passed straight through arrives as text
+/// too - and the next step that multiplies it has a number on one side and text on the
+/// other. The mapper says what each of its outputs is, so it says so here rather than
+/// leaving every later step to work it out again. Tolerant, like the rest of the read: a
+/// value that will not parse becomes NULL rather than ending the run.
+fn as_declared(sql: &str, declared: &str) -> String {
+    let ty = match declared {
+        "id_BigDecimal" => "DECIMAL(38,4)",
+        "id_Double" | "id_Float" => "DOUBLE",
+        "id_Integer" | "id_Long" | "id_Short" => "BIGINT",
+        _ => return sql.to_string(),
+    };
+    // Already said, or a literal that needs no saying.
+    if sql.contains(&format!("AS {ty})")) || is_number(sql) {
+        return sql.to_string();
+    }
+    format!("TRY_CAST({sql} AS {ty})")
+}
+
 /// Put the value a mapper's named intermediate stands for in place of the name.
 ///
 /// Textual, and in order, which is how the mapper computes them: each one may use the
@@ -2449,7 +2470,7 @@ fn mapper_expressions(raw: &RawNode, job: &str, warnings: &mut Vec<Warning>) -> 
 /// reported rather than guessed at.
 fn mapper_expressions_of(
     raw: &RawNode,
-    entries: &[(String, String)],
+    entries: &[(String, String, String)],
     job: &str,
     warnings: &mut Vec<Warning>,
 ) -> JsonValue {
@@ -2474,7 +2495,7 @@ fn mapper_expressions_of(
         let resolved = inline_mapper_vars(body, &vars);
         vars.push((name.clone(), resolved));
     }
-    for (col, expr) in entries {
+    for (col, expr, declared) in entries {
         // The job's own name is a value the tool supplies, and it is this one.
         let e = inline_mapper_vars(expr.trim(), &vars).replace("jobName", &format!("\"{job}\""));
         let e = e.trim();
@@ -2485,7 +2506,7 @@ fn mapper_expressions_of(
         }
         match java_expr_to_sql(e, &raw.mapper_types, &ports) {
             Some(c) => {
-                out.insert(col.clone(), JsonValue::String(c));
+                out.insert(col.clone(), JsonValue::String(as_declared(&c, declared)));
             }
             None => warnings.push(Warning::JavaExpression {
                 node: raw.unique.clone(),
@@ -3869,9 +3890,10 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                         if in_output_table {
                             if let (Some(n), Some(col)) = (cur.as_mut(), attr("name")) {
                                 if let Some(expr) = attr("expression") {
-                                    n.mapper_out.push((col.clone(), expr.clone()));
+                                    let ty = attr("type").unwrap_or_default();
+                                    n.mapper_out.push((col.clone(), expr.clone(), ty.clone()));
                                     if let Some(last) = n.mapper_outs.last_mut() {
-                                        last.1.push((col, expr));
+                                        last.1.push((col, expr, ty));
                                     }
                                 }
                             }
@@ -5758,6 +5780,35 @@ mod tests {
             "the columns arrive under the names the job uses: {q}"
         );
         assert!(q.contains("select A, B from T"), "and the query itself is untouched: {q}");
+    }
+
+    #[test]
+    fn a_mapper_output_carries_the_type_its_schema_declares() {
+        // A delimited file arrives as text, so a column passed straight through a mapper
+        // arrives as text too - and the next step that multiplies it has a number on one
+        // side and text on the other. The mapper says what each output is, so it says so
+        // in the SQL rather than leaving every later step to work it out again.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/d/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <outputTables name="o">
+              <mapperTableEntries name="RATE" expression="row1.RATE" type="id_BigDecimal"/>
+              <mapperTableEntries name="NAME" expression="row1.NAME" type="id_String"/>
+              <mapperTableEntries name="COUNT" expression="row1.C" type="id_Integer"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let ex = &im.nodes.iter().find(|n| n.id == "m_1").unwrap()
+            .data.properties.as_ref().unwrap()["expressions"];
+        assert_eq!(ex["RATE"].as_str(), Some("TRY_CAST(RATE AS DECIMAL(38,4))"));
+        assert_eq!(ex["COUNT"].as_str(), Some("TRY_CAST(C AS BIGINT)"));
+        assert_eq!(ex["NAME"].as_str(), Some("NAME"), "text is left as it is");
     }
 
     #[test]
