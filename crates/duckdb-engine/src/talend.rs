@@ -455,10 +455,37 @@ fn is_encrypted(v: &str) -> bool {
     v.trim_matches('"').starts_with("enc:")
 }
 
+/// The column of the loop's current row a value reads, if that is all it reads.
+///
+/// A row column is written `<flow>.<column>`; a component's own statistic has no dot and
+/// is a different thing entirely, so only the dotted form is a row.
+fn loop_row_column(v: &str) -> Option<&str> {
+    let inner = v.split("globalMap.get(").nth(1)?;
+    // Nothing may follow but the closing brackets, or this is part of a larger expression
+    // and rewriting it alone would change what the whole says.
+    let (key, rest) = inner.trim_start().strip_prefix('"')?.split_once('"')?;
+    if !rest.trim_end_matches([')', ' ']).is_empty() {
+        return None;
+    }
+    let (_, column) = key.split_once('.')?;
+    let ok = !column.is_empty()
+        && column.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !column.contains('.');
+    ok.then_some(column)
+}
+
 /// `context.foo` and `context.getProperty("foo")` become Duckle's `${foo}`, so
 /// an imported job keeps using a context variable rather than freezing a value.
 fn rewrite_context(v: &str) -> Option<String> {
     let t = v.trim();
+    // A loop puts the row it is on where the steps inside it can reach it, by name. The
+    // names are the loop's own and mean nothing here, so a value taken from the current
+    // row - a file name, a query - arrived as the Java that would have fetched it, and
+    // the step tried to use that text. The loop hands each column of the row to the work
+    // it runs, so the column is named the way that work receives it.
+    if let Some(column) = loop_row_column(t) {
+        return Some(format!("${{ITER_ITEM_{}}}", column.to_uppercase()));
+    }
     if let Some(rest) = t.strip_prefix("context.getProperty(") {
         let name = rest.trim_end_matches(')').trim().trim_matches('"');
         if !name.is_empty() {
@@ -941,11 +968,7 @@ fn properties_for(
             // produces no columns and every step that reads one fails on a name that is
             // not there.
             let mut cols = JsonMap::new();
-            for row in raw.tables.get("VALUES").into_iter().flatten() {
-                let (Some(name), Some(value)) = (row.get("SCHEMA_COLUMN"), row.get("VALUE"))
-                else {
-                    continue;
-                };
+            for (name, value) in row_value_pairs(raw) {
                 if name.trim().is_empty() {
                     continue;
                 }
@@ -2396,6 +2419,18 @@ fn split_multi_output_mappers(
     (nodes, edges)
 }
 
+/// The column/value rows a row-producing component was given.
+///
+/// The fixed-row component calls the table VALUES and the loop-row one calls it MAPPING;
+/// they hold the same thing, and reading only one name leaves the other with no columns.
+fn row_value_pairs(raw: &RawNode) -> impl Iterator<Item = (&String, &String)> {
+    ["VALUES", "MAPPING"]
+        .into_iter()
+        .filter_map(|k| raw.tables.get(k))
+        .flatten()
+        .filter_map(|row| Some((row.get("SCHEMA_COLUMN")?, row.get("VALUE")?)))
+}
+
 /// Read the row a file loop hands on from the list it loops.
 ///
 /// Iterating a folder and turning the current file into a row is the most ordinary batch
@@ -2416,10 +2451,7 @@ fn read_loop_rows_from_their_list(
         let mut source: Option<String> = None;
         let mut columns = JsonMap::new();
         let mut all_from_loop = true;
-        for row in raw.tables.get("VALUES").into_iter().flatten() {
-            let (Some(name), Some(value)) = (row.get("SCHEMA_COLUMN"), row.get("VALUE")) else {
-                continue;
-            };
+        for (name, value) in row_value_pairs(raw) {
             match loop_variable(value) {
                 Some((list, part)) if source.as_deref().unwrap_or(&list) == list => {
                     source = Some(list);
@@ -2473,9 +2505,12 @@ fn loop_variable(value: &str) -> Option<(String, &'static str)> {
     let inner = value.split("globalMap.get(").nth(1)?;
     let key = inner.trim_start().trim_start_matches('"');
     let key = key.split('"').next()?;
+    // The list yields the path and the name; the folder is the path without the name.
+    // Its paths come back with forward slashes whatever the platform, so one separator
+    // is enough to find where the name starts.
     for (suffix, column) in [
         ("_CURRENT_FILEPATH", "file"),
-        ("_CURRENT_FILEDIRECTORY", "directory"),
+        ("_CURRENT_FILEDIRECTORY", "regexp_replace(file, '[^/]+$', '')"),
         ("_CURRENT_FILE", "filename"),
     ] {
         if let Some(list) = key.strip_suffix(suffix) {
@@ -4387,7 +4422,7 @@ mod tests {
           </node>
           <node componentName="tIterateToFlow" posX="120" posY="10">
             <elementParameter name="UNIQUE_NAME" value="row_1"/>
-            <elementParameter field="TABLE" name="VALUES">
+            <elementParameter field="TABLE" name="MAPPING">
               <elementValue elementRef="SCHEMA_COLUMN" value="File_Name_Path"/>
               <elementValue elementRef="VALUE" value="((String)globalMap.get(&quot;list_1_CURRENT_FILEPATH&quot;))"/>
               <elementValue elementRef="SCHEMA_COLUMN" value="File_Name"/>
@@ -4413,6 +4448,25 @@ mod tests {
             "and the list feeds it: {:?}",
             im.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_loop_row_column_is_read_as_the_value_the_loop_hands_the_child() {
+        // A loop puts the row it is on where the steps inside it can reach it, by name.
+        // Those names are the loop's own and mean nothing here, so a file name taken from
+        // the current row arrived as the Java that would have fetched it and the step
+        // tried to open a file called exactly that.
+        let j = |v: &str| rewrite_context(v);
+        assert_eq!(
+            j(r#"((String)globalMap.get("out1.File_Name_Path"))"#).as_deref(),
+            Some("${ITER_ITEM_FILE_NAME_PATH}")
+        );
+        assert_eq!(
+            j(r#"globalMap.get("row2.SQLQUERY")"#).as_deref(),
+            Some("${ITER_ITEM_SQLQUERY}")
+        );
+        // A component's own statistic is not a row column and is left alone.
+        assert_eq!(j(r#"((String)globalMap.get("tFileList_1_CURRENT_FILE"))"#), None);
     }
 
     #[test]
