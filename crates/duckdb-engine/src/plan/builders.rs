@@ -4590,8 +4590,14 @@ fn csv_read_args_base(props: &JsonValue) -> Vec<String> {
     if let Some(d) = delim.as_deref().filter(|s| !s.is_empty()) {
         args.push(format!("delim='{}'", sql_escape(d)));
     }
-    if let Some(q) = quote.as_deref().filter(|s| !s.is_empty()) {
-        args.push(format!("quote='{}'", sql_escape(q)));
+    // Told nothing, the reader keeps its own default, which is the double quote. An
+    // empty value is not nothing: it is the "None" choice, saying the file has no
+    // quoting at all, and that has to be said out loud - left unsaid, a file whose
+    // lines hold a lone quote is read from there to the next one as a single field.
+    match quote.as_deref() {
+        Some("") => args.push("quote=''".to_string()),
+        Some(q) => args.push(format!("quote='{}'", sql_escape(q))),
+        None => {}
     }
     if let Some(n) = null_val.as_deref().filter(|s| !s.is_empty()) {
         args.push(format!("nullstr='{}'", sql_escape(n)));

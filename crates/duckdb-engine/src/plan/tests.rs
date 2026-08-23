@@ -1687,6 +1687,26 @@
     }
 
     #[test]
+    fn quoting_off_is_said_to_the_reader_not_left_unsaid() {
+        // "None" in the quote box means the file has no quoting: a lone double quote in
+        // the middle of a line is data, not the start of a quoted field. Leaving the
+        // argument out does not say that - it leaves the reader on its default, which is
+        // the double quote - so a file whose text contains one was swallowed from that
+        // point to the next one and came back with no rows at all.
+        let off = build_csv_source(
+            &serde_json::json!({ "path": "d.txt", "hasHeader": false, "quoteChar": "" }),
+            None,
+        );
+        assert!(off.contains("quote=''"), "got: {}", off);
+        // Said nothing at all, the reader keeps its own default: still nothing emitted.
+        let unsaid = build_csv_source(
+            &serde_json::json!({ "path": "d.txt", "hasHeader": false }),
+            None,
+        );
+        assert!(!unsaid.contains("quote="), "got: {}", unsaid);
+    }
+
+    #[test]
     fn csv_extra_read_options_and_filename() {
         // #83: filename=true + a readOptions passthrough land in read_csv args.
         let sql = build_csv_source(
