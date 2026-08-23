@@ -2130,6 +2130,34 @@ fn named_port(connector: &str) -> Option<String> {
     (!is_link_type && !connector.trim().is_empty()).then(|| connector.to_string())
 }
 
+/// Everything inside a loop's body.
+///
+/// The body becomes a pipeline of its own, which it can only do while nothing outside it
+/// feeds it. So an ordering link must not reach into one, or across one: adding it would
+/// leave the loop pointing at a body that could no longer be lifted, which costs the whole
+/// child pipeline to gain an ordering that the loop already implies.
+fn loop_body_nodes(
+    edges: &[PipelineEdge],
+    connections: &[Conn],
+) -> std::collections::BTreeSet<String> {
+    let mut inside: std::collections::BTreeSet<String> = Default::default();
+    for c in connections
+        .iter()
+        .filter(|c| c.connector.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("ITERATE")))
+    {
+        let mut stack = vec![c.target.clone()];
+        while let Some(node) = stack.pop() {
+            if node == c.source || !inside.insert(node.clone()) {
+                continue;
+            }
+            stack.extend(
+                edges.iter().filter(|e| e.source == node).map(|e| e.target.clone()),
+            );
+        }
+    }
+    inside
+}
+
 /// Make the work after a parallel join wait for the branches, not for the fork.
 ///
 /// A job that forks into parallel branches and then carries on records the join as a link
@@ -2158,7 +2186,11 @@ fn rewire_parallel_joins(mut edges: Vec<PipelineEdge>, connections: &[Conn]) -> 
         return edges;
     }
 
+    let inside_loop = loop_body_nodes(&edges, connections);
     for (fork, after) in joins {
+        if inside_loop.contains(&after) {
+            continue;
+        }
         let roots: Vec<String> = connections
             .iter()
             .filter(|c| is(c, "PARALLELIZE") && c.source == fork)
@@ -2201,6 +2233,7 @@ fn rewire_parallel_joins(mut edges: Vec<PipelineEdge>, connections: &[Conn]) -> 
                 }
             }
         }
+        ends.retain(|e| !inside_loop.contains(e));
         if ends.is_empty() {
             continue;
         }
@@ -2282,6 +2315,9 @@ fn chain_declared_subjobs(
     for root in connections.iter().filter(|c| is(c, "PARALLELIZE")) {
         parallel.insert(root.target.clone());
     }
+    // A loop's body is lifted into a pipeline of its own and cannot be fed from outside,
+    // so it is left out of the chain at both ends.
+    parallel.extend(loop_body_nodes(&edges, connections));
 
     let known: std::collections::BTreeSet<String> = edges
         .iter()
@@ -3525,6 +3561,65 @@ mod tests {
         assert!(
             into_after.contains(&"a_1") && into_after.contains(&"b_1"),
             "and the join still waits for both: {into_after:?}"
+        );
+    }
+
+    #[test]
+    fn a_loop_body_still_lifts_when_the_job_declares_its_subjob_order() {
+        // The body of a loop becomes a pipeline of its own, which it can only do while
+        // nothing outside it feeds it. Keeping the declared order of subjobs put an edge
+        // into the subjob that starts the loop, and if that edge lands on the body the
+        // body stops being separable and the loop is left pointing at nothing.
+        //
+        // This goes through the whole import rather than calling the lifter directly:
+        // the two features only meet here, which is exactly why hand-built nodes and
+        // edges could not catch it.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="prev_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/prev.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="10" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="feed_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/feed.csv&quot;"/>
+          </node>
+          <node componentName="tFlowToIterate" posX="120" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="loop_1"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="220" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="body_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/each.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="320" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="body_2"/>
+            <elementParameter name="FILENAME" value="&quot;/data/each.out&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="feed_1" target="loop_1"/>
+          <connection connectorName="ITERATE" source="loop_1" target="body_1"/>
+          <connection connectorName="FLOW" source="body_1" target="body_2"/>
+          <subjob><elementParameter name="UNIQUE_NAME" value="prev_1"/></subjob>
+          <subjob><elementParameter name="UNIQUE_NAME" value="body_1"/></subjob>
+          <subjob><elementParameter name="UNIQUE_NAME" value="feed_1"/></subjob>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert_eq!(
+            im.children.len(),
+            1,
+            "the body is still a pipeline of its own; warnings were {:?}",
+            im.warnings
+        );
+        let body = &im.children[0];
+        let mut ids: Vec<&str> = body.nodes.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["body_1", "body_2"]);
+        assert!(
+            im.nodes
+                .iter()
+                .find(|n| n.id == "loop_1")
+                .and_then(|n| n.data.properties.as_ref())
+                .and_then(|p| p.get("pipelineRef"))
+                .is_some(),
+            "and the loop still names the file it became"
         );
     }
 
