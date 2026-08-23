@@ -12052,6 +12052,67 @@ fn run_log_writes_per_pipeline_ndjson() {
 }
 
 #[test]
+fn a_converted_java_body_sets_the_value_a_later_step_reads() {
+    // The whole point of carrying the body over: a Talend job works out a context value
+    // in Java from the row it just read, and a later step filters on that name. Imported
+    // and then RUN, the value has to actually be there - a node that compiles and sets
+    // nothing would pass every check up to this one.
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,REGION\n1,EU\n2,US\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let xml = format!(
+        r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;{csv}&quot;"/>
+            <elementParameter name="HEADER" value="1"/>
+            <metadata connector="FLOW" name="in_1">
+              <column name="id" type="id_String" nullable="true"/>
+              <column name="REGION" type="id_String" nullable="true"/>
+            </metadata>
+          </node>
+          <node componentName="tJavaRow" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="jr_1"/>
+            <elementParameter name="CODE" value="context.picked = input_row.REGION;"/>
+          </node>
+          <node componentName="tFilterRow" posX="240" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="f_1"/>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="jr_1"/>
+          <connection connectorName="FLOW" source="jr_1" target="f_1"/>
+        </talendfile:ProcessType>"#
+    );
+    let im = duckle_duckdb_engine::talend::import_item(&xml, "j").expect("imports");
+    // The importer produced the setting node; wire a step that reads the name and a
+    // sink, so the value has to survive all the way to a file.
+    let mut nodes = serde_json::to_value(&im.nodes).unwrap();
+    let mut edges = serde_json::to_value(&im.edges).unwrap();
+    let ns = nodes.as_array_mut().unwrap();
+    ns.retain(|n| n["id"] != "f_1");
+    ns.push(node(
+        "q",
+        "code.sql",
+        json!({ "sql": "SELECT id FROM input WHERE REGION = '${picked}'" }),
+    ));
+    ns.push(node("k", "snk.csv", json!({ "path": out, "hasHeader": true })));
+    let es = edges.as_array_mut().unwrap();
+    es.retain(|e| e["target"] != "f_1");
+    es.push(main_edge("e_q", "jr_1__picked", "q"));
+    es.push(main_edge("e_k", "q", "k"));
+
+    let d: PipelineDoc =
+        serde_json::from_value(json!({ "nodes": nodes, "edges": edges }))
+            .expect("the imported doc parses");
+    let r = engine.execute_pipeline(&d);
+    assert_eq!(r.status, "ok", "converted run failed: {:?}", r.error);
+    // The first row carries EU, so that is what the name stands for and only that row
+    // comes through. Set to nothing, the filter would match no row at all.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 1);
+    assert_eq!(scalar_string(&format!("SELECT id FROM read_csv_auto('{}')", out)), "1");
+}
+
+#[test]
 fn a_run_variable_reaches_a_later_step_on_either_execution_path() {
     // The value is worked out from the rows the run has just read, and a later step
     // filters on it. This is the whole point of the component: nothing knows the value

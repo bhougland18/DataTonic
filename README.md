@@ -619,6 +619,14 @@ and the report separates it so you can see how much there is:
   fails, since a pipeline that runs while omitting the rules is worse than one that stops.
   A body whose every statement is a print carries no rules and is called out separately, so
   a long list sorts into what can be deleted and what has to be ported.
+- A body whose every statement sets a context value is carried over instead, as one Set
+  Run Variable node per value, wired in the order the body set them. All of it or none of
+  it: one statement that cannot be read leaves the whole body for a person, because
+  carrying half of it over leaves something that looks finished and is not. A body that
+  took its values from the row it was given ran once per row, so the last row decided what
+  they held, while a node sets them once from the first row - the same thing for a single
+  row, which is what these bodies are usually fed, and the report says which nodes it
+  applies to rather than leaving you to notice.
 
 A component with no equivalent is imported as a named placeholder and reported. That
 includes a job body's input and output ports: a child pipeline runs for its side effects,

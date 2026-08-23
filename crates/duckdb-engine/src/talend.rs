@@ -60,6 +60,9 @@ pub enum Warning {
     /// still arrives with no SQL and still fails: the flag is there to triage a long
     /// list, not to let anything run.
     JavaBody { node: String, only_prints: bool },
+    /// A Java body that set context values from the row it was given, carried over to
+    /// nodes that set them once.
+    ContextSetFromFirstRow { node: String, names: Vec<String> },
     /// The write action has no exact equivalent, so the nearest one was used.
     WriteActionApproximated { node: String, action: String, used: String },
     /// A SQL step that changes the database rather than returning rows.
@@ -124,6 +127,11 @@ impl std::fmt::Display for Warning {
             Warning::JavaBody { node, only_prints: false } => write!(
                 f,
                 "{node}: the Java body has to be rewritten as SQL before this job runs"
+            ),
+            Warning::ContextSetFromFirstRow { node, names } => write!(
+                f,
+                "{node}: sets {} from the row it is given. The Java ran once per row, so the last row decided what they held; a node sets them once, from the first row. The same thing for a single row, a different one for more",
+                names.join(", ")
             ),
         }
     }
@@ -1780,6 +1788,65 @@ fn call_args<'a>(e: &'a str, name: &str) -> Option<Vec<&'a str>> {
 /// Such a body has no effect on the data, so it carries no rules to port. Anything else -
 /// an assignment, a context write, a call - counts as a rule, because treating one as
 /// harmless is how a pipeline ends up running happily while omitting the logic.
+/// A Java body with its comments taken out.
+fn java_source_without_comments(code: &str) -> Option<String> {
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            // An unclosed comment means the body is not readable at all.
+            None => return None,
+        }
+    }
+    out.push_str(rest);
+    Some(
+        out.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// The context values a Java body sets, in the order it sets them.
+///
+/// `None` unless the body is nothing BUT such assignments. A body that decides
+/// something, keeps a working value of its own, or prints, has rules in it that do not
+/// survive being reduced to a list of assignments - and reading only the assignments
+/// out of one would carry half of it over and quietly leave the rest behind, which is
+/// worse than carrying none of it, because what is left looks finished.
+fn context_assignments(code: &str) -> Option<Vec<(String, String)>> {
+    let source = java_source_without_comments(code)?;
+    // Anything that opens a block is control flow, and control flow is a rule.
+    if source.contains('{') || source.contains('}') {
+        return None;
+    }
+    let mut out = Vec::new();
+    for stmt in split_top_level(&source, ";") {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let rest = stmt.strip_prefix("context.")?;
+        let (name, value) = rest.split_once('=')?;
+        let name = name.trim();
+        // `==` is a comparison, not an assignment, and a name is a plain word.
+        if value.starts_with('=')
+            || name.is_empty()
+            || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        out.push((name.to_string(), value.to_string()));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn java_body_only_prints(code: &str) -> bool {
     let without_block_comments = {
         let mut out = String::with_capacity(code.len());
@@ -2815,6 +2882,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
 
     let (nodes, edges) =
         split_multi_output_mappers(nodes, edges, &raw_nodes, &connections, job_name, &mut warnings);
+    let (nodes, edges) = set_context_at_run_time(nodes, edges, &raw_nodes, &mut warnings);
     let (nodes, edges) = read_loop_rows_from_their_list(nodes, edges, &raw_nodes);
     let edges = rewire_parallel_joins(edges, &connections);
     let edges = anchor_subjob_links_at_their_end(edges);
@@ -3120,6 +3188,107 @@ fn named_port(connector: &str) -> Option<String> {
 /// The link leaving a mapper names the output it carries, so each one is wired to the
 /// relation it actually reads. A link that names nothing recognisable stays on the first
 /// output and is reported, since guessing which branch it meant is the whole problem.
+/// Carry a Java body that only sets context values over to nodes that set them.
+///
+/// A job routinely works out a value in Java - the date on the batch it just read, a
+/// code it just looked up - and later steps read it by name. There is a component for
+/// exactly that, so such a body is carried over instead of being left for someone to
+/// rewrite.
+///
+/// All of the body or none of it. A body with one statement that cannot be read stays
+/// exactly as it was, because carrying half of it over leaves something that looks
+/// finished and is not.
+fn set_context_at_run_time(
+    mut nodes: Vec<PipelineNode>,
+    mut edges: Vec<PipelineEdge>,
+    raw_nodes: &[RawNode],
+    warnings: &mut Vec<Warning>,
+) -> (Vec<PipelineNode>, Vec<PipelineEdge>) {
+    for raw in raw_nodes.iter().filter(|r| r.component.starts_with("tJava")) {
+        let Some(code) = raw.params.get("CODE").map(|c| unquote(c)) else { continue };
+        let Some(pairs) = context_assignments(&code) else { continue };
+        // Every value has to be readable as SQL, or the body is left alone.
+        let mut translated: Vec<(String, String)> = Vec::new();
+        for (name, value) in &pairs {
+            match java_expr_to_sql(value, &Default::default(), &Default::default()) {
+                Some(sql) => translated.push((name.clone(), sql)),
+                None => {
+                    translated.clear();
+                    break;
+                }
+            }
+        }
+        if translated.is_empty() {
+            continue;
+        }
+        let Some(at) = nodes.iter().position(|n| n.id == raw.unique) else { continue };
+        let original = nodes[at].clone();
+
+        let mut made: Vec<String> = Vec::new();
+        for (offset, (name, value)) in translated.iter().enumerate() {
+            let mut copy = original.clone();
+            copy.id = format!("{}__{}", raw.unique, name);
+            copy.data.label = copy.id.clone();
+            copy.data.component_id = Some("ctl.setvar".into());
+            copy.data.properties = Some(serde_json::json!({
+                "name": name,
+                "value": value,
+            }));
+            copy.position.y += 70.0 * offset as f64;
+            made.push(copy.id.clone());
+            nodes.push(copy);
+        }
+        nodes.remove(at);
+
+        // What came in reaches the first, what left carries on from the last, and they
+        // run in the order the body set them - a value can be built from an earlier one.
+        let first = made[0].clone();
+        let last = made[made.len() - 1].clone();
+        for e in edges.iter_mut() {
+            if e.target == raw.unique {
+                e.target = first.clone();
+            }
+            if e.source == raw.unique {
+                e.source = last.clone();
+            }
+        }
+        for pair in made.windows(2) {
+            edges.push(PipelineEdge {
+                id: format!("{}__{}-to-{}", raw.unique, pair[0], pair[1]),
+                source: pair[0].clone(),
+                target: pair[1].clone(),
+                source_handle: Some("main".into()),
+                target_handle: Some("main".into()),
+                edge_type: None,
+                data: Some(EdgeData {
+                    connection_type: "main".into(),
+                    label: None,
+                    condition: None,
+                }),
+            });
+        }
+
+        // It no longer has to be ported by hand, so it no longer says so.
+        warnings.retain(|w| !matches!(w, Warning::JavaBody { node, .. } if node == &raw.unique));
+        // A body that reads the row it is given ran once per row, so the last row
+        // decided what the value ended up as. A node sets it once, from the first row.
+        // The same thing for a single row, which is what these bodies are usually fed,
+        // and a different thing for more - so it is said rather than assumed.
+        let from_rows: Vec<String> = pairs
+            .iter()
+            .filter(|(_, java)| java.contains("input_row."))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !from_rows.is_empty() {
+            warnings.push(Warning::ContextSetFromFirstRow {
+                node: raw.unique.clone(),
+                names: from_rows,
+            });
+        }
+    }
+    (nodes, edges)
+}
+
 fn split_multi_output_mappers(
     mut nodes: Vec<PipelineNode>,
     mut edges: Vec<PipelineEdge>,
@@ -5801,6 +5970,154 @@ mod tests {
         let im = import_item(&off, "j").unwrap();
         let p = im.nodes[0].data.properties.as_ref().unwrap();
         assert_eq!(p["hasHeader"], false);
+    }
+
+    #[test]
+    fn a_java_body_of_context_assignments_is_read_as_assignments() {
+        let one = context_assignments("context.A = row1.X;");
+        assert_eq!(one, Some(vec![("A".into(), "row1.X".into())]));
+
+        // In order, because a later one can be built from an earlier one.
+        let two = context_assignments("context.A = row1.X;\ncontext.B = context.A;");
+        assert_eq!(
+            two,
+            Some(vec![
+                ("A".into(), "row1.X".into()),
+                ("B".into(), "context.A".into()),
+            ])
+        );
+
+        // Comments are not statements.
+        let commented = context_assignments("// set it\ncontext.A = row1.X; /* done */");
+        assert_eq!(commented, Some(vec![("A".into(), "row1.X".into())]));
+
+        // A semicolon inside text is not the end of a statement.
+        let quoted = context_assignments(r#"context.A = "a;b";"#);
+        assert_eq!(quoted, Some(vec![("A".into(), r#""a;b""#.into())]));
+    }
+
+    #[test]
+    fn a_java_body_that_is_not_only_assignments_is_not_read_as_assignments() {
+        // A body that decides something, keeps its own working value, or prints, is a
+        // body with rules in it. Reading only the assignments out of one would drop the
+        // rest and leave something that looks like it works.
+        assert_eq!(context_assignments("if (x != null) { context.A = 0; }"), None);
+        assert_eq!(context_assignments("String d = f();\ncontext.A = d;"), None);
+        assert_eq!(context_assignments("System.out.println(\"hi\");"), None);
+        assert_eq!(context_assignments("context.A = row1.X;\nfoo();"), None);
+        assert_eq!(context_assignments(""), None);
+        assert_eq!(context_assignments("   \n  "), None);
+    }
+
+    #[test]
+    fn a_java_node_that_only_sets_context_becomes_nodes_that_set_them() {
+        // A job works out a value in Java and later steps read it as a context name.
+        // There is a component for exactly that now, so the body is carried over rather
+        // than left for someone to rewrite by hand.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tJavaRow" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="jr_1"/>
+            <elementParameter name="CODE" value="context.batch_date = input_row.TXNDATE;&#10;context.region = &quot;EU&quot;;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="240" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/o.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="jr_1"/>
+          <connection connectorName="FLOW" source="jr_1" target="out_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let ids: Vec<&str> = im.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(!ids.contains(&"jr_1"), "the Java node is gone: {ids:?}");
+        assert!(ids.contains(&"jr_1__batch_date"), "got: {ids:?}");
+        assert!(ids.contains(&"jr_1__region"), "got: {ids:?}");
+
+        let of = |id: &str| -> (String, String) {
+            let n = im.nodes.iter().find(|n| n.id == id).unwrap();
+            let p = n.data.properties.as_ref().unwrap();
+            assert_eq!(n.data.component_id.as_deref(), Some("ctl.setvar"));
+            (
+                p["name"].as_str().unwrap().to_string(),
+                p["value"].as_str().unwrap().to_string(),
+            )
+        };
+        assert_eq!(of("jr_1__batch_date"), ("batch_date".into(), "TXNDATE".into()));
+        assert_eq!(of("jr_1__region"), ("region".into(), "'EU'".into()));
+
+        // Wired in order, with what came in reaching the first and what left the last.
+        let edge = |from: &str, to: &str| {
+            im.edges.iter().any(|e| e.source == from && e.target == to)
+        };
+        assert!(edge("in_1", "jr_1__batch_date"), "input reaches the first");
+        assert!(edge("jr_1__batch_date", "jr_1__region"), "they run in order");
+        assert!(edge("jr_1__region", "out_1"), "the last one carries rows on");
+    }
+
+    #[test]
+    fn only_a_value_taken_from_the_row_is_called_out() {
+        // The caveat is about WHICH row decided, so it belongs only on a value that came
+        // from one. A fixed value is the same however many rows went past.
+        let body = |code: &str| {
+            let xml = format!(
+                r#"<talendfile:ProcessType xmlns:talendfile="x">
+              <node componentName="tFileInputDelimited" posX="10" posY="10">
+                <elementParameter name="UNIQUE_NAME" value="in_1"/>
+                <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+              </node>
+              <node componentName="tJavaRow" posX="120" posY="10">
+                <elementParameter name="UNIQUE_NAME" value="jr_1"/>
+                <elementParameter name="CODE" value="{code}"/>
+              </node>
+              <connection connectorName="FLOW" source="in_1" target="jr_1"/>
+            </talendfile:ProcessType>"#
+            );
+            let im = import_item(&xml, "j").unwrap();
+            im.warnings
+                .iter()
+                .any(|w| matches!(w, Warning::ContextSetFromFirstRow { .. }))
+        };
+        assert!(body("context.a = input_row.X;"), "taken from the row");
+        assert!(!body("context.a = &quot;EU&quot;;"), "a fixed value needs no caveat");
+        assert!(!body("context.a = 7;"), "nor does a number");
+    }
+
+    #[test]
+    fn a_java_node_that_does_more_than_set_context_is_left_as_it_was() {
+        // One statement that cannot be read means the whole body stays for a person to
+        // port. Carrying over the readable half would silently drop the other half.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tJavaRow" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="jr_1"/>
+            <elementParameter name="CODE" value="context.a = input_row.X;&#10;String t = helper();"/>
+          </node>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert_eq!(im.nodes[0].id, "jr_1");
+        assert_eq!(im.nodes[0].data.component_id.as_deref(), Some("code.sql"));
+        assert!(
+            im.warnings.iter().any(|w| matches!(w, Warning::JavaBody { .. })),
+            "it still has to be ported by hand: {:?}",
+            im.warnings
+        );
+    }
+
+    #[test]
+    fn a_context_assignment_that_will_not_translate_leaves_the_body_alone() {
+        // The body is only assignments, but one of them reads a component's own
+        // statistic, which is not a value this tool can produce.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tJava" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="j_1"/>
+            <elementParameter name="CODE" value="context.a = &quot;x&quot;;&#10;context.b = ((String)globalMap.get(&quot;tFileList_1_CURRENT_FILE&quot;));"/>
+          </node>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert_eq!(im.nodes[0].id, "j_1", "nothing was replaced: {:?}", im.nodes[0].id);
+        assert_eq!(im.nodes[0].data.component_id.as_deref(), Some("code.sql"));
     }
 
     #[test]
