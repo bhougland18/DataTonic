@@ -308,6 +308,15 @@ pub fn import_tree(src: &Path, out: &Path) -> Result<BulkReport, String> {
         }
     }
 
+    // With every job in hand, the tables the project produces for its own use can be
+    // told from the ones it produces for someone else, and the reads of the first kind
+    // no longer have to leave the machine.
+    {
+        let mut all: Vec<&mut talend::Import> =
+            parsed.iter_mut().filter_map(|(_, _, im)| im.as_mut()).collect();
+        talend::route_reads_to_local_mirror(&mut all);
+    }
+
     for (rel, outcome, import) in parsed {
         match import {
             // A body that was spliced into its callers is not a pipeline of its own.
@@ -743,6 +752,209 @@ mod tests {
             parent.warnings.iter().any(|w| w.contains("hands rows back")),
             "got {:?}",
             parent.warnings
+        );
+    }
+
+    #[test]
+    fn a_warehouse_table_the_project_reads_back_is_read_locally_instead() {
+        // The point of the move is that intermediate work stops costing warehouse time.
+        // A table this project writes and then reads again is intermediate: the write
+        // still lands, so nothing downstream can tell the difference, but the read is
+        // served from a local mirror instead of going back out.
+        //
+        // The exception is a read that also needs a table the project does not write.
+        // That one still has to run where that table lives, so it stays - and so does
+        // the staging table it reads, since a mirror would then be serving only half of
+        // what the project asks for.
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let attr = |v: serde_json::Value| {
+            v.to_string().replace('&', "&amp;").replace('"', "&quot;")
+        };
+        let sink = |name: &str, table: &str, x: i32| {
+            let blob = attr(serde_json::json!({
+                "outputAction": {"storedValue": "INSERT"},
+                "table": {"tableName": {"storedValue": table}},
+            }));
+            format!(
+                r#"<node componentName="tSnowflakeOutput" posX="{x}" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="{name}"/>
+    <elementParameter name="PROPERTIES" value="{blob}"/>
+  </node>"#
+            )
+        };
+        let source = |name: &str, query: &str, x: i32| {
+            let blob = attr(serde_json::json!({"query": {"storedValue": query}}));
+            format!(
+                r#"<node componentName="tSnowflakeInput" posX="{x}" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="{name}"/>
+    <elementParameter name="PROPERTIES" value="{blob}"/>
+  </node>"#
+            )
+        };
+        write(
+            src.path(),
+            "J_0.1.item",
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<talendfile:ProcessType xmlns:talendfile="platform:/resource/org.talend.model/model/TalendFile.xsd">
+  <node componentName="tFileInputDelimited" posX="10" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="in_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+  </node>
+  {w1}
+  {r1}
+  {w2}
+  {r2}
+  {wfinal}
+  <connection connectorName="FLOW" source="in_1" target="w_1"/>
+  <connection connectorName="FLOW" source="in_1" target="w_2"/>
+  <connection connectorName="FLOW" source="r_1" target="final_1"/>
+  <connection connectorName="SUBJOB_OK" source="w_1" target="r_1"/>
+  <connection connectorName="SUBJOB_OK" source="w_2" target="r_2"/>
+</talendfile:ProcessType>
+"#,
+                w1 = sink("w_1", "STAGE_T", 120),
+                r1 = source("r_1", "SELECT * FROM STAGE_T WHERE X = 1", 240),
+                w2 = sink("w_2", "SHARED_T", 120),
+                r2 = source("r_2", "SELECT * FROM SHARED_T JOIN VENDOR_T ON a = b", 240),
+                wfinal = sink("final_1", "RESULT_T", 360),
+            ),
+        );
+
+        let report = import_tree(src.path(), out.path()).unwrap();
+        assert_eq!(report.failed(), 0);
+        let j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.path().join("J.json")).unwrap())
+                .unwrap();
+        let nodes = j["nodes"].as_array().unwrap().clone();
+        let node = |id: &str| {
+            nodes
+                .iter()
+                .find(|n| n["id"] == id)
+                .unwrap_or_else(|| panic!("no node {id}"))
+                .clone()
+        };
+        let component = |id: &str| node(id)["data"]["componentId"].as_str().unwrap().to_string();
+
+        // The staging table nothing else complicates: read locally, written to both.
+        assert_eq!(component("r_1"), "src.duckdb", "the read no longer leaves the machine");
+        assert_eq!(
+            node("r_1")["data"]["properties"]["sql"].as_str().unwrap(),
+            r#"SELECT * FROM duckle_src."STAGE_T" WHERE X = 1"#,
+            "and it reads the mirror rather than a table of the same name"
+        );
+        assert_eq!(
+            component("w_1"),
+            "snk.snowflake",
+            "the write still lands where it landed before, so nothing downstream changes"
+        );
+        assert_eq!(component("w_1__local"), "snk.duckdb", "and it also fills the mirror");
+        assert_eq!(
+            node("w_1__local")["data"]["properties"]["mode"].as_str().unwrap(),
+            "append",
+            "the mirror is written the same way the original is"
+        );
+        assert!(
+            j["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["source"] == "in_1" && e["target"] == "w_1__local"),
+            "fed from whatever fed the write it mirrors"
+        );
+
+        // The read that reaches outside the project, and the table it strands.
+        assert_eq!(
+            component("r_2"),
+            "src.snowflake",
+            "a read that also needs a table from outside cannot be served locally"
+        );
+        assert_eq!(
+            component("w_2"),
+            "snk.snowflake",
+            "so the table it reads stays remote, with no mirror to fall out of step"
+        );
+        assert!(
+            !nodes.iter().any(|n| n["id"] == "w_2__local"),
+            "a mirror nothing reads is pure cost"
+        );
+
+        // The output the project exists to produce.
+        assert_eq!(
+            component("final_1"),
+            "snk.snowflake",
+            "a table nobody reads back is a real output and is left alone"
+        );
+        assert!(!nodes.iter().any(|n| n["id"] == "final_1__local"));
+    }
+
+    #[test]
+    fn a_read_that_could_run_before_the_write_it_depends_on_is_left_alone() {
+        // Reading the mirror is only the same as reading the warehouse if the mirror has
+        // been filled by then. Where a job writes a table and reads it back with nothing
+        // ordering the two, that is not established, and a local read would turn a table
+        // that merely held stale rows into one that is not there at all. So the read is
+        // mapped as it was and keeps going to the warehouse.
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let attr =
+            |v: serde_json::Value| v.to_string().replace('&', "&amp;").replace('"', "&quot;");
+        let blob_sink = attr(serde_json::json!({
+            "outputAction": {"storedValue": "INSERT"},
+            "table": {"tableName": {"storedValue": "STAGE_T"}},
+        }));
+        let blob_read =
+            attr(serde_json::json!({"query": {"storedValue": "SELECT * FROM STAGE_T"}}));
+        write(
+            src.path(),
+            "J_0.1.item",
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<talendfile:ProcessType xmlns:talendfile="platform:/resource/org.talend.model/model/TalendFile.xsd">
+  <node componentName="tFileInputDelimited" posX="10" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="in_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+  </node>
+  <node componentName="tSnowflakeOutput" posX="120" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="w_1"/>
+    <elementParameter name="PROPERTIES" value="{blob_sink}"/>
+  </node>
+  <node componentName="tSnowflakeInput" posX="240" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="r_1"/>
+    <elementParameter name="PROPERTIES" value="{blob_read}"/>
+  </node>
+  <node componentName="tFileOutputDelimited" posX="360" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="out_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/out.csv&quot;"/>
+  </node>
+  <connection connectorName="FLOW" source="in_1" target="w_1"/>
+  <connection connectorName="FLOW" source="r_1" target="out_1"/>
+</talendfile:ProcessType>
+"#
+            ),
+        );
+
+        let report = import_tree(src.path(), out.path()).unwrap();
+        assert_eq!(report.failed(), 0);
+        let j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.path().join("J.json")).unwrap())
+                .unwrap();
+        let nodes = j["nodes"].as_array().unwrap();
+        let component = |id: &str| {
+            nodes.iter().find(|n| n["id"] == id).unwrap()["data"]["componentId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            component("r_1"),
+            "src.snowflake",
+            "nothing says the write happens first, so the read is not moved"
+        );
+        assert!(
+            !nodes.iter().any(|n| n["id"] == "w_1__local"),
+            "and no mirror is written for a table nothing reads locally"
         );
     }
 

@@ -49,6 +49,8 @@ pub enum Warning {
     /// still arrives with no SQL and still fails: the flag is there to triage a long
     /// list, not to let anything run.
     JavaBody { node: String, only_prints: bool },
+    /// The write action has no exact equivalent, so the nearest one was used.
+    WriteActionApproximated { node: String, action: String, used: String },
 }
 
 impl std::fmt::Display for Warning {
@@ -68,6 +70,10 @@ impl std::fmt::Display for Warning {
                 f,
                 "{node}: {property} is encrypted with a Studio key and cannot be read. Set \
                  {placeholder} in the environment before running"
+            ),
+            Warning::WriteActionApproximated { node, action, used } => write!(
+                f,
+                "{node}: the legacy write action {action} amends rows that match the key and                  drops the rest. The nearest write mode here is '{used}', which also inserts                  the rows that do not match. Check that is what the table should hold"
             ),
             Warning::JavaExpression { node, column, expression } => write!(
                 f,
@@ -311,6 +317,31 @@ fn is_subflow_name(name: &str) -> bool {
     }
     let mut c = name.chars();
     !matches!((c.next(), c.next()), (Some('t'), Some(second)) if second.is_ascii_uppercase())
+}
+
+/// Columns the component's own schema marks as keys.
+///
+/// A key-matched write needs to know what it matches on. The setting that names the
+/// key explicitly is ignored by the component whenever it is told to use the schema's
+/// keys instead, which is the usual configuration, so the schema is the reliable
+/// source. It is stored as a JSON document inside the blob rather than as structure.
+fn tcomp_key_columns(blob: &JsonValue) -> Vec<String> {
+    let Some(raw) = tcomp_stored(blob, "table.main.schema") else {
+        return Vec::new();
+    };
+    let Ok(schema) = serde_json::from_str::<JsonValue>(&raw) else {
+        return Vec::new();
+    };
+    schema["fields"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|f| f["talend.field.isKey"].as_str() == Some("true"))
+                .filter_map(|f| f["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Resolve the generic `tDBInput` / `tDBOutput` via the node's `TYPE` value.
@@ -676,6 +707,45 @@ fn properties_for(
             if let Some(t) = tcomp_value(&blob, "table.tableName") {
                 props.insert("tableName".into(), JsonValue::String(unquote(&t)));
             }
+            // How the component writes. Without this the sink takes the default write
+            // mode, which replaces the whole table - so an append became a replace, and
+            // on a table several nodes write to, each one erased the one before it.
+            if component_id == "snk.snowflake" {
+                if let Some(action) = tcomp_stored(&blob, "outputAction") {
+                    let action = action.trim().to_uppercase();
+                    let mode = match action.as_str() {
+                        "INSERT" => "append",
+                        // Both match on a key. The legacy upsert amends the matching row
+                        // and inserts the rest, which is what this mode does; the legacy
+                        // update drops the rest instead, which no mode here does, so it
+                        // is approximated and reported below.
+                        "UPSERT" | "UPDATE" => "upsert",
+                        // DELETE, and anything a later version adds, has no equivalent.
+                        // Leaving the mode unset is the honest outcome: the node arrives
+                        // unconfigured and is reported, rather than writing the wrong way.
+                        _ => "",
+                    };
+                    if !mode.is_empty() {
+                        props.insert("mode".into(), JsonValue::String(mode.into()));
+                    }
+                    if mode == "upsert" {
+                        let keys = tcomp_key_columns(&blob);
+                        if !keys.is_empty() {
+                            props.insert(
+                                "conflictColumns".into(),
+                                JsonValue::String(keys.join(",")),
+                            );
+                        }
+                    }
+                    if action == "UPDATE" {
+                        warnings.push(Warning::WriteActionApproximated {
+                            node: raw.unique.clone(),
+                            action,
+                            used: mode.into(),
+                        });
+                    }
+                }
+            }
             if let Some(q) = tcomp_value(&blob, "query") {
                 if component_id == "src.snowflake" && !q.trim().is_empty() {
                     props.insert("query".into(), JsonValue::String(unquote(&q)));
@@ -814,6 +884,334 @@ fn properties_for(
 /// It travels to the child as an ordinary context substitution, so the child names it
 /// without knowing where the parent put it.
 pub const RETURN_FILE: &str = "${DUCKLE_RETURN}";
+
+/// Where an imported project keeps the tables it produces for its own use.
+///
+/// One file for the whole project, not one per job, because a table written by one job
+/// and read by another is the common case and each job runs in its own process.
+pub const STAGING_DB: &str = "${workspace}/.duckle/staging.duckdb";
+
+/// Serve every warehouse read the project can satisfy from its own output locally.
+///
+/// A job written against a warehouse uses it as working storage as well as a destination:
+/// it writes a staging table, reads it back, joins it, writes it again. Every one of those
+/// hops is billed, and none of them has to happen there - the rows were produced on this
+/// machine and are being fetched back to be worked on here.
+///
+/// So a table this project both writes and reads is mirrored into a local file as it is
+/// written, and the reads are pointed at the mirror. The warehouse write is left exactly
+/// as it was, which is what makes this safe to do unasked: every table still lands where
+/// it landed before, so nothing downstream of the project - a report, another tool, a
+/// person - can tell the difference. Only the reads move.
+///
+/// A read moves only when the whole of it can: a query that also names a table this
+/// project does not write still needs the warehouse to resolve that table, so it stays
+/// there, and so does the table it reads, since a mirror would then be serving only part
+/// of the query. Anything else - a query assembled at run time, a name that cannot be read
+/// statically - is left alone rather than guessed at.
+///
+/// Returns the number of reads that moved.
+pub fn route_reads_to_local_mirror(imports: &mut [&mut Import]) -> usize {
+    // A job keeps its loop bodies as pipelines of their own, and the warehouse traffic is
+    // as often inside one of those as it is in the job itself, so both passes walk the
+    // whole tree rather than the top level.
+    let mut written: std::collections::BTreeSet<String> = Default::default();
+    let mut reads: Vec<Vec<String>> = Vec::new();
+    for im in imports.iter() {
+        survey(im, &mut written, &mut reads);
+    }
+    if written.is_empty() {
+        return 0;
+    }
+
+    // A table is worth mirroring when the project writes it and reads it back. It stops
+    // being worth mirroring the moment one of its reads cannot move, because that read
+    // would still go to the warehouse and would then be the only reader of a table the
+    // rest of the project had stopped treating as remote. Dropping one table can strand
+    // another read, so this settles rather than deciding in one pass.
+    let mut local: std::collections::BTreeSet<String> = reads
+        .iter()
+        .flatten()
+        .filter(|t| written.contains(*t))
+        .cloned()
+        .collect();
+    loop {
+        let stranded: std::collections::BTreeSet<String> = reads
+            .iter()
+            .filter(|tables| {
+                tables.iter().any(|t| local.contains(t))
+                    && !tables.iter().all(|t| local.contains(t))
+            })
+            .flatten()
+            .filter(|t| local.contains(*t))
+            .cloned()
+            .collect();
+        if stranded.is_empty() {
+            break;
+        }
+        local.retain(|t| !stranded.contains(t));
+    }
+    if local.is_empty() {
+        return 0;
+    }
+
+    imports.iter_mut().map(|im| reroute(im, &local)).sum()
+}
+
+/// Collect what the project writes to the warehouse, and what each read of it names.
+fn survey(
+    im: &Import,
+    written: &mut std::collections::BTreeSet<String>,
+    reads: &mut Vec<Vec<String>>,
+) {
+    for n in &im.nodes {
+        match n.data.component_id.as_deref() {
+            Some("snk.snowflake") => {
+                if let Some(t) = node_table(n) {
+                    written.insert(t);
+                }
+            }
+            Some("src.snowflake") => {
+                let tables = read_tables(n);
+                if !tables.is_empty() {
+                    reads.push(tables);
+                }
+            }
+            _ => {}
+        }
+    }
+    for c in &im.children {
+        survey(c, written, reads);
+    }
+}
+
+/// Point every read of a mirrored table at the mirror, and fill the mirror as it is
+/// written. Returns the number of reads that moved.
+fn reroute(im: &mut Import, local: &std::collections::BTreeSet<String>) -> usize {
+    let unordered = unordered_here(im, local);
+    let mut moved = 0;
+    for n in im.nodes.iter_mut() {
+        if n.data.component_id.as_deref() != Some("src.snowflake") {
+            continue;
+        }
+        let tables = read_tables(n);
+        if tables.is_empty() || !tables.iter().all(|t| local.contains(t)) {
+            continue;
+        }
+        if !unordered.is_empty() && tables.iter().any(|t| unordered.contains(t)) {
+            continue;
+        }
+        let Some(props) = n.data.properties.as_mut().and_then(|p| p.as_object_mut()) else {
+            continue;
+        };
+        // The local file is attached under a fixed alias, so a query that named the table
+        // outright now qualifies it. A read that named only a table needs no query at all.
+        let query = props
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // The warehouse connection is no longer part of this node, and a token placeholder
+        // left behind would keep asking for a secret nothing uses.
+        props.retain(|k, _| {
+            !matches!(
+                k.as_str(),
+                "account"
+                    | "database"
+                    | "schema"
+                    | "warehouse"
+                    | "role"
+                    | "username"
+                    | "pat"
+                    | "query"
+                    | "tableName"
+            )
+        });
+        props.insert("database".into(), JsonValue::String(STAGING_DB.into()));
+        if query.trim().is_empty() {
+            props.insert("tableName".into(), JsonValue::String(tables[0].clone()));
+        } else {
+            props.insert("sql".into(), JsonValue::String(qualify_tables(&query, local)));
+        }
+        n.data.component_id = Some("src.duckdb".into());
+        n.data.subtitle = Some("local mirror".into());
+        moved += 1;
+    }
+
+    // Mirror each write of a moved table, alongside the warehouse write it already does.
+    let mirrors: Vec<PipelineNode> = im
+        .nodes
+        .iter()
+        .filter(|n| n.data.component_id.as_deref() == Some("snk.snowflake"))
+        .filter(|n| {
+            node_table(n).is_some_and(|t| local.contains(&t) && !unordered.contains(&t))
+        })
+        .map(|n| {
+            let mut copy = n.clone();
+            copy.id = format!("{}__local", n.id);
+            copy.data.label = format!("{} (local mirror)", n.data.label);
+            copy.data.component_id = Some("snk.duckdb".into());
+            copy.data.subtitle = Some("local mirror".into());
+            copy.position.y += 90.0;
+            if let Some(props) = copy.data.properties.as_mut().and_then(|p| p.as_object_mut()) {
+                // How it writes carries over; where it wrote does not.
+                props.retain(|k, _| matches!(k.as_str(), "tableName" | "mode" | "conflictColumns"));
+                props.insert("database".into(), JsonValue::String(STAGING_DB.into()));
+            }
+            copy
+        })
+        .collect();
+    for mirror in mirrors {
+        let original = mirror.id.trim_end_matches("__local").to_string();
+        let feeds: Vec<PipelineEdge> = im
+            .edges
+            .iter()
+            .filter(|e| e.target == original)
+            .map(|e| {
+                let mut copy = e.clone();
+                copy.id = format!("{}__local", e.id);
+                copy.target = mirror.id.clone();
+                copy
+            })
+            .collect();
+        im.edges.extend(feeds);
+        im.nodes.push(mirror);
+    }
+
+    for c in im.children.iter_mut() {
+        moved += reroute(c, local);
+    }
+    moved
+}
+
+/// Tables this pipeline writes and reads with nothing ordering the two.
+///
+/// Reading the mirror is only the same as reading the warehouse if the mirror has been
+/// filled by then. Within one pipeline that is a question the graph answers: the write has
+/// to lead to the read, by rows or by one of the links that say what runs after what.
+/// Where it does not, the read is left going to the warehouse - the difference being that
+/// a warehouse table nothing wrote yet holds stale rows, while a local one is simply not
+/// there, so guessing turns a quiet wrong answer into a failed run.
+///
+/// A write in a different pipeline is not this graph's business: whatever ordered it
+/// before the warehouse read still orders it before the local one.
+fn unordered_here(
+    im: &Import,
+    local: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let writes: Vec<(&str, String)> = im
+        .nodes
+        .iter()
+        .filter(|n| n.data.component_id.as_deref() == Some("snk.snowflake"))
+        .filter_map(|n| node_table(n).map(|t| (n.id.as_str(), t)))
+        .filter(|(_, t)| local.contains(t))
+        .collect();
+    if writes.is_empty() {
+        return Default::default();
+    }
+    let reads: Vec<(&str, Vec<String>)> = im
+        .nodes
+        .iter()
+        .filter(|n| n.data.component_id.as_deref() == Some("src.snowflake"))
+        .map(|n| (n.id.as_str(), read_tables(n)))
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+
+    let mut out: std::collections::BTreeSet<String> = Default::default();
+    for (write_id, table) in &writes {
+        for (read_id, read_of) in &reads {
+            if !read_of.contains(table) || reaches(im, write_id, read_id) {
+                continue;
+            }
+            out.insert(table.clone());
+        }
+    }
+    out
+}
+
+/// Whether one node leads to another, by rows or by an ordering link.
+fn reaches(im: &Import, from: &str, to: &str) -> bool {
+    let mut seen: std::collections::BTreeSet<&str> = Default::default();
+    let mut stack = vec![from];
+    while let Some(node) = stack.pop() {
+        if node == to {
+            return true;
+        }
+        if !seen.insert(node) {
+            continue;
+        }
+        stack.extend(
+            im.edges.iter().filter(|e| e.source == node).map(|e| e.target.as_str()),
+        );
+    }
+    false
+}
+
+/// The table a warehouse node names outright, if it names one.
+fn node_table(n: &PipelineNode) -> Option<String> {
+    let t = n.data.properties.as_ref()?.get("tableName")?.as_str()?.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// The tables a warehouse read names - from its table setting, or from its query.
+fn read_tables(n: &PipelineNode) -> Vec<String> {
+    let Some(props) = n.data.properties.as_ref() else {
+        return Vec::new();
+    };
+    let query = props.get("query").and_then(|v| v.as_str()).unwrap_or_default();
+    if query.trim().is_empty() {
+        return node_table(n).into_iter().collect();
+    }
+    tables_in_query(query)
+}
+
+/// Table names a query reads from.
+///
+/// Deliberately shallow: it reads the name after FROM and JOIN and nothing else. That is
+/// enough to tell a query reading one staging table from one that also reaches for
+/// something this project does not write, which is the only question being asked. A name
+/// it cannot make sense of leaves the query where it is, which is the safe direction.
+fn tables_in_query(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    for (i, w) in words.iter().enumerate() {
+        if !w.eq_ignore_ascii_case("from") && !w.eq_ignore_ascii_case("join") {
+            continue;
+        }
+        let Some(next) = words.get(i + 1) else { continue };
+        // A subquery or a derived table is not a plain name, so this read stays put.
+        if next.starts_with('(') {
+            return Vec::new();
+        }
+        let name = next.trim_end_matches([',', ';', ')']).trim();
+        let plain = name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '{' | '}' | '.' | '"'));
+        if name.is_empty() || !plain {
+            return Vec::new();
+        }
+        out.push(name.to_string());
+    }
+    out
+}
+
+/// Rewrite the name after FROM / JOIN so it reads from the attached local file.
+fn qualify_tables(sql: &str, local: &std::collections::BTreeSet<String>) -> String {
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut after_keyword = false;
+    for part in sql.split_inclusive(char::is_whitespace) {
+        let word = part.trim();
+        let bare = word.trim_end_matches([',', ';', ')']);
+        if after_keyword && local.contains(bare) {
+            out.push_str(&part.replacen(bare, &format!("duckle_src.\"{bare}\""), 1));
+        } else {
+            out.push_str(part);
+        }
+        after_keyword = word.eq_ignore_ascii_case("from") || word.eq_ignore_ascii_case("join");
+    }
+    out
+}
+
 
 impl Import {
     /// Does this job hand rows back to whoever calls it?
@@ -1395,6 +1793,8 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         })
         .collect();
 
+    let edges = rewire_parallel_joins(edges, &connections);
+
     // A child pipeline is handed no rows and returns none, so a row link leaving a call
     // is a data path the source tool had and this one does not.
     let mut wants_rows: Vec<String> = Vec::new();
@@ -1655,6 +2055,101 @@ fn named_port(connector: &str) -> Option<String> {
             | "SYNCHRONIZE"
     );
     (!is_link_type && !connector.trim().is_empty()).then(|| connector.to_string())
+}
+
+/// Make the work after a parallel join wait for the branches, not for the fork.
+///
+/// A job that forks into parallel branches and then carries on records the join as a link
+/// from the node that forked - the same node the branches themselves hang off. Read
+/// literally that makes the work after the join a third branch, free to run alongside the
+/// two it exists to wait for, and everything downstream of it then sees whatever those
+/// branches happened to have finished. The link is a join, so it is written as one: the
+/// end of every branch feeds it.
+///
+/// What counts as a branch matters here. Branches converge - two of them will hand their
+/// failures to the same error handler, and that handler is usually downstream of the join
+/// as well. Following a branch to wherever it leads therefore walks straight past the join
+/// and comes back round, and hanging the join off that would be a loop rather than a wait.
+/// So a branch is only the part of itself that the work after the join cannot already
+/// reach, and a fork with nothing left after that is left exactly as it was.
+fn rewire_parallel_joins(mut edges: Vec<PipelineEdge>, connections: &[Conn]) -> Vec<PipelineEdge> {
+    let is = |c: &Conn, name: &str| {
+        c.connector.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(name))
+    };
+    let joins: Vec<(String, String)> = connections
+        .iter()
+        .filter(|c| is(c, "SYNCHRONIZE"))
+        .map(|c| (c.source.clone(), c.target.clone()))
+        .collect();
+    if joins.is_empty() {
+        return edges;
+    }
+
+    for (fork, after) in joins {
+        let roots: Vec<String> = connections
+            .iter()
+            .filter(|c| is(c, "PARALLELIZE") && c.source == fork)
+            .map(|c| c.target.clone())
+            .collect();
+        if roots.is_empty() {
+            continue;
+        }
+        let successors = |from: &str, edges: &[PipelineEdge]| -> Vec<String> {
+            edges.iter().filter(|e| e.source == from).map(|e| e.target.clone()).collect()
+        };
+        let reachable = |from: &str, edges: &[PipelineEdge]| -> std::collections::BTreeSet<String> {
+            let mut seen: std::collections::BTreeSet<String> = Default::default();
+            let mut stack = vec![from.to_string()];
+            while let Some(node) = stack.pop() {
+                if !seen.insert(node.clone()) {
+                    continue;
+                }
+                stack.extend(successors(&node, edges));
+            }
+            seen
+        };
+
+        // Everything the work after the join already leads to is not part of a branch,
+        // whatever a branch link says: it happens after the join, not before it.
+        let downstream = reachable(&after, &edges);
+        let mut ends: Vec<String> = Vec::new();
+        for root in &roots {
+            if downstream.contains(root) {
+                continue;
+            }
+            let branch: std::collections::BTreeSet<String> = reachable(root, &edges)
+                .into_iter()
+                .filter(|n| !downstream.contains(n))
+                .collect();
+            for node in &branch {
+                let leads_on = successors(node, &edges).iter().any(|t| branch.contains(t));
+                if !leads_on && !ends.contains(node) {
+                    ends.push(node.clone());
+                }
+            }
+        }
+        if ends.is_empty() {
+            continue;
+        }
+
+        edges.retain(|e| !(e.source == fork && e.target == after));
+        for end in ends {
+            edges.push(PipelineEdge {
+                id: format!("join-{end}-{after}"),
+                source: end,
+                target: after.clone(),
+                source_handle: Some("main".into()),
+                target_handle: Some("main".into()),
+                edge_type: None,
+                data: Some(EdgeData {
+                    connection_type: "on-subjob-ok".into(),
+                    label: None,
+                    condition: None,
+                }),
+            });
+        }
+    }
+    edges
 }
 
 fn connection_type_for(connector: Option<&str>) -> &'static str {
@@ -2620,14 +3115,137 @@ mod tests {
         assert_eq!(j(r#""/data/"+context.grp"#).as_deref(), Some("/data/${grp}"));
         assert_eq!(j("context.A").as_deref(), Some("${A}"), "the bare form still works");
         assert_eq!(
-            j(r#""SELECT * FROM "+context.Entry_tablename+" WHERE x=1""#).as_deref(),
-            Some("SELECT * FROM ${Entry_tablename} WHERE x=1")
+            j(r#""SELECT * FROM "+context.target_table+" WHERE x=1""#).as_deref(),
+            Some("SELECT * FROM ${target_table} WHERE x=1")
         );
         // anything that is not a literal or a context name is left alone: a row reference
         // or a call means the value is computed, and guessing it would be wrong
         assert_eq!(j(r#""x"+row1.COL"#), None);
         assert_eq!(j(r#"context.A.substring(1)"#), None);
         assert_eq!(j(r#""a"+someMethod()"#), None);
+    }
+
+    #[test]
+    fn a_warehouse_write_keeps_the_action_it_was_configured_with() {
+        // The legacy component records how it writes - append a row, or amend the row
+        // that is already there - and the mode it lands on decides whether a re-run
+        // adds rows or replaces them. Dropping it defaulted the write to a full-table
+        // replace, so on a table with several writers each one erased the last.
+        // One key column, one ordinary column, and the write action under test.
+        let schema = r#"{"fields":[{"name":"REF_NO","talend.field.isKey":"true"},{"name":"AMT","talend.field.isKey":"false"}]}"#;
+        let blob = |action: &str| {
+            let json = serde_json::json!({
+                "tableAction": {"storedValue": "NONE"},
+                "outputAction": {"storedValue": action},
+                "table": {
+                    "tableName": {"storedValue": "T"},
+                    "main": {"schema": {"storedValue": schema}},
+                },
+            });
+            // The blob rides inside an XML attribute, so it arrives escaped.
+            json.to_string().replace('&', "&amp;").replace('"', "&quot;")
+        };
+        let job = |action: &str| {
+            let xml = format!(
+                r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tSnowflakeOutput" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="PROPERTIES" value="{}"/>
+          </node></talendfile:ProcessType>"#,
+                blob(action)
+            );
+            import_item(&xml, "j").unwrap()
+        };
+
+        let ins = job("INSERT");
+        let p = ins.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(
+            p.get("mode").and_then(|v| v.as_str()),
+            Some("append"),
+            "an insert adds rows; it does not replace the table"
+        );
+
+        let ups = job("UPSERT");
+        let p = ups.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(p.get("mode").and_then(|v| v.as_str()), Some("upsert"));
+        assert_eq!(
+            p.get("conflictColumns").and_then(|v| v.as_str()),
+            Some("REF_NO"),
+            "the key it matches on comes from the columns the schema marks as keys"
+        );
+    }
+
+    #[test]
+    fn an_update_only_write_is_reported_rather_than_quietly_widened() {
+        // The legacy update amends rows that match and drops the rest. The nearest
+        // mode here also inserts the rest, so the import is close but not equal -
+        // and a difference that only shows up as extra rows in production is exactly
+        // the kind that has to be said out loud at import time.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tSnowflakeOutput" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="PROPERTIES" value="{&quot;outputAction&quot;:{&quot;storedValue&quot;:&quot;UPDATE&quot;},&quot;table&quot;:{&quot;tableName&quot;:{&quot;storedValue&quot;:&quot;T&quot;}}}"/>
+          </node></talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert!(
+            im.warnings.iter().any(|w| matches!(
+                w,
+                Warning::WriteActionApproximated { node, action, .. }
+                    if node == "out_1" && action == "UPDATE"
+            )),
+            "got {:?}",
+            im.warnings
+        );
+    }
+
+    #[test]
+    fn work_after_a_parallel_join_waits_for_the_branches_it_joins() {
+        // A job that forks into parallel branches and then carries on writes the join as a
+        // link from the node that forked, not from the branches - so read literally, the
+        // work after the join looks like a third branch and is free to run alongside the
+        // two it is supposed to be waiting for. Everything downstream of the join then
+        // reads whatever those branches happened to have finished writing.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tParallelize" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="fork_1"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="100" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="a_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="200" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="a_2"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.out&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="100" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="b_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/b.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="300" posY="50">
+            <elementParameter name="UNIQUE_NAME" value="after_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/c.csv&quot;"/>
+          </node>
+          <connection connectorName="PARALLELIZE" source="fork_1" target="a_1"/>
+          <connection connectorName="PARALLELIZE" source="fork_1" target="b_1"/>
+          <connection connectorName="FLOW" source="a_1" target="a_2"/>
+          <connection connectorName="SYNCHRONIZE" source="fork_1" target="after_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let into = |t: &str| {
+            let mut v: Vec<&str> = im
+                .edges
+                .iter()
+                .filter(|e| e.target == t)
+                .map(|e| e.source.as_str())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            into("after_1"),
+            vec!["a_2", "b_1"],
+            "the work after the join waits for the end of every branch, not for the fork"
+        );
     }
 
     #[test]

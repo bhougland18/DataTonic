@@ -624,6 +624,30 @@ A component with no equivalent is imported as a named placeholder and reported. 
 includes a job body's input and output ports: a child pipeline runs for its side effects,
 so it does not yet take rows from its caller or hand them back.
 
+**How a write writes is carried across.** A warehouse sink records whether it appends rows
+or amends the ones already there, and importing that as the default write mode turned an
+append into a full-table replace - so on a table several nodes write to, each one erased
+the one before it. The write action now comes across, with the key it matches on taken
+from the columns the schema marks as keys. An action with no exact equivalent here is
+reported rather than widened in silence.
+
+**Intermediate work moves to DuckDB.** A job written against a warehouse uses it as
+working storage as well as a destination: it writes a staging table, reads it back, joins
+it, writes it again, and every one of those hops is billed for rows that were produced on
+this machine in the first place. So a table the imported project both writes and reads is
+mirrored into `<workspace>/.duckle/staging.duckdb` as it is written, and the reads are
+pointed at the mirror. The warehouse write is left exactly as it was, which is what makes
+this safe to do unasked: every table still lands where it landed before, so nothing
+downstream of the project can tell the difference. Only the reads move.
+
+A read moves only when the whole of it can. A query that also names a table the project
+does not write still needs the warehouse to resolve it, so that read stays - and so does
+the staging table it reads, since a mirror would then be serving only half of what the
+project asks for. Neither does a read the job could run before its own write: within one
+pipeline the write has to lead to the read, by rows or by an ordering link, because a
+warehouse table nothing wrote yet holds stale rows while a local one is simply not there.
+Anything else, including a query assembled at run time, is mapped as it was.
+
 ### Workspace catalog (what reads and writes what)
 
 Every other lineage view in Duckle answers about **one** pipeline. The catalog answers about the whole workspace, by joining pipelines through the assets they name: two pipelines that read and write the same table are connected whether or not anyone drew a line between them.
