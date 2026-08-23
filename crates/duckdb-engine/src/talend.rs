@@ -1047,9 +1047,10 @@ fn properties_for(
             // column, a failure to read the file at all. So it is read with a separator
             // and a quote the text cannot hold.
             if raw.component == "tFileInputFullRow" {
-                let never = "\u{7}".to_string();
-                props.insert("delimiter".into(), JsonValue::String(never.clone()));
-                props.insert("quote".into(), JsonValue::String(never));
+                props.insert("delimiter".into(), JsonValue::String("\u{7}".to_string()));
+                // And no quoting: the line is text, so a double quote standing in it is
+                // a character like any other rather than the start of a quoted field.
+                props.insert("quoteChar".into(), JsonValue::String(String::new()));
             }
             // The component counts header ROWS to skip and names its columns itself.
             // Read as "the first line is the header", the names come from whatever that
@@ -5622,10 +5623,13 @@ mod tests {
             sep.chars().all(|c| c.is_control()),
             "the separator is one the text cannot contain, got {sep:?}"
         );
+        // Off, under the name the reader actually looks for. Named anything else the
+        // setting is not seen at all and the reader keeps its default double quote,
+        // which eats a file whose lines contain one.
         assert_eq!(
-            p["quote"].as_str(),
-            Some(sep),
-            "and quoting is off too, or a line starting with a quote is taken apart"
+            p["quoteChar"].as_str(),
+            Some(""),
+            "and quoting is off too, or a line holding a quote is taken apart"
         );
         assert_eq!(p["hasHeader"], false);
         assert_eq!(p["skipLines"], 1);
