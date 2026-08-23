@@ -1630,12 +1630,17 @@ fn call_args<'a>(e: &'a str, name: &str) -> Option<Vec<&'a str>> {
         return None;
     }
     let mut out = Vec::new();
-    let (mut depth, mut start) = (0i32, 0usize);
+    let (mut depth, mut start, mut in_string) = (0i32, 0usize, false);
+    let bytes = inner.as_bytes();
     for (i, c) in inner.char_indices() {
         match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
+            // A comma inside a literal is part of the literal, not a separator between
+            // arguments. Split on it and a call looks like it has more arguments than it
+            // does, so the whole expression goes unread.
+            '"' if !(i > 0 && bytes[i - 1] == b'\\') => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => depth -= 1,
+            ',' if depth == 0 && !in_string => {
                 out.push(&inner[start..i]);
                 start = i + 1;
             }
@@ -2232,12 +2237,13 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     }
     // A static call, not a method on a value.
     if let Some(args) = call_args(e, "StringHandling.EREPLACE") {
+        // The pattern is as often a setting as a literal, and either reads.
         if args.len() == 3 {
             return Some(format!(
                 "regexp_replace({}, {}, {}, 'g')",
                 java_expr_to_sql(args[0], types)?,
-                java_string_to_sql(args[1])?,
-                java_string_to_sql(args[2])?
+                java_expr_to_sql(args[1], types)?,
+                java_expr_to_sql(args[2], types)?
             ));
         }
     }
@@ -5237,6 +5243,12 @@ mod tests {
         assert_eq!(sql("row1.NAME.toUpperCase()").as_deref(), Some("upper(NAME)"));
         assert_eq!(sql("row1.NAME.toLowerCase()").as_deref(), Some("lower(NAME)"));
         assert_eq!(sql("row1.NAME.length()").as_deref(), Some("length(NAME)"));
+        // A comma inside a literal is part of the literal. Split on it, the call looked
+        // like it had three arguments and the whole expression went unread.
+        assert_eq!(
+            sql(r#"row1.CODE.replaceAll("x",",")"#).as_deref(),
+            Some("regexp_replace(CODE, 'x', ',', 'g')")
+        );
         // Java counts from zero and takes an end; SQL counts from one and takes a length.
         assert_eq!(sql("row1.NAME.substring(2)").as_deref(), Some("substr(NAME, 2 + 1)"));
         assert_eq!(
