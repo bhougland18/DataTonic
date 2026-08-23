@@ -2173,6 +2173,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         split_multi_output_mappers(nodes, edges, &raw_nodes, &connections, &mut warnings);
     let (nodes, edges) = read_loop_rows_from_their_list(nodes, edges, &raw_nodes);
     let edges = rewire_parallel_joins(edges, &connections);
+    let edges = anchor_subjob_links_at_their_end(edges);
     let edges = chain_declared_subjobs(edges, &subjob_heads, &connections);
 
     // A child pipeline is handed no rows and returns none, so a row link leaving a call
@@ -2253,13 +2254,93 @@ struct Conn {
 /// also fed from outside the loop, moving it would silently cut the main flow,
 /// so the loop is left alone and the job says so instead. Extracting the wrong
 /// subgraph is worse than not extracting it.
-fn extract_loop_bodies(
-    parent_name: &str,
-    nodes: &mut Vec<PipelineNode>,
-    edges: &mut Vec<PipelineEdge>,
-    warnings: &mut Vec<Warning>,
-) -> Vec<Import> {
-    let loops: Vec<String> = nodes
+/// Which nodes make up one loop's body.
+///
+/// The single definition of it. An ordering link must not cross a body's boundary, or the
+/// body stops being liftable and the loop is left naming a file nobody wrote - and the
+/// pass that adds those links and the pass that lifts the body have to agree about where
+/// the boundary is. Working it out twice is how they came to disagree: a body also draws
+/// in the sources its joins read, and a walk that only follows the flow forwards misses
+/// them.
+///
+/// Empty when the loop has no body to speak of.
+fn loop_body_members(
+    loop_id: &str,
+    edges: &[PipelineEdge],
+) -> std::collections::HashSet<String> {
+    // The body starts at whatever the loop's iterate link points to.
+    let entries: Vec<String> = edges
+        .iter()
+        .filter(|e| {
+            e.source == loop_id
+                && e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("iterate")
+        })
+        .map(|e| e.target.clone())
+        .collect();
+    let mut body: std::collections::HashSet<String> = Default::default();
+    if entries.is_empty() {
+        return body;
+    }
+
+    // Everything reachable from those entries, not passing back through the loop itself.
+    let mut queue = entries;
+    while let Some(id) = queue.pop() {
+        if id == loop_id || !body.insert(id.clone()) {
+            continue;
+        }
+        for e in edges.iter().filter(|e| e.source == id) {
+            if e.target != loop_id {
+                queue.push(e.target.clone());
+            }
+        }
+    }
+
+    // A join inside the loop reads its reference table from a source that sits outside
+    // it. That source is part of the body's work, not of the main flow, so pull it in -
+    // along with whatever feeds it - rather than refusing a loop whose only sin is having
+    // a lookup.
+    loop {
+        let pull: Vec<String> = edges
+            .iter()
+            .filter(|e| body.contains(&e.target) && e.source != loop_id)
+            .filter(|e| !body.contains(&e.source))
+            .filter(|e| {
+                e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("lookup")
+                    || e.target_handle.as_deref() == Some("lookup")
+            })
+            .map(|e| e.source.clone())
+            .collect();
+        // Only if nothing outside the body still reads it: moving a source the main flow
+        // also uses would cut the parent.
+        let safe: Vec<String> = pull
+            .into_iter()
+            .filter(|src| {
+                !edges
+                    .iter()
+                    .any(|e| e.source == *src && !body.contains(&e.target) && e.target != loop_id)
+            })
+            .collect();
+        if safe.is_empty() {
+            break;
+        }
+        for id in safe {
+            let mut q = vec![id];
+            while let Some(x) = q.pop() {
+                if x == loop_id || !body.insert(x.clone()) {
+                    continue;
+                }
+                for e in edges.iter().filter(|e| e.target == x) {
+                    q.push(e.source.clone());
+                }
+            }
+        }
+    }
+    body
+}
+
+/// The loops in a graph, in the order their nodes appear.
+fn loop_nodes(nodes: &[PipelineNode]) -> Vec<String> {
+    nodes
         .iter()
         .filter(|n| {
             matches!(
@@ -2268,80 +2349,20 @@ fn extract_loop_bodies(
             )
         })
         .map(|n| n.id.clone())
-        .collect();
+        .collect()
+}
 
+fn extract_loop_bodies(
+    parent_name: &str,
+    nodes: &mut Vec<PipelineNode>,
+    edges: &mut Vec<PipelineEdge>,
+    warnings: &mut Vec<Warning>,
+) -> Vec<Import> {
     let mut children = Vec::new();
-    for loop_id in loops {
-        // The body starts at whatever the loop's iterate link points to.
-        let entries: Vec<String> = edges
-            .iter()
-            .filter(|e| {
-                e.source == loop_id
-                    && e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("iterate")
-            })
-            .map(|e| e.target.clone())
-            .collect();
-        if entries.is_empty() {
-            continue;
-        }
-
-        // Everything reachable from those entries, not passing back through the
-        // loop itself.
-        let mut body: std::collections::HashSet<String> = Default::default();
-        let mut queue = entries.clone();
-        while let Some(id) = queue.pop() {
-            if id == loop_id || !body.insert(id.clone()) {
-                continue;
-            }
-            for e in edges.iter().filter(|e| e.source == id) {
-                if e.target != loop_id {
-                    queue.push(e.target.clone());
-                }
-            }
-        }
+    for loop_id in loop_nodes(nodes) {
+        let mut body = loop_body_members(&loop_id, edges);
         if body.is_empty() {
             continue;
-        }
-
-        // A join inside the loop reads its reference table from a source that
-        // sits outside it. That source is part of the body's work, not of the
-        // main flow, so pull it in - along with whatever feeds it - rather than
-        // refusing a loop whose only sin is having a lookup.
-        loop {
-            let pull: Vec<String> = edges
-                .iter()
-                .filter(|e| body.contains(&e.target) && e.source != loop_id)
-                .filter(|e| !body.contains(&e.source))
-                .filter(|e| {
-                    e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("lookup")
-                        || e.target_handle.as_deref() == Some("lookup")
-                })
-                .map(|e| e.source.clone())
-                .collect();
-            // Only if nothing outside the body still reads it: moving a source
-            // the main flow also uses would cut the parent.
-            let safe: Vec<String> = pull
-                .into_iter()
-                .filter(|src| {
-                    !edges.iter().any(|e| {
-                        e.source == *src && !body.contains(&e.target) && e.target != loop_id
-                    })
-                })
-                .collect();
-            if safe.is_empty() {
-                break;
-            }
-            for id in safe {
-                let mut q = vec![id];
-                while let Some(x) = q.pop() {
-                    if x == loop_id || !body.insert(x.clone()) {
-                        continue;
-                    }
-                    for e in edges.iter().filter(|e| e.target == x) {
-                        q.push(e.source.clone());
-                    }
-                }
-            }
         }
 
         // Refuse if anything in the body is still fed from outside it: that is a
@@ -2819,6 +2840,103 @@ fn rewire_parallel_joins(mut edges: Vec<PipelineEdge>, connections: &[Conn]) -> 
             });
         }
     }
+    edges
+}
+
+/// Make "after this subjob" wait for all of the subjob.
+///
+/// The link is written out of the component the subjob starts at, because that component
+/// is how the tool names the subjob. Read as a link out of that one component it means
+/// "after the first step" - a much weaker thing: everything the subjob went on to do,
+/// including the file it wrote, is free to happen afterwards. A job that writes a file in
+/// one subjob and reads it in the next then reads it before it exists, and reports
+/// success either way.
+///
+/// So the link is moved to where the subjob ends. A subjob is what the rows flow through,
+/// so its end is what nothing else reads from; a subjob that ends in several places has
+/// the next one wait for all of them.
+fn anchor_subjob_links_at_their_end(mut edges: Vec<PipelineEdge>) -> Vec<PipelineEdge> {
+    let is_row = |e: &PipelineEdge| {
+        matches!(
+            e.data.as_ref().map(|d| d.connection_type.as_str()),
+            Some("main") | Some("lookup")
+        )
+    };
+    let waits: Vec<(usize, String, String)> = edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("on-subjob-ok")
+        })
+        .map(|(i, e)| (i, e.source.clone(), e.target.clone()))
+        .collect();
+    if waits.is_empty() {
+        return edges;
+    }
+
+    let mut added: Vec<PipelineEdge> = Vec::new();
+    let mut drop: std::collections::BTreeSet<usize> = Default::default();
+    for (at, head, after) in waits {
+        // What the rows flow through from here, without leaving by the link itself.
+        let mut subjob: std::collections::BTreeSet<String> = Default::default();
+        let mut stack = vec![head.clone()];
+        while let Some(node) = stack.pop() {
+            if node == after || !subjob.insert(node.clone()) {
+                continue;
+            }
+            stack.extend(
+                edges
+                    .iter()
+                    .filter(|e| e.source == node && is_row(e))
+                    .map(|e| e.target.clone()),
+            );
+        }
+        let ends: Vec<String> = subjob
+            .iter()
+            .filter(|n| {
+                !edges
+                    .iter()
+                    .any(|e| &&e.source == n && is_row(e) && subjob.contains(&e.target))
+            })
+            .cloned()
+            .collect();
+        // A subjob of one component is already its own end.
+        if ends.len() == 1 && ends[0] == head {
+            continue;
+        }
+        let mut moved = false;
+        for end in ends {
+            if end == head || would_cycle(&edges, &end, &after) {
+                continue;
+            }
+            added.push(PipelineEdge {
+                id: format!("after-{end}-{after}"),
+                source: end,
+                target: after.clone(),
+                source_handle: Some("main".into()),
+                target_handle: Some("main".into()),
+                edge_type: None,
+                data: Some(EdgeData {
+                    connection_type: "on-subjob-ok".into(),
+                    label: None,
+                    condition: None,
+                }),
+            });
+            moved = true;
+        }
+        // The original link is kept unless the whole of the subjob now stands behind the
+        // next one; dropping it otherwise would lose an ordering rather than sharpen it.
+        if moved {
+            drop.insert(at);
+        }
+    }
+    let mut i = 0;
+    edges.retain(|_| {
+        let keep = !drop.contains(&i);
+        i += 1;
+        keep
+    });
+    edges.extend(added);
     edges
 }
 
@@ -4657,6 +4775,58 @@ mod tests {
             sql("row1.NAME.substring(2,5)").as_deref(),
             Some("substr(NAME, 2 + 1, 5 - 2)")
         );
+    }
+
+    #[test]
+    fn work_that_waits_for_a_subjob_waits_for_all_of_it() {
+        // "After this subjob" is written as a link out of the component the subjob starts
+        // at. Read as a link out of that one component it means "after the first step",
+        // which is a much weaker thing: everything the subjob went on to do - including
+        // the file it wrote - was free to happen afterwards. A job that wrote a file in
+        // one subjob and read it in the next then read it before it existed.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="head_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="90" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="mid_1"/>
+            <outputTables name="o">
+              <mapperTableEntries name="A" expression="row1.A"/>
+            </outputTables>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="170" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="write_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/mid.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="260" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="next_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/mid.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="head_1" target="mid_1"/>
+          <connection connectorName="FLOW" source="mid_1" target="write_1"/>
+          <connection connectorName="SUBJOB_OK" source="head_1" target="next_1"/>
+        </talendfile:ProcessType>"#;
+        let im = im_edges(xml);
+        assert!(
+            im.iter().any(|(a, b)| a == "write_1" && b == "next_1"),
+            "the next subjob waits for the end of this one, not its first step: {im:?}"
+        );
+        assert!(
+            !im.iter().any(|(a, b)| a == "head_1" && b == "next_1"),
+            "and no longer for the first step alone: {im:?}"
+        );
+    }
+
+    #[cfg(test)]
+    fn im_edges(xml: &str) -> Vec<(String, String)> {
+        import_item(xml, "j")
+            .unwrap()
+            .edges
+            .iter()
+            .filter(|e| e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("on-subjob-ok"))
+            .map(|e| (e.source.clone(), e.target.clone()))
+            .collect()
     }
 
     #[test]
