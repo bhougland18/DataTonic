@@ -3764,7 +3764,13 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                         }
                     }
                     "metadata" => {
-                        in_flow_metadata = attr("connector").as_deref() == Some("FLOW");
+                        // The row-carrying schema is spelled FLOW by some components and
+                        // MAIN by others; both describe what the node hands on. Reading
+                        // only one left the other with no columns at all, so a read took
+                        // its query's names rather than the ones the job uses. REJECT and
+                        // the rest describe different shapes and stay out.
+                        in_flow_metadata =
+                            matches!(attr("connector").as_deref(), Some("FLOW") | Some("MAIN"));
                     }
                     "column" => {
                         if in_flow_metadata {
