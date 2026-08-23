@@ -1687,6 +1687,23 @@
     }
 
     #[test]
+    fn a_join_key_that_is_an_expression_is_one_key_not_two() {
+        // Keys are written as a comma-separated list, and a key can be an expression
+        // rather than a bare column. Split on every comma, an expression that takes
+        // more than one argument counts as several keys, so a perfectly good single-key
+        // join is refused for having "2 vs 1" - and the count is the only thing wrong.
+        assert_eq!(parse_key_list("a,b"), vec!["a", "b"]);
+        assert_eq!(parse_key_list("right(File_Name, 5)"), vec!["right(File_Name, 5)"]);
+        assert_eq!(
+            parse_key_list("right(File_Name, 5), CODE"),
+            vec!["right(File_Name, 5)", "CODE"]
+        );
+        // A comma inside text is not a separator either.
+        assert_eq!(parse_key_list("replace(x, ',', '')"), vec!["replace(x, ',', '')"]);
+        assert_eq!(parse_key_list("  a , , b "), vec!["a", "b"]);
+    }
+
+    #[test]
     fn a_run_variable_is_set_from_the_rows_that_reach_it() {
         // A job routinely works out a value while it runs - the date on the batch it
         // just read, the id it just wrote - and later steps ask for that value. The

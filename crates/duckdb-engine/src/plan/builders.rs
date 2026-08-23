@@ -4382,11 +4382,28 @@ pub(crate) fn is_plain_column(k: &str) -> bool {
 }
 
 pub(crate) fn parse_key_list(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+    // Only a comma that separates keys splits the list. A key can be an expression
+    // rather than a bare column, and an expression carries commas of its own between
+    // its arguments and inside its text - counted as separators, a single key becomes
+    // several and the join is refused for a count that was never wrong.
+    let (mut depth, mut in_string, mut start) = (0i32, false, 0usize);
+    let mut out: Vec<String> = Vec::new();
+    let bytes = raw.as_bytes();
+    for (i, c) in raw.char_indices() {
+        match c {
+            '\'' if !(i > 0 && bytes[i - 1] == b'\\') => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => depth -= 1,
+            ',' if depth == 0 && !in_string => {
+                out.push(raw[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(raw[start..].trim().to_string());
+    out.retain(|s| !s.is_empty());
+    out
 }
 
 /// Collect join key pairs from either the legacy `leftKey`/`rightKey` text
