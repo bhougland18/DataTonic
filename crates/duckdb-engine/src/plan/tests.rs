@@ -4654,3 +4654,24 @@
             assert!(supports_merge(ok), "{} should still support MERGE", ok);
         }
     }
+
+    #[test]
+    fn a_warehouse_upsert_needs_no_second_write_mode_beside_it() {
+        // An upsert is asked for by naming the key columns and setting mode to "upsert",
+        // which is how it is documented. The truncate check reads `writeMode` and falls
+        // back to `mode`, so it used to find "upsert" there and refuse it as an unknown
+        // write mode - and the way through was to also set writeMode to "append", which
+        // says nothing that mode has not already said.
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s1","position":{"x":0,"y":0},"data":{"label":"in","componentId":"src.csv","properties":{"path":"/tmp/in.csv"}}},
+                {"id":"k1","position":{"x":1,"y":0},"data":{"label":"out","componentId":"snk.snowflake","properties":{
+                  "account":"a","database":"d","schema":"s","warehouse":"w","username":"u","pat":"p",
+                  "tableName":"T","mode":"upsert","conflictColumns":["id"]}}}
+              ],
+              "edges": [{"id":"e1","source":"s1","target":"k1","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        compile(&doc).expect("an upsert spelled the documented way compiles");
+    }

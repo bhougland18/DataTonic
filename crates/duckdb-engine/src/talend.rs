@@ -1101,7 +1101,7 @@ fn reroute(im: &mut Import, local: &std::collections::BTreeSet<String>) -> usize
         for source in sources {
             // The mapper this lookup feeds is already behind the write, so this cannot
             // close a loop - but a graph is cheap to ask and a deadlock is not.
-            if reaches(im, &read_id, &source) {
+            if would_cycle(&im.edges, &source, &read_id) {
                 continue;
             }
             im.edges.push(PipelineEdge {
@@ -2130,6 +2130,30 @@ fn named_port(connector: &str) -> Option<String> {
     (!is_link_type && !connector.trim().is_empty()).then(|| connector.to_string())
 }
 
+/// Whether adding `source -> target` would let something reach round to itself.
+///
+/// Checked per link rather than per pair of subjobs, because the link is drawn from the
+/// END of a subjob: its head can sit safely behind the next subjob while something
+/// further down it is already downstream of that subjob. A pipeline with a loop in it
+/// cannot be ordered at all and is refused whole, so one ordering is never worth the job.
+fn would_cycle(edges: &[PipelineEdge], source: &str, target: &str) -> bool {
+    if source == target {
+        return true;
+    }
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    let mut stack = vec![target.to_string()];
+    while let Some(node) = stack.pop() {
+        if node == source {
+            return true;
+        }
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        stack.extend(edges.iter().filter(|e| e.source == node).map(|e| e.target.clone()));
+    }
+    false
+}
+
 /// Everything inside a loop's body.
 ///
 /// The body becomes a pipeline of its own, which it can only do while nothing outside it
@@ -2240,6 +2264,9 @@ fn rewire_parallel_joins(mut edges: Vec<PipelineEdge>, connections: &[Conn]) -> 
 
         edges.retain(|e| !(e.source == fork && e.target == after));
         for end in ends {
+            if would_cycle(&edges, &end, &after) {
+                continue;
+            }
             edges.push(PipelineEdge {
                 id: format!("join-{end}-{after}"),
                 source: end,
@@ -2343,10 +2370,11 @@ fn chain_declared_subjobs(
             .filter(|n| !successors(n, &edges).iter().any(|t| body.contains(t)))
             .cloned()
             .collect();
-        let added: Vec<PipelineEdge> = ends
-            .into_iter()
-            .filter(|end| known.contains(end) || *end == *before)
-            .map(|end| PipelineEdge {
+        for end in ends {
+            if !(known.contains(&end) || end == *before) || would_cycle(&edges, &end, head) {
+                continue;
+            }
+            edges.push(PipelineEdge {
                 id: format!("order-{end}-{head}"),
                 source: end,
                 target: head.clone(),
@@ -2358,9 +2386,8 @@ fn chain_declared_subjobs(
                     label: None,
                     condition: None,
                 }),
-            })
-            .collect();
-        edges.extend(added);
+            });
+        }
     }
     edges
 }
@@ -3621,6 +3648,63 @@ mod tests {
                 .is_some(),
             "and the loop still names the file it became"
         );
+    }
+
+    #[test]
+    fn an_ordering_link_is_never_drawn_where_it_would_close_a_loop() {
+        // The link runs from the end of one subjob to the start of the next, and it is
+        // the end that has to be checked: a subjob's head can be safely behind the next
+        // subjob while something further down it is already downstream of that subjob.
+        // Drawing it anyway produces a pipeline that cannot be ordered at all, which the
+        // planner rejects outright - so the whole job is lost to gain one ordering.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="h1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="10" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="h2"/>
+            <elementParameter name="FILENAME" value="&quot;/data/b.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="200" posY="50">
+            <elementParameter name="UNIQUE_NAME" value="t1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.out&quot;"/>
+          </node>
+          <connection connectorName="COMPONENT_OK" source="h1" target="t1"/>
+          <connection connectorName="COMPONENT_OK" source="h2" target="t1"/>
+          <subjob><elementParameter name="UNIQUE_NAME" value="h1"/></subjob>
+          <subjob><elementParameter name="UNIQUE_NAME" value="h2"/></subjob>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert!(
+            !im.edges.iter().any(|e| e.source == "t1" && e.target == "h2"),
+            "t1 already runs after h2, so it cannot also run before it: {:?}",
+            im.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>()
+        );
+
+        // And the graph still has no way round to itself.
+        let reachable = |from: &str| -> std::collections::BTreeSet<String> {
+            let mut seen: std::collections::BTreeSet<String> = Default::default();
+            let mut stack = vec![from.to_string()];
+            while let Some(n) = stack.pop() {
+                if !seen.insert(n.clone()) {
+                    continue;
+                }
+                stack.extend(
+                    im.edges.iter().filter(|e| e.source == n).map(|e| e.target.clone()),
+                );
+            }
+            seen
+        };
+        for n in &im.nodes {
+            let onward: Vec<String> = im
+                .edges
+                .iter()
+                .filter(|e| e.source == n.id)
+                .flat_map(|e| reachable(&e.target))
+                .collect();
+            assert!(!onward.contains(&n.id), "{} reaches itself", n.id);
+        }
     }
 
     #[test]

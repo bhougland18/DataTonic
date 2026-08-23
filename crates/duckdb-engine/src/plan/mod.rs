@@ -963,7 +963,11 @@ fn snowflake_truncate_first(props: &JsonValue, component_id: &str) -> Result<boo
         .or_else(|| string_prop(props, "mode"))
         .filter(|s| !s.is_empty());
     match mode.as_deref() {
-        None | Some("append") | Some("insert") => Ok(false),
+        // "upsert" is spelled on `mode`, which this also reads when `writeMode` is unset,
+        // so the documented way of asking for one was refused as an unknown write mode
+        // unless a redundant writeMode sat beside it. An upsert merges into what is
+        // already there, which is the one thing it certainly does not truncate.
+        None | Some("append") | Some("insert") | Some("upsert") => Ok(false),
         Some("overwrite") | Some("replace") => {
             if !upsert_keys_from(props, component_id)?.is_empty() {
                 return Err(EngineError::Config(format!(
