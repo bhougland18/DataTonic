@@ -11481,6 +11481,146 @@ fn a_later_step_can_read_an_earlier_one_s_row_count() {
 }
 
 #[test]
+fn a_run_variable_reaches_a_child_job() {
+    // The legacy tool this imports from propagates its context INTO a child job, and a
+    // job routinely works a value out in the parent and reads it in the child. A run
+    // variable that stopped at the pipeline boundary would carry the parent's half of
+    // that and quietly drop the child's, which is the half that does the loading.
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,d\n1,2025-01-01\n2,2025-03-09\n");
+    // The child names its output after a value only the parent's run knows.
+    let out_template = out_path(tmp.path(), "picked_${latest}.csv");
+    let child_val = json!({
+        "nodes": [
+            node("cs", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("ck", "snk.csv", json!({ "path": out_template, "hasHeader": true })),
+        ],
+        "edges": [ main_edge("ce", "cs", "ck") ]
+    });
+    let child_path = write_file(
+        tmp.path(),
+        "child.json",
+        &serde_json::to_string(&child_val).unwrap(),
+    );
+
+    let parent = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("v", "ctl.setvar", json!({ "name": "latest", "value": "max(d)" })),
+            node("rj", "ctl.runjob", json!({ "pipelineRef": child_path })),
+        ]),
+        json!([main_edge("e1", "s", "v"), main_edge("e2", "v", "rj")]),
+    );
+    let r = engine.execute_pipeline(&parent);
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+    let expected = out_path(tmp.path(), "picked_2025-03-09.csv");
+    assert!(
+        Path::new(&expected).exists(),
+        "the child never saw the value the parent worked out; wrote nothing at {expected}"
+    );
+    assert_eq!(count(&format!("read_csv_auto('{}')", expected)), 2);
+}
+
+#[test]
+fn a_run_variable_reaches_a_loop_body_and_a_grandchild() {
+    // The two shapes a migrated job actually uses: the work happens in a body the loop
+    // runs per row, and that body calls another job. A value that stopped at the first
+    // boundary would be missing from both.
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,d\n1,2025-01-01\n2,2025-03-09\n");
+    let drive = write_file(tmp.path(), "drive.csv", "part\nA\n");
+
+    // The grandchild names its output after BOTH: the parent's run value and the row
+    // the loop is on. Only a value that travelled two levels can name the first.
+    let grand = json!({
+        "nodes": [
+            node("gs", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("gk", "snk.csv", json!({
+                "path": out_path(tmp.path(), "deep_${latest}_${ITER_ITEM_PART}.csv"),
+                "hasHeader": true
+            })),
+        ],
+        "edges": [ main_edge("ge", "gs", "gk") ]
+    });
+    let grand_path = write_file(tmp.path(), "grand.json", &serde_json::to_string(&grand).unwrap());
+    let body = json!({
+        "nodes": [ node("brj", "ctl.runjob", json!({ "pipelineRef": grand_path })) ],
+        "edges": []
+    });
+    let body_path = write_file(tmp.path(), "body.json", &serde_json::to_string(&body).unwrap());
+
+    let parent = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("v", "ctl.setvar", json!({ "name": "latest", "value": "max(d)" })),
+            node("dr", "src.csv", json!({ "path": drive, "hasHeader": true })),
+            node("fe", "ctl.foreach", json!({ "pipelineRef": body_path })),
+        ]),
+        json!([
+            main_edge("e1", "s", "v"),
+            main_edge("e2", "v", "dr"),
+            main_edge("e3", "dr", "fe"),
+        ]),
+    );
+    let r = engine.execute_pipeline(&parent);
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+    let expected = out_path(tmp.path(), "deep_2025-03-09_A.csv");
+    assert!(
+        Path::new(&expected).exists(),
+        "the value did not travel through the loop body into the job it called; \
+         wanted {expected}"
+    );
+    assert_eq!(count(&format!("read_csv_auto('{}')", expected)), 2);
+}
+
+#[test]
+fn a_value_named_on_the_call_still_beats_the_run_variable() {
+    // Naming a value on the call is how a parent says "run the child with this one",
+    // so it has to win over what the run happened to work out - otherwise the override
+    // silently does nothing.
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,d\n1,2025-01-01\n2,2025-03-09\n");
+    let out_template = out_path(tmp.path(), "picked_${latest}.csv");
+    let child_val = json!({
+        "nodes": [
+            node("cs", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("ck", "snk.csv", json!({ "path": out_template, "hasHeader": true })),
+        ],
+        "edges": [ main_edge("ce", "cs", "ck") ]
+    });
+    let child_path = write_file(
+        tmp.path(),
+        "child.json",
+        &serde_json::to_string(&child_val).unwrap(),
+    );
+    let parent = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("v", "ctl.setvar", json!({ "name": "latest", "value": "max(d)" })),
+            node(
+                "rj",
+                "ctl.runjob",
+                json!({ "pipelineRef": child_path, "contextVariables": { "latest": "chosen" } })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "v"), main_edge("e2", "v", "rj")]),
+    );
+    let r = engine.execute_pipeline(&parent);
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+    assert!(
+        Path::new(&out_path(tmp.path(), "picked_chosen.csv")).exists(),
+        "the value named on the call should have won"
+    );
+    assert!(
+        !Path::new(&out_path(tmp.path(), "picked_2025-03-09.csv")).exists(),
+        "the run variable should not have been used"
+    );
+}
+
+#[test]
 fn runjob_passes_context_vars_to_child() {
     // Run Job / Master Job: a parent ctl.runjob calls a child pipeline file,
     // passing context variables that are substituted as ${VAR} into the child

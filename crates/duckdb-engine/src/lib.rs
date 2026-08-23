@@ -340,6 +340,60 @@ impl DuckdbEngine {
         Ok(parse_json_arrays(&out).into_iter().next().unwrap_or_default())
     }
 
+    /// The run variables set so far, as text, for passing into a child job.
+    ///
+    /// A child runs in its own database, so a value the parent worked out cannot be
+    /// read there the way a later step in the parent reads it. It is handed over the
+    /// way every other value reaching a child is handed over: substituted as `${name}`
+    /// before the child starts. Read from the run's own database, so it is whatever the
+    /// run has actually set by the time the call is made.
+    ///
+    /// A name whose value is NULL is left out. It has no value, and the convention
+    /// everywhere else is that an unset `${...}` stays as it is rather than arriving as
+    /// the four characters of the word NULL.
+    fn run_vars_so_far(&self, db: &Path) -> std::collections::HashMap<String, String> {
+        let prefix = plan::run_var_relation("");
+        let listed = self
+            .run_rows(
+                Some(db),
+                &format!(
+                    "SELECT table_name FROM duckdb_tables() WHERE table_name LIKE '{}%'",
+                    prefix.replace('\'', "''")
+                ),
+            )
+            .unwrap_or_default();
+        let names: Vec<String> = listed
+            .iter()
+            .filter_map(|r| r.get("table_name").and_then(JsonValue::as_str))
+            .filter_map(|t| t.strip_prefix(prefix.as_str()))
+            .map(|n| n.to_string())
+            .collect();
+        if names.is_empty() {
+            return Default::default();
+        }
+        // One question rather than one per name: every stage costs a process to ask.
+        let query = names
+            .iter()
+            .map(|n| {
+                format!(
+                    "SELECT '{}' AS k, CAST(v AS VARCHAR) AS v FROM {}",
+                    n.replace('\'', "''"),
+                    plan::quote_ident(&plan::run_var_relation(n))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        self.run_rows(Some(db), &query)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                let k = r.get("k").and_then(JsonValue::as_str)?;
+                let v = r.get("v").and_then(JsonValue::as_str)?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect()
+    }
+
     /// Row count of an already-materialized upstream view/table, for the
     /// ctl.log / ctl.warn `{rows}` token and ctl.die row-based conditions.
     /// Returns 0 when there's no input or the count can't be read - the
@@ -948,6 +1002,16 @@ impl DuckdbEngine {
         ));
         let _guard = TempDbGuard(db_path.clone());
 
+        // Asking the run database what it has set costs a process, and a call or a loop
+        // is where that would be paid. A pipeline that sets nothing has nothing to
+        // answer with, so it is not asked - which keeps every pipeline that does not use
+        // the feature exactly as fast as it was. What a caller handed THIS job travels
+        // on through `inherited_subs`, which is not this question.
+        let sets_run_vars = compiled
+            .stages
+            .iter()
+            .any(|s| s.component_id == "ctl.setvar");
+
         // Cloud credentials, prefixed to every stage invocation (each is
         // a fresh CLI session).
         let secrets = collect_pipeline_secrets(doc);
@@ -1331,11 +1395,17 @@ impl DuckdbEngine {
                 // trigger model). Full block-scope composition needs
                 // the DAG-engine refactor noted in the README.
                 if let Some(RuntimeSpec::RunJob { path, vars }) = stage.runtime.as_ref() {
-                    let res = if vars.is_empty() {
+                    // What the run has worked out so far goes first, and what the call
+                    // names goes over it: naming a value on the call is how a parent
+                    // says "run the child with this one", so it has to win.
+                    let mut subs = match sets_run_vars {
+                        true => self.run_vars_so_far(&db_path),
+                        false => Default::default(),
+                    };
+                    subs.extend(vars.iter().cloned());
+                    let res = if subs.is_empty() {
                         self.run_subpipeline(path)
                     } else {
-                        let subs: std::collections::HashMap<String, String> =
-                            vars.iter().cloned().collect();
                         self.run_subpipeline_with_subs(path, &subs)
                     };
                     if let Err(e) = res {
@@ -1348,8 +1418,12 @@ impl DuckdbEngine {
                 if let Some(RuntimeSpec::Iterate { path: iter_path, count }) = stage.runtime.as_ref()
                 {
                     let mut iter_err: Option<String> = None;
+                    let carried = match sets_run_vars {
+                        true => self.run_vars_so_far(&db_path),
+                        false => Default::default(),
+                    };
                     for i in 0..*count {
-                        let mut subs = std::collections::HashMap::new();
+                        let mut subs = carried.clone();
                         subs.insert("ITER_INDEX".to_string(), i.to_string());
                         if let Err(e) = self.run_subpipeline_with_subs(iter_path, &subs) {
                             iter_err = Some(format!(
@@ -1393,11 +1467,18 @@ impl DuckdbEngine {
                     // gives every table its own watermark instead of 400 tables
                     // sharing one. Without it, every iteration is the same run -
                     // the behaviour before itemKey existed.
+                    // The run's own values travel into the body the same way they travel
+                    // into a called job. The row's own values are put in after, so a
+                    // column of the same name is the one the body is being run for.
+                    let carried = match sets_run_vars {
+                        true => self.run_vars_so_far(&db_path),
+                        false => Default::default(),
+                    };
                     let per_row: Vec<(std::collections::HashMap<String, String>, Option<String>)> = rows
                         .iter()
                         .enumerate()
                         .map(|(i, row)| {
-                            let mut subs = std::collections::HashMap::new();
+                            let mut subs = carried.clone();
                             subs.insert("ITER_INDEX".to_string(), i.to_string());
                             if let Some(obj) = row.as_object() {
                                 for (k, v) in obj {
