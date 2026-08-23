@@ -2548,9 +2548,13 @@ fn mapper_expressions_of(
         // The job's own name is a value the tool supplies, and it is this one.
         let e = inline_mapper_vars(expr.trim(), &vars).replace("jobName", &format!("\"{job}\""));
         let e = e.trim();
-        // An expression of nothing but empty brackets says nothing; it is not a reading
-        // we failed to find, so it is passed over rather than reported.
+        // An output can name a column and give it nothing to compute: the row carries the
+        // column, and the column carries nothing. Leaving it out changes the shape the
+        // mapper hands on, so every later step that names it fails to bind - a whole
+        // branch lost for a column that was only ever empty. Nothing to compute is not a
+        // reading we failed to find, so it is not reported either.
         if e.is_empty() || e.chars().all(|c| matches!(c, '(' | ')' | ' ')) {
+            out.insert(col.clone(), JsonValue::String(as_declared("NULL", declared)));
             continue;
         }
         match java_expr_to_sql(e, &raw.mapper_types, &ports) {
@@ -3963,12 +3967,14 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                         }
                         if in_output_table {
                             if let (Some(n), Some(col)) = (cur.as_mut(), attr("name")) {
-                                if let Some(expr) = attr("expression") {
-                                    let ty = attr("type").unwrap_or_default();
-                                    n.mapper_out.push((col.clone(), expr.clone(), ty.clone()));
-                                    if let Some(last) = n.mapper_outs.last_mut() {
-                                        last.1.push((col, expr, ty));
-                                    }
+                                // A column with nothing to compute has no expression at
+                                // all, not an empty one. It is still a column the row
+                                // carries, so it is taken either way.
+                                let expr = attr("expression").unwrap_or_default();
+                                let ty = attr("type").unwrap_or_default();
+                                n.mapper_out.push((col.clone(), expr.clone(), ty.clone()));
+                                if let Some(last) = n.mapper_outs.last_mut() {
+                                    last.1.push((col, expr, ty));
                                 }
                             }
                         }
@@ -5905,6 +5911,39 @@ mod tests {
         assert_eq!(ex["RATE"].as_str(), Some("TRY_CAST(RATE AS DECIMAL(38,4))"));
         assert_eq!(ex["COUNT"].as_str(), Some("TRY_CAST(C AS BIGINT)"));
         assert_eq!(ex["NAME"].as_str(), Some("NAME"), "text is left as it is");
+    }
+
+    #[test]
+    fn an_output_column_with_nothing_to_compute_is_still_a_column() {
+        // A mapper output can name a column and give it nothing: the row carries it, and
+        // it carries nothing. Dropping it instead left the column out of the shape the
+        // mapper hands on, so every later step that named it failed to bind - which is a
+        // whole branch lost for a column that was only ever empty.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/d/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <outputTables name="o">
+              <mapperTableEntries name="KEPT" expression="row1.A" type="id_String"/>
+              <mapperTableEntries name="BLANK" type="id_String"/>
+              <mapperTableEntries name="BLANK_NUM" type="id_BigDecimal"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let ex = &im.nodes.iter().find(|n| n.id == "m_1").unwrap()
+            .data.properties.as_ref().unwrap()["expressions"];
+        assert_eq!(ex["KEPT"].as_str(), Some("A"));
+        assert_eq!(ex["BLANK"].as_str(), Some("NULL"), "named, and empty");
+        assert_eq!(
+            ex["BLANK_NUM"].as_str(),
+            Some("TRY_CAST(NULL AS DECIMAL(38,4))"),
+            "and still the type the mapper says it is"
+        );
     }
 
     #[test]
