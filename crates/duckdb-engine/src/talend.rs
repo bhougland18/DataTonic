@@ -2043,6 +2043,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
 
     let (nodes, edges) =
         split_multi_output_mappers(nodes, edges, &raw_nodes, &connections, &mut warnings);
+    let (nodes, edges) = read_loop_rows_from_their_list(nodes, edges, &raw_nodes);
     let edges = rewire_parallel_joins(edges, &connections);
     let edges = chain_declared_subjobs(edges, &subjob_heads, &connections);
 
@@ -2393,6 +2394,97 @@ fn split_multi_output_mappers(
         edges.extend(extra);
     }
     (nodes, edges)
+}
+
+/// Read the row a file loop hands on from the list it loops.
+///
+/// Iterating a folder and turning the current file into a row is the most ordinary batch
+/// shape there is. The row is described in terms of the loop's own variables - the current
+/// path, the current name - which are not values this side of the move: read literally the
+/// node produces no columns at all, and the step that reads one fails on a name that is
+/// not there.
+///
+/// The list already yields a row per file, so the names are taken from it and the list
+/// feeds the node. A row built from anything else is left as it was: it is a fixed row,
+/// and its values are its own.
+fn read_loop_rows_from_their_list(
+    mut nodes: Vec<PipelineNode>,
+    mut edges: Vec<PipelineEdge>,
+    raw_nodes: &[RawNode],
+) -> (Vec<PipelineNode>, Vec<PipelineEdge>) {
+    for raw in raw_nodes.iter().filter(|r| r.component == "tIterateToFlow") {
+        let mut source: Option<String> = None;
+        let mut columns = JsonMap::new();
+        let mut all_from_loop = true;
+        for row in raw.tables.get("VALUES").into_iter().flatten() {
+            let (Some(name), Some(value)) = (row.get("SCHEMA_COLUMN"), row.get("VALUE")) else {
+                continue;
+            };
+            match loop_variable(value) {
+                Some((list, part)) if source.as_deref().unwrap_or(&list) == list => {
+                    source = Some(list);
+                    columns.insert(name.trim().to_string(), JsonValue::String(part.into()));
+                }
+                _ => {
+                    all_from_loop = false;
+                    break;
+                }
+            }
+        }
+        let (Some(list), true) = (source, all_from_loop && !columns.is_empty()) else {
+            continue;
+        };
+        let Some(node) = nodes.iter_mut().find(|n| n.id == raw.unique) else { continue };
+        node.data.component_id = Some("xf.map".into());
+        node.data.properties = Some(JsonValue::Object({
+            let mut p = JsonMap::new();
+            p.insert("expressions".into(), JsonValue::Object(columns));
+            p
+        }));
+
+        // The loop link says which list it walks; the rows come the same way.
+        // The loop link is already there and says which list it walks; what is missing
+        // is the rows, which is a different kind of link between the same two nodes.
+        if !edges.iter().any(|e| {
+            e.source == list
+                && e.target == raw.unique
+                && e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("main")
+        }) {
+            edges.push(PipelineEdge {
+                id: format!("rows-{list}-{}", raw.unique),
+                source: list,
+                target: raw.unique.clone(),
+                source_handle: Some("main".into()),
+                target_handle: Some("main".into()),
+                edge_type: None,
+                data: Some(EdgeData {
+                    connection_type: "main".into(),
+                    label: None,
+                    condition: None,
+                }),
+            });
+        }
+    }
+    (nodes, edges)
+}
+
+/// `globalMap.get("<list>_CURRENT_FILE")` -> the list and the column that answers it.
+fn loop_variable(value: &str) -> Option<(String, &'static str)> {
+    let inner = value.split("globalMap.get(").nth(1)?;
+    let key = inner.trim_start().trim_start_matches('"');
+    let key = key.split('"').next()?;
+    for (suffix, column) in [
+        ("_CURRENT_FILEPATH", "file"),
+        ("_CURRENT_FILEDIRECTORY", "directory"),
+        ("_CURRENT_FILE", "filename"),
+    ] {
+        if let Some(list) = key.strip_suffix(suffix) {
+            if !list.is_empty() {
+                return Some((list.to_string(), column));
+            }
+        }
+    }
+    None
 }
 
 /// Whether adding `source -> target` would let something reach round to itself.
@@ -4278,6 +4370,48 @@ mod tests {
             cols.get("JOBNAME").and_then(|v| v.as_str()),
             Some("DAILY_LOAD"),
             "and a literal loses the quotes it was written with"
+        );
+    }
+
+    #[test]
+    fn the_row_a_file_loop_hands_on_is_read_from_the_list_it_loops() {
+        // Iterating a folder and turning the current file into a row is the most ordinary
+        // batch shape there is. The row is described as the loop's own variables, which
+        // are not values this side of the move: read literally the node produces no
+        // columns at all, and the step that reads one fails on a name that is not there.
+        // The list already yields a row per file, so the names are taken from it.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileList" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="list_1"/>
+            <elementParameter name="DIRECTORY" value="&quot;/data/in&quot;"/>
+          </node>
+          <node componentName="tIterateToFlow" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="row_1"/>
+            <elementParameter field="TABLE" name="VALUES">
+              <elementValue elementRef="SCHEMA_COLUMN" value="File_Name_Path"/>
+              <elementValue elementRef="VALUE" value="((String)globalMap.get(&quot;list_1_CURRENT_FILEPATH&quot;))"/>
+              <elementValue elementRef="SCHEMA_COLUMN" value="File_Name"/>
+              <elementValue elementRef="VALUE" value="((String)globalMap.get(&quot;list_1_CURRENT_FILE&quot;))"/>
+            </elementParameter>
+          </node>
+          <connection connectorName="ITERATE" source="list_1" target="row_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let n = im.nodes.iter().find(|n| n.id == "row_1").unwrap();
+        assert_eq!(
+            n.data.component_id.as_deref(),
+            Some("xf.map"),
+            "it reads the list rather than inventing a row"
+        );
+        let ex = &n.data.properties.as_ref().unwrap()["expressions"];
+        assert_eq!(ex["File_Name_Path"].as_str(), Some("file"));
+        assert_eq!(ex["File_Name"].as_str(), Some("filename"));
+        assert!(
+            im.edges.iter().any(|e| e.source == "list_1"
+                && e.target == "row_1"
+                && e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("main")),
+            "and the list feeds it: {:?}",
+            im.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>()
         );
     }
 
