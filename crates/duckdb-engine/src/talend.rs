@@ -218,6 +218,34 @@ struct RawNode {
     y: f64,
 }
 
+/// Give a query's columns the names the job uses.
+///
+/// A database input names its own columns and takes whatever its query returns in that
+/// order - the two disagree often enough, a query selecting a column the job calls
+/// something else. Carried across with the query's own names, every step downstream
+/// refers to a column that is not there.
+///
+/// The query is left exactly as written and the names are put on around it, so nothing
+/// about what is fetched changes. Where the job names no columns there is nothing to
+/// apply and the query stands alone.
+fn named_by_schema(query: &str, columns: &[String]) -> String {
+    let q = query.trim();
+    if columns.is_empty() || q.is_empty() {
+        return query.to_string();
+    }
+    let names = columns
+        .iter()
+        .map(|c| quote_sql_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT * FROM ({}) AS t({})", q.trim_end_matches(';'), names)
+}
+
+/// A column name as SQL writes one.
+fn quote_sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// The columns a delimited file declares, as a schema.
 ///
 /// Only the reading components get one: a schema on a writer would pin the shape of what
@@ -881,7 +909,10 @@ fn properties_for(
             }
             if let Some(q) = tcomp_value(&blob, "query") {
                 if component_id == "src.snowflake" && !q.trim().is_empty() {
-                    props.insert("query".into(), JsonValue::String(unquote(&q)));
+                    props.insert(
+                        "query".into(),
+                        JsonValue::String(named_by_schema(&unquote(&q), &raw.columns)),
+                    );
                 }
             }
             // The password is Studio-encrypted and cannot be recovered here, so
@@ -2731,8 +2762,12 @@ fn loop_body_members(
             .filter(|e| body.contains(&e.target) && e.source != loop_id)
             .filter(|e| !body.contains(&e.source))
             .filter(|e| {
+                // A mapper numbers its lookup ports, so the name is a prefix rather than
+                // the whole of it. Matching the bare word missed every numbered one, and
+                // a body that could not draw in the sources its joins read stopped being
+                // liftable at all.
                 e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("lookup")
-                    || e.target_handle.as_deref() == Some("lookup")
+                    || e.target_handle.as_deref().is_some_and(|h| h.starts_with("lookup"))
             })
             .map(|e| e.source.clone())
             .collect();
@@ -3396,6 +3431,9 @@ fn anchor_subjob_links_at_their_end(mut edges: Vec<PipelineEdge>) -> Vec<Pipelin
         matches!(
             e.data.as_ref().map(|d| d.connection_type.as_str()),
             Some("main") | Some("lookup")
+        ) || matches!(
+            e.data.as_ref().map(|d| d.connection_type.as_str()),
+            Some(k) if k.starts_with("lookup")
         )
     };
     let waits: Vec<(usize, String, String)> = edges
@@ -5663,6 +5701,30 @@ mod tests {
         assert_eq!(handle("main_1"), "main");
         assert_eq!(handle("ref_1"), "lookup_1");
         assert_eq!(handle("ref_2"), "lookup_2", "the second lookup has a port of its own");
+    }
+
+    #[test]
+    fn a_database_read_gives_its_columns_the_names_the_job_uses() {
+        // A database input names its own columns and takes whatever its query returns in
+        // that order. The two disagree often enough - a query selecting a column the job
+        // calls something else - and carried across with the query's names, every step
+        // downstream referred to a column that was not there.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tSnowflakeInput" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="read_1"/>
+            <elementParameter name="PROPERTIES" value="{&quot;query&quot;:{&quot;storedValue&quot;:&quot;select A, B from T&quot;}}"/>
+            <metadata connector="FLOW" name="read_1">
+              <column name="ALPHA" type="id_String" nullable="true"/>
+              <column name="BRAVO" type="id_String" nullable="true"/>
+            </metadata>
+          </node></talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let q = im.nodes[0].data.properties.as_ref().unwrap()["query"].as_str().unwrap();
+        assert!(
+            q.contains("\"ALPHA\"") && q.contains("\"BRAVO\""),
+            "the columns arrive under the names the job uses: {q}"
+        );
+        assert!(q.contains("select A, B from T"), "and the query itself is untouched: {q}");
     }
 
     #[test]
