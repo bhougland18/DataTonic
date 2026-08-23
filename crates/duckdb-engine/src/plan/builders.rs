@@ -4027,6 +4027,31 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
         if outputs.is_empty() {
             return Ok(format!("SELECT * FROM {}", quote_ident(upstream)));
         }
+        // A mapper's expressions read its input. Where an output is named after a column
+        // the mapper also reads, SQL resolves the name to the output beside it instead:
+        // the expression sees the value being computed next to it rather than the one
+        // that came in, and where the collision runs the other way it refuses to compile
+        // at all. The names are applied outside the query that reads the input, so an
+        // output can never stand in for the column it is named after.
+        if shadows_an_input(&outputs) {
+            let inner: Vec<String> = outputs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, expr))| format!("{} AS \"__m{}\"", strip_port_prefixes(expr), i))
+                .collect();
+            let outer: Vec<String> = outputs
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| format!("\"__m{}\" AS {}", i, quote_ident(name)))
+                .collect();
+            let mut inner_sql =
+                format!("SELECT {} FROM {}", inner.join(", "), quote_ident(upstream));
+            if let Some(predicate) = &filter {
+                inner_sql.push_str(" WHERE ");
+                inner_sql.push_str(&strip_port_prefixes(predicate));
+            }
+            return Ok(format!("SELECT {} FROM ({}) AS \"__map\"", outer.join(", "), inner_sql));
+        }
         let terms: Vec<String> = outputs
             .iter()
             .map(|(name, expr)| format!("{} AS {}", strip_port_prefixes(expr), quote_ident(name)))
@@ -4079,6 +4104,37 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
         sql.push_str(&qualify_port_refs(predicate, &aliases));
     }
     Ok(sql)
+}
+
+/// Whether any output is named after a column the mapper's own expressions read.
+///
+/// Only then does the naming have to be moved out of the way; leaving every other mapper
+/// as it was keeps the SQL it emits, and the tests that read it, unchanged.
+fn shadows_an_input(outputs: &[(String, String)]) -> bool {
+    let names: std::collections::BTreeSet<&str> =
+        outputs.iter().map(|(n, _)| n.as_str()).collect();
+    outputs.iter().any(|(_, expr)| {
+        let mut in_string = false;
+        let mut word = String::new();
+        let mut hit = false;
+        for c in expr.chars().chain(std::iter::once(' ')) {
+            if c == '\'' {
+                in_string = !in_string;
+            }
+            if !in_string && (c.is_alphanumeric() || c == '_') {
+                word.push(c);
+                continue;
+            }
+            if !word.is_empty() {
+                // A name written as `<table>.<column>` is already unambiguous.
+                if c != '.' && names.contains(word.as_str()) {
+                    hit = true;
+                }
+                word.clear();
+            }
+        }
+        hit
+    })
 }
 
 pub(crate) fn strip_port_prefixes(expr: &str) -> String {

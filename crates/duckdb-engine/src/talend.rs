@@ -934,6 +934,28 @@ fn properties_for(
                 props.insert("hasHeader".into(), JsonValue::Bool(false));
             }
         }
+        "src.inline" => {
+            // The component hands one row of named values downstream - a batch id, a
+            // file name, an error message. They are a TABLE parameter of column/value
+            // pairs, and read as flat parameters there is nothing there at all: the node
+            // produces no columns and every step that reads one fails on a name that is
+            // not there.
+            let mut cols = JsonMap::new();
+            for row in raw.tables.get("VALUES").into_iter().flatten() {
+                let (Some(name), Some(value)) = (row.get("SCHEMA_COLUMN"), row.get("VALUE"))
+                else {
+                    continue;
+                };
+                if name.trim().is_empty() {
+                    continue;
+                }
+                let v = rewrite_context(value).unwrap_or_else(|| unquote(value));
+                cols.insert(name.trim().to_string(), JsonValue::String(v));
+            }
+            if !cols.is_empty() {
+                props.insert("columns".into(), JsonValue::Object(cols));
+            }
+        }
         "src.excel" | "snk.excel" => {
             copy_params(raw, &[("FILENAME", "path")], &mut props, warnings);
         }
@@ -4225,6 +4247,37 @@ mod tests {
         assert_eq!(
             schema.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["record_type", "amount"]
+        );
+    }
+
+    #[test]
+    fn a_fixed_row_carries_the_values_it_was_given() {
+        // The component exists to hand one row of named values downstream - a batch id, a
+        // file name, an error message. They live in a TABLE parameter as column/value
+        // pairs, and without them the node arrives configured with nothing: it produces
+        // no columns, and every step that reads one fails on a name that is not there.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFixedFlowInput" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="row_1"/>
+            <elementParameter field="TABLE" name="VALUES">
+              <elementValue elementRef="SCHEMA_COLUMN" value="BATCH_ID"/>
+              <elementValue elementRef="VALUE" value="context.batchID"/>
+              <elementValue elementRef="SCHEMA_COLUMN" value="JOBNAME"/>
+              <elementValue elementRef="VALUE" value="&quot;DAILY_LOAD&quot;"/>
+            </elementParameter>
+          </node></talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes[0].data.properties.as_ref().unwrap();
+        let cols = p.get("columns").and_then(|c| c.as_object()).expect("the row came across");
+        assert_eq!(
+            cols.get("BATCH_ID").and_then(|v| v.as_str()),
+            Some("${batchID}"),
+            "a context value stays one, so the run resolves it"
+        );
+        assert_eq!(
+            cols.get("JOBNAME").and_then(|v| v.as_str()),
+            Some("DAILY_LOAD"),
+            "and a literal loses the quotes it was written with"
         );
     }
 

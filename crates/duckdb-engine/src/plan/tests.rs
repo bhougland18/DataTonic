@@ -4705,3 +4705,35 @@
             "not a passthrough: {sql}"
         );
     }
+
+    #[test]
+    fn a_mapper_output_never_stands_in_for_the_input_column_it_is_named_after() {
+        // A mapper's expressions read its INPUT. An output named after a column it also
+        // reads used to shadow it: SQL resolves a name to a sibling output when the two
+        // collide, so the expression saw the value being computed beside it rather than
+        // the one that came in - and where the collision ran the other way it refused to
+        // compile at all, on a job that was correct.
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{"label":"in","componentId":"src.csv","properties":{"path":"/tmp/in.csv","hasHeader":true}}},
+                {"id":"m","position":{"x":1,"y":0},"data":{"label":"Map","componentId":"xf.map","properties":{
+                  "expressions": {"BATCH_ID": "coalesce(BATCH_ID, 0)", "NEXT_ID": "BATCH_ID + 1"}}}},
+                {"id":"k","position":{"x":2,"y":0},"data":{"label":"out","componentId":"snk.parquet","properties":{"path":"/tmp/o.parquet"}}}
+              ],
+              "edges": [
+                {"id":"e1","source":"s","target":"m","data":{"connectionType":"main"}},
+                {"id":"e2","source":"m","target":"k","data":{"connectionType":"main"}}
+              ]
+            }"#,
+        );
+        let sql = map_sql(&doc);
+        // Both expressions read the input, so neither can be resolved against the other:
+        // the names they are given are applied outside the scope that computes them.
+        assert!(
+            !sql.contains("AS \"BATCH_ID\" ,") && sql.matches("FROM").count() >= 2,
+            "the outputs are named outside the query that reads the input: {sql}"
+        );
+        assert!(sql.contains("coalesce(BATCH_ID, 0)"), "{sql}");
+        assert!(sql.contains("BATCH_ID + 1"), "{sql}");
+    }
