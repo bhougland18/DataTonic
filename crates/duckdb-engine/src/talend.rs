@@ -154,6 +154,16 @@ impl Import {
     }
 }
 
+/// One input of a mapper: what it is called, what it is matched on, and whether a row
+/// with no match is dropped.
+#[derive(Debug, Clone, Default)]
+struct MapperInput {
+    name: String,
+    /// (its own column, the expression on the main side it is matched against)
+    keys: Vec<(String, String)>,
+    inner: bool,
+}
+
 /// One `<node>` as read from the file, before mapping.
 struct RawNode {
     component: String,
@@ -187,6 +197,10 @@ struct RawNode {
     /// Flattened across every output the mapper writes, which is what a single-output
     /// mapper needs. [`mapper_outs`] keeps them apart for the rest.
     mapper_out: Vec<(String, String)>,
+    /// The mapper's inputs, in the order the file lists them: the first carries the rows
+    /// and the rest are looked up. Each keeps the columns it is matched on and whether
+    /// the match is required.
+    mapper_inputs: Vec<MapperInput>,
     /// Intermediate values the mapper names, in the order it computes them.
     ///
     /// They belong to the mapper: nothing outside it knows the name, so an output that
@@ -2468,6 +2482,36 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         let mut props = properties_for(raw, component_id, &context, &mut warnings);
         if component_id == "xf.map" {
             props.insert("expressions".into(), mapper_expressions(raw, job_name, &mut warnings));
+            // What the mapper looks up, and what it matches on. Wired in but not joined,
+            // every column taken from a lookup refers to something that is not there.
+            let joins: Vec<JsonValue> = raw
+                .mapper_inputs
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(_, t)| !t.keys.is_empty())
+                .map(|(at, t)| {
+                    let left: Vec<String> = t
+                        .keys
+                        .iter()
+                        .map(|(_, expr)| {
+                            let e = expr.trim();
+                            e.rsplit_once('.').map(|(_, c)| c).unwrap_or(e).to_string()
+                        })
+                        .collect();
+                    let right: Vec<String> =
+                        t.keys.iter().map(|(col, _)| col.clone()).collect();
+                    serde_json::json!({
+                        "port": format!("lookup_{at}"),
+                        "leftKey": left.join(","),
+                        "rightKey": right.join(","),
+                        "joinType": if t.inner { "inner" } else { "left" },
+                    })
+                })
+                .collect();
+            if !joins.is_empty() {
+                props.insert("lookups".into(), JsonValue::Array(joins));
+            }
         }
 
         let mut data = node_data(
@@ -2491,7 +2535,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
     // which the planner refuses. Only the first row link into a node is main;
     // the rest are lookups, in the order the file lists them.
     let mut seen_main: std::collections::HashSet<&str> = Default::default();
-    let mut target_port: std::collections::HashMap<usize, &'static str> = Default::default();
+    let mut target_port: std::collections::HashMap<usize, String> = Default::default();
     for (i, c) in connections.iter().enumerate() {
         if connection_type_for(c.connector.as_deref()) != "main" {
             continue;
@@ -2499,10 +2543,29 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         if !known.contains(c.source.as_str()) || !known.contains(c.target.as_str()) {
             continue;
         }
-        let port = if seen_main.insert(c.target.as_str()) {
-            "main"
-        } else {
-            "lookup"
+        // A mapper says which of its inputs carries the rows and which are looked up, by
+        // name, so the link is put on the port the file gives it. Numbering matters: two
+        // lookups sharing one port means the second replaces the first.
+        let named = raw_nodes
+            .iter()
+            .find(|r| r.unique == c.target && r.mapper_inputs.len() > 1)
+            .and_then(|r| {
+                let label = c.label.as_deref()?.trim();
+                let at = r.mapper_inputs.iter().position(|t| t.name == label)?;
+                Some(match at {
+                    0 => "main".to_string(),
+                    n => format!("lookup_{n}"),
+                })
+            });
+        let port = match named {
+            Some(p) => {
+                if p == "main" {
+                    seen_main.insert(c.target.as_str());
+                }
+                p
+            }
+            None if seen_main.insert(c.target.as_str()) => "main".to_string(),
+            None => "lookup".to_string(),
         };
         target_port.insert(i, port);
     }
@@ -2517,7 +2580,9 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
             source: c.source.clone(),
             target: c.target.clone(),
             source_handle: Some("main".into()),
-            target_handle: Some(target_port.get(&i).copied().unwrap_or("main").into()),
+            target_handle: Some(
+                target_port.get(&i).cloned().unwrap_or_else(|| "main".to_string()),
+            ),
             edge_type: None,
             data: Some(EdgeData {
                 connection_type: connection_type_for(c.connector.as_deref()).into(),
@@ -3597,6 +3662,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             mapper_outs: Vec::new(),
                             mapper_types: Default::default(),
                             mapper_vars: Vec::new(),
+                            mapper_inputs: Vec::new(),
                             x: attr("posX").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                             y: attr("posY").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                         });
@@ -3676,7 +3742,11 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                         in_var_table = false;
                         if let Some(n) = cur.as_mut() {
                             input_table = attr("name");
-                            let _ = &n.mapper_types;
+                            n.mapper_inputs.push(MapperInput {
+                                name: input_table.clone().unwrap_or_default(),
+                                keys: Vec::new(),
+                                inner: attr("innerJoin").as_deref() == Some("true"),
+                            });
                         }
                     }
                     "outputTables" => {
@@ -3705,6 +3775,15 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             if !in_output_table {
                                 if let Some(t) = input_table.as_deref() {
                                     n.mapper_types.insert(format!("{t}.{col}"), ty.clone());
+                                }
+                                // An input entry with an expression is a column this
+                                // input is matched on; the expression is the main side.
+                                if let Some(expr) = attr("expression") {
+                                    if !expr.trim().is_empty() {
+                                        if let Some(input) = n.mapper_inputs.last_mut() {
+                                            input.keys.push((col.clone(), expr));
+                                        }
+                                    }
                                 }
                                 n.mapper_types.entry(col).or_insert(ty);
                             }
@@ -5519,6 +5598,71 @@ mod tests {
             sql(r#"row1.A.contains("-") ? 1 : 0"#).as_deref(),
             Some("CASE WHEN contains(A, '-') THEN 1 ELSE 0 END")
         );
+    }
+
+    #[test]
+    fn a_mapper_that_looks_something_up_says_what_it_joins_on() {
+        // A mapper reads its main rows and looks the rest up. Which input is which, and
+        // what they are matched on, is in the file - and without it the lookup was wired
+        // in but never joined, so every column taken from it referred to something that
+        // was not there and the step failed to bind.
+        //
+        // Two lookups also have to be told apart: sharing one port, the second one
+        // replaces the first.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="main_1"/>
+            <elementParameter name="FILENAME" value="&quot;/d/m.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="10" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="ref_1"/>
+            <elementParameter name="FILENAME" value="&quot;/d/r.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="10" posY="170">
+            <elementParameter name="UNIQUE_NAME" value="ref_2"/>
+            <elementParameter name="FILENAME" value="&quot;/d/s.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="140" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <inputTables name="rows">
+              <mapperTableEntries name="CODE" type="id_String"/>
+            </inputTables>
+            <inputTables name="lk1" innerJoin="true">
+              <mapperTableEntries name="CODE" expression="rows.CODE" type="id_String"/>
+              <mapperTableEntries name="RATE" expression="" type="id_String"/>
+            </inputTables>
+            <inputTables name="lk2">
+              <mapperTableEntries name="CODE" expression="rows.CODE" type="id_String"/>
+            </inputTables>
+            <outputTables name="o">
+              <mapperTableEntries name="RATE" expression="lk1.RATE"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="main_1" target="m_1" label="rows"/>
+          <connection connectorName="FLOW" source="ref_1" target="m_1" label="lk1"/>
+          <connection connectorName="FLOW" source="ref_2" target="m_1" label="lk2"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let n = im.nodes.iter().find(|n| n.id == "m_1").unwrap();
+        let lookups = n.data.properties.as_ref().unwrap()["lookups"].as_array().unwrap();
+        assert_eq!(lookups.len(), 2, "one entry per input that is looked up");
+        assert_eq!(lookups[0]["port"], "lookup_1");
+        assert_eq!(lookups[0]["leftKey"], "CODE");
+        assert_eq!(lookups[0]["rightKey"], "CODE");
+        assert_eq!(lookups[0]["joinType"], "inner", "the file says this one is an inner join");
+        assert_eq!(lookups[1]["port"], "lookup_2");
+        assert_eq!(lookups[1]["joinType"], "left", "and this one is not");
+
+        let handle = |src: &str| {
+            im.edges
+                .iter()
+                .find(|e| e.source == src && e.target == "m_1")
+                .and_then(|e| e.target_handle.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(handle("main_1"), "main");
+        assert_eq!(handle("ref_1"), "lookup_1");
+        assert_eq!(handle("ref_2"), "lookup_2", "the second lookup has a port of its own");
     }
 
     #[test]
