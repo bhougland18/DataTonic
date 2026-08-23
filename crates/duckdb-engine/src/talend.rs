@@ -170,6 +170,12 @@ struct RawNode {
     /// component unconfigured and failing validation for a setting that IS in
     /// the file.
     tables: BTreeMap<String, Vec<BTreeMap<String, String>>>,
+    /// Declared type of each column, in the order the file lists them.
+    ///
+    /// A delimited file names its own columns and counts the rows to skip; the names are
+    /// not in the file, so they have to come across with the node or the relation is
+    /// named after a line of data.
+    column_types: Vec<(String, String)>,
     /// Column names the node declares on its main output.
     ///
     /// Some components take their output shape from the schema rather than from
@@ -191,6 +197,36 @@ struct RawNode {
     mapper_outs: Vec<(String, Vec<(String, String)>)>,
     x: f64,
     y: f64,
+}
+
+/// The columns a delimited file declares, as a schema.
+///
+/// Only the reading components get one: a schema on a writer would pin the shape of what
+/// it is handed rather than describe what it reads.
+fn declared_schema(raw: &RawNode, component_id: &str) -> Option<duckle_metadata::Schema> {
+    if !matches!(component_id, "src.csv") || raw.column_types.is_empty() {
+        return None;
+    }
+    use duckle_metadata::{Column, DataType};
+    Some(
+        raw.column_types
+            .iter()
+            .map(|(name, ty)| Column {
+                name: name.clone(),
+                // The component reads a delimited file, so every field arrives as text
+                // and the expressions that follow do their own conversion. Declaring a
+                // narrower type here would make the read fail on a value the job itself
+                // handles.
+                data_type: match ty.as_str() {
+                    "id_Date" => DataType::Date,
+                    _ => DataType::String,
+                },
+                nullable: true,
+                primary_key: None,
+                format: None,
+            })
+            .collect(),
+    )
 }
 
 /// Talend component -> (Duckle component id, React Flow node type).
@@ -873,13 +909,29 @@ fn properties_for(
             if let Some(sep) = value_for(raw, "FIELDSEPARATOR", warnings) {
                 props.insert("delimiter".into(), sep);
             }
-            // Talend counts header ROWS; Duckle asks whether there is a header.
+            // The component counts header ROWS to skip and names its columns itself.
+            // Read as "the first line is the header", the names come from whatever that
+            // line happens to hold, so every column is renamed to a piece of data and
+            // every expression downstream refers to something that is not there. Where
+            // the node declares its columns they are the names, and the header count is
+            // simply lines to skip. Where it declares none, the file's own header is the
+            // only thing left to name them.
+            let declared = !raw.column_types.is_empty();
             if let Some(h) = raw.params.get("HEADER") {
                 let n: i64 = unquote(h).parse().unwrap_or(0);
-                props.insert("hasHeader".into(), JsonValue::Bool(n > 0));
-                if n > 1 {
-                    props.insert("skipLines".into(), JsonValue::from(n - 1));
+                if declared {
+                    props.insert("hasHeader".into(), JsonValue::Bool(false));
+                    if n > 0 {
+                        props.insert("skipLines".into(), JsonValue::from(n));
+                    }
+                } else {
+                    props.insert("hasHeader".into(), JsonValue::Bool(n > 0));
+                    if n > 1 {
+                        props.insert("skipLines".into(), JsonValue::from(n - 1));
+                    }
                 }
+            } else if declared {
+                props.insert("hasHeader".into(), JsonValue::Bool(false));
             }
         }
         "src.excel" | "snk.excel" => {
@@ -1907,15 +1959,18 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
             props.insert("expressions".into(), mapper_expressions(raw, &mut warnings));
         }
 
+        let mut data = node_data(
+            raw.unique.clone(),
+            Some(component_id.into()),
+            Some(JsonValue::Object(props)),
+        );
+        data.schema = declared_schema(raw, component_id);
+
         nodes.push(PipelineNode {
             id: raw.unique.clone(),
             flow_type: Some(flow_type.into()),
             position: Position { x: raw.x, y: raw.y },
-            data: node_data(
-                raw.unique.clone(),
-                Some(component_id.into()),
-                Some(JsonValue::Object(props)),
-            ),
+            data,
         });
     }
 
@@ -2681,6 +2736,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             component: attr("componentName").unwrap_or_default(),
                             unique: String::new(),
                             columns: Vec::new(),
+                            column_types: Vec::new(),
                             tables: BTreeMap::new(),
                             params: BTreeMap::new(),
                             mapper_out: Vec::new(),
@@ -2754,7 +2810,9 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                     "column" => {
                         if in_flow_metadata {
                             if let (Some(n), Some(c)) = (cur.as_mut(), attr("name")) {
-                                n.columns.push(c);
+                                let ty = attr("type").unwrap_or_default();
+                                n.columns.push(c.clone());
+                                n.column_types.push((c, ty));
                             }
                         }
                     }
@@ -4135,6 +4193,39 @@ mod tests {
                 "{ty} is not exact and stays reported"
             );
         }
+    }
+
+    #[test]
+    fn a_delimited_file_takes_its_column_names_from_the_schema_it_declares() {
+        // The component counts header ROWS to skip and names its columns itself. Read as
+        // "the first line is the header", the names come from whatever that line happens
+        // to hold - so every column is renamed to a piece of data and every expression
+        // downstream refers to something that is not there.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+            <elementParameter name="FIELDSEPARATOR" value="&quot;;&quot;"/>
+            <elementParameter name="HEADER" value="1"/>
+            <metadata connector="FLOW" name="in_1">
+              <column name="record_type" type="id_String" nullable="true"/>
+              <column name="amount" type="id_BigDecimal" nullable="true"/>
+            </metadata>
+          </node></talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let n = im.nodes.iter().find(|n| n.id == "in_1").unwrap();
+        let p = n.data.properties.as_ref().unwrap();
+        assert_eq!(p["delimiter"], ";");
+        assert_eq!(
+            p["hasHeader"], false,
+            "the line it skips is not a header row to take names from"
+        );
+        assert_eq!(p["skipLines"], 1, "it is a line to skip");
+        let schema = n.data.schema.as_ref().expect("the declared columns come across");
+        assert_eq!(
+            schema.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["record_type", "amount"]
+        );
     }
 
     #[test]
