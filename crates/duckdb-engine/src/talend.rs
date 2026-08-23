@@ -30,6 +30,12 @@ use quick_xml::Reader;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::BTreeMap;
 
+/// Talend type of each column a mapper reads, keyed by `Table.Column` and by `Column`.
+///
+/// The file records it, which is what makes `new BigDecimal(x)` readable: the exact
+/// constructor takes a string, the lossy one takes a double, and they do not agree.
+type ColTypes = std::collections::BTreeMap<String, String>;
+
 /// A component Duckle could not translate, or a value it refused to guess.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Warning {
@@ -53,6 +59,8 @@ pub enum Warning {
     WriteActionApproximated { node: String, action: String, used: String },
     /// A SQL step that changes the database rather than returning rows.
     StatementNotQuery { node: String, verb: String },
+    /// A link leaving a multi-output mapper that does not say which output it carries.
+    MapperOutputUnnamed { node: String, target: String, outputs: Vec<String> },
 }
 
 impl std::fmt::Display for Warning {
@@ -76,6 +84,13 @@ impl std::fmt::Display for Warning {
             Warning::WriteActionApproximated { node, action, used } => write!(
                 f,
                 "{node}: the legacy write action {action} amends rows that match the key and                  drops the rest. The nearest write mode here is '{used}', which also inserts                  the rows that do not match. Check that is what the table should hold"
+            ),
+            Warning::MapperOutputUnnamed { node, target, outputs } => write!(
+                f,
+                "{node}: the link to {target} does not say which of its outputs it \
+                 carries ({}). It was attached to the first; check that is the one \
+                 intended, because the outputs of a mapper are usually alternatives",
+                outputs.join(", ")
             ),
             Warning::StatementNotQuery { node, verb } => write!(
                 f,
@@ -162,7 +177,18 @@ struct RawNode {
     /// at all - the names are in the file, just not where parameters live.
     columns: Vec<String>,
     /// Mapper output expressions, keyed by output column.
+    ///
+    /// Flattened across every output the mapper writes, which is what a single-output
+    /// mapper needs. [`mapper_outs`] keeps them apart for the rest.
     mapper_out: Vec<(String, String)>,
+    /// Talend type of each column the mapper reads, keyed by `Table.Column` and `Column`.
+    mapper_types: ColTypes,
+    /// The same expressions, grouped by the output that declares them, in file order.
+    ///
+    /// A mapper writes one relation per output and they are not variations on a theme:
+    /// the two halves of a decision routinely share a column name and give it different
+    /// expressions, so merging them silently answers one branch with the other's number.
+    mapper_outs: Vec<(String, Vec<(String, String)>)>,
     x: f64,
     y: f64,
 }
@@ -1585,11 +1611,11 @@ fn split_ternary(e: &str) -> Option<(&str, &str, &str)> {
 
 /// Translate a Java boolean to SQL. Only equality is read: an ordering would need its
 /// sign checked against the comparison's contract, which is a guess we do not make.
-fn java_condition_to_sql(cond: &str) -> Option<String> {
+fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
     let c = cond.trim();
     if let Some(inner) = c.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         if balanced(inner) {
-            return java_condition_to_sql(inner);
+            return java_condition_to_sql(inner, types);
         }
     }
     for (token, op) in [("==", "="), ("!=", "<>")] {
@@ -1603,8 +1629,8 @@ fn java_condition_to_sql(cond: &str) -> Option<String> {
         }
         return Some(format!(
             "{} {op} {}",
-            java_expr_to_sql(recv)?,
-            java_expr_to_sql(args[0])?
+            java_expr_to_sql(recv, types)?,
+            java_expr_to_sql(args[0], types)?
         ));
     }
     let (recv, args) = method_call(c, "equals")?;
@@ -1613,8 +1639,8 @@ fn java_condition_to_sql(cond: &str) -> Option<String> {
     }
     Some(format!(
         "{} = {}",
-        java_expr_to_sql(recv)?,
-        java_expr_to_sql(args[0])?
+        java_expr_to_sql(recv, types)?,
+        java_expr_to_sql(args[0], types)?
     ))
 }
 
@@ -1655,7 +1681,7 @@ fn single_arg<'a>(e: &'a str, name: &str) -> Option<&'a str> {
 /// Only forms with a single faithful SQL reading are translated. Arithmetic, branching
 /// and anything whose index base is not established stay reported: guessing one of those
 /// wrong produces a silently wrong number instead of a failure.
-fn java_expr_to_sql(expr: &str) -> Option<String> {
+fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     let e = expr.trim();
     if e.is_empty() {
         return None;
@@ -1676,9 +1702,9 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
     if let Some((cond, yes, no)) = split_ternary(e) {
         return Some(format!(
             "CASE WHEN {} THEN {} ELSE {} END",
-            java_condition_to_sql(cond)?,
-            java_expr_to_sql(yes)?,
-            java_expr_to_sql(no)?
+            java_condition_to_sql(cond, types)?,
+            java_expr_to_sql(yes, types)?,
+            java_expr_to_sql(no, types)?
         ));
     }
     if let Some(inner) = e.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
@@ -1689,20 +1715,30 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
     }
     if let Some(inner) = e.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         if balanced(inner) {
-            return java_expr_to_sql(inner);
+            return java_expr_to_sql(inner, types);
         }
     }
     if let Some(head) = e.strip_suffix(".toString()") {
-        return java_expr_to_sql(head);
+        return java_expr_to_sql(head, types);
     }
     if let Some(arg) = single_arg(e, "Double.valueOf") {
-        return Some(format!("TRY_CAST({} AS DOUBLE)", java_expr_to_sql(arg)?));
+        return Some(format!("TRY_CAST({} AS DOUBLE)", java_expr_to_sql(arg, types)?));
     }
     if let Some(arg) = single_arg(e, "new BigDecimal") {
         let inner = arg.trim();
         // The double-valued form goes through a double in Java, so DOUBLE is faithful.
         if single_arg(inner, "Double.valueOf").is_some() {
-            return java_expr_to_sql(inner);
+            return java_expr_to_sql(inner, types);
+        }
+        // A column whose declared type is a string goes through BigDecimal(String), the
+        // exact constructor, so reading it as a fixed-point number is faithful rather
+        // than a guess. The file records the type; it was only ever unavailable to a
+        // reader that did not look. A double-valued column still goes through binary
+        // floating point and is left refused.
+        if let Some(kind) = types.get(inner.trim()) {
+            if kind.eq_ignore_ascii_case("id_String") {
+                return Some(format!("CAST({} AS DECIMAL(38,4))", java_expr_to_sql(inner, types)?));
+            }
         }
         // A quoted number is an exact decimal, and the literal already carries its own
         // scale, so writing it through keeps that rather than inventing a cast.
@@ -1716,7 +1752,7 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
         return None;
     }
     if let Some(arg) = single_arg(e, "StringHandling.TRIM") {
-        return Some(format!("trim({})", java_expr_to_sql(arg)?));
+        return Some(format!("trim({})", java_expr_to_sql(arg, types)?));
     }
     // The character helpers. SUBSTR takes a start and a length counted from 1, the same
     // as SQL, rather than Java's begin/end: a reference migration of this dialect renders
@@ -1731,7 +1767,7 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
         if args.len() != arity {
             return None;
         }
-        let subject = java_expr_to_sql(args[0])?;
+        let subject = java_expr_to_sql(args[0], types)?;
         let counts = args[1..]
             .iter()
             .map(|a| {
@@ -1743,7 +1779,35 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
     }
     // Sign-changing arithmetic on an exact decimal, which SQL does the same way.
     if let Some(recv) = e.strip_suffix(".negate()") {
-        return Some(format!("-({})", java_expr_to_sql(recv)?));
+        return Some(format!("-({})", java_expr_to_sql(recv, types)?));
+    }
+    // `divide` and `setScale` name the scale they round to, so the rounding is not a
+    // detail to be inferred from the target column: it is part of the expression.
+    if let Some((recv, args)) = method_call(e, "divide") {
+        let left = java_expr_to_sql(recv, types)?;
+        let right = java_expr_to_sql(args.first()?, types)?;
+        // Java throws on a zero divisor rather than returning NULL, but a pipeline that
+        // stops on one row of bad data is worse than one that carries a NULL, and NULL
+        // is what every other division here already yields.
+        let quotient = format!("({left}) / NULLIF({right}, 0)");
+        return match args.len() {
+            1 => Some(quotient),
+            // (divisor, scale, rounding-mode)
+            3 if is_number(args[1].trim()) => {
+                Some(format!("ROUND({quotient}, {})", args[1].trim()))
+            }
+            _ => None,
+        };
+    }
+    if let Some((recv, args)) = method_call(e, "setScale") {
+        if !args.is_empty() && is_number(args[0].trim()) {
+            return Some(format!(
+                "ROUND({}, {})",
+                java_expr_to_sql(recv, types)?,
+                args[0].trim()
+            ));
+        }
+        return None;
     }
     for (name, op) in [("multiply", "*"), ("subtract", "-"), ("add", "+")] {
         let Some((recv, args)) = method_call(e, name) else { continue };
@@ -1752,12 +1816,12 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
         }
         return Some(format!(
             "({}) {op} ({})",
-            java_expr_to_sql(recv)?,
-            java_expr_to_sql(args[0])?
+            java_expr_to_sql(recv, types)?,
+            java_expr_to_sql(args[0], types)?
         ));
     }
     if let Some(arg) = single_arg(e, "String.valueOf") {
-        return Some(format!("CAST({} AS VARCHAR)", java_expr_to_sql(arg)?));
+        return Some(format!("CAST({} AS VARCHAR)", java_expr_to_sql(arg, types)?));
     }
     // `Table.Column`, the only bare form that reads one way.
     let (table, column) = e.split_once('.')?;
@@ -1768,13 +1832,23 @@ fn java_expr_to_sql(expr: &str) -> Option<String> {
 /// Translate mapper output expressions. Anything without one faithful SQL reading is
 /// reported rather than guessed at.
 fn mapper_expressions(raw: &RawNode, warnings: &mut Vec<Warning>) -> JsonValue {
+    mapper_expressions_of(raw, &raw.mapper_out, warnings)
+}
+
+/// Translate one output's expressions. Anything without one faithful SQL reading is
+/// reported rather than guessed at.
+fn mapper_expressions_of(
+    raw: &RawNode,
+    entries: &[(String, String)],
+    warnings: &mut Vec<Warning>,
+) -> JsonValue {
     let mut out = JsonMap::new();
-    for (col, expr) in &raw.mapper_out {
+    for (col, expr) in entries {
         let e = expr.trim();
         if e.is_empty() {
             continue;
         }
-        match java_expr_to_sql(e) {
+        match java_expr_to_sql(e, &raw.mapper_types) {
             Some(c) => {
                 out.insert(col.clone(), JsonValue::String(c));
             }
@@ -1890,6 +1964,8 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         })
         .collect();
 
+    let (nodes, edges) =
+        split_multi_output_mappers(nodes, edges, &raw_nodes, &connections, &mut warnings);
     let edges = rewire_parallel_joins(edges, &connections);
     let edges = chain_declared_subjobs(edges, &subjob_heads, &connections);
 
@@ -1956,6 +2032,9 @@ struct Conn {
     /// Talend's `connectorName`. It says whether a link carries rows or only
     /// ordering, and dropping it turned every trigger into a data dependency.
     connector: Option<String>,
+    /// The connection's own name, which for a mapper output is the output it
+    /// carries. Distinct from the connector kind.
+    label: Option<String>,
 }
 
 /// Lift each loop's body out into a pipeline of its own and point the loop at it.
@@ -2153,6 +2232,90 @@ fn named_port(connector: &str) -> Option<String> {
             | "SYNCHRONIZE"
     );
     (!is_link_type && !connector.trim().is_empty()).then(|| connector.to_string())
+}
+
+/// Give a mapper that writes several outputs one relation per output.
+///
+/// The outputs of a mapper are usually the branches of a decision - inbound and outbound,
+/// one record type and the rest - and they routinely give the same column name different
+/// expressions. Read as one set they overwrite each other and every reader downstream
+/// gets whichever was parsed last, which is not a near miss: it is the other branch's
+/// number, on a branch that still runs and still looks right.
+///
+/// The link leaving a mapper names the output it carries, so each one is wired to the
+/// relation it actually reads. A link that names nothing recognisable stays on the first
+/// output and is reported, since guessing which branch it meant is the whole problem.
+fn split_multi_output_mappers(
+    mut nodes: Vec<PipelineNode>,
+    mut edges: Vec<PipelineEdge>,
+    raw_nodes: &[RawNode],
+    connections: &[Conn],
+    warnings: &mut Vec<Warning>,
+) -> (Vec<PipelineNode>, Vec<PipelineEdge>) {
+    // The name a link carries is not the port it leaves by: a joblet's boundary is found
+    // by the port, while which output a mapper link carries is the link's own name. Both
+    // are on the connection, and reading one for the other loses the link entirely.
+    let flow_name: std::collections::BTreeMap<(&str, &str), &str> = connections
+        .iter()
+        .filter_map(|c| {
+            let l = c.label.as_deref()?.trim();
+            (!l.is_empty()).then_some(((c.source.as_str(), c.target.as_str()), l))
+        })
+        .collect();
+    for raw in raw_nodes.iter().filter(|r| r.mapper_outs.len() > 1) {
+        let Some(at) = nodes.iter().position(|n| n.id == raw.unique) else { continue };
+        let original = nodes[at].clone();
+
+        // One node per output, each reading whatever the mapper read.
+        let mut made: Vec<(String, String)> = Vec::new();
+        for (name, entries) in &raw.mapper_outs {
+            let mut copy = original.clone();
+            copy.id = format!("{}__{}", raw.unique, name);
+            copy.data.label = copy.id.clone();
+            if let Some(props) = copy.data.properties.as_mut().and_then(|p| p.as_object_mut()) {
+                props.insert(
+                    "expressions".into(),
+                    mapper_expressions_of(raw, entries, warnings),
+                );
+            }
+            copy.position.y += 70.0 * made.len() as f64;
+            made.push((name.clone(), copy.id.clone()));
+            nodes.push(copy);
+        }
+        nodes.remove(at);
+
+        let first = made[0].1.clone();
+        let mut extra: Vec<PipelineEdge> = Vec::new();
+        for e in edges.iter_mut() {
+            if e.target == raw.unique {
+                // Every output reads the same input, so the link is copied to each.
+                for (_, id) in made.iter().skip(1) {
+                    let mut copy = e.clone();
+                    copy.id = format!("{}__{}", e.id, id);
+                    copy.target = id.clone();
+                    extra.push(copy);
+                }
+                e.target = first.clone();
+            } else if e.source == raw.unique {
+                let named = flow_name
+                    .get(&(raw.unique.as_str(), e.target.as_str()))
+                    .and_then(|l| made.iter().find(|(name, _)| name == l));
+                match named {
+                    Some((_, id)) => e.source = id.clone(),
+                    None => {
+                        warnings.push(Warning::MapperOutputUnnamed {
+                            node: raw.unique.clone(),
+                            target: e.target.clone(),
+                            outputs: made.iter().map(|(n, _)| n.clone()).collect(),
+                        });
+                        e.source = first.clone();
+                    }
+                }
+            }
+        }
+        edges.extend(extra);
+    }
+    (nodes, edges)
 }
 
 /// Whether adding `source -> target` would let something reach round to itself.
@@ -2473,6 +2636,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
     let mut cur: Option<RawNode> = None;
     // Mapper entries are only outputs when we are inside <outputTables>.
     let mut in_output_table = false;
+    let mut input_table: Option<String> = None;
     let mut in_subjob = false;
     let mut subjob_heads: Vec<String> = Vec::new();
     // The TABLE parameter whose rows we are currently collecting, if any.
@@ -2520,6 +2684,8 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             tables: BTreeMap::new(),
                             params: BTreeMap::new(),
                             mapper_out: Vec::new(),
+                            mapper_outs: Vec::new(),
+                            mapper_types: Default::default(),
                             x: attr("posX").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                             y: attr("posY").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                         });
@@ -2592,13 +2758,48 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             }
                         }
                     }
-                    "outputTables" => in_output_table = true,
-                    "inputTables" | "varTables" => in_output_table = false,
+                    "inputTables" => {
+                        in_output_table = false;
+                        if let Some(n) = cur.as_mut() {
+                            input_table = attr("name");
+                            let _ = &n.mapper_types;
+                        }
+                    }
+                    "outputTables" => {
+                        in_output_table = true;
+                        input_table = None;
+                        if let Some(n) = cur.as_mut() {
+                            let name = attr("name").unwrap_or_else(|| {
+                                format!("out{}", n.mapper_outs.len() + 1)
+                            });
+                            n.mapper_outs.push((name, Vec::new()));
+                        }
+                    }
+                    "varTables" => {
+                        in_output_table = false;
+                        input_table = None;
+                    }
                     "mapperTableEntries" => {
+                        // An input entry records the column's Talend type, which is what
+                        // says whether `new BigDecimal(x)` is the exact constructor or the
+                        // lossy one. Without it the expression cannot be read at all.
+                        if let (Some(n), Some(col), Some(ty)) =
+                            (cur.as_mut(), attr("name"), attr("type"))
+                        {
+                            if !in_output_table {
+                                if let Some(t) = input_table.as_deref() {
+                                    n.mapper_types.insert(format!("{t}.{col}"), ty.clone());
+                                }
+                                n.mapper_types.entry(col).or_insert(ty);
+                            }
+                        }
                         if in_output_table {
                             if let (Some(n), Some(col)) = (cur.as_mut(), attr("name")) {
                                 if let Some(expr) = attr("expression") {
-                                    n.mapper_out.push((col, expr));
+                                    n.mapper_out.push((col.clone(), expr.clone()));
+                                    if let Some(last) = n.mapper_outs.last_mut() {
+                                        last.1.push((col, expr));
+                                    }
                                 }
                             }
                         }
@@ -2609,6 +2810,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                                 source: s,
                                 target: t,
                                 connector: attr("connectorName"),
+                                label: attr("label"),
                             });
                         }
                     }
@@ -3024,7 +3226,7 @@ mod tests {
         // human, and the largest groups are a literal, a null, or a cast. Those have one
         // faithful SQL form each, so reporting them buries the ones that genuinely need
         // judgement.
-        let sql = |e: &str| java_expr_to_sql(e);
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         assert_eq!(sql("null").as_deref(), Some("NULL"));
         assert_eq!(sql(r#""""#).as_deref(), Some("''"));
         assert_eq!(sql(r#""S""#).as_deref(), Some("'S'"));
@@ -3045,7 +3247,7 @@ mod tests {
 
     #[test]
     fn the_string_helpers_become_their_sql_equivalents() {
-        let sql = |e: &str| java_expr_to_sql(e);
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         assert_eq!(sql("StringHandling.LEFT(row1.NID,2)").as_deref(), Some("left(NID, 2)"));
         assert_eq!(sql("StringHandling.RIGHT(row1.NID,2)").as_deref(), Some("right(NID, 2)"));
         // SUBSTR takes a start and a length from 1, matching SQL, rather than Java's
@@ -3070,7 +3272,7 @@ mod tests {
     fn a_string_helper_with_a_computed_length_is_still_reported() {
         // The count argument has to be a plain integer. Anything else could be a Java
         // expression whose value we would be guessing at.
-        let sql = |e: &str| java_expr_to_sql(e);
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         assert_eq!(sql("StringHandling.LEFT(row1.NID,row1.N)"), None);
         assert_eq!(sql("StringHandling.LEFT(row1.NID)"), None, "wrong arity");
         assert_eq!(sql("StringHandling.SUBSTR(row1.CODE,1)"), None, "wrong arity");
@@ -3131,7 +3333,7 @@ mod tests {
 
     #[test]
     fn a_choice_becomes_a_case_expression() {
-        let sql = |e: &str| java_expr_to_sql(e);
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         // compareTo(x) == 0 is numeric equality ignoring scale, which is what SQL = does.
         assert_eq!(
             sql(r#"row6.PCT.compareTo(new BigDecimal("100")) == 0 ? row6.A : row6.B"#).as_deref(),
@@ -3160,7 +3362,7 @@ mod tests {
 
     #[test]
     fn a_choice_we_cannot_read_is_still_reported() {
-        let sql = |e: &str| java_expr_to_sql(e);
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         assert_eq!(sql("a ? b : c"), None, "operands are not readable");
         assert_eq!(
             sql("row6.PCT.compareTo(row6.X) > 0 ? row6.A : row6.B"),
@@ -3172,7 +3374,7 @@ mod tests {
 
     #[test]
     fn numeric_literals_and_exact_decimals_become_sql() {
-        let sql = |e: &str| java_expr_to_sql(e);
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         // A bare number is a number.
         assert_eq!(sql("0").as_deref(), Some("0"));
         assert_eq!(sql("-1").as_deref(), Some("-1"));
@@ -3189,7 +3391,7 @@ mod tests {
 
     #[test]
     fn sign_changing_arithmetic_becomes_sql() {
-        let sql = |e: &str| java_expr_to_sql(e);
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         assert_eq!(sql("row6.AMT.negate()").as_deref(), Some("-(AMT)"));
         assert_eq!(
             sql(r#"row6.AMT.multiply(new BigDecimal("-1"))"#).as_deref(),
@@ -3204,7 +3406,7 @@ mod tests {
         // The point of translating the easy ones is that what remains is worth reading.
         // Anything with branching, arithmetic or an unverified index must keep warning:
         // guessing one of these wrong is a silent wrong number, not a failure.
-        let sql = |e: &str| java_expr_to_sql(e);
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         assert_eq!(sql("jobName"), None, "a bare identifier is not a column");
         assert_eq!(sql("new BigDecimal(Var.ID)"), None, "exact decimal, not a double");
         assert_eq!(sql("new BigDecimal(row1.AMT)"), None, "exact decimal or double, unrecorded");
@@ -3804,6 +4006,133 @@ mod tests {
                 !im.warnings.iter().any(|w| matches!(w, Warning::StatementNotQuery { .. })),
                 "{q} is a query: {:?}",
                 im.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn a_mapper_with_several_outputs_keeps_them_apart() {
+        // A mapper can write several outputs, each with its own columns and its own
+        // expression for a column they share. Read as one set they overwrite each other,
+        // so every reader gets whichever was parsed last - and the outputs of a mapper
+        // are usually the two halves of a decision, so that is not a near miss but the
+        // wrong number, on a branch that still runs.
+        //
+        // Each output becomes a relation of its own, and the link that leaves the mapper
+        // says by name which one it carries.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <outputTables name="Outbound">
+              <mapperTableEntries name="SHARE" expression="row1.OUT_PCT"/>
+              <mapperTableEntries name="ONLY_OUT" expression="row1.A"/>
+            </outputTables>
+            <outputTables name="Inbound">
+              <mapperTableEntries name="SHARE" expression="row1.IN_PCT"/>
+            </outputTables>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="240" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="sink_out"/>
+            <elementParameter name="FILENAME" value="&quot;/data/o.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="240" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="sink_in"/>
+            <elementParameter name="FILENAME" value="&quot;/data/i.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+          <connection connectorName="FLOW" source="m_1" target="sink_out" label="Outbound"/>
+          <connection connectorName="FLOW" source="m_1" target="sink_in" label="Inbound"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+
+        let expr = |id: &str, col: &str| -> Option<String> {
+            im.nodes
+                .iter()
+                .find(|n| n.id == id)?
+                .data
+                .properties
+                .as_ref()?
+                .get("expressions")?
+                .get(col)?
+                .as_str()
+                .map(str::to_string)
+        };
+        assert_eq!(
+            expr("m_1__Outbound", "SHARE").as_deref(),
+            Some("OUT_PCT"),
+            "each output keeps its own expression for a shared column; nodes were {:?}",
+            im.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+        assert_eq!(expr("m_1__Inbound", "SHARE").as_deref(), Some("IN_PCT"));
+        assert_eq!(
+            expr("m_1__Inbound", "ONLY_OUT"),
+            None,
+            "and only the columns it actually declares"
+        );
+
+        let feeds = |target: &str| -> Vec<&str> {
+            let mut v: Vec<&str> =
+                im.edges.iter().filter(|e| e.target == target).map(|e| e.source.as_str()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(feeds("sink_out"), vec!["m_1__Outbound"], "the link carries the output it names");
+        assert_eq!(feeds("sink_in"), vec!["m_1__Inbound"]);
+        assert_eq!(feeds("m_1__Outbound"), vec!["in_1"], "both read the same input");
+        assert_eq!(feeds("m_1__Inbound"), vec!["in_1"]);
+        assert!(
+            !im.nodes.iter().any(|n| n.id == "m_1"),
+            "and the merged node is gone"
+        );
+    }
+
+    #[test]
+    fn an_exact_decimal_reads_when_the_file_records_the_column_type() {
+        // `new BigDecimal(x)` has two constructors that disagree: the one taking a string
+        // is exact, the one taking a double goes through binary floating point. Which
+        // applies depends on the column's type - and the file records it, on the mapper's
+        // own input table. It was refused for want of a type that was there all along.
+        let job = |ty: &str| {
+            let xml = format!(
+                r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/d/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <inputTables name="Onboarded">
+              <mapperTableEntries name="AMT" type="{ty}" nullable="true"/>
+            </inputTables>
+            <outputTables name="out">
+              <mapperTableEntries name="TOTAL" expression="new BigDecimal(Onboarded.AMT)"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+        </talendfile:ProcessType>"#
+            );
+            import_item(&xml, "j").unwrap()
+        };
+
+        let exact = job("id_String");
+        assert_eq!(
+            exact.nodes.iter().find(|n| n.id == "m_1").unwrap().data.properties.as_ref()
+                .unwrap()["expressions"]["TOTAL"].as_str(),
+            Some("CAST(AMT AS DECIMAL(38,4))"),
+            "a string column takes the exact constructor"
+        );
+
+        // A double-valued column still goes through binary floating point, and no type
+        // recorded still means no reading at all.
+        for ty in ["id_Double", "id_Float"] {
+            let im = job(ty);
+            assert!(
+                im.warnings.iter().any(|w| matches!(w, Warning::JavaExpression { column, .. } if column == "TOTAL")),
+                "{ty} is not exact and stays reported"
             );
         }
     }
