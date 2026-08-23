@@ -1726,35 +1726,146 @@ fn split_ternary(e: &str) -> Option<(&str, &str, &str)> {
 /// sign checked against the comparison's contract, which is a guess we do not make.
 fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
     let c = cond.trim();
+    if c.is_empty() {
+        return None;
+    }
     if let Some(inner) = c.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         if balanced(inner) {
             return java_condition_to_sql(inner, types);
         }
     }
-    for (token, op) in [("==", "="), ("!=", "<>")] {
-        let Some((lhs, rhs)) = c.split_once(token) else { continue };
-        if !rhs.trim().eq("0") {
+
+    // Tests joined together, loosest first so the reading nests the way Java does.
+    for (token, op) in [("||", "OR"), ("&&", "AND")] {
+        let parts = split_top_level(c, token);
+        if parts.len() > 1 {
+            let rendered = parts
+                .iter()
+                .map(|p| Some(format!("({})", java_condition_to_sql(p, types)?)))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(rendered.join(&format!(" {op} ")));
+        }
+    }
+    if let Some(rest) = c.strip_prefix('!') {
+        // `!=` is a comparison, not a negation.
+        if !rest.starts_with('=') {
+            return Some(format!("NOT ({})", java_condition_to_sql(rest, types)?));
+        }
+    }
+
+    // A comparison. The longer spellings come first so `<=` is not read as `<`.
+    for (token, op) in [
+        ("==", "="),
+        ("!=", "<>"),
+        ("<=", "<="),
+        (">=", ">="),
+        ("<", "<"),
+        (">", ">"),
+    ] {
+        let parts = split_top_level(c, token);
+        if parts.len() != 2 {
             continue;
         }
-        let (recv, args) = method_call(lhs.trim(), "compareTo")?;
-        if args.len() != 1 {
-            return None;
+        let (lhs, rhs) = (parts[0], parts[1]);
+        // `x.compareTo(y) == 0` is how Java spells `x = y` for an exact decimal.
+        if let Some((recv, args)) = method_call(lhs.trim(), "compareTo") {
+            if args.len() == 1 && rhs.trim() == "0" && matches!(op, "=" | "<>" | "<" | ">" | "<=" | ">=")
+            {
+                return Some(format!(
+                    "{} {op} {}",
+                    java_expr_to_sql(recv, types)?,
+                    java_expr_to_sql(args[0], types)?
+                ));
+            }
         }
         return Some(format!(
             "{} {op} {}",
-            java_expr_to_sql(recv, types)?,
-            java_expr_to_sql(args[0], types)?
+            java_expr_to_sql(lhs, types)?,
+            java_expr_to_sql(rhs, types)?
         ));
     }
-    let (recv, args) = method_call(c, "equals")?;
-    if args.len() != 1 {
-        return None;
+
+    // A test written as a method on the value.
+    if let Some((recv, args)) = method_call(c, "equals") {
+        if args.len() == 1 {
+            return Some(format!(
+                "{} = {}",
+                java_expr_to_sql(recv, types)?,
+                java_expr_to_sql(args[0], types)?
+            ));
+        }
     }
-    Some(format!(
-        "{} = {}",
-        java_expr_to_sql(recv, types)?,
-        java_expr_to_sql(args[0], types)?
-    ))
+    if let Some((recv, args)) = method_call(c, "equalsIgnoreCase") {
+        if args.len() == 1 {
+            return Some(format!(
+                "upper({}) = upper({})",
+                java_expr_to_sql(recv, types)?,
+                java_expr_to_sql(args[0], types)?
+            ));
+        }
+    }
+    if let Some((recv, args)) = method_call(c, "isEmpty") {
+        if args.iter().all(|a| a.trim().is_empty()) {
+            return Some(format!("{} = ''", java_expr_to_sql(recv, types)?));
+        }
+    }
+    for (name, sql_fn) in [("startsWith", "starts_with"), ("endsWith", "ends_with")] {
+        if let Some((recv, args)) = method_call(c, name) {
+            if args.len() == 1 {
+                return Some(format!(
+                    "{sql_fn}({}, {})",
+                    java_expr_to_sql(recv, types)?,
+                    java_expr_to_sql(args[0], types)?
+                ));
+            }
+        }
+    }
+    // A bare value used as a test is a boolean column, and reads as itself.
+    java_expr_to_sql(c, types)
+}
+
+/// Split on a token at the top level, outside any string or bracket.
+fn split_top_level<'a>(e: &'a str, token: &str) -> Vec<&'a str> {
+    let (mut depth, mut in_string) = (0i32, false);
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let bytes = e.as_bytes();
+    let mut i = 0usize;
+    while i < e.len() {
+        if !e.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let c = e[i..].chars().next().unwrap();
+        match c {
+            '"' if !(i > 0 && bytes[i - 1] == b'\\') => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => depth -= 1,
+            _ if !in_string && depth == 0 && e[i..].starts_with(token) => {
+                // `=` inside `==` / `<=` must not be taken for the shorter spelling.
+                let before = i.checked_sub(1).map(|j| bytes[j]);
+                let after = e.as_bytes().get(i + token.len()).copied();
+                let glued = matches!(before, Some(b'=' | b'<' | b'>' | b'!'))
+                    || matches!(after, Some(b'='))
+                    || (token.len() == 1
+                        && matches!(token.as_bytes()[0], b'<' | b'>')
+                        && matches!(after, Some(b'=')));
+                if !glued {
+                    parts.push(&e[start..i]);
+                    start = i + token.len();
+                    i += token.len();
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += c.len_utf8();
+    }
+    if parts.is_empty() {
+        return vec![e];
+    }
+    parts.push(&e[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
 }
 
 /// An optionally signed decimal number, written out in full.
@@ -1921,6 +2032,123 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
             ));
         }
         return None;
+    }
+    // The routines the tool ships, each with one reading in SQL.
+    for (name, sql_fn) in [
+        ("StringHandling.LEN", "length"),
+        ("StringHandling.UPCASE", "upper"),
+        ("StringHandling.DOWNCASE", "lower"),
+    ] {
+        if let Some(arg) = single_arg(e, name) {
+            return Some(format!("{sql_fn}({})", java_expr_to_sql(arg, types)?));
+        }
+    }
+    if let Some(args) = call_args(e, "StringHandling.CHANGE") {
+        if args.len() == 3 {
+            return Some(format!(
+                "regexp_replace({}, {}, {}, 'g')",
+                java_expr_to_sql(args[0], types)?,
+                java_string_to_sql(args[1])?,
+                java_string_to_sql(args[2])?
+            ));
+        }
+    }
+    if let Some(args) = call_args(e, "StringHandling.INDEX") {
+        // Java counts from zero and answers -1 when absent; instr counts from one and
+        // answers 0, so one subtraction says both.
+        if args.len() == 2 {
+            return Some(format!(
+                "instr({}, {}) - 1",
+                java_expr_to_sql(args[0], types)?,
+                java_expr_to_sql(args[1], types)?
+            ));
+        }
+    }
+    if let Some(args) = call_args(e, "StringHandling.COUNT") {
+        if args.len() == 2 {
+            let subject = java_expr_to_sql(args[0], types)?;
+            let needle = java_expr_to_sql(args[1], types)?;
+            return Some(format!(
+                "(length({subject}) - length(replace({subject}, {needle}, ''))) / \
+                 nullif(length({needle}), 0)"
+            ));
+        }
+    }
+    // Arithmetic the tool spells as a routine over text.
+    for (name, op) in [
+        ("Mathematical.SMUL", "*"),
+        ("Mathematical.SADD", "+"),
+        ("Mathematical.SSUB", "-"),
+        ("Mathematical.SDIV", "/"),
+    ] {
+        let Some(args) = call_args(e, name) else { continue };
+        if args.len() != 2 {
+            return None;
+        }
+        let left = java_expr_to_sql(args[0], types)?;
+        let right = java_expr_to_sql(args[1], types)?;
+        // The routine takes its operands as text and reads them as numbers, so the
+        // reading is part of the translation. Tolerant, like the rest of the read.
+        let divisor = matches!(op, "/");
+        return Some(match divisor {
+            true => format!(
+                "TRY_CAST({left} AS DOUBLE) / nullif(TRY_CAST({right} AS DOUBLE), 0)"
+            ),
+            false => format!("TRY_CAST({left} AS DOUBLE) {op} TRY_CAST({right} AS DOUBLE)"),
+        });
+    }
+    // Reading a number out of text, and the wrappers that only change the Java type.
+    for (name, ty) in [
+        ("Double.parseDouble", "DOUBLE"),
+        ("Float.parseFloat", "DOUBLE"),
+        ("Integer.parseInt", "BIGINT"),
+        ("Long.parseLong", "BIGINT"),
+    ] {
+        if let Some(arg) = single_arg(e, name) {
+            return Some(format!("TRY_CAST({} AS {ty})", java_expr_to_sql(arg, types)?));
+        }
+    }
+    for (suffix, ty) in [
+        (".doubleValue()", "DOUBLE"),
+        (".floatValue()", "DOUBLE"),
+        (".intValue()", "INTEGER"),
+        (".longValue()", "BIGINT"),
+    ] {
+        if let Some(recv) = e.strip_suffix(suffix) {
+            return Some(format!("CAST({} AS {ty})", java_expr_to_sql(recv, types)?));
+        }
+    }
+    // Finding and replacing on a plain string rather than a pattern.
+    if let Some((recv, args)) = method_call(e, "indexOf") {
+        if args.len() == 1 {
+            return Some(format!(
+                "instr({}, {}) - 1",
+                java_expr_to_sql(recv, types)?,
+                java_expr_to_sql(args[0], types)?
+            ));
+        }
+    }
+    if let Some((recv, args)) = method_call(e, "lastIndexOf") {
+        if args.len() == 1 {
+            let subject = java_expr_to_sql(recv, types)?;
+            let needle = java_expr_to_sql(args[0], types)?;
+            // Found from the back, then counted from the front; absent is -1 either way.
+            return Some(format!(
+                "CASE WHEN instr(reverse({subject}), reverse({needle})) = 0 THEN -1 ELSE \
+                 length({subject}) - instr(reverse({subject}), reverse({needle})) - \
+                 length({needle}) + 1 END"
+            ));
+        }
+    }
+    if let Some((recv, args)) = method_call(e, "replace") {
+        if args.len() == 2 {
+            return Some(format!(
+                "replace({}, {}, {})",
+                java_expr_to_sql(recv, types)?,
+                java_expr_to_sql(args[0], types)?,
+                java_expr_to_sql(args[1], types)?
+            ));
+        }
     }
     // The ordinary things a mapper does to a field. Each has one reading in SQL, so
     // leaving them out only meant the whole expression around them went unread.
@@ -2731,27 +2959,9 @@ fn numeric_operand(e: &str, types: &ColTypes) -> Option<String> {
 
 /// Split on `+` at the top level, outside any string or bracket.
 fn split_top_level_plus(e: &str) -> Vec<&str> {
-    let (mut depth, mut in_string, mut start) = (0i32, false, 0usize);
-    let mut parts = Vec::new();
-    let bytes = e.as_bytes();
-    for (i, c) in e.char_indices() {
-        match c {
-            '"' if !(i > 0 && bytes[i - 1] == b'\\') => in_string = !in_string,
-            '(' if !in_string => depth += 1,
-            ')' if !in_string => depth -= 1,
-            '+' if !in_string && depth == 0 => {
-                parts.push(&e[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    if parts.is_empty() {
-        return vec![e];
-    }
-    parts.push(&e[start..]);
-    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
+    split_top_level(e, "+")
 }
+
 
 /// Whether a piece is text: a literal, a column the file records as one, or a call that
 /// produces text whatever it was given.
@@ -3944,10 +4154,12 @@ mod tests {
     fn a_choice_we_cannot_read_is_still_reported() {
         let sql = |e: &str| java_expr_to_sql(e, &Default::default());
         assert_eq!(sql("a ? b : c"), None, "operands are not readable");
+        // An ordering reads now: comparing the sign this returns against zero is how
+        // Java spells the comparison itself, and it means the same thing whichever way
+        // round the test is written.
         assert_eq!(
-            sql("row6.PCT.compareTo(row6.X) > 0 ? row6.A : row6.B"),
-            None,
-            "only equality is translated; an ordering needs its sign checked"
+            sql("row6.PCT.compareTo(row6.X) > 0 ? row6.A : row6.B").as_deref(),
+            Some("CASE WHEN PCT > X THEN A ELSE B END")
         );
         assert_eq!(sql("row6.A.compareTo(row6.B) == 1"), None, "not a boolean shape");
     }
@@ -5041,6 +5253,45 @@ mod tests {
         );
         // An ordinary column reference is still a column reference.
         assert_eq!(sql("row1.REGION_CODE").as_deref(), Some("REGION_CODE"));
+    }
+
+    #[test]
+    fn a_condition_reads_the_way_it_is_written() {
+        // Conditions in a mapper are ordinary Java: tests joined with and/or, negated,
+        // compared. Only two shapes were understood, so a choice that turned on anything
+        // else took the whole column with it - and a choice is the commonest thing a
+        // mapper does.
+        let types = ColTypes::new();
+        let sql = |e: &str| java_expr_to_sql(e, &types);
+
+        assert_eq!(
+            sql(r#"row1.D.equals("2")||row1.D.equals("5") ? "S" : "P""#).as_deref(),
+            Some("CASE WHEN (D = '2') OR (D = '5') THEN 'S' ELSE 'P' END")
+        );
+        assert_eq!(
+            sql(r#"row1.A.equals("x") && row1.B.equals("y") ? 1 : 0"#).as_deref(),
+            Some("CASE WHEN (A = 'x') AND (B = 'y') THEN 1 ELSE 0 END")
+        );
+        assert_eq!(
+            sql(r#"!row1.A.equals("x") ? 1 : 0"#).as_deref(),
+            Some("CASE WHEN NOT (A = 'x') THEN 1 ELSE 0 END")
+        );
+        assert_eq!(
+            sql(r#"StringHandling.LEN(row1.A)==0 ? "z" : row1.A"#).as_deref(),
+            Some("CASE WHEN length(A) = 0 THEN 'z' ELSE A END")
+        );
+        assert_eq!(
+            sql(r#"row1.A.equalsIgnoreCase("x") ? 1 : 0"#).as_deref(),
+            Some("CASE WHEN upper(A) = upper('x') THEN 1 ELSE 0 END")
+        );
+        assert_eq!(
+            sql(r#"row1.A.startsWith("ST") ? 1 : 0"#).as_deref(),
+            Some("CASE WHEN starts_with(A, 'ST') THEN 1 ELSE 0 END")
+        );
+        assert_eq!(
+            sql(r#"row1.A.isEmpty() ? 1 : 0"#).as_deref(),
+            Some("CASE WHEN A = '' THEN 1 ELSE 0 END")
+        );
     }
 
     #[test]
