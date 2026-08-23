@@ -219,6 +219,9 @@ struct RawNode {
     /// the two halves of a decision routinely share a column name and give it different
     /// expressions, so merging them silently answers one branch with the other's number.
     mapper_outs: Vec<(String, Vec<(String, String, String)>)>,
+    /// The condition on an output, by output name, for the outputs that have one
+    /// switched on. It decides which rows reach that output and no other.
+    mapper_out_filters: Vec<(String, String)>,
     x: f64,
     y: f64,
 }
@@ -2531,16 +2534,13 @@ fn mapper_expressions(raw: &RawNode, job: &str, warnings: &mut Vec<Warning>) -> 
 
 /// Translate one output's expressions. Anything without one faithful SQL reading is
 /// reported rather than guessed at.
-fn mapper_expressions_of(
-    raw: &RawNode,
-    entries: &[(String, String, String)],
-    job: &str,
-    warnings: &mut Vec<Warning>,
-) -> JsonValue {
-    let mut out = JsonMap::new();
-    // A mapper's own named values are resolved into the expressions that use them, in the
-    // order the mapper computes them, so a name that stands for another name resolves too.
-    // With one input a name is unambiguous; with more, it is kept qualified.
+/// A mapper's own named values, resolved in the order it computes them, and which of its
+/// inputs each name belongs to.
+///
+/// A name that stands for another name resolves too. With one input a name is
+/// unambiguous; with more, it is kept qualified, because the same column can sit in
+/// either relation.
+fn mapper_vars_and_ports(raw: &RawNode) -> (Vec<(String, String)>, PortMap) {
     let ports: PortMap = match raw.mapper_inputs.len() > 1 {
         false => Default::default(),
         true => raw
@@ -2558,6 +2558,40 @@ fn mapper_expressions_of(
         let resolved = inline_mapper_vars(body, &vars);
         vars.push((name.clone(), resolved));
     }
+    (vars, ports)
+}
+
+/// The condition on one of a mapper's outputs, as SQL.
+///
+/// None means either that the output has no condition or that this one could not be
+/// read. The two are not the same and the second is reported, because an unread
+/// condition lets through every row it was there to hold back.
+fn mapper_filter(raw: &RawNode, output: &str, warnings: &mut Vec<Warning>) -> Option<String> {
+    let cond = raw.mapper_out_filters.iter().find(|(n, _)| n == output).map(|(_, c)| c)?;
+    let (vars, ports) = mapper_vars_and_ports(raw);
+    let c = inline_mapper_vars(cond.trim(), &vars);
+    let c = c.trim();
+    match java_condition_to_sql(c, &raw.mapper_types, &ports) {
+        Some(sql) => Some(sql),
+        None => {
+            warnings.push(Warning::JavaExpression {
+                node: raw.unique.clone(),
+                column: format!("the condition on output {output}"),
+                expression: c.to_string(),
+            });
+            None
+        }
+    }
+}
+
+fn mapper_expressions_of(
+    raw: &RawNode,
+    entries: &[(String, String, String)],
+    job: &str,
+    warnings: &mut Vec<Warning>,
+) -> JsonValue {
+    let mut out = JsonMap::new();
+    let (vars, ports) = mapper_vars_and_ports(raw);
     for (col, expr, declared) in entries {
         // The job's own name is a value the tool supplies, and it is this one.
         let e = inline_mapper_vars(expr.trim(), &vars).replace("jobName", &format!("\"{job}\""));
@@ -2628,6 +2662,18 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         let mut props = properties_for(raw, component_id, &context, &mut warnings);
         if component_id == "xf.map" {
             props.insert("expressions".into(), mapper_expressions(raw, job_name, &mut warnings));
+            // With several outputs the node is split into one per output further on, and
+            // each takes its own condition there. Setting one here would put the first
+            // output's condition on all of them.
+            if raw.mapper_outs.len() <= 1 {
+                if let Some(f) = raw
+                    .mapper_outs
+                    .first()
+                    .and_then(|(name, _)| mapper_filter(raw, name, &mut warnings))
+                {
+                    props.insert("filter".into(), JsonValue::String(f));
+                }
+            }
             // What the mapper looks up, and what it matches on. Wired in but not joined,
             // every column taken from a lookup refers to something that is not there.
             let joins: Vec<JsonValue> = raw
@@ -3099,6 +3145,10 @@ fn split_multi_output_mappers(
                     "expressions".into(),
                     mapper_expressions_of(raw, entries, job, warnings),
                 );
+                match mapper_filter(raw, name, warnings) {
+                    Some(f) => props.insert("filter".into(), JsonValue::String(f)),
+                    None => props.remove("filter"),
+                };
             }
             copy.position.y += 70.0 * made.len() as f64;
             made.push((name.clone(), copy.id.clone()));
@@ -3412,6 +3462,15 @@ fn leading_statement_verb(sql: &str) -> Option<String> {
             | "ALTER"
             | "GRANT"
             | "CALL"
+            // A block, and the statements that steer a session rather than ask it
+            // anything. None of them returns rows either.
+            | "BEGIN"
+            | "DECLARE"
+            | "EXECUTE"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "USE"
+            | "SET"
     )
     .then_some(first)
 }
@@ -3831,6 +3890,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             params: BTreeMap::new(),
                             mapper_out: Vec::new(),
                             mapper_outs: Vec::new(),
+                            mapper_out_filters: Vec::new(),
                             mapper_types: Default::default(),
                             mapper_vars: Vec::new(),
                             mapper_inputs: Vec::new(),
@@ -3941,6 +4001,15 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             let name = attr("name").unwrap_or_else(|| {
                                 format!("out{}", n.mapper_outs.len() + 1)
                             });
+                            // The text of a condition is kept in the file whether it is
+                            // in use or not, so the switch is what says to apply it.
+                            if attr("activateExpressionFilter").as_deref() == Some("true") {
+                                if let Some(f) =
+                                    attr("expressionFilter").filter(|f| !f.trim().is_empty())
+                                {
+                                    n.mapper_out_filters.push((name.clone(), f));
+                                }
+                            }
                             n.mapper_outs.push((name, Vec::new()));
                         }
                     }
@@ -5226,6 +5295,101 @@ mod tests {
                 im.warnings
             );
         }
+    }
+
+    #[test]
+    fn an_output_keeps_the_condition_that_decides_which_rows_reach_it() {
+        // A mapper output can carry a condition, and that is how a Talend job splits one
+        // stream into branches: the same rows arrive at every output and each keeps only
+        // the ones its condition holds for. Dropped, every branch keeps every row - so a
+        // parse that should hand 550 rows one way and 8 another hands all 588 to both,
+        // and the run still reports success.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <outputTables name="Wide" expressionFilter="row1.KIND.equals(&quot;6&quot;)" activateExpressionFilter="true">
+              <mapperTableEntries name="A" expression="row1.A"/>
+            </outputTables>
+            <outputTables name="Narrow" expressionFilter="!row1.KIND.equals(&quot;6&quot;)" activateExpressionFilter="true">
+              <mapperTableEntries name="A" expression="row1.A"/>
+            </outputTables>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="240" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="sink_w"/>
+            <elementParameter name="FILENAME" value="&quot;/data/w.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="240" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="sink_n"/>
+            <elementParameter name="FILENAME" value="&quot;/data/n.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+          <connection connectorName="FLOW" source="m_1" target="sink_w" label="Wide"/>
+          <connection connectorName="FLOW" source="m_1" target="sink_n" label="Narrow"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let filter = |id: &str| -> Option<String> {
+            Some(
+                im.nodes
+                    .iter()
+                    .find(|n| n.id == id)?
+                    .data
+                    .properties
+                    .as_ref()?
+                    .get("filter")?
+                    .as_str()?
+                    .to_string(),
+            )
+        };
+        assert_eq!(filter("m_1__Wide").as_deref(), Some("KIND = '6'"));
+        assert_eq!(filter("m_1__Narrow").as_deref(), Some("NOT (KIND = '6')"));
+    }
+
+    #[test]
+    fn a_single_output_keeps_its_condition_too() {
+        // The same condition on a mapper with one output. There is no branch to get
+        // wrong here, just rows that should have been left behind and were not.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <outputTables name="out1" expressionFilter="!row1.NAME.endsWith(&quot;.gz&quot;)" activateExpressionFilter="true">
+              <mapperTableEntries name="NAME" expression="row1.NAME"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes.iter().find(|n| n.id == "m_1").unwrap().data.properties.as_ref().unwrap();
+        assert_eq!(p["filter"].as_str(), Some("NOT (ends_with(NAME, '.gz'))"));
+    }
+
+    #[test]
+    fn a_condition_left_off_is_not_a_condition() {
+        // The file keeps the text of a condition that has been switched off. Applied, it
+        // takes rows out that the job keeps.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <outputTables name="out1" expressionFilter="row1.NAME.equals(&quot;x&quot;)">
+              <mapperTableEntries name="NAME" expression="row1.NAME"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes.iter().find(|n| n.id == "m_1").unwrap().data.properties.as_ref().unwrap();
+        assert!(p.get("filter").is_none(), "got: {:?}", p.get("filter"));
     }
 
     #[test]
