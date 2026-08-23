@@ -1021,6 +1021,7 @@ Database sinks support an optional **dead-letter (validate-before-insert)** step
 | **Switch / Conditional Split** | Route rows to `case_1..N` outputs by boolean (first match wins); `default` for unmatched |
 | **Wait / Delay** | Sleep `N ms / s / min / h` before passing rows through |
 | **Throttle** | Inter-stage delay derived from a rows-per-second target |
+| **Set Run Variable** | Work out a value while the run is under way and let later steps in the same pipeline read it as `${name}` (`ctl.setvar`). Wired to rows the expression is read against them and the first row decides, so use an aggregate to read the whole input; wired to nothing it stands on its own. The value is held in the run's own database, so it survives whichever way the engine executes the stages |
 | **Checkpoint** | Pass rows through and also write a parquet snapshot to a path |
 | **Dead Letter Queue** | Terminal sink for rejected rows (JSON / CSV / Parquet) |
 | **Run Pipeline** | Inline-execute another pipeline file (`ctl.runpipeline`) |
@@ -1035,6 +1036,13 @@ Database sinks support an optional **dead-letter (validate-before-insert)** step
 | **Warn** | Emit a warning log line, pass rows through (`ctl.warn`) |
 | **Die / Fail** | Stop the run with a message: always, only when the input has rows, or only when empty (`ctl.die`) |
 | **Schedule** | Cron / interval / file-watch triggers via the orchestration crate |
+
+A run variable is read as a value wherever the SQL of a later step names it: on its
+own, as a whole string literal (`'${name}'`, the usual way to write a value into a
+`WHERE` clause, where the quotes come off with it), or inside a longer literal, which
+is joined around it. A name a node sets this way is left for the run to fill in, so a
+static context entry of the same name does not pre-empt it. The scope is the one
+pipeline: a child job gets its variables through Run Job / For Each instead.
 
 A sub-pipeline runs under its own name, so its run log lands in
 `logs/<child>/` and an `xf.incremental` watermark inside it is saved to

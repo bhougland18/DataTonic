@@ -12052,6 +12052,57 @@ fn run_log_writes_per_pipeline_ndjson() {
 }
 
 #[test]
+fn a_run_variable_reaches_a_later_step_on_either_execution_path() {
+    // The value is worked out from the rows the run has just read, and a later step
+    // filters on it. This is the whole point of the component: nothing knows the value
+    // until the run is under way, so the static context cannot carry it.
+    //
+    // It is run twice on purpose. The engine collapses a pure-SQL pipeline into ONE
+    // duckdb invocation but drops to one invocation PER STAGE when anything needs a
+    // Rust-side hook, and those are separate connections to the same database file.
+    // A session variable would be there on the first path and quietly missing on the
+    // second, so the value is kept in the database and both paths have to agree.
+    let engine = engine_or_skip!();
+    for forced_per_stage in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let csv = write_file(tmp.path(), "in.csv", "id,d\n1,2025-01-01\n2,2025-03-09\n3,2025-02-02\n");
+        let out = out_path(tmp.path(), "out.csv");
+        // The lever that forces the per-stage path, as in the xf.incremental tests.
+        let keep = match forced_per_stage {
+            true => json!({ "sql": "SELECT * FROM input WHERE d = '${latest}'", "memoryLimitMb": 512 }),
+            false => json!({ "sql": "SELECT * FROM input WHERE d = '${latest}'" }),
+        };
+        let d = doc(
+            json!([
+                node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node("v", "ctl.setvar", json!({ "name": "latest", "value": "max(d)" })),
+                node("q", "code.sql", keep),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([
+                main_edge("e1", "s", "v"),
+                main_edge("e2", "v", "q"),
+                main_edge("e3", "q", "k"),
+            ]),
+        );
+        let r = engine.execute_pipeline(&d);
+        assert_eq!(r.status, "ok", "run failed (per-stage={forced_per_stage}): {:?}", r.error);
+        // Only the row carrying the largest date survives, and it is the right one.
+        assert_eq!(
+            count(&format!("read_csv_auto('{}')", out)),
+            1,
+            "per-stage={forced_per_stage}"
+        );
+        assert_eq!(
+            scalar_string(&format!("SELECT id FROM read_csv_auto('{}')", out)),
+            "2",
+            "the value the run worked out is the one the later step used \
+             (per-stage={forced_per_stage})"
+        );
+    }
+}
+
+#[test]
 fn ctl_log_passes_through_rows() {
     // ctl.log emits a diagnostic and passes the upstream through unchanged,
     // so a downstream sink still gets every row.

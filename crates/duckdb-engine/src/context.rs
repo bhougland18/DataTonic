@@ -364,10 +364,22 @@ pub fn apply_workspace_context(doc: &mut PipelineDoc, workspace: &Path) {
         Ok(re) => re,
         Err(_) => return,
     };
+    // A name a node in this pipeline works out while the run is under way belongs to
+    // that node, not to the static context. The context routinely declares the same
+    // name with no value - that is how a job declares one it means to fill in later -
+    // and taking it from there first would replace the placeholder with nothing, so
+    // the step meant to read the run value would quietly read an empty string instead.
+    let set_at_run_time = crate::plan::run_var_names(doc);
     let replace = |s: &str| -> String {
-        re.replace_all(s, |caps: &regex::Captures| match vars.get(caps[1].trim()) {
-            Some(v) => v.clone(),
-            None => caps[0].to_string(),
+        re.replace_all(s, |caps: &regex::Captures| {
+            let name = caps[1].trim();
+            if set_at_run_time.contains(name) {
+                return caps[0].to_string();
+            }
+            match vars.get(name) {
+                Some(v) => v.clone(),
+                None => caps[0].to_string(),
+            }
         })
         .into_owned()
     };
@@ -1294,6 +1306,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(super::discover_parameters(&doc), vec!["REGION".to_string()]);
+    }
+
+    #[test]
+    fn a_name_a_node_sets_is_not_taken_from_the_static_context() {
+        // A name a node works out while the run is under way belongs to that node. The
+        // static context routinely declares the same name with no value - that is how a
+        // Talend job declares one it intends to fill in at run time - and substituting
+        // it first replaces the placeholder with nothing at all, so the step that was
+        // meant to read the run value silently compares against an empty string.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(ws.join("repository.json"), r#"[{"type":"context","id":"c","name":"Default"}]"#).unwrap();
+        std::fs::create_dir_all(ws.join("contexts")).unwrap();
+        std::fs::write(
+            ws.join("contexts").join("c.json"),
+            r#"{"variables":[{"key":"batch_date","value":""},{"key":"REGION","value":"EU"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("context.env"),
+            "batch_date=\nREGION=EU\n",
+        )
+        .unwrap();
+
+        let mut doc: crate::PipelineDoc = serde_json::from_str(
+            r#"{"nodes":[
+                 {"id":"v","position":{"x":0,"y":0},"data":{"label":"Set","componentId":"ctl.setvar",
+                   "properties":{"name":"batch_date","value":"max(D)"}}},
+                 {"id":"q","position":{"x":0,"y":0},"data":{"label":"SQL","componentId":"code.sql",
+                   "properties":{"sql":"SELECT * FROM input WHERE d = '${batch_date}' AND r = '${REGION}'"}}}
+               ],"edges":[]}"#,
+        )
+        .unwrap();
+        super::apply_workspace_context(&mut doc, ws);
+        let sql = doc.nodes[1].data.properties.as_ref().unwrap()["sql"].as_str().unwrap();
+        assert!(
+            sql.contains("'${batch_date}'"),
+            "the name its own node sets is left for the run to fill: {sql}"
+        );
+        // Everything else still resolves exactly as before.
+        assert!(sql.contains("r = 'EU'"), "got: {sql}");
     }
 
     #[test]

@@ -107,6 +107,92 @@ impl Stage {
     }
 }
 
+/// The relation a run variable's value is kept in.
+///
+/// Prefixed so it cannot be mistaken for, or collide with, a node's own relation.
+pub(crate) fn run_var_relation(name: &str) -> String {
+    format!("duckle_var__{name}")
+}
+
+/// How a run variable is read back in SQL.
+fn run_var_read(name: &str) -> String {
+    format!("(SELECT v FROM {})", quote_ident(&run_var_relation(name)))
+}
+
+/// Put the run variables a pipeline sets into the SQL of the steps that name them.
+///
+/// `${name}` stands for a VALUE, so it becomes a read of the one-row relation the
+/// setting node wrote:
+///
+/// - standing on its own, it is replaced where it stands;
+/// - written as a whole string literal, `'${name}'` - which is how a value is usually
+///   spelled into a WHERE clause - the quotes come off with it, because what it stands
+///   for is the value and not the eight characters of its name;
+/// - written inside a longer literal, the literal is joined around it so it keeps its
+///   shape.
+///
+/// Only names a node in THIS pipeline sets are touched. Every other `${...}` belongs to
+/// some other pass and is left exactly as it is.
+fn read_run_vars(sql: &str, names: &std::collections::BTreeSet<String>) -> String {
+    if names.is_empty() || !sql.contains("${") {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut in_string = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < sql.len() {
+        if !sql.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &sql[i..];
+        if rest.starts_with('\'') {
+            in_string = !in_string;
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+        if rest.starts_with("${") {
+            if let Some(end) = rest.find('}') {
+                let name = rest[2..end].trim();
+                if names.contains(name) {
+                    let read = run_var_read(name);
+                    // Inside a literal the literal is closed and reopened around the
+                    // value, so text on either side of the name survives.
+                    if in_string {
+                        out.push_str(&format!("' || {read} || '"));
+                    } else {
+                        out.push_str(&read);
+                    }
+                    i += end + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+        let _ = bytes;
+    }
+    // A name that WAS the whole literal leaves an empty piece on each side. They are
+    // harmless but unreadable, and this SQL is read by people when a run goes wrong.
+    out.replace("'' || ", "").replace(" || ''", "")
+}
+
+/// The names every `ctl.setvar` node in a pipeline sets.
+pub(crate) fn run_var_names(doc: &PipelineDoc) -> std::collections::BTreeSet<String> {
+    doc.nodes
+        .iter()
+        .filter(|n| n.data.component_id.as_deref() == Some("ctl.setvar"))
+        .filter_map(|n| {
+            let props = n.data.properties.as_ref()?;
+            let name = props.get("name")?.as_str()?.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
 /// The single non-SQL action a Stage performs (or None for pure SQL).
 /// Terminal variants (sources / sinks / transforms) replace the stage's
 /// SQL run in the executor; control-flow variants (RunJob / Iterate /
@@ -895,6 +981,18 @@ fn compile_impl(pipeline: &PipelineDoc, allow_view_upgrade: bool) -> Result<Comp
         .filter(|id| !excluded.contains(id.as_str()) && !has_downstream.contains(id.as_str()))
         .cloned()
         .collect();
+
+    // A step that names a run variable reads the value the setting node wrote. This is
+    // done on the finished SQL rather than on node properties because a name stands for
+    // a value in SQL and nowhere else - a path or a file name cannot read a relation.
+    let run_vars = run_var_names(pipeline);
+    if !run_vars.is_empty() {
+        for s in stages.iter_mut() {
+            if s.component_id != "ctl.setvar" {
+                s.sql = read_run_vars(&s.sql, &run_vars);
+            }
+        }
+    }
 
     Ok(CompiledPipeline { stages, leaves })
 }
@@ -2841,6 +2939,61 @@ fn build_stage(
             StageKind::View,
             None,
         )
+    } else if component_id == "ctl.setvar" {
+        // Work out a value while the run is under way and let later steps ask for it
+        // by name. A job routinely needs one - the date on the batch it just read, the
+        // id it just wrote - and the static context cannot hold it, because nothing
+        // knows it until the run has started.
+        //
+        // The value is kept in the run's OWN DATABASE, not in the session. A stage is
+        // sometimes a separate connection to the same file (see the per-stage path in
+        // lib.rs), and session state does not cross that boundary - so a session
+        // variable would be there on one path and quietly missing on the other, which
+        // is the worst of the two.
+        let name = string_prop(&props, "name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "{}: `name` is required - it is the name later steps write as ${{name}}",
+                    component_id
+                ))
+            })?;
+        let value = string_prop(&props, "value")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "{}: `value` is required - it is the expression that produces the value",
+                    component_id
+                ))
+            })?;
+        // Wired to rows, the expression is read against them and the first row decides,
+        // so an aggregate over the whole input is written as one. Wired to nothing, it
+        // stands on its own and is simply evaluated.
+        let holder = run_var_relation(&name);
+        let set = match inputs.main() {
+            Some(from_view) => format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT ({}) AS v FROM {} LIMIT 1",
+                quote_ident(&holder),
+                value,
+                quote_ident(from_view)
+            ),
+            None => format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT ({}) AS v",
+                quote_ident(&holder),
+                value
+            ),
+        };
+        let (pass, from) = match inputs.main() {
+            Some(from_view) => (
+                passthrough_view_sql(&node.id, from_view),
+                Some(from_view.to_string()),
+            ),
+            None => (passthrough_placeholder_sql(&node.id, "set"), None),
+        };
+        (format!("{set};
+{pass}"), StageKind::View, from)
     } else if component_id == "ctl.try" {
         // Side-effect fallback installer: pass through upstream
         // unchanged; on any subsequent stage failure, the engine

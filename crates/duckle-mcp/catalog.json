@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 390,
+  "componentCount": 391,
   "components": [
     {
       "id": "src.csv",
@@ -1997,116 +1997,6 @@
               "label": "reject",
               "type": "reject",
               "optional": true
-            }
-          ]
-        }
-      }
-    },
-    {
-      "id": "src.inline",
-      "label": "Inline Rows",
-      "kind": "source",
-      "availability": "available",
-      "summary": "Rows you write here rather than read from anywhere: a control row, an audit stamp, a fixed lookup. Give each column a name and a value; rowCount repeats the row. Every other source names an external system, so this was previously a throwaway file.",
-      "ports": {
-        "inputs": [],
-        "outputs": [
-          {
-            "id": "main",
-            "label": "main",
-            "type": "main"
-          }
-        ]
-      },
-      "manifest": {
-        "id": "src.inline",
-        "kind": "source",
-        "label": "Inline Rows",
-        "description": "Rows you write here rather than read from anywhere: a control row, an audit stamp, a fixed lookup. Give each column a name and a value; rowCount repeats the row. Every other source names an external system, so this was previously a throwaway file.",
-        "schemaSource": "infer",
-        "sections": [
-          {
-            "label": "Inline Rows",
-            "fields": [
-              {
-                "key": "columns",
-                "label": "Columns",
-                "kind": "keyvalue",
-                "required": true
-              },
-              {
-                "key": "rowCount",
-                "label": "Row count",
-                "kind": "number"
-              }
-            ]
-          }
-        ],
-        "ports": {
-          "inputs": [],
-          "outputs": [
-            {
-              "id": "main",
-              "label": "main",
-              "type": "main"
-            }
-          ]
-        }
-      }
-    },
-    {
-      "id": "src.filelist",
-      "label": "File List",
-      "kind": "source",
-      "availability": "available",
-      "summary": "One row per file in a directory - file (full path) and filename - so a pipeline can iterate a folder. Set a glob pattern and optionally recurse. Pair it with ForEach to process every file.",
-      "ports": {
-        "inputs": [],
-        "outputs": [
-          {
-            "id": "main",
-            "label": "main",
-            "type": "main"
-          }
-        ]
-      },
-      "manifest": {
-        "id": "src.filelist",
-        "kind": "source",
-        "label": "File List",
-        "description": "One row per file in a directory - file (full path) and filename - so a pipeline can iterate a folder. Set a glob pattern and optionally recurse. Pair it with ForEach to process every file.",
-        "schemaSource": "infer",
-        "sections": [
-          {
-            "label": "File List",
-            "fields": [
-              {
-                "key": "directory",
-                "label": "Directory",
-                "kind": "open-path",
-                "required": true
-              },
-              {
-                "key": "pattern",
-                "label": "Pattern",
-                "kind": "text",
-                "placeholder": "*"
-              },
-              {
-                "key": "recursive",
-                "label": "Include subfolders",
-                "kind": "toggle"
-              }
-            ]
-          }
-        ],
-        "ports": {
-          "inputs": [],
-          "outputs": [
-            {
-              "id": "main",
-              "label": "main",
-              "type": "main"
             }
           ]
         }
@@ -37818,11 +37708,11 @@
       }
     },
     {
-      "id": "src.runevents",
-      "label": "Run Events",
-      "kind": "control",
+      "id": "src.inline",
+      "label": "Inline Rows",
+      "kind": "source",
       "availability": "available",
-      "summary": "Rows describing the stages that have already failed in this run: node_id, kind, status, message, category, duration_ms. Wire it into a mail or table sink to report failures. It reports failures the run SURVIVED, so mark the stages that may fail with Continue on failure.",
+      "summary": "Rows you write here rather than read from anywhere: a control row, an audit stamp, a fixed lookup. Give each column a name and a value; rowCount repeats the row. Every other source names an external system, so this was previously a throwaway file.",
       "ports": {
         "inputs": [],
         "outputs": [
@@ -37830,19 +37720,33 @@
             "id": "main",
             "label": "main",
             "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
           }
         ]
       },
       "manifest": {
-        "id": "src.runevents",
+        "id": "src.inline",
         "kind": "source",
-        "label": "Run Events",
-        "description": "Rows describing the stages that have already failed in this run: node_id, kind, status, message, category, duration_ms. Wire it into a mail or table sink to report failures. It reports failures the run SURVIVED, so mark the stages that may fail with Continue on failure.",
-        "schemaSource": "fixed",
+        "label": "Inline Rows",
+        "description": "Rows you write here rather than read from anywhere: a control row, an audit stamp, a fixed lookup. Give each column a name and a value; rowCount repeats the row. Every other source names an external system, so this was previously a throwaway file.",
+        "schemaSource": "upstream",
         "sections": [
           {
-            "label": "Run Events",
-            "fields": []
+            "label": "Settings",
+            "fields": [
+              {
+                "key": "notes",
+                "label": "Notes",
+                "kind": "textarea",
+                "rows": 3,
+                "description": "Component-specific configuration not yet modeled - describe the intent here."
+              }
+            ]
           }
         ],
         "ports": {
@@ -37852,6 +37756,144 @@
               "id": "main",
               "label": "main",
               "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.filelist",
+      "label": "File List",
+      "kind": "source",
+      "availability": "available",
+      "summary": "One row per file in a directory - file (full path) and filename - so a pipeline can iterate a folder. Set a glob pattern and optionally recurse. Pair it with ForEach to process every file.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.filelist",
+        "kind": "source",
+        "label": "File List",
+        "description": "One row per file in a directory - file (full path) and filename - so a pipeline can iterate a folder. Set a glob pattern and optionally recurse. Pair it with ForEach to process every file.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Settings",
+            "fields": [
+              {
+                "key": "notes",
+                "label": "Notes",
+                "kind": "textarea",
+                "rows": 3,
+                "description": "Component-specific configuration not yet modeled - describe the intent here."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ctl.runevents",
+      "label": "Run Events",
+      "kind": "control",
+      "availability": "available",
+      "summary": "Rows describing the stages that have already failed in this run: node_id, kind, status, message, category, duration_ms. Wire it into a mail or table sink to report failures. It reports failures the run SURVIVED, so mark the stages that may fail with Continue on failure.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "ctl.runevents",
+        "kind": "transform",
+        "label": "Run Events",
+        "description": "Rows describing the stages that have already failed in this run: node_id, kind, status, message, category, duration_ms. Wire it into a mail or table sink to report failures. It reports failures the run SURVIVED, so mark the stages that may fail with Continue on failure.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Settings",
+            "fields": [
+              {
+                "key": "notes",
+                "label": "Notes",
+                "kind": "textarea",
+                "rows": 3,
+                "description": "Component-specific configuration not yet modeled - describe the intent here."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
             }
           ]
         }
@@ -37864,67 +37906,69 @@
       "availability": "available",
       "summary": "One typed filesystem operation: copy, move or delete a file. Staging a file between a landing area and a working area is ordinary batch work; before this the only filesystem-capable component ran a shell command, which cannot serve both platforms from one authored pipeline.",
       "ports": {
-        "inputs": [],
-        "outputs": []
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
       },
       "manifest": {
         "id": "ctl.file",
         "kind": "transform",
         "label": "File Operation",
         "description": "One typed filesystem operation: copy, move or delete a file. Staging a file between a landing area and a working area is ordinary batch work; before this the only filesystem-capable component ran a shell command, which cannot serve both platforms from one authored pipeline.",
-        "schemaSource": "none",
-        "ports": {
-          "inputs": [],
-          "outputs": []
-        },
+        "schemaSource": "upstream",
         "sections": [
           {
-            "label": "File Operation",
+            "label": "Settings",
             "fields": [
               {
-                "key": "op",
-                "label": "Operation",
-                "kind": "select",
-                "required": true,
-                "options": [
-                  {
-                    "value": "copy",
-                    "label": "Copy"
-                  },
-                  {
-                    "value": "move",
-                    "label": "Move"
-                  },
-                  {
-                    "value": "delete",
-                    "label": "Delete"
-                  }
-                ]
-              },
-              {
-                "key": "source",
-                "label": "Source path",
-                "kind": "open-path",
-                "required": true
-              },
-              {
-                "key": "destination",
-                "label": "Destination path",
-                "kind": "save-path"
-              },
-              {
-                "key": "overwrite",
-                "label": "Overwrite destination",
-                "kind": "toggle"
-              },
-              {
-                "key": "failOnError",
-                "label": "Fail the run on error",
-                "kind": "toggle"
+                "key": "notes",
+                "label": "Notes",
+                "kind": "textarea",
+                "rows": 3,
+                "description": "Component-specific configuration not yet modeled - describe the intent here."
               }
             ]
           }
-        ]
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
       }
     },
     {
@@ -37934,30 +37978,141 @@
       "availability": "available",
       "summary": "Does no work itself. It exists so ordering links have something to attach to: wire a trigger out of it to say what runs after, or into it to say what must finish first. Takes no input and produces no rows, so it never joins the data flow.",
       "ports": {
-        "inputs": [],
-        "outputs": []
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
       },
       "manifest": {
         "id": "ctl.anchor",
         "kind": "transform",
         "label": "Sequence Anchor",
         "description": "Does no work itself. It exists so ordering links have something to attach to: wire a trigger out of it to say what runs after, or into it to say what must finish first. Takes no input and produces no rows, so it never joins the data flow.",
-        "schemaSource": "none",
+        "schemaSource": "upstream",
         "sections": [
           {
-            "label": "Sequence Anchor",
+            "label": "Settings",
             "fields": [
               {
-                "key": "note",
-                "label": "Note",
-                "kind": "text"
+                "key": "notes",
+                "label": "Notes",
+                "kind": "textarea",
+                "rows": 3,
+                "description": "Component-specific configuration not yet modeled - describe the intent here."
               }
             ]
           }
         ],
         "ports": {
-          "inputs": [],
-          "outputs": []
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ctl.setvar",
+      "label": "Set Run Variable",
+      "kind": "control",
+      "availability": "available",
+      "summary": "Work out a value while the run is under way and let later steps in the same pipeline ask for it as ${name}: the date on the batch just read, the id just written. Wired to rows the expression is read against them; wired to nothing it stands on its own. The static context cannot carry these, because nothing knows them until the run has started.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main",
+            "optional": true
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "ctl.setvar",
+        "kind": "transform",
+        "label": "Set Run Variable",
+        "description": "Work out a value while the run is under way and let later steps in the same pipeline ask for it as ${name}: the date on the batch just read, the id just written. Wired to rows the expression is read against them; wired to nothing it stands on its own. The static context cannot carry these, because nothing knows them until the run has started.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Set Run Variable",
+            "fields": [
+              {
+                "key": "name",
+                "label": "Variable name",
+                "kind": "text",
+                "required": true,
+                "placeholder": "batch_date",
+                "description": "Later steps in this pipeline write ${name} to read the value."
+              },
+              {
+                "key": "value",
+                "label": "Value expression",
+                "kind": "text",
+                "required": true,
+                "placeholder": "max(TXNDATE)",
+                "description": "SQL evaluated when this node runs. Wired to rows it is read against them and the first row decides, so use an aggregate to read the whole input. Wired to nothing it stands on its own (current_date, a literal)."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main",
+              "optional": true
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main",
+              "optional": true
+            }
+          ]
         }
       }
     },

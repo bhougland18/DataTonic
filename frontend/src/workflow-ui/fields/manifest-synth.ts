@@ -719,6 +719,15 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
         return { inputs: [MAIN_IN], outputs: [MAIN_OUT] };
     }
 
+    // Set Run Variable - pass-through: rows go through unchanged, and it can also
+    // stand on its own with nothing wired in (a fixed value, or one from the clock).
+    if (id === 'ctl.setvar') {
+        return {
+            inputs: [{ id: 'main', label: 'main', type: 'main', optional: true }],
+            outputs: [{ id: 'main', label: 'main', type: 'main', optional: true }],
+        };
+    }
+
     // Die - one input; an optional output so a non-firing Die can still
     // chain downstream (it passes rows through when its condition is false).
     if (id === 'ctl.die') {
@@ -4979,6 +4988,32 @@ function synthPipelineControl(comp: ComponentDef): ComponentManifest {
                         placeholder: '0 = auto',
                         description:
                             '0 = auto: runs one branch per CPU core (capped to the branch count). Set a number to cap concurrency explicitly.',
+                    },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (comp.id === 'ctl.setvar') {
+        return base(comp, [
+            {
+                label: 'Set Run Variable',
+                fields: [
+                    {
+                        key: 'name',
+                        label: 'Variable name',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'batch_date',
+                        description: 'Later steps in this pipeline write ${name} to read the value.',
+                    },
+                    {
+                        key: 'value',
+                        label: 'Value expression',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'max(TXNDATE)',
+                        description:
+                            'SQL evaluated when this node runs. Wired to rows it is read against them and the first row decides, so use an aggregate to read the whole input. Wired to nothing it stands on its own (current_date, a literal).',
                     },
                 ],
             },

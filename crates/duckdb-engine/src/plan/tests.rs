@@ -1687,6 +1687,128 @@
     }
 
     #[test]
+    fn a_run_variable_is_set_from_the_rows_that_reach_it() {
+        // A job routinely works out a value while it runs - the date on the batch it
+        // just read, the id it just wrote - and later steps ask for that value. The
+        // static context cannot hold it, because nothing knows it until the run is
+        // under way.
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"v","position":{"x":0,"y":0},"data":{
+                  "label":"Set","componentId":"ctl.setvar",
+                  "properties":{"name":"batch_date","value":"max(TXNDATE)"}}}
+              ],
+              "edges":[{"id":"e","source":"s","target":"v","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        let sql = compile(&doc).unwrap().stages.into_iter()
+            .find(|s| s.node_id == "v").unwrap().sql;
+        // Held in the run's own database rather than in the session, because a stage
+        // can be a separate connection to the same file and session state does not
+        // cross that boundary.
+        assert!(sql.contains(r#"CREATE OR REPLACE TABLE "duckle_var__batch_date""#), "got: {sql}");
+        assert!(sql.contains("(max(TXNDATE)) AS v"), "got: {sql}");
+        assert!(sql.contains(r#"FROM "s""#), "it reads the rows wired into it: {sql}");
+    }
+
+    #[test]
+    fn a_run_variable_with_nothing_wired_in_stands_on_its_own() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"v","position":{"x":0,"y":0},"data":{
+                  "label":"Set","componentId":"ctl.setvar",
+                  "properties":{"name":"today","value":"current_date"}}}
+              ],
+              "edges":[]
+            }"#,
+        );
+        let sql = compile(&doc).unwrap().stages.into_iter()
+            .find(|s| s.node_id == "v").unwrap().sql;
+        assert!(sql.contains("(current_date) AS v"), "got: {sql}");
+        assert!(!sql.contains(" FROM \""), "nothing to read from: {sql}");
+    }
+
+    #[test]
+    fn a_run_variable_without_a_name_is_refused() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"v","position":{"x":0,"y":0},"data":{
+                  "label":"Set","componentId":"ctl.setvar",
+                  "properties":{"value":"current_date"}}}
+              ],
+              "edges":[]
+            }"#,
+        );
+        let msg = compile(&doc).expect_err("a variable with no name is nothing").to_string();
+        assert!(msg.contains("`name` is required"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_later_step_reads_the_run_variable_where_it_names_it() {
+        // The three ways the name gets written. It stands for a VALUE, so where it is
+        // spelled as a whole string literal - which is how a value is usually written
+        // into a WHERE clause - the quotes come off with it. Left as text, the step
+        // would compare its column against the eight characters of the placeholder.
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"v","position":{"x":0,"y":0},"data":{
+                  "label":"Set","componentId":"ctl.setvar",
+                  "properties":{"name":"d","value":"max(TXNDATE)"}}},
+                {"id":"q","position":{"x":0,"y":0},"data":{
+                  "label":"SQL","componentId":"code.sql",
+                  "properties":{"sql":"SELECT * FROM input WHERE a = '${d}' AND b = ${d} AND c = 'x${d}y'"}}}
+              ],
+              "edges":[
+                {"id":"e1","source":"s","target":"v","data":{"connectionType":"main"}},
+                {"id":"e2","source":"v","target":"q","data":{"connectionType":"main"}}
+              ]
+            }"#,
+        );
+        let sql = compile(&doc).unwrap().stages.into_iter()
+            .find(|s| s.node_id == "q").unwrap().sql;
+        let read = r#"(SELECT v FROM "duckle_var__d")"#;
+        assert!(sql.contains(&format!("a = {read}")), "a whole literal loses its quotes: {sql}");
+        assert!(sql.contains(&format!("b = {read}")), "standing on its own: {sql}");
+        assert!(
+            sql.contains(&format!("c = 'x' || {read} || 'y'")),
+            "inside a longer literal the literal keeps its shape: {sql}"
+        );
+        assert!(!sql.contains("${d}"), "nothing is left as text: {sql}");
+    }
+
+    #[test]
+    fn a_name_no_node_sets_is_left_alone() {
+        // Only the names a node in this pipeline actually sets are read this way.
+        // Anything else is somebody else's placeholder and is left exactly as it is.
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"q","position":{"x":0,"y":0},"data":{
+                  "label":"SQL","componentId":"code.sql",
+                  "properties":{"sql":"SELECT * FROM input WHERE a = '${d}'"}}}
+              ],
+              "edges":[{"id":"e2","source":"s","target":"q","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        let sql = compile(&doc).unwrap().stages.into_iter()
+            .find(|s| s.node_id == "q").unwrap().sql;
+        assert!(sql.contains("'${d}'"), "got: {sql}");
+    }
+
+    #[test]
     fn quoting_off_is_said_to_the_reader_not_left_unsaid() {
         // "None" in the quote box means the file has no quoting: a lone double quote in
         // the middle of a line is data, not the start of a quoted field. Leaving the
