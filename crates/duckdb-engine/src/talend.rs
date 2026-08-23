@@ -36,6 +36,11 @@ use std::collections::BTreeMap;
 /// constructor takes a string, the lossy one takes a double, and they do not agree.
 type ColTypes = std::collections::BTreeMap<String, String>;
 
+/// Which of a mapper's inputs each name belongs to, keyed by the name the file gives
+/// the input. Only needed where the mapper looks something up: with more than one
+/// relation in play, a bare column can sit in either and the reading is ambiguous.
+type PortMap = std::collections::BTreeMap<String, String>;
+
 /// A component Duckle could not translate, or a value it refused to guess.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Warning {
@@ -1774,14 +1779,14 @@ fn split_ternary(e: &str) -> Option<(&str, &str, &str)> {
 
 /// Translate a Java boolean to SQL. Only equality is read: an ordering would need its
 /// sign checked against the comparison's contract, which is a guess we do not make.
-fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
+fn java_condition_to_sql(cond: &str, types: &ColTypes, ports: &PortMap) -> Option<String> {
     let c = cond.trim();
     if c.is_empty() {
         return None;
     }
     if let Some(inner) = c.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         if balanced(inner) {
-            return java_condition_to_sql(inner, types);
+            return java_condition_to_sql(inner, types, ports);
         }
     }
 
@@ -1791,7 +1796,7 @@ fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
         if parts.len() > 1 {
             let rendered = parts
                 .iter()
-                .map(|p| Some(format!("({})", java_condition_to_sql(p, types)?)))
+                .map(|p| Some(format!("({})", java_condition_to_sql(p, types, ports)?)))
                 .collect::<Option<Vec<_>>>()?;
             return Some(rendered.join(&format!(" {op} ")));
         }
@@ -1799,7 +1804,7 @@ fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
     if let Some(rest) = c.strip_prefix('!') {
         // `!=` is a comparison, not a negation.
         if !rest.starts_with('=') {
-            return Some(format!("NOT ({})", java_condition_to_sql(rest, types)?));
+            return Some(format!("NOT ({})", java_condition_to_sql(rest, types, ports)?));
         }
     }
 
@@ -1823,15 +1828,15 @@ fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
             {
                 return Some(format!(
                     "{} {op} {}",
-                    java_expr_to_sql(recv, types)?,
-                    java_expr_to_sql(args[0], types)?
+                    java_expr_to_sql(recv, types, ports)?,
+                    java_expr_to_sql(args[0], types, ports)?
                 ));
             }
         }
         return Some(format!(
             "{} {op} {}",
-            java_expr_to_sql(lhs, types)?,
-            java_expr_to_sql(rhs, types)?
+            java_expr_to_sql(lhs, types, ports)?,
+            java_expr_to_sql(rhs, types, ports)?
         ));
     }
 
@@ -1840,8 +1845,8 @@ fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 1 {
             return Some(format!(
                 "{} = {}",
-                java_expr_to_sql(recv, types)?,
-                java_expr_to_sql(args[0], types)?
+                java_expr_to_sql(recv, types, ports)?,
+                java_expr_to_sql(args[0], types, ports)?
             ));
         }
     }
@@ -1849,14 +1854,14 @@ fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 1 {
             return Some(format!(
                 "upper({}) = upper({})",
-                java_expr_to_sql(recv, types)?,
-                java_expr_to_sql(args[0], types)?
+                java_expr_to_sql(recv, types, ports)?,
+                java_expr_to_sql(args[0], types, ports)?
             ));
         }
     }
     if let Some((recv, args)) = method_call(c, "isEmpty") {
         if args.iter().all(|a| a.trim().is_empty()) {
-            return Some(format!("{} = ''", java_expr_to_sql(recv, types)?));
+            return Some(format!("{} = ''", java_expr_to_sql(recv, types, ports)?));
         }
     }
     for (name, sql_fn) in [
@@ -1868,14 +1873,14 @@ fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
             if args.len() == 1 {
                 return Some(format!(
                     "{sql_fn}({}, {})",
-                    java_expr_to_sql(recv, types)?,
-                    java_expr_to_sql(args[0], types)?
+                    java_expr_to_sql(recv, types, ports)?,
+                    java_expr_to_sql(args[0], types, ports)?
                 ));
             }
         }
     }
     // A bare value used as a test is a boolean column, and reads as itself.
-    java_expr_to_sql(c, types)
+    java_expr_to_sql(c, types, ports)
 }
 
 /// Split on a token at the top level, outside any string or bracket.
@@ -1959,7 +1964,7 @@ fn single_arg<'a>(e: &'a str, name: &str) -> Option<&'a str> {
 /// Only forms with a single faithful SQL reading are translated. Arithmetic, branching
 /// and anything whose index base is not established stay reported: guessing one of those
 /// wrong produces a silently wrong number instead of a failure.
-fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
+fn java_expr_to_sql(expr: &str, types: &ColTypes, ports: &PortMap) -> Option<String> {
     let e = expr.trim();
     if e.is_empty() {
         return None;
@@ -1980,9 +1985,9 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     if let Some((cond, yes, no)) = split_ternary(e) {
         return Some(format!(
             "CASE WHEN {} THEN {} ELSE {} END",
-            java_condition_to_sql(cond, types)?,
-            java_expr_to_sql(yes, types)?,
-            java_expr_to_sql(no, types)?
+            java_condition_to_sql(cond, types, ports)?,
+            java_expr_to_sql(yes, types, ports)?,
+            java_expr_to_sql(no, types, ports)?
         ));
     }
     if let Some(inner) = e.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
@@ -1993,27 +1998,27 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     }
     if let Some(inner) = e.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         if balanced(inner) {
-            return java_expr_to_sql(inner, types);
+            return java_expr_to_sql(inner, types, ports);
         }
     }
     if let Some(head) = e.strip_suffix(".toString()") {
-        return java_expr_to_sql(head, types);
+        return java_expr_to_sql(head, types, ports);
     }
     if let Some(arg) = single_arg(e, "Double.valueOf") {
-        return Some(format!("TRY_CAST({} AS DOUBLE)", java_expr_to_sql(arg, types)?));
+        return Some(format!("TRY_CAST({} AS DOUBLE)", java_expr_to_sql(arg, types, ports)?));
     }
     if let Some(arg) = single_arg(e, "new BigDecimal") {
         let inner = arg.trim();
         // The double-valued form goes through a double in Java, so DOUBLE is faithful.
         if single_arg(inner, "Double.valueOf").is_some() {
-            return java_expr_to_sql(inner, types);
+            return java_expr_to_sql(inner, types, ports);
         }
         // Wrapping something already computed is a change of type, not of value: what it
         // wraps decides the number, and the wrapper only says how it is held. A bare
         // column is the exception below - there the wrapper is the only thing that would
         // say which reading was meant, and it does not say enough.
         if inner.contains('(') {
-            if let Some(sql) = java_expr_to_sql(inner, types) {
+            if let Some(sql) = java_expr_to_sql(inner, types, ports) {
                 return Some(format!("CAST({sql} AS DECIMAL(38,4))"));
             }
         }
@@ -2024,7 +2029,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         // floating point and is left refused.
         if let Some(kind) = types.get(inner.trim()) {
             if kind.eq_ignore_ascii_case("id_String") {
-                return Some(format!("CAST({} AS DECIMAL(38,4))", java_expr_to_sql(inner, types)?));
+                return Some(format!("CAST({} AS DECIMAL(38,4))", java_expr_to_sql(inner, types, ports)?));
             }
         }
         // A quoted number is an exact decimal, and the literal already carries its own
@@ -2039,7 +2044,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         return None;
     }
     if let Some(arg) = single_arg(e, "StringHandling.TRIM") {
-        return Some(format!("trim({})", java_expr_to_sql(arg, types)?));
+        return Some(format!("trim({})", java_expr_to_sql(arg, types, ports)?));
     }
     // The character helpers. SUBSTR takes a start and a length counted from 1, the same
     // as SQL, rather than Java's begin/end: a reference migration of this dialect renders
@@ -2054,25 +2059,25 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() != arity {
             return None;
         }
-        let subject = java_expr_to_sql(args[0], types)?;
+        let subject = java_expr_to_sql(args[0], types, ports)?;
         // How far to take is as often worked out as written down. Both count from the
         // same place in either language, so a count that is itself an expression reads
         // like any other; refusing those took the whole column with them.
         let counts = args[1..]
             .iter()
-            .map(|a| java_expr_to_sql(a, types))
+            .map(|a| java_expr_to_sql(a, types, ports))
             .collect::<Option<Vec<_>>>()?;
         return Some(format!("{sql_fn}({subject}, {})", counts.join(", ")));
     }
     // Sign-changing arithmetic on an exact decimal, which SQL does the same way.
     if let Some(recv) = e.strip_suffix(".negate()") {
-        return Some(format!("-({})", java_expr_to_sql(recv, types)?));
+        return Some(format!("-({})", java_expr_to_sql(recv, types, ports)?));
     }
     // `divide` and `setScale` name the scale they round to, so the rounding is not a
     // detail to be inferred from the target column: it is part of the expression.
     if let Some((recv, args)) = method_call(e, "divide") {
-        let left = java_expr_to_sql(recv, types)?;
-        let right = java_expr_to_sql(args.first()?, types)?;
+        let left = java_expr_to_sql(recv, types, ports)?;
+        let right = java_expr_to_sql(args.first()?, types, ports)?;
         // Java throws on a zero divisor rather than returning NULL, but a pipeline that
         // stops on one row of bad data is worse than one that carries a NULL, and NULL
         // is what every other division here already yields.
@@ -2090,7 +2095,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if !args.is_empty() && is_number(args[0].trim()) {
             return Some(format!(
                 "ROUND({}, {})",
-                java_expr_to_sql(recv, types)?,
+                java_expr_to_sql(recv, types, ports)?,
                 args[0].trim()
             ));
         }
@@ -2112,7 +2117,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 2 {
             return Some(format!(
                 "strftime({}, '{}')",
-                java_expr_to_sql(args[1], types)?,
+                java_expr_to_sql(args[1], types, ports)?,
                 date_format_to_strftime(args[0])?
             ));
         }
@@ -2121,7 +2126,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 2 {
             return Some(format!(
                 "strptime({}, '{}')",
-                java_expr_to_sql(args[1], types)?,
+                java_expr_to_sql(args[1], types, ports)?,
                 date_format_to_strftime(args[0])?
             ));
         }
@@ -2136,8 +2141,8 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     // two counters apart and has nothing to answer to here.
     if let Some(args) = call_args(e, "Numeric.sequence") {
         if args.len() == 3 {
-            let start = java_expr_to_sql(args[1], types)?;
-            let step = java_expr_to_sql(args[2], types)?;
+            let start = java_expr_to_sql(args[1], types, ports)?;
+            let step = java_expr_to_sql(args[2], types, ports)?;
             return Some(format!("({start} + (row_number() OVER () - 1) * {step})"));
         }
     }
@@ -2148,14 +2153,14 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         ("StringHandling.DOWNCASE", "lower"),
     ] {
         if let Some(arg) = single_arg(e, name) {
-            return Some(format!("{sql_fn}({})", java_expr_to_sql(arg, types)?));
+            return Some(format!("{sql_fn}({})", java_expr_to_sql(arg, types, ports)?));
         }
     }
     if let Some(args) = call_args(e, "StringHandling.CHANGE") {
         if args.len() == 3 {
             return Some(format!(
                 "regexp_replace({}, {}, {}, 'g')",
-                java_expr_to_sql(args[0], types)?,
+                java_expr_to_sql(args[0], types, ports)?,
                 java_string_to_sql(args[1])?,
                 java_string_to_sql(args[2])?
             ));
@@ -2167,15 +2172,15 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 2 {
             return Some(format!(
                 "instr({}, {}) - 1",
-                java_expr_to_sql(args[0], types)?,
-                java_expr_to_sql(args[1], types)?
+                java_expr_to_sql(args[0], types, ports)?,
+                java_expr_to_sql(args[1], types, ports)?
             ));
         }
     }
     if let Some(args) = call_args(e, "StringHandling.COUNT") {
         if args.len() == 2 {
-            let subject = java_expr_to_sql(args[0], types)?;
-            let needle = java_expr_to_sql(args[1], types)?;
+            let subject = java_expr_to_sql(args[0], types, ports)?;
+            let needle = java_expr_to_sql(args[1], types, ports)?;
             return Some(format!(
                 "(length({subject}) - length(replace({subject}, {needle}, ''))) / \
                  nullif(length({needle}), 0)"
@@ -2193,8 +2198,8 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() != 2 {
             return None;
         }
-        let left = java_expr_to_sql(args[0], types)?;
-        let right = java_expr_to_sql(args[1], types)?;
+        let left = java_expr_to_sql(args[0], types, ports)?;
+        let right = java_expr_to_sql(args[1], types, ports)?;
         // The routine takes its operands as text and reads them as numbers, so the
         // reading is part of the translation. Tolerant, like the rest of the read.
         let divisor = matches!(op, "/");
@@ -2213,7 +2218,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         ("Long.parseLong", "BIGINT"),
     ] {
         if let Some(arg) = single_arg(e, name) {
-            return Some(format!("TRY_CAST({} AS {ty})", java_expr_to_sql(arg, types)?));
+            return Some(format!("TRY_CAST({} AS {ty})", java_expr_to_sql(arg, types, ports)?));
         }
     }
     for (suffix, ty) in [
@@ -2223,7 +2228,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         (".longValue()", "BIGINT"),
     ] {
         if let Some(recv) = e.strip_suffix(suffix) {
-            return Some(format!("CAST({} AS {ty})", java_expr_to_sql(recv, types)?));
+            return Some(format!("CAST({} AS {ty})", java_expr_to_sql(recv, types, ports)?));
         }
     }
     // Finding and replacing on a plain string rather than a pattern.
@@ -2231,15 +2236,15 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 1 {
             return Some(format!(
                 "instr({}, {}) - 1",
-                java_expr_to_sql(recv, types)?,
-                java_expr_to_sql(args[0], types)?
+                java_expr_to_sql(recv, types, ports)?,
+                java_expr_to_sql(args[0], types, ports)?
             ));
         }
     }
     if let Some((recv, args)) = method_call(e, "lastIndexOf") {
         if args.len() == 1 {
-            let subject = java_expr_to_sql(recv, types)?;
-            let needle = java_expr_to_sql(args[0], types)?;
+            let subject = java_expr_to_sql(recv, types, ports)?;
+            let needle = java_expr_to_sql(args[0], types, ports)?;
             // Found from the back, then counted from the front; absent is -1 either way.
             return Some(format!(
                 "CASE WHEN instr(reverse({subject}), reverse({needle})) = 0 THEN -1 ELSE \
@@ -2252,9 +2257,9 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 2 {
             return Some(format!(
                 "replace({}, {}, {})",
-                java_expr_to_sql(recv, types)?,
-                java_expr_to_sql(args[0], types)?,
-                java_expr_to_sql(args[1], types)?
+                java_expr_to_sql(recv, types, ports)?,
+                java_expr_to_sql(args[0], types, ports)?,
+                java_expr_to_sql(args[1], types, ports)?
             ));
         }
     }
@@ -2269,7 +2274,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if let Some((recv, args)) = method_call(e, name) {
             // A call with no arguments still yields one, empty.
             if args.iter().all(|a| a.trim().is_empty()) {
-                return Some(format!("{}({})", sql_fn, java_expr_to_sql(recv, types)?));
+                return Some(format!("{}({})", sql_fn, java_expr_to_sql(recv, types, ports)?));
             }
         }
     }
@@ -2278,7 +2283,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 2 {
             return Some(format!(
                 "regexp_replace({}, {}, {}, 'g')",
-                java_expr_to_sql(recv, types)?,
+                java_expr_to_sql(recv, types, ports)?,
                 java_string_to_sql(args[0])?,
                 java_string_to_sql(args[1])?
             ));
@@ -2290,9 +2295,9 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         if args.len() == 3 {
             return Some(format!(
                 "regexp_replace({}, {}, {}, 'g')",
-                java_expr_to_sql(args[0], types)?,
-                java_expr_to_sql(args[1], types)?,
-                java_expr_to_sql(args[2], types)?
+                java_expr_to_sql(args[0], types, ports)?,
+                java_expr_to_sql(args[1], types, ports)?,
+                java_expr_to_sql(args[2], types, ports)?
             ));
         }
     }
@@ -2300,15 +2305,15 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     // length. Written out rather than folded, so a bound that is itself an expression
     // still reads.
     if let Some((recv, args)) = method_call(e, "substring") {
-        let subject = java_expr_to_sql(recv, types)?;
+        let subject = java_expr_to_sql(recv, types, ports)?;
         return match args.len() {
-            1 => Some(format!("substr({}, {} + 1)", subject, java_expr_to_sql(args[0], types)?)),
+            1 => Some(format!("substr({}, {} + 1)", subject, java_expr_to_sql(args[0], types, ports)?)),
             2 => Some(format!(
                 "substr({}, {} + 1, {} - {})",
                 subject,
-                java_expr_to_sql(args[0], types)?,
-                java_expr_to_sql(args[1], types)?,
-                java_expr_to_sql(args[0], types)?
+                java_expr_to_sql(args[0], types, ports)?,
+                java_expr_to_sql(args[1], types, ports)?,
+                java_expr_to_sql(args[0], types, ports)?
             )),
             _ => None,
         };
@@ -2320,12 +2325,12 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         }
         return Some(format!(
             "{} {op} {}",
-            numeric_operand(recv, types)?,
-            numeric_operand(args[0], types)?
+            numeric_operand(recv, types, ports)?,
+            numeric_operand(args[0], types, ports)?
         ));
     }
     if let Some(arg) = single_arg(e, "String.valueOf") {
-        return Some(format!("CAST({} AS VARCHAR)", java_expr_to_sql(arg, types)?));
+        return Some(format!("CAST({} AS VARCHAR)", java_expr_to_sql(arg, types, ports)?));
     }
     // Java writes joining text and adding numbers the same way. SQL does not, and reads
     // the one written for text as arithmetic on it, which it refuses - so an expression
@@ -2343,8 +2348,8 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         let rendered = parts
             .iter()
             .map(|p| match textual {
-                true => Some(format!("({})", java_expr_to_sql(p, types)?)),
-                false => numeric_operand(p, types),
+                true => Some(format!("({})", java_expr_to_sql(p, types, ports)?)),
+                false => numeric_operand(p, types, ports),
             })
             .collect::<Option<Vec<_>>>()?;
         let op = if textual { "||" } else { "+" };
@@ -2363,7 +2368,7 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
         }
         let rendered = parts
             .iter()
-            .map(|p| numeric_operand(p, types))
+            .map(|p| numeric_operand(p, types, ports))
             .collect::<Option<Vec<_>>>()?;
         return Some(rendered.join(&format!(" {op} ")));
     }
@@ -2384,7 +2389,16 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     // `Table.Column`, the only bare form that reads one way.
     let (table, column) = e.split_once('.')?;
     let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_');
-    (ident(table) && ident(column)).then(|| column.to_string())
+    if !(ident(table) && ident(column)) {
+        return None;
+    }
+    // Where the mapper looks something up there is more than one relation in play and the
+    // same column name can sit in either, so the input it came from is kept. With a
+    // single input there is nothing to be ambiguous about and the name stands alone.
+    Some(match ports.get(table) {
+        Some(port) => format!("{port}.{column}"),
+        None => column.to_string(),
+    })
 }
 
 /// Put the value a mapper's named intermediate stands for in place of the name.
@@ -2442,6 +2456,19 @@ fn mapper_expressions_of(
     let mut out = JsonMap::new();
     // A mapper's own named values are resolved into the expressions that use them, in the
     // order the mapper computes them, so a name that stands for another name resolves too.
+    // With one input a name is unambiguous; with more, it is kept qualified.
+    let ports: PortMap = match raw.mapper_inputs.len() > 1 {
+        false => Default::default(),
+        true => raw
+            .mapper_inputs
+            .iter()
+            .enumerate()
+            .map(|(at, t)| {
+                let port = if at == 0 { "main".to_string() } else { format!("lookup_{at}") };
+                (t.name.clone(), port)
+            })
+            .collect(),
+    };
     let mut vars: Vec<(String, String)> = Vec::new();
     for (name, body) in &raw.mapper_vars {
         let resolved = inline_mapper_vars(body, &vars);
@@ -2456,7 +2483,7 @@ fn mapper_expressions_of(
         if e.is_empty() || e.chars().all(|c| matches!(c, '(' | ')' | ' ')) {
             continue;
         }
-        match java_expr_to_sql(e, &raw.mapper_types) {
+        match java_expr_to_sql(e, &raw.mapper_types, &ports) {
             Some(c) => {
                 out.insert(col.clone(), JsonValue::String(c));
             }
@@ -3140,8 +3167,8 @@ fn would_cycle(edges: &[PipelineEdge], source: &str, target: &str) -> bool {
 /// by storage, so arithmetic on one says so. Tolerant on purpose: a field that does not
 /// parse becomes NULL rather than ending the run, which is what the rest of the read
 /// already does.
-fn numeric_operand(e: &str, types: &ColTypes) -> Option<String> {
-    let sql = java_expr_to_sql(e, types)?;
+fn numeric_operand(e: &str, types: &ColTypes, ports: &PortMap) -> Option<String> {
+    let sql = java_expr_to_sql(e, types, ports)?;
     let declared = column_type(e, types).is_some() && !is_number(e.trim());
     Some(match declared {
         true => format!("(TRY_CAST({sql} AS DECIMAL(38,4)))"),
@@ -4276,7 +4303,7 @@ mod tests {
         // human, and the largest groups are a literal, a null, or a cast. Those have one
         // faithful SQL form each, so reporting them buries the ones that genuinely need
         // judgement.
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         assert_eq!(sql("null").as_deref(), Some("NULL"));
         assert_eq!(sql(r#""""#).as_deref(), Some("''"));
         assert_eq!(sql(r#""S""#).as_deref(), Some("'S'"));
@@ -4299,7 +4326,7 @@ mod tests {
 
     #[test]
     fn the_string_helpers_become_their_sql_equivalents() {
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         assert_eq!(sql("StringHandling.LEFT(row1.NID,2)").as_deref(), Some("left(NID, 2)"));
         assert_eq!(sql("StringHandling.RIGHT(row1.NID,2)").as_deref(), Some("right(NID, 2)"));
         // SUBSTR takes a start and a length from 1, matching SQL, rather than Java's
@@ -4337,7 +4364,7 @@ mod tests {
         // now when it has a faithful reading of its own, and where it has none the whole
         // expression still refuses - so the guess never happens either way, and a count
         // that is worked out rather than written down no longer costs the column.
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         assert_eq!(
             sql("StringHandling.LEFT(row1.NID,row1.N)").as_deref(),
             Some("left(NID, N)")
@@ -4406,7 +4433,7 @@ mod tests {
 
     #[test]
     fn a_choice_becomes_a_case_expression() {
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         // compareTo(x) == 0 is numeric equality ignoring scale, which is what SQL = does.
         assert_eq!(
             sql(r#"row6.PCT.compareTo(new BigDecimal("100")) == 0 ? row6.A : row6.B"#).as_deref(),
@@ -4435,7 +4462,7 @@ mod tests {
 
     #[test]
     fn a_choice_we_cannot_read_is_still_reported() {
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         assert_eq!(sql("a ? b : c"), None, "operands are not readable");
         // An ordering reads now: comparing the sign this returns against zero is how
         // Java spells the comparison itself, and it means the same thing whichever way
@@ -4449,7 +4476,7 @@ mod tests {
 
     #[test]
     fn numeric_literals_and_exact_decimals_become_sql() {
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         // A bare number is a number.
         assert_eq!(sql("0").as_deref(), Some("0"));
         assert_eq!(sql("-1").as_deref(), Some("-1"));
@@ -4466,7 +4493,7 @@ mod tests {
 
     #[test]
     fn sign_changing_arithmetic_becomes_sql() {
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         assert_eq!(sql("row6.AMT.negate()").as_deref(), Some("-(AMT)"));
         assert_eq!(
             sql(r#"row6.AMT.multiply(new BigDecimal("-1"))"#).as_deref(),
@@ -4481,7 +4508,7 @@ mod tests {
         // The point of translating the easy ones is that what remains is worth reading.
         // Anything with branching, arithmetic or an unverified index must keep warning:
         // guessing one of these wrong is a silent wrong number, not a failure.
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         assert_eq!(sql("jobName"), None, "a bare identifier is not a column");
         assert_eq!(sql("new BigDecimal(Var.ID)"), None, "exact decimal, not a double");
         assert_eq!(sql("new BigDecimal(row1.AMT)"), None, "exact decimal or double, unrecorded");
@@ -5378,7 +5405,7 @@ mod tests {
 
     #[test]
     fn the_ordinary_string_operations_read_as_sql() {
-        let sql = |e: &str| java_expr_to_sql(e, &Default::default());
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
         // Stripping quotes out of a field is the commonest thing a mapper does to a
         // delimited file, and it stopped the whole expression from being read.
         assert_eq!(
@@ -5498,7 +5525,7 @@ mod tests {
         types.insert("A".into(), "id_String".into());
         types.insert("B".into(), "id_String".into());
         types.insert("N".into(), "id_BigDecimal".into());
-        let sql = |e: &str| java_expr_to_sql(e, &types);
+        let sql = |e: &str| java_expr_to_sql(e, &types, &Default::default());
 
         assert_eq!(sql("row1.A + row1.B").as_deref(), Some("(A) || (B)"));
         assert_eq!(
@@ -5519,7 +5546,7 @@ mod tests {
         );
         // And where nothing says which it is, it is left to a person.
         let unknown = ColTypes::new();
-        assert_eq!(java_expr_to_sql("row1.X + row1.Y", &unknown), None);
+        assert_eq!(java_expr_to_sql("row1.X + row1.Y", &unknown, &Default::default()), None);
     }
 
     #[test]
@@ -5529,7 +5556,7 @@ mod tests {
         // name: where none exists the step fails, and where one does it quietly answers
         // with the row's own value instead of the setting - which is worse.
         let types = ColTypes::new();
-        let sql = |e: &str| java_expr_to_sql(e, &types);
+        let sql = |e: &str| java_expr_to_sql(e, &types, &Default::default());
         assert_eq!(sql("context.REGION_CODE").as_deref(), Some("'${REGION_CODE}'"));
         assert_eq!(
             sql(r#"context.getProperty("batch_no")"#).as_deref(),
@@ -5551,7 +5578,7 @@ mod tests {
         // else took the whole column with it - and a choice is the commonest thing a
         // mapper does.
         let types = ColTypes::new();
-        let sql = |e: &str| java_expr_to_sql(e, &types);
+        let sql = |e: &str| java_expr_to_sql(e, &types, &Default::default());
 
         assert_eq!(
             sql(r#"row1.D.equals("2")||row1.D.equals("5") ? "S" : "P""#).as_deref(),
@@ -5586,7 +5613,7 @@ mod tests {
     #[test]
     fn the_remaining_routines_read_as_sql() {
         let types = ColTypes::new();
-        let sql = |e: &str| java_expr_to_sql(e, &types);
+        let sql = |e: &str| java_expr_to_sql(e, &types, &Default::default());
 
         // A value the loop put aside, used inside a larger expression rather than alone.
         assert_eq!(
@@ -5623,7 +5650,7 @@ mod tests {
         // the column and everything downstream naming it.
         let mut types = ColTypes::new();
         types.insert("N".into(), "id_BigDecimal".into());
-        let sql = |e: &str| java_expr_to_sql(e, &types);
+        let sql = |e: &str| java_expr_to_sql(e, &types, &Default::default());
 
         assert_eq!(
             sql("row1.N - row1.N").as_deref(),
