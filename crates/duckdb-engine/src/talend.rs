@@ -2017,7 +2017,9 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
     // reference to one of that name: where none exists the step fails, and where one does
     // it quietly answers with the row's own value instead of the setting.
     if e.starts_with("context.") {
-        return rewrite_context(e);
+        // Quoted, because it stands where a value stands. The run puts the setting in as
+        // text, so unquoted it would read as the name of a column instead.
+        return rewrite_context(e).map(|v| format!("'{v}'"));
     }
     // `Table.Column`, the only bare form that reads one way.
     let (table, column) = e.split_once('.')?;
@@ -5027,14 +5029,14 @@ mod tests {
         // with the row's own value instead of the setting - which is worse.
         let types = ColTypes::new();
         let sql = |e: &str| java_expr_to_sql(e, &types);
-        assert_eq!(sql("context.REGION_CODE").as_deref(), Some("${REGION_CODE}"));
+        assert_eq!(sql("context.REGION_CODE").as_deref(), Some("'${REGION_CODE}'"));
         assert_eq!(
             sql(r#"context.getProperty("batch_no")"#).as_deref(),
-            Some("${batch_no}")
+            Some("'${batch_no}'")
         );
         assert_eq!(
             sql(r#""grp" + context.batch_no"#).as_deref(),
-            Some("('grp') || (${batch_no})"),
+            Some("('grp') || ('${batch_no}')"),
             "and it joins with text like anything else"
         );
         // An ordinary column reference is still a column reference.
