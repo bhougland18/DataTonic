@@ -11449,6 +11449,38 @@ fn code_shell_timeout_kills_long_running_child() {
 }
 
 #[test]
+fn a_later_step_can_read_an_earlier_one_s_row_count() {
+    // Legacy jobs routinely branch on how many rows or files an earlier component saw.
+    // The engine already records that per node; this makes it readable downstream as
+    // ${<node>_NB_LINE}, which is the name the source tool used.
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id
+1
+2
+3
+4
+5
+");
+    let out = out_path(tmp.path(), "counted.csv");
+    let engine = engine_or_skip!();
+    let d = doc(
+        json!([
+            node("src_1", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("t", "code.sql", json!({ "sql": "SELECT ${src_1_NB_LINE} AS seen FROM input LIMIT 1" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "src_1", "t"), main_edge("e2", "t", "k")]),
+    );
+    let r = engine.execute_pipeline(&d);
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+    assert_eq!(
+        scalar_string(&format!("SELECT CAST(seen AS VARCHAR) FROM read_csv_auto('{}')", out)),
+        "5",
+        "the later step should see the five rows the source read"
+    );
+}
+
+#[test]
 fn runjob_passes_context_vars_to_child() {
     // Run Job / Master Job: a parent ctl.runjob calls a child pipeline file,
     // passing context variables that are substituted as ${VAR} into the child

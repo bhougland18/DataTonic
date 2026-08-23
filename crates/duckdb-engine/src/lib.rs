@@ -137,6 +137,11 @@ impl std::fmt::Debug for DuckdbEngine {
     }
 }
 
+/// Does this SQL read a figure that only exists once an earlier node has finished?
+fn references_node_stat(sql: &str) -> bool {
+    sql.contains("_NB_LINE}") || sql.contains("_NB_FILE}") || sql.contains("_DURATION}")
+}
+
 impl DuckdbEngine {
     /// Construct an engine pointing at a DuckDB CLI binary. The binary
     /// need not exist yet - calls fail with a clear error if it's
@@ -1001,6 +1006,10 @@ impl DuckdbEngine {
                     // runs under -bail, so the first error ends the whole
                     // script and "carry on" has nowhere to happen.
                     && !s.continue_on_failure
+                    // A stage that reads an earlier node's row or file count has to run
+                    // after that node has finished. The batched script is one statement
+                    // list, so nothing inside it can see a figure from earlier in itself.
+                    && !references_node_stat(&s.sql)
                     && !(s.sink_mode.as_deref() == Some("error")
                         && s.sink_path.as_deref().map(is_local_path).unwrap_or(false)
                         && s.sink_path
@@ -1281,7 +1290,26 @@ impl DuckdbEngine {
                 prag
             };
             // Enforce "error if exists" before writing a local file sink.
-            let sql = format!("{}{}{}", secret_prefix, memory_pragma, stage.sql);
+            // A legacy job routinely branches on how many rows or files an earlier
+            // component saw. Those figures are already recorded per node, so expose them
+            // under the names the source tool used rather than leaving the caller to
+            // re-count. Read from what has finished, so a stage only ever sees figures
+            // that are already final.
+            let mut stage_sql = stage.sql.clone();
+            if stage_sql.contains("${") {
+                for (id, st) in &nodes {
+                    if let Some(r) = st.rows {
+                        let r = r.to_string();
+                        stage_sql = stage_sql.replace(&format!("${{{id}_NB_LINE}}"), &r);
+                        stage_sql = stage_sql.replace(&format!("${{{id}_NB_FILE}}"), &r);
+                    }
+                    if let Some(d) = st.duration_ms {
+                        stage_sql =
+                            stage_sql.replace(&format!("${{{id}_DURATION}}"), &d.to_string());
+                    }
+                }
+            }
+            let sql = format!("{}{}{}", secret_prefix, memory_pragma, stage_sql);
             // Retry loop: retry_attempts >= 1; with the default of 1 we
             // call run() exactly once. Retries sleep retry_backoff_ms
             // (linearly scaled by attempt index) between attempts.
