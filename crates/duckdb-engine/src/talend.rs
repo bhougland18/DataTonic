@@ -238,12 +238,61 @@ fn named_by_schema(query: &str, columns: &[String]) -> String {
     if columns.is_empty() || q.is_empty() {
         return query.to_string();
     }
+    // A node often declares the whole table and fetches part of it. Then the names it
+    // declares cannot be laid over what comes back one for one, and the component matches
+    // them up by name instead - so the query is left exactly as it is. Only where we can
+    // see the query returns as many columns as the node names is the order the thing that
+    // decides, and only then is anything put on around it.
+    if selected_column_count(q) != Some(columns.len()) {
+        return query.to_string();
+    }
     let names = columns
         .iter()
         .map(|c| quote_sql_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
     format!("SELECT * FROM ({}) AS t({})", q.trim_end_matches(';'), names)
+}
+
+/// How many columns a query returns, when that can be seen from the query itself.
+///
+/// Only a plain select list is counted: `*` stands for however many the table has, and a
+/// query assembled from something else cannot be read at all. None means "not knowable",
+/// which is treated as "do not touch it".
+fn selected_column_count(query: &str) -> Option<usize> {
+    let q = query.trim().trim_end_matches(';');
+    let rest = q.strip_prefix("select").or_else(|| q.strip_prefix("SELECT"))?;
+    let rest = match rest.trim_start().strip_prefix("DISTINCT") {
+        Some(r) => r,
+        None => rest.trim_start().strip_prefix("distinct").unwrap_or(rest),
+    };
+    // The list runs to the FROM that closes it.
+    let (mut depth, mut in_string, mut end) = (0i32, false, None);
+    let bytes = rest.as_bytes();
+    for (i, c) in rest.char_indices() {
+        match c {
+            '\'' if !(i > 0 && bytes[i - 1] == b'\\') => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => depth -= 1,
+            _ if !in_string
+                && depth == 0
+                && rest[i..].len() >= 4
+                && rest[i..i + 4].eq_ignore_ascii_case("from")
+                && i > 0
+                && bytes[i - 1].is_ascii_whitespace() =>
+            {
+                end = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let list = &rest[..end?];
+    if list.contains('*') {
+        return None;
+    }
+    let items = split_top_level(list, ",");
+    (!items.is_empty()).then_some(items.len())
 }
 
 /// A column name as SQL writes one.
@@ -3817,8 +3866,15 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                         // only one left the other with no columns at all, so a read took
                         // its query's names rather than the ones the job uses. REJECT and
                         // the rest describe different shapes and stay out.
-                        in_flow_metadata =
+                        // A node can carry several schemas - what it hands on, what it
+                        // rejects, what a second port carries. The row-carrying one is
+                        // spelled FLOW by some components and MAIN by others, and a node
+                        // with both would otherwise have the two read as one long list
+                        // of columns that matches nothing it actually produces.
+                        let row_carrying =
                             matches!(attr("connector").as_deref(), Some("FLOW") | Some("MAIN"));
+                        let already = cur.as_ref().is_some_and(|n| !n.columns.is_empty());
+                        in_flow_metadata = row_carrying && !already;
                     }
                     "column" => {
                         if in_flow_metadata {
@@ -5780,6 +5836,26 @@ mod tests {
             "the columns arrive under the names the job uses: {q}"
         );
         assert!(q.contains("select A, B from T"), "and the query itself is untouched: {q}");
+    }
+
+    #[test]
+    fn a_database_read_is_left_alone_when_it_fetches_fewer_columns_than_it_declares() {
+        // A node often declares the whole table and fetches part of it. Then the names it
+        // declares cannot be laid over what comes back one for one, and the component
+        // matches them up by name instead - so the query is left exactly as it is.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tSnowflakeInput" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="read_1"/>
+            <elementParameter name="PROPERTIES" value="{&quot;query&quot;:{&quot;storedValue&quot;:&quot;select ID, CODE from T&quot;}}"/>
+            <metadata connector="MAIN" name="MAIN">
+              <column name="ID" type="id_String" nullable="true"/>
+              <column name="CODE" type="id_String" nullable="true"/>
+              <column name="EXTRA" type="id_String" nullable="true"/>
+            </metadata>
+          </node></talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let q = im.nodes[0].data.properties.as_ref().unwrap()["query"].as_str().unwrap();
+        assert_eq!(q, "select ID, CODE from T", "left exactly as written: {q}");
     }
 
     #[test]
