@@ -624,6 +624,11 @@ A component with no equivalent is imported as a named placeholder and reported. 
 includes a job body's input and output ports: a child pipeline runs for its side effects,
 so it does not yet take rows from its caller or hand them back.
 
+**A SQL step that changes the database is reported, not converted.** A SQL step returns
+rows and compiles into a view, so a step carrying an `UPDATE`, `MERGE` or `CREATE` cannot
+become one: it would reach the database wrapped in `CREATE VIEW` and fail there. That is
+knowable at import, so it is said at import. On a 125-file corpus, 16 steps.
+
 **How a write writes is carried across.** A warehouse sink records whether it appends rows
 or amends the ones already there, and importing that as the default write mode turned an
 append into a full-table replace - so on a table several nodes write to, each one erased

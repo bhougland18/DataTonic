@@ -51,6 +51,8 @@ pub enum Warning {
     JavaBody { node: String, only_prints: bool },
     /// The write action has no exact equivalent, so the nearest one was used.
     WriteActionApproximated { node: String, action: String, used: String },
+    /// A SQL step that changes the database rather than returning rows.
+    StatementNotQuery { node: String, verb: String },
 }
 
 impl std::fmt::Display for Warning {
@@ -74,6 +76,13 @@ impl std::fmt::Display for Warning {
             Warning::WriteActionApproximated { node, action, used } => write!(
                 f,
                 "{node}: the legacy write action {action} amends rows that match the key and                  drops the rest. The nearest write mode here is '{used}', which also inserts                  the rows that do not match. Check that is what the table should hold"
+            ),
+            Warning::StatementNotQuery { node, verb } => write!(
+                f,
+                "{node}: this step runs a {verb}, which changes the database rather than \
+                 returning rows. A SQL step here is read as a query and becomes a view, so \
+                 the {verb} would not run. Move it into the sink that writes the table, or \
+                 run it outside the pipeline"
             ),
             Warning::JavaExpression { node, column, expression } => write!(
                 f,
@@ -403,6 +412,12 @@ fn rewrite_context(v: &str) -> Option<String> {
     // A path or a query is usually assembled from context values and literals joined with
     // +. It only reads one way when EVERY part is a literal or a context name; a row
     // reference or a call means the value is computed and must not be guessed at.
+    //
+    // A query field filled in as though it were a Java statement carries the terminator
+    // as well. That is not part of the value, and leaving it on made the last piece stop
+    // looking like a literal - so the whole query was carried across as Java and reached
+    // the database still spelled `"UPDATE "+context...`.
+    let t = t.strip_suffix(';').map(str::trim_end).unwrap_or(t);
     if t.contains('+') {
         let mut out = String::new();
         let (mut depth, mut in_string, mut start) = (0i32, false, 0usize);
@@ -528,6 +543,16 @@ fn properties_for(
                 .or_else(|| raw.params.get("SQLQUERY").map(|v| unquote(v)));
             match sql.filter(|q| !q.trim().is_empty()) {
                 Some(q) => {
+                    // A SQL step returns rows and is compiled into a view. A statement
+                    // that changes the database is not a query and cannot become one, so
+                    // it would reach the database wrapped in CREATE VIEW and fail there.
+                    // Say so at import instead, where it can still be dealt with.
+                    if let Some(verb) = leading_statement_verb(&q) {
+                        warnings.push(Warning::StatementNotQuery {
+                            node: raw.unique.clone(),
+                            verb,
+                        });
+                    }
                     props.insert("sql".into(), JsonValue::String(q));
                 }
                 None => warnings.push(Warning::RepositoryConnection {
@@ -2154,6 +2179,36 @@ fn would_cycle(edges: &[PipelineEdge], source: &str, target: &str) -> bool {
     false
 }
 
+/// The verb of a SQL statement that changes the database, if this is one.
+///
+/// Only the leading word is read, and only the handful that a job actually carries. A
+/// query that merely mentions one of these words further in is a query, and a WITH ...
+/// SELECT is too - guessing more than the first word would refuse work that runs.
+fn leading_statement_verb(sql: &str) -> Option<String> {
+    let first = sql
+        .trim_start()
+        .lines()
+        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("--"))?
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()?
+        .to_ascii_uppercase();
+    matches!(
+        first.as_str(),
+        "UPDATE"
+            | "INSERT"
+            | "DELETE"
+            | "MERGE"
+            | "TRUNCATE"
+            | "CREATE"
+            | "DROP"
+            | "ALTER"
+            | "GRANT"
+            | "CALL"
+    )
+    .then_some(first)
+}
+
 /// Everything inside a loop's body.
 ///
 /// The body becomes a pipeline of its own, which it can only do while nothing outside it
@@ -3380,6 +3435,13 @@ mod tests {
         assert_eq!(j(r#""x"+row1.COL"#), None);
         assert_eq!(j(r#"context.A.substring(1)"#), None);
         assert_eq!(j(r#""a"+someMethod()"#), None);
+        // A query field that was filled in as if it were a Java statement carries the
+        // terminator too. It is not part of the value, and leaving it there made the
+        // last piece stop looking like a literal, so the whole query stayed as Java.
+        assert_eq!(
+            j(r#""UPDATE "+context.target_tab+context.grp+" SET x = 1";"#).as_deref(),
+            Some("UPDATE ${target_tab}${grp} SET x = 1")
+        );
     }
 
     #[test]
@@ -3704,6 +3766,45 @@ mod tests {
                 .flat_map(|e| reachable(&e.target))
                 .collect();
             assert!(!onward.contains(&n.id), "{} reaches itself", n.id);
+        }
+    }
+
+    #[test]
+    fn a_sql_step_that_changes_the_database_is_reported_not_imported_as_a_query() {
+        // A SQL step returns rows and compiles into a view. A statement that changes the
+        // database is not a query and cannot become one: carried across it reaches the
+        // database wrapped in CREATE VIEW and fails there, which is a run-time surprise
+        // for something that was knowable at import.
+        let job = |query: &str| {
+            let xml = format!(
+                r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tDBRow" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="row_1"/>
+            <elementParameter name="TYPE" value="SNOWFLAKE"/>
+            <elementParameter name="QUERY" value="{query}"/>
+          </node></talendfile:ProcessType>"#
+            );
+            import_item(&xml, "j").unwrap()
+        };
+
+        let changed = job("&quot;UPDATE t SET x = 1&quot;");
+        assert!(
+            changed.warnings.iter().any(|w| matches!(
+                w,
+                Warning::StatementNotQuery { node, verb } if node == "row_1" && verb == "UPDATE"
+            )),
+            "got {:?}",
+            changed.warnings
+        );
+
+        // A query is left to get on with it, including one that opens with a CTE.
+        for q in ["&quot;SELECT * FROM t&quot;", "&quot;WITH c AS (SELECT 1) SELECT * FROM c&quot;"] {
+            let im = job(q);
+            assert!(
+                !im.warnings.iter().any(|w| matches!(w, Warning::StatementNotQuery { .. })),
+                "{q} is a query: {:?}",
+                im.warnings
+            );
         }
     }
 
