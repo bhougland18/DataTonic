@@ -1693,7 +1693,7 @@ fn mapper_expressions(raw: &RawNode, warnings: &mut Vec<Warning>) -> JsonValue {
 
 /// Read one Talend `.item` file.
 pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
-    let (raw_nodes, connections, context) = parse(xml)?;
+    let (raw_nodes, connections, context, subjob_heads) = parse(xml)?;
 
     let mut components: BTreeMap<String, usize> = BTreeMap::new();
     for n in &raw_nodes {
@@ -1794,6 +1794,7 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
         .collect();
 
     let edges = rewire_parallel_joins(edges, &connections);
+    let edges = chain_declared_subjobs(edges, &subjob_heads, &connections);
 
     // A child pipeline is handed no rows and returns none, so a row link leaving a call
     // is a data path the source tool had and this one does not.
@@ -2152,6 +2153,110 @@ fn rewire_parallel_joins(mut edges: Vec<PipelineEdge>, connections: &[Conn]) -> 
     edges
 }
 
+/// Keep the order subjobs are declared in, for the ones nothing else orders.
+///
+/// A job is mostly a list of subjobs that run one after another. Only some of them are
+/// linked to each other; the rest are sequenced by nothing more than the order the file
+/// lists them at the end, which is the order they were generated to run in. Read without
+/// that, a job that writes a table in one subjob and reads it in the next looks like two
+/// things that could happen in either order, and anything that has to prove the write
+/// comes first cannot.
+///
+/// The exception is a parallel fork, whose branches are declared one after another like
+/// everything else and are the one part of the job that genuinely does not run in that
+/// order. Branches are left out, and so is any pair already ordered - and any pair whose
+/// ordering would contradict a link that is already there.
+fn chain_declared_subjobs(
+    mut edges: Vec<PipelineEdge>,
+    heads: &[String],
+    connections: &[Conn],
+) -> Vec<PipelineEdge> {
+    if heads.len() < 2 {
+        return edges;
+    }
+    let is = |c: &Conn, name: &str| {
+        c.connector.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(name))
+    };
+    let successors = |from: &str, edges: &[PipelineEdge]| -> Vec<String> {
+        edges.iter().filter(|e| e.source == from).map(|e| e.target.clone()).collect()
+    };
+    let reachable = |from: &str, edges: &[PipelineEdge]| -> std::collections::BTreeSet<String> {
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        let mut stack = vec![from.to_string()];
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            stack.extend(successors(&node, edges));
+        }
+        seen
+    };
+
+    // Everything inside a parallel fork. Scoped the same way the join is: the part of a
+    // branch that the work after the join cannot already reach.
+    let mut parallel: std::collections::BTreeSet<String> = Default::default();
+    for join in connections.iter().filter(|c| is(c, "SYNCHRONIZE")) {
+        let downstream = reachable(&join.target, &edges);
+        for root in connections.iter().filter(|c| is(c, "PARALLELIZE") && c.source == join.source)
+        {
+            for n in reachable(&root.target, &edges) {
+                if !downstream.contains(&n) {
+                    parallel.insert(n);
+                }
+            }
+        }
+    }
+    // A fork with no join still starts its branches itself.
+    for root in connections.iter().filter(|c| is(c, "PARALLELIZE")) {
+        parallel.insert(root.target.clone());
+    }
+
+    let known: std::collections::BTreeSet<String> = edges
+        .iter()
+        .flat_map(|e| [e.source.clone(), e.target.clone()])
+        .collect();
+    let mut previous: Option<String> = None;
+    for head in heads {
+        // A head with no links of its own is still a subjob; it just has no edges to be
+        // found in, so it is only skipped when it is part of a fork.
+        if parallel.contains(head) {
+            continue;
+        }
+        let Some(before) = previous.replace(head.clone()) else { continue };
+        let onward = reachable(&before, &edges);
+        if onward.contains(head) || reachable(head, &edges).contains(&before) {
+            continue;
+        }
+        // Wait for the end of the previous subjob, not its start: a write sitting at the
+        // end of it has to be behind the next subjob, and only its own tail is.
+        let body: Vec<String> = onward.into_iter().filter(|n| !parallel.contains(n)).collect();
+        let ends: Vec<String> = body
+            .iter()
+            .filter(|n| !successors(n, &edges).iter().any(|t| body.contains(t)))
+            .cloned()
+            .collect();
+        let added: Vec<PipelineEdge> = ends
+            .into_iter()
+            .filter(|end| known.contains(end) || *end == *before)
+            .map(|end| PipelineEdge {
+                id: format!("order-{end}-{head}"),
+                source: end,
+                target: head.clone(),
+                source_handle: Some("main".into()),
+                target_handle: Some("main".into()),
+                edge_type: None,
+                data: Some(EdgeData {
+                    connection_type: "on-subjob-ok".into(),
+                    label: None,
+                    condition: None,
+                }),
+            })
+            .collect();
+        edges.extend(added);
+    }
+    edges
+}
+
 fn connection_type_for(connector: Option<&str>) -> &'static str {
     match connector.unwrap_or("").to_ascii_uppercase().as_str() {
         "ITERATE" => "iterate",
@@ -2167,7 +2272,9 @@ fn connection_type_for(connector: Option<&str>) -> &'static str {
 
 /// Pull `<node>`, its `<elementParameter>`s, its mapper output entries, and the
 /// `<connection>` list out of the job XML.
-fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>), String> {
+type Parsed = (Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>, Vec<String>);
+
+fn parse(xml: &str) -> Result<Parsed, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -2176,6 +2283,8 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>
     let mut cur: Option<RawNode> = None;
     // Mapper entries are only outputs when we are inside <outputTables>.
     let mut in_output_table = false;
+    let mut in_subjob = false;
+    let mut subjob_heads: Vec<String> = Vec::new();
     // The TABLE parameter whose rows we are currently collecting, if any.
     let mut table_param: Option<String> = None;
     let mut in_flow_metadata = false;
@@ -2225,6 +2334,17 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>
                             y: attr("posY").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                         });
                         in_output_table = false;
+                    }
+                    // The file closes with one <subjob> per subjob, in the order they
+                    // run. Nothing else records that order, and most subjobs have no link
+                    // to each other at all.
+                    "subjob" => in_subjob = true,
+                    "elementParameter" if in_subjob => {
+                        if attr("name").as_deref() == Some("UNIQUE_NAME") {
+                            if let Some(v) = attr("value") {
+                                subjob_heads.push(v);
+                            }
+                        }
                     }
                     "elementParameter" => {
                         if let (Some(n), Some(k)) = (cur.as_mut(), attr("name")) {
@@ -2313,6 +2433,8 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>
                     }
                 } else if name.as_ref() == b"outputTables" {
                     in_output_table = false;
+                } else if name.as_ref() == b"subjob" {
+                    in_subjob = false;
                 }
             }
             _ => {}
@@ -2330,7 +2452,7 @@ fn parse(xml: &str) -> Result<(Vec<RawNode>, Vec<Conn>, BTreeMap<String, String>
             n.unique = format!("{}_{}", n.component, i + 1);
         }
     }
-    Ok((nodes, conns, context))
+    Ok((nodes, conns, context, subjob_heads))
 }
 
 #[cfg(test)]
@@ -3245,6 +3367,92 @@ mod tests {
             into("after_1"),
             vec!["a_2", "b_1"],
             "the work after the join waits for the end of every branch, not for the fork"
+        );
+    }
+
+    #[test]
+    fn subjobs_with_no_links_between_them_keep_the_order_they_are_declared_in() {
+        // Most subjobs are not linked to each other at all: they simply run one after
+        // another, in the order the file lists them at the end. Nothing in the graph said
+        // so, which left a job that writes a table in one subjob and reads it in the next
+        // looking like two things that could run in either order - and a reader that has
+        // to prove the write happens first then cannot.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="a_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <node componentName="tFileOutputDelimited" posX="90" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="a_2"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.out&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="10" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="b_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/b.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="10" posY="170">
+            <elementParameter name="UNIQUE_NAME" value="c_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/c.csv&quot;"/>
+          </node>
+          <connection connectorName="FLOW" source="a_1" target="a_2"/>
+          <subjob><elementParameter name="UNIQUE_NAME" value="a_1"/></subjob>
+          <subjob><elementParameter name="UNIQUE_NAME" value="b_1"/></subjob>
+          <subjob><elementParameter name="UNIQUE_NAME" value="c_1"/></subjob>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let into = |t: &str| {
+            let mut v: Vec<&str> =
+                im.edges.iter().filter(|e| e.target == t).map(|e| e.source.as_str()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            into("b_1"),
+            vec!["a_2"],
+            "the next subjob waits for the end of the one declared before it, not its start"
+        );
+        assert_eq!(into("c_1"), vec!["b_1"]);
+    }
+
+    #[test]
+    fn subjobs_that_run_in_parallel_are_not_put_back_in_a_queue() {
+        // Branches of a parallel fork are declared one after another like anything else,
+        // and chaining them in that order would undo the only thing the fork is for.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tParallelize" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="fork_1"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="90" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="a_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/a.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="90" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="b_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/b.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="200" posY="50">
+            <elementParameter name="UNIQUE_NAME" value="after_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/c.csv&quot;"/>
+          </node>
+          <connection connectorName="PARALLELIZE" source="fork_1" target="a_1"/>
+          <connection connectorName="PARALLELIZE" source="fork_1" target="b_1"/>
+          <connection connectorName="SYNCHRONIZE" source="fork_1" target="after_1"/>
+          <subjob><elementParameter name="UNIQUE_NAME" value="fork_1"/></subjob>
+          <subjob><elementParameter name="UNIQUE_NAME" value="a_1"/></subjob>
+          <subjob><elementParameter name="UNIQUE_NAME" value="b_1"/></subjob>
+          <subjob><elementParameter name="UNIQUE_NAME" value="after_1"/></subjob>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        assert!(
+            !im.edges.iter().any(|e| e.source == "a_1" && e.target == "b_1"),
+            "one branch must not be made to wait for the other: {:?}",
+            im.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>()
+        );
+        let into_after: Vec<&str> =
+            im.edges.iter().filter(|e| e.target == "after_1").map(|e| e.source.as_str()).collect();
+        assert!(
+            into_after.contains(&"a_1") && into_after.contains(&"b_1"),
+            "and the join still waits for both: {into_after:?}"
         );
     }
 

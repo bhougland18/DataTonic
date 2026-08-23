@@ -631,6 +631,12 @@ the one before it. The write action now comes across, with the key it matches on
 from the columns the schema marks as keys. An action with no exact equivalent here is
 reported rather than widened in silence.
 
+**The order subjobs run in is kept.** Most subjobs are not linked to each other at all;
+they run one after another in the order the file lists them at the end, and that order was
+being dropped. A job that wrote a table in one subjob and read it in the next then arrived
+as two things that could happen in either order. Branches of a parallel fork are the one
+part that genuinely does not run in declared order, so they are left out of the chain.
+
 **Intermediate work moves to DuckDB.** A job written against a warehouse uses it as
 working storage as well as a destination: it writes a staging table, reads it back, joins
 it, writes it again, and every one of those hops is billed for rows that were produced on
