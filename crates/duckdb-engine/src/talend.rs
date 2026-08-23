@@ -1079,6 +1079,14 @@ fn properties_for(
             } else if declared {
                 props.insert("hasHeader".into(), JsonValue::Bool(false));
             }
+            // A writer says whether it puts the column names out as a first line. That is
+            // its own setting, not the reader's count of lines to skip, so it is read on
+            // its own - and it has to be, because the step that reads the file back is
+            // told to skip a line either way. Written without the names, the line skipped
+            // is a line of data.
+            if let Some(h) = raw.params.get("INCLUDEHEADER") {
+                props.insert("hasHeader".into(), JsonValue::Bool(unquote(h) == "true"));
+            }
         }
         "src.inline" => {
             // The component hands one row of named values downstream - a batch id, a
@@ -5763,6 +5771,36 @@ mod tests {
             .filter(|e| e.data.as_ref().map(|d| d.connection_type.as_str()) == Some("on-subjob-ok"))
             .map(|e| (e.source.clone(), e.target.clone()))
             .collect()
+    }
+
+    #[test]
+    fn a_writer_that_puts_the_names_out_says_so() {
+        // A sink says whether it writes the column names as a first line. Left unread,
+        // the file goes out without them - and the step that reads it back was told to
+        // skip a line, so it skips a line of data instead and the run is one row short
+        // for a reason nothing reports.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileOutputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="out_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/o.csv&quot;"/>
+            <elementParameter name="INCLUDEHEADER" value="true"/>
+            <metadata connector="FLOW" name="out_1">
+              <column name="A" type="id_String" nullable="true"/>
+            </metadata>
+          </node>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(p["hasHeader"], true);
+
+        // And a writer that does not put them out still does not.
+        let off = xml.replace(
+            r#"<elementParameter name="INCLUDEHEADER" value="true"/>"#,
+            r#"<elementParameter name="INCLUDEHEADER" value="false"/>"#,
+        );
+        let im = import_item(&off, "j").unwrap();
+        let p = im.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(p["hasHeader"], false);
     }
 
     #[test]
