@@ -990,6 +990,12 @@ fn survey(
 fn reroute(im: &mut Import, local: &std::collections::BTreeSet<String>) -> usize {
     let unordered = unordered_here(im, local);
     let mut moved = 0;
+    // A lookup that moves has to be held until the mirror it now reads has been filled.
+    // Its mapper already waits for the write, but the lookup itself waits for nothing, and
+    // a mirror read too early is an absent table rather than a stale one.
+    let mut held: Vec<(String, Vec<String>)> = Vec::new();
+    let fed: std::collections::BTreeSet<String> =
+        im.edges.iter().map(|e| e.target.clone()).collect();
     for n in im.nodes.iter_mut() {
         if n.data.component_id.as_deref() != Some("src.snowflake") {
             continue;
@@ -1001,6 +1007,8 @@ fn reroute(im: &mut Import, local: &std::collections::BTreeSet<String>) -> usize
         if !unordered.is_empty() && tables.iter().any(|t| unordered.contains(t)) {
             continue;
         }
+        let node_id = n.id.clone();
+        let is_lookup = !fed.contains(&node_id);
         let Some(props) = n.data.properties.as_mut().and_then(|p| p.as_object_mut()) else {
             continue;
         };
@@ -1035,6 +1043,9 @@ fn reroute(im: &mut Import, local: &std::collections::BTreeSet<String>) -> usize
         }
         n.data.component_id = Some("src.duckdb".into());
         n.data.subtitle = Some("local mirror".into());
+        if is_lookup {
+            held.push((node_id, tables));
+        }
         moved += 1;
     }
 
@@ -1076,6 +1087,37 @@ fn reroute(im: &mut Import, local: &std::collections::BTreeSet<String>) -> usize
             .collect();
         im.edges.extend(feeds);
         im.nodes.push(mirror);
+    }
+
+    // Hold each moved lookup until the mirrors of the tables it reads have been filled.
+    for (read_id, tables) in held {
+        let sources: Vec<String> = im
+            .nodes
+            .iter()
+            .filter(|n| n.data.component_id.as_deref() == Some("snk.duckdb"))
+            .filter(|n| node_table(n).is_some_and(|t| tables.contains(&t)))
+            .map(|n| n.id.clone())
+            .collect();
+        for source in sources {
+            // The mapper this lookup feeds is already behind the write, so this cannot
+            // close a loop - but a graph is cheap to ask and a deadlock is not.
+            if reaches(im, &read_id, &source) {
+                continue;
+            }
+            im.edges.push(PipelineEdge {
+                id: format!("await-{source}-{read_id}"),
+                source,
+                target: read_id.clone(),
+                source_handle: Some("main".into()),
+                target_handle: Some("main".into()),
+                edge_type: None,
+                data: Some(EdgeData {
+                    connection_type: "on-subjob-ok".into(),
+                    label: None,
+                    condition: None,
+                }),
+            });
+        }
     }
 
     for c in im.children.iter_mut() {
@@ -1120,13 +1162,43 @@ fn unordered_here(
     let mut out: std::collections::BTreeSet<String> = Default::default();
     for (write_id, table) in &writes {
         for (read_id, read_of) in &reads {
-            if !read_of.contains(table) || reaches(im, write_id, read_id) {
+            if !read_of.contains(table) {
+                continue;
+            }
+            if positions_of(im, read_id).iter().all(|at| reaches(im, write_id, at)) {
                 continue;
             }
             out.insert(table.clone());
         }
     }
     out
+}
+
+/// Where a read sits in the order.
+///
+/// Normally that is the read itself. A mapper's second input is the exception: nothing
+/// feeds it, so nothing can be shown to run before it and the question always answers
+/// "nothing". Its real place is its mapper's, because that is when it is loaded - so a
+/// write that lands before the mapper lands before the lookup too.
+///
+/// A read that feeds nothing keeps its own position; there is nowhere else to put it, and
+/// it is not going to move anyway.
+fn positions_of<'a>(im: &'a Import, read_id: &'a str) -> Vec<&'a str> {
+    let fed = im.edges.iter().any(|e| e.target == read_id);
+    if fed {
+        return vec![read_id];
+    }
+    let consumers: Vec<&str> = im
+        .edges
+        .iter()
+        .filter(|e| e.source == read_id)
+        .map(|e| e.target.as_str())
+        .collect();
+    if consumers.is_empty() {
+        vec![read_id]
+    } else {
+        consumers
+    }
 }
 
 /// Whether one node leads to another, by rows or by an ordering link.

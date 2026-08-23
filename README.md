@@ -652,6 +652,10 @@ the staging table it reads, since a mirror would then be serving only half of wh
 project asks for. Neither does a read the job could run before its own write: within one
 pipeline the write has to lead to the read, by rows or by an ordering link, because a
 warehouse table nothing wrote yet holds stale rows while a local one is simply not there.
+A mapper's second input is judged by where its mapper sits, since that is when a lookup is
+loaded and nothing feeds the lookup itself; where such a read does move it is held until
+the mirror has been filled. A mapper that reads a table and produces the write back to it
+keeps reading the warehouse, because what the lookup feeds is what changes the table.
 Anything else, including a query assembled at run time, is mapped as it was.
 
 ### Workspace catalog (what reads and writes what)

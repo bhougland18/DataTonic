@@ -958,6 +958,121 @@ mod tests {
         );
     }
 
+    /// A job whose mapper takes a second input from the warehouse.
+    ///
+    /// `write_after` puts the mapper downstream of the write, which is the ordinary case;
+    /// `false` instead has the mapper produce the write, which is a read-modify-write.
+    #[cfg(test)]
+    fn lookup_job(write_after: bool) -> String {
+        let attr = |v: serde_json::Value| {
+            v.to_string().replace('&', "&amp;").replace('"', "&quot;")
+        };
+        let sink = attr(serde_json::json!({
+            "outputAction": {"storedValue": "INSERT"},
+            "table": {"tableName": {"storedValue": "STAGE_T"}},
+        }));
+        let read = attr(serde_json::json!({
+            "query": {"storedValue": "SELECT * FROM STAGE_T"}
+        }));
+        // Either the write happens first and the mapper reads afterwards, or the mapper
+        // is what produces the write.
+        let wiring = if write_after {
+            r#"<connection connectorName="FLOW" source="src_1" target="w_1"/>
+  <connection connectorName="SUBJOB_OK" source="w_1" target="feed_1"/>
+  <connection connectorName="FLOW" source="feed_1" target="map_1"/>
+  <connection connectorName="FLOW" source="look_1" target="map_1"/>
+  <connection connectorName="FLOW" source="map_1" target="out_1"/>"#
+        } else {
+            r#"<connection connectorName="FLOW" source="src_1" target="feed_1"/>
+  <connection connectorName="FLOW" source="feed_1" target="map_1"/>
+  <connection connectorName="FLOW" source="look_1" target="map_1"/>
+  <connection connectorName="FLOW" source="map_1" target="w_1"/>"#
+        };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<talendfile:ProcessType xmlns:talendfile="platform:/resource/org.talend.model/model/TalendFile.xsd">
+  <node componentName="tFileInputDelimited" posX="10" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="src_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+  </node>
+  <node componentName="tSnowflakeOutput" posX="120" posY="10">
+    <elementParameter name="UNIQUE_NAME" value="w_1"/>
+    <elementParameter name="PROPERTIES" value="{sink}"/>
+  </node>
+  <node componentName="tFileInputDelimited" posX="10" posY="120">
+    <elementParameter name="UNIQUE_NAME" value="feed_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/feed.csv&quot;"/>
+  </node>
+  <node componentName="tSnowflakeInput" posX="10" posY="200">
+    <elementParameter name="UNIQUE_NAME" value="look_1"/>
+    <elementParameter name="PROPERTIES" value="{read}"/>
+  </node>
+  <node componentName="tMap" posX="240" posY="120">
+    <elementParameter name="UNIQUE_NAME" value="map_1"/>
+  </node>
+  <node componentName="tFileOutputDelimited" posX="360" posY="120">
+    <elementParameter name="UNIQUE_NAME" value="out_1"/>
+    <elementParameter name="FILENAME" value="&quot;/data/out.csv&quot;"/>
+  </node>
+  {wiring}
+</talendfile:ProcessType>
+"#
+        )
+    }
+
+    #[cfg(test)]
+    fn imported_lookup_job(write_after: bool) -> serde_json::Value {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write(src.path(), "J_0.1.item", &lookup_job(write_after));
+        let report = import_tree(src.path(), out.path()).unwrap();
+        assert_eq!(report.failed(), 0);
+        serde_json::from_str(&std::fs::read_to_string(out.path().join("J.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_lookup_takes_its_place_in_the_order_from_what_it_feeds() {
+        // A mapper's second input has nothing feeding it, so nothing can be shown to run
+        // before it and a rule that asks what precedes it always answers "nothing". Its
+        // real place in the order is its mapper's: the lookup is loaded when the mapper
+        // runs. Read that way, a write that happens before the mapper happens before the
+        // lookup too, and the lookup can be served locally.
+        let j = imported_lookup_job(true);
+        let nodes = j["nodes"].as_array().unwrap();
+        let component = |id: &str| {
+            nodes.iter().find(|n| n["id"] == id).unwrap()["data"]["componentId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(component("look_1"), "src.duckdb");
+        assert_eq!(component("w_1__local"), "snk.duckdb");
+        assert!(
+            j["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["source"] == "w_1__local" && e["target"] == "look_1"),
+            "and the lookup is held until the mirror it now reads has been filled"
+        );
+    }
+
+    #[test]
+    fn a_lookup_the_mapper_writes_back_to_is_left_alone() {
+        // The same mapper reads the table and produces the write to it. The lookup has to
+        // see the table as it was before this run, because what it feeds is what changes
+        // it - so it is not the mapper's position that applies here, and holding the
+        // lookup until the write landed would feed the mapper its own output.
+        let j = imported_lookup_job(false);
+        let nodes = j["nodes"].as_array().unwrap();
+        assert_eq!(
+            nodes.iter().find(|n| n["id"] == "look_1").unwrap()["data"]["componentId"],
+            "src.snowflake",
+            "a read whose own output becomes the write cannot be served from the write"
+        );
+        assert!(!nodes.iter().any(|n| n["id"] == "w_1__local"));
+    }
+
     #[test]
     fn a_called_body_is_spliced_into_its_caller() {
         // A body is not runnable on its own: it takes its rows from whoever calls it, and
