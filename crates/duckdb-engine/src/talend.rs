@@ -1814,7 +1814,11 @@ fn java_condition_to_sql(cond: &str, types: &ColTypes) -> Option<String> {
             return Some(format!("{} = ''", java_expr_to_sql(recv, types)?));
         }
     }
-    for (name, sql_fn) in [("startsWith", "starts_with"), ("endsWith", "ends_with")] {
+    for (name, sql_fn) in [
+        ("startsWith", "starts_with"),
+        ("endsWith", "ends_with"),
+        ("contains", "contains"),
+    ] {
         if let Some((recv, args)) = method_call(c, name) {
             if args.len() == 1 {
                 return Some(format!(
@@ -2299,6 +2303,23 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes) -> Option<String> {
             })
             .collect::<Option<Vec<_>>>()?;
         let op = if textual { "||" } else { "+" };
+        return Some(rendered.join(&format!(" {op} ")));
+    }
+    // The other signs, loosest first, so what sits either side of the looser one stays
+    // together and the nesting comes out with the usual precedence. Only arithmetic is
+    // written this way - joining text has its own sign, handled above - so there is
+    // nothing to decide between.
+    for op in ["-", "*", "/"] {
+        let parts = split_top_level(e, op);
+        // A leading sign is part of the number, not an operation with nothing on its
+        // left; `split_top_level` drops the empty piece, so a single part says so.
+        if parts.len() < 2 {
+            continue;
+        }
+        let rendered = parts
+            .iter()
+            .map(|p| numeric_operand(p, types))
+            .collect::<Option<Vec<_>>>()?;
         return Some(rendered.join(&format!(" {op} ")));
     }
     // A context value is written the same way a column is. Read as a column it becomes a
@@ -5464,6 +5485,34 @@ mod tests {
         assert_eq!(
             sql(r#"Numeric.sequence("s1",1,1)"#).as_deref(),
             Some("(1 + (row_number() OVER () - 1) * 1)")
+        );
+    }
+
+    #[test]
+    fn arithmetic_written_with_signs_reads_like_arithmetic() {
+        // Only the method spellings of arithmetic were read. Written with signs - which
+        // is how anyone writes a subtraction - the expression went unread, and with it
+        // the column and everything downstream naming it.
+        let mut types = ColTypes::new();
+        types.insert("N".into(), "id_BigDecimal".into());
+        let sql = |e: &str| java_expr_to_sql(e, &types);
+
+        assert_eq!(
+            sql("row1.N - row1.N").as_deref(),
+            Some("(TRY_CAST(N AS DECIMAL(38,4))) - (TRY_CAST(N AS DECIMAL(38,4)))")
+        );
+        assert_eq!(sql("1 * 2").as_deref(), Some("(1) * (2)"));
+        assert_eq!(sql("1 / 2").as_deref(), Some("(1) / (2)"));
+        // Signs keep their usual precedence: the looser one splits first, so what is
+        // left on either side of it stays together.
+        assert_eq!(sql("1 - 2 * 3").as_deref(), Some("(1) - ((2) * (3))"));
+        assert_eq!(sql("1 * 2 - 3").as_deref(), Some("((1) * (2)) - (3)"));
+        // A negative number is a number, not a subtraction with nothing on its left.
+        assert_eq!(sql("-1").as_deref(), Some("-1"));
+        // Asking whether one string is inside another.
+        assert_eq!(
+            sql(r#"row1.A.contains("-") ? 1 : 0"#).as_deref(),
+            Some("CASE WHEN contains(A, '-') THEN 1 ELSE 0 END")
         );
     }
 
