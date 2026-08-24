@@ -1157,6 +1157,7 @@ function synthFileSink(comp: ComponentDef): ComponentManifest {
                             { label: 'ESRI Shapefile', value: 'ESRI Shapefile' },
                             { label: 'KML', value: 'KML' },
                             { label: 'GPX', value: 'GPX' },
+                            { label: 'GeoParquet', value: 'GeoParquet' },
                         ],
                     },
                 ],

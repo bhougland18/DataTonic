@@ -28736,6 +28736,10 @@
                   {
                     "label": "GPX",
                     "value": "GPX"
+                  },
+                  {
+                    "label": "GeoParquet",
+                    "value": "GeoParquet"
                   }
                 ]
               }

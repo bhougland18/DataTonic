@@ -2140,6 +2140,38 @@
     }
 
     #[test]
+    fn the_geospatial_sink_writes_geoparquet_through_the_parquet_writer() {
+        // #241. GeoParquet was asked for on the Geospatial sink, which writes through
+        // GDAL. The bundled spatial extension has no GDAL Parquet driver - st_drivers()
+        // lists none, and a COPY naming one writes NO FILE AT ALL and does not complain,
+        // so offering it there would have been a silent no-op.
+        //
+        // DuckDB's own Parquet writer does write GeoParquet: the footer carries the
+        // `geo` key and the geometry keeps its CRS. So the option exists where it was
+        // looked for, and goes out through the writer that works.
+        use crate::plan::builders::build_spatial_sink;
+        let gp = build_spatial_sink(
+            &serde_json::json!({ "path": "/out/f.parquet", "driver": "GeoParquet" }),
+            "up",
+        );
+        assert!(gp.contains("FORMAT PARQUET"), "got: {gp}");
+        assert!(!gp.contains("FORMAT GDAL"), "not through GDAL: {gp}");
+
+        // Every other driver still goes through GDAL exactly as before.
+        for d in ["GeoJSON", "GPKG", "ESRI Shapefile", "KML", "GPX"] {
+            let sql = build_spatial_sink(
+                &serde_json::json!({ "path": "/out/f", "driver": d }),
+                "up",
+            );
+            assert!(sql.contains("FORMAT GDAL"), "{d}: {sql}");
+            assert!(sql.contains(&format!("DRIVER '{d}'")), "{d}: {sql}");
+        }
+        // Unset is GeoJSON through GDAL, as it was.
+        let dflt = build_spatial_sink(&serde_json::json!({ "path": "/out/f" }), "up");
+        assert!(dflt.contains("FORMAT GDAL, DRIVER 'GeoJSON'"), "got: {dflt}");
+    }
+
+    #[test]
     fn json_flatten_is_a_setting_and_repeated_keys_can_keep_their_parent() {
         // #238. Two things, reported together.
         //

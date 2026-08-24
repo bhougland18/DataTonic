@@ -6235,6 +6235,20 @@ pub(crate) fn build_spatial_sink(props: &JsonValue, from_view: &str) -> String {
     let driver = string_prop(props, "driver")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "GeoJSON".into());
+    // GeoParquet does not go out through GDAL. The bundled spatial extension has no GDAL
+    // Parquet driver - st_drivers() lists none, and a COPY naming one writes NO FILE AT
+    // ALL without complaining, so routing it there would be a silent no-op.
+    //
+    // DuckDB's own Parquet writer does write GeoParquet: the footer carries the `geo`
+    // key and the geometry keeps its CRS. So the option sits where it is looked for and
+    // goes out through the writer that works.
+    if driver.eq_ignore_ascii_case("geoparquet") || driver.eq_ignore_ascii_case("parquet") {
+        return format!(
+            "COPY (SELECT * FROM {}) TO '{}' (FORMAT PARQUET)",
+            quote_ident(from_view),
+            sql_escape(&path)
+        );
+    }
     format!(
         "COPY (SELECT * FROM {}) TO '{}' (FORMAT GDAL, DRIVER '{}')",
         quote_ident(from_view),
