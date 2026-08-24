@@ -4047,7 +4047,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
             let mut inner_sql =
                 format!("SELECT {} FROM {}", inner.join(", "), quote_ident(upstream));
             if let Some(predicate) = &filter {
-                inner_sql.push_str(" WHERE ");
+                inner_sql.push_str(filter_clause(predicate));
                 inner_sql.push_str(&strip_port_prefixes(predicate));
             }
             return Ok(format!("SELECT {} FROM ({}) AS \"__map\"", outer.join(", "), inner_sql));
@@ -4058,7 +4058,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
             .collect();
         let mut sql = format!("SELECT {} FROM {}", terms.join(", "), quote_ident(upstream));
         if let Some(predicate) = &filter {
-            sql.push_str(" WHERE ");
+            sql.push_str(filter_clause(predicate));
             sql.push_str(&strip_port_prefixes(predicate));
         }
         return Ok(sql);
@@ -4108,7 +4108,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
 
     let mut sql = format!("SELECT {} FROM {}", terms.join(", "), from);
     if let Some(predicate) = &filter {
-        sql.push_str(" WHERE ");
+        sql.push_str(filter_clause(predicate));
         sql.push_str(&qualify_port_refs(predicate, &aliases));
     }
     Ok(sql)
@@ -4379,6 +4379,50 @@ pub(crate) fn split_leading_token(s: &str) -> (&str, &str) {
 pub(crate) fn is_plain_column(k: &str) -> bool {
     let t = k.trim();
     !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Where a mapper's filter belongs: `WHERE`, or `QUALIFY` when it ranks rows.
+///
+/// A legacy job bounds a loop by asking for a running sequence number and keeping the
+/// rows below a bound. That reads as a window function, and SQL does not allow one in
+/// `WHERE` at all - the step fails to bind and the branch is lost, for a filter that was
+/// translated correctly and then put in the wrong clause. `QUALIFY` is the clause that
+/// filters on a window result.
+fn filter_clause(predicate: &str) -> &'static str {
+    match mentions_window_function(predicate) {
+        true => " QUALIFY ",
+        false => " WHERE ",
+    }
+}
+
+/// Whether a predicate calls a window function: the word `OVER` followed by its bracket,
+/// outside any string literal. A predicate comparing against text that merely contains
+/// the word is not one.
+fn mentions_window_function(predicate: &str) -> bool {
+    let bytes = predicate.as_bytes();
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < predicate.len() {
+        if !predicate.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &predicate[i..];
+        if rest.starts_with('\'') && !(i > 0 && bytes[i - 1] == b'\\') {
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+        if !in_string && rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("over") {
+            let before_ok = i == 0 || !(bytes[i - 1] as char).is_alphanumeric() && bytes[i - 1] != b'_';
+            let after = rest[4..].trim_start();
+            if before_ok && after.starts_with('(') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 pub(crate) fn parse_key_list(raw: &str) -> Vec<String> {

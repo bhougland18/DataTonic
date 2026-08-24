@@ -2372,6 +2372,27 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes, ports: &PortMap) -> Option<Str
             return Some(format!("CAST({} AS {ty})", java_expr_to_sql(recv, types, ports)?));
         }
     }
+    // Cutting a string on a separator and taking one piece. Java counts the pieces from
+    // zero and a SQL list counts from one, so the piece asked for moves by one.
+    if e.ends_with(']') {
+        if let Some(open) = e.rfind('[') {
+            let index: Option<i64> = e[open + 1..e.len() - 1].trim().parse().ok();
+            // A piece named by anything but a number cannot be moved by one without
+            // knowing what it is, so that is left unread rather than guessed at.
+            if let Some(n) = index.filter(|n| *n >= 0) {
+                if let Some((recv, args)) = method_call(e[..open].trim(), "split") {
+                    if args.len() == 1 {
+                        return Some(format!(
+                            "str_split({}, {})[{}]",
+                            java_expr_to_sql(recv, types, ports)?,
+                            java_expr_to_sql(args[0], types, ports)?,
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // Finding and replacing on a plain string rather than a pattern.
     if let Some((recv, args)) = method_call(e, "indexOf") {
         if args.len() == 1 {
@@ -2773,24 +2794,45 @@ pub fn import_item(xml: &str, job_name: &str) -> Result<Import, String> {
                             (t.name.clone(), port)
                         })
                         .collect();
-                    let left: Vec<String> = t
-                        .keys
-                        .iter()
-                        .map(|(_, expr)| {
-                            java_expr_to_sql(expr.trim(), &raw.mapper_types, &ports)
-                                .unwrap_or_else(|| {
-                                    let e = expr.trim();
-                                    e.rsplit_once('.').map(|(_, c)| c).unwrap_or(e).to_string()
-                                })
-                        })
-                        .collect();
+                    // A key that cannot be read is left out rather than approximated.
+                    // Falling back to whatever followed the last dot turned
+                    // `row1.File_Name.split("_")[3]` into `split("_")[3]`: the column
+                    // being split gone, the separator now a quoted NAME. A match decides
+                    // which rows pair up, so an approximate one is a wrong answer that
+                    // still runs. Left out, the job refuses to compile and says why.
+                    let mut left: Vec<String> = Vec::new();
+                    let mut unreadable: Vec<String> = Vec::new();
+                    for (_, expr) in &t.keys {
+                        match java_expr_to_sql(expr.trim(), &raw.mapper_types, &ports) {
+                            Some(sql) => left.push(sql),
+                            None => unreadable.push(expr.trim().to_string()),
+                        }
+                    }
                     let right: Vec<String> =
                         t.keys.iter().map(|(col, _)| col.clone()).collect();
+                    (
+                        at,
+                        t.inner,
+                        if unreadable.is_empty() { left.join(",") } else { String::new() },
+                        right.join(","),
+                        unreadable,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(at, inner, left, right, unreadable)| {
+                    for expression in unreadable {
+                        warnings.push(Warning::JavaExpression {
+                            node: raw.unique.clone(),
+                            column: format!("the key matching lookup_{at}"),
+                            expression,
+                        });
+                    }
                     serde_json::json!({
                         "port": format!("lookup_{at}"),
-                        "leftKey": left.join(","),
-                        "rightKey": right.join(","),
-                        "joinType": if t.inner { "inner" } else { "left" },
+                        "leftKey": left,
+                        "rightKey": right,
+                        "joinType": if inner { "inner" } else { "left" },
                     })
                 })
                 .collect();
@@ -3522,8 +3564,14 @@ fn yields_text(e: &str, types: &ColTypes) -> bool {
     if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
         return true;
     }
+    // The string helpers are text as a family, with three exceptions: the ones that
+    // answer with a position or a count answer with a NUMBER whatever they were given.
+    // Counted as text, `INDEX(name,"_")+2` reads as joining rather than adding, and what
+    // wanted a position gets two digits stuck together.
+    if t.starts_with("StringHandling.") && !starts_with_numeric_string_helper(t) {
+        return true;
+    }
     for marker in [
-        "StringHandling.",
         ".replaceAll(",
         ".toUpperCase(",
         ".toLowerCase(",
@@ -3543,10 +3591,18 @@ fn yields_text(e: &str, types: &ColTypes) -> bool {
     column_type(t, types).is_some_and(|k| k.eq_ignore_ascii_case("id_String"))
 }
 
-/// Whether a piece is a number: a literal, or a column the file records as one.
+/// The string helpers that answer with a number rather than with text.
+fn starts_with_numeric_string_helper(t: &str) -> bool {
+    ["StringHandling.INDEX", "StringHandling.LEN", "StringHandling.COUNT"]
+        .iter()
+        .any(|n| t.starts_with(n))
+}
+
+/// Whether a piece is a number: a literal, a column the file records as one, or a call
+/// that answers with a number whatever it was given.
 fn yields_number(e: &str, types: &ColTypes) -> bool {
     let t = e.trim();
-    if is_number(t) {
+    if is_number(t) || starts_with_numeric_string_helper(t) {
         return true;
     }
     column_type(t, types).is_some_and(|k| {
@@ -5970,6 +6026,107 @@ mod tests {
         let im = import_item(&off, "j").unwrap();
         let p = im.nodes[0].data.properties.as_ref().unwrap();
         assert_eq!(p["hasHeader"], false);
+    }
+
+    #[test]
+    fn a_match_on_something_unreadable_is_not_guessed_at() {
+        // The side of a match that could not be read used to fall back to whatever
+        // followed the last dot. On `row1.File_Name.split("_")[3]` that is
+        // `split("_")[3]`: the column being split is gone and the separator has become a
+        // quoted NAME, so the step matched on a column called _ that does not exist.
+        // A match is what decides which rows pair up, so a key that cannot be read is
+        // left out and reported - the job then refuses to compile, which is the point.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tFileInputDelimited" posX="10" posY="90">
+            <elementParameter name="UNIQUE_NAME" value="ref_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/ref.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <inputTables name="row1"/>
+            <inputTables name="lk" innerJoin="true">
+              <mapperTableEntries name="K" type="id_String" expression="row1.NAME.mysteryCall(7)"/>
+            </inputTables>
+            <outputTables name="out1">
+              <mapperTableEntries name="K" expression="row1.NAME"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1" label="row1"/>
+          <connection connectorName="FLOW" source="ref_1" target="m_1" label="lk"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes.iter().find(|n| n.id == "m_1").unwrap().data.properties.as_ref().unwrap();
+        let left = p
+            .get("lookups")
+            .and_then(|l| l.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("leftKey"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
+        assert!(
+            !left.contains("mysteryCall"),
+            "an unread call must not be handed on as a key: {left}"
+        );
+        assert!(left.is_empty(), "nothing is invented for it either: {left}");
+        assert!(
+            im.warnings
+                .iter()
+                .any(|w| matches!(w, Warning::JavaExpression { expression, .. }
+                                  if expression.contains("mysteryCall"))),
+            "and it is reported: {:?}",
+            im.warnings
+        );
+    }
+
+    #[test]
+    fn a_position_plus_a_number_is_addition_not_joining() {
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
+        // Java writes joining text and adding numbers the same way, so each side has to
+        // say which it is. The string helpers were treated as text as a family, but the
+        // ones that answer with a POSITION or a COUNT answer with a number - so
+        // `INDEX(name,"_")+2` was read as joining and the SUBSTR around it was handed
+        // "81" where it wanted 9, which SQL then refused outright.
+        assert_eq!(
+            sql(r#"StringHandling.INDEX(row1.A,"_")+2"#).as_deref(),
+            Some("(instr(A, '_') - 1) + (2)")
+        );
+        assert_eq!(
+            sql(r#"StringHandling.LEN(row1.A)+1"#).as_deref(),
+            Some("(length(A)) + (1)")
+        );
+        // The ones that answer with text still join.
+        assert_eq!(
+            sql(r#"StringHandling.TRIM(row1.A) + "-""#).as_deref(),
+            Some("(trim(A)) || ('-')")
+        );
+        assert_eq!(
+            sql(r#"row1.A + "-" + row1.B"#).as_deref(),
+            Some("(A) || ('-') || (B)")
+        );
+    }
+
+    #[test]
+    fn splitting_a_string_and_taking_a_piece_reads_as_that() {
+        let sql = |e: &str| java_expr_to_sql(e, &Default::default(), &Default::default());
+        // Java counts the pieces from zero and SQL counts a list from one, so the piece
+        // asked for moves by one. Left untranslated the call lost the thing it was
+        // splitting and the separator became a QUOTED NAME, so the step went looking for
+        // a column called _ and the whole branch failed to bind.
+        assert_eq!(
+            sql(r#"row1.File_Name.split("_")[3]"#).as_deref(),
+            Some(r#"str_split(File_Name, '_')[4]"#)
+        );
+        assert_eq!(
+            sql(r#"row1.A.split("-")[0]"#).as_deref(),
+            Some(r#"str_split(A, '-')[1]"#)
+        );
+        // A piece named by something other than a number cannot be moved by one without
+        // knowing what it is, so it is refused rather than guessed at.
+        assert_eq!(sql(r#"row1.A.split("_")[n]"#), None);
     }
 
     #[test]

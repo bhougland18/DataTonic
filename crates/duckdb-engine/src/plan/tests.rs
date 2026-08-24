@@ -1687,6 +1687,69 @@
     }
 
     #[test]
+    fn a_filter_that_ranks_rows_goes_where_ranking_is_allowed() {
+        // A legacy job limits a loop by asking for a running sequence number and keeping
+        // the rows below a bound. That reads as a window function, and SQL does not allow
+        // one in WHERE at all - the step fails to bind, so the whole branch is lost for a
+        // filter that was translated correctly and then put in the wrong clause.
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"m","position":{"x":0,"y":0},"data":{
+                  "label":"Map","componentId":"xf.map",
+                  "properties":{"expressions":{"A":"A"},
+                                "filter":"(1 + (row_number() OVER () - 1) * 1) <= 5"}}}
+              ],
+              "edges":[{"id":"e","source":"s","target":"m","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        let sql = compile(&doc).unwrap().stages.into_iter()
+            .find(|s| s.node_id == "m").unwrap().sql;
+        assert!(sql.contains("QUALIFY"), "got: {sql}");
+        assert!(!sql.contains("WHERE (1 +"), "not in WHERE: {sql}");
+
+        // An ordinary filter still goes where an ordinary filter goes.
+        let plain = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"m","position":{"x":0,"y":0},"data":{
+                  "label":"Map","componentId":"xf.map",
+                  "properties":{"expressions":{"A":"A"},"filter":"A > 5"}}}
+              ],
+              "edges":[{"id":"e","source":"s","target":"m","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        let sql = compile(&plain).unwrap().stages.into_iter()
+            .find(|s| s.node_id == "m").unwrap().sql;
+        assert!(sql.contains("WHERE A > 5"), "got: {sql}");
+        assert!(!sql.contains("QUALIFY"), "got: {sql}");
+
+        // The word inside a piece of text is not a window function.
+        let texty = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"m","position":{"x":0,"y":0},"data":{
+                  "label":"Map","componentId":"xf.map",
+                  "properties":{"expressions":{"A":"A"},"filter":"A = 'left over (x)'"}}}
+              ],
+              "edges":[{"id":"e","source":"s","target":"m","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        let sql = compile(&texty).unwrap().stages.into_iter()
+            .find(|s| s.node_id == "m").unwrap().sql;
+        assert!(!sql.contains("QUALIFY"), "got: {sql}");
+    }
+
+    #[test]
     fn a_join_key_that_is_an_expression_is_one_key_not_two() {
         // Keys are written as a comma-separated list, and a key can be an expression
         // rather than a bare column. Split on every comma, an expression that takes
