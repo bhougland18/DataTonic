@@ -199,6 +199,9 @@ struct RawNode {
     /// not in the file, so they have to come across with the node or the relation is
     /// named after a line of data.
     column_types: Vec<(String, String)>,
+    /// The width a column declares, by name: (length, precision). A decimal
+    /// declared with 9 decimal places is a different number from one rounded to 4.
+    column_scale: std::collections::BTreeMap<String, (u32, u32)>,
     /// Column names the node declares on its main output.
     ///
     /// Some components take their output shape from the schema rather than from
@@ -2574,9 +2577,29 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes, ports: &PortMap) -> Option<Str
 /// other. The mapper says what each of its outputs is, so it says so here rather than
 /// leaving every later step to work it out again. Tolerant, like the rest of the read: a
 /// value that will not parse becomes NULL rather than ending the run.
-fn as_declared(sql: &str, declared: &str) -> String {
+fn as_declared(sql: &str, declared: &str, width: Option<(u32, u32)>) -> String {
+    // The SCALE the schema declares, and never its width. A rate declared with 9 decimal
+    // places rounded to 4 is a different number, and money - so the scale is taken. The
+    // width is NOT: the tool holds these as arbitrary-precision decimals and the declared
+    // width is what the DATABASE column is, which real values routinely exceed. Held to
+    // it, a 16-digit charge overflows a 13-digit column, and a cast that overflows gives
+    // NULL - so the charge disappears, and every total built from it disappears too.
+    // Never deeper than the default, which is what keeps this safe to take at all.
+    // DuckDB's decimal stops at 38 digits and a product needs both scales, so a value
+    // held at 9 decimal places overflows on the first multiplication and ends the run -
+    // measured on a real job. A scale no deeper than the default cannot add an overflow
+    // that was not already there, and it fixes the far more common case: a whole number
+    // declared with no decimal places was arriving as 20251110.0000.
+    //
+    // The cost is that a rate declared with 9 places is still rounded to 4. That is a
+    // real difference on money and it is not fixed here: it needs the arithmetic to stop
+    // being fixed-point, which is a bigger decision than this.
+    let decimal = match width {
+        Some((_, scale)) if scale <= 4 => format!("DECIMAL(38,{scale})"),
+        _ => "DECIMAL(38,4)".to_string(),
+    };
     let ty = match declared {
-        "id_BigDecimal" => "DECIMAL(38,4)",
+        "id_BigDecimal" => decimal.as_str(),
         "id_Double" | "id_Float" => "DOUBLE",
         "id_Integer" | "id_Long" | "id_Short" => "BIGINT",
         _ => return sql.to_string(),
@@ -2702,12 +2725,18 @@ fn mapper_expressions_of(
         // branch lost for a column that was only ever empty. Nothing to compute is not a
         // reading we failed to find, so it is not reported either.
         if e.is_empty() || e.chars().all(|c| matches!(c, '(' | ')' | ' ')) {
-            out.insert(col.clone(), JsonValue::String(as_declared("NULL", declared)));
+            out.insert(
+                col.clone(),
+                JsonValue::String(as_declared("NULL", declared, raw.column_scale.get(col).copied())),
+            );
             continue;
         }
         match java_expr_to_sql(e, &raw.mapper_types, &ports) {
             Some(c) => {
-                out.insert(col.clone(), JsonValue::String(as_declared(&c, declared)));
+                out.insert(
+                    col.clone(),
+                    JsonValue::String(as_declared(&c, declared, raw.column_scale.get(col).copied())),
+                );
             }
             None => warnings.push(Warning::JavaExpression {
                 node: raw.unique.clone(),
@@ -4123,6 +4152,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                             unique: String::new(),
                             columns: Vec::new(),
                             column_types: Vec::new(),
+                            column_scale: Default::default(),
                             tables: BTreeMap::new(),
                             params: BTreeMap::new(),
                             mapper_out: Vec::new(),
@@ -4213,6 +4243,19 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                         if in_flow_metadata {
                             if let (Some(n), Some(c)) = (cur.as_mut(), attr("name")) {
                                 let ty = attr("type").unwrap_or_default();
+                                // A decimal says how wide it is and how much of that is
+                                // after the point. Both have to survive, or the value is
+                                // rounded to whatever scale is assumed instead.
+                                let width = |k: &str| -> Option<u32> {
+                                    attr(k).and_then(|v| v.trim().parse::<i64>().ok())
+                                        .filter(|v| *v >= 0)
+                                        .map(|v| v as u32)
+                                };
+                                if let (Some(len), Some(prec)) = (width("length"), width("precision")) {
+                                    if len > 0 && prec <= len && len <= 38 {
+                                        n.column_scale.insert(c.clone(), (len, prec));
+                                    }
+                                }
                                 n.columns.push(c.clone());
                                 n.column_types.push((c, ty));
                             }
@@ -6084,6 +6127,48 @@ mod tests {
             "and it is reported: {:?}",
             im.warnings
         );
+    }
+
+    #[test]
+    fn a_decimal_keeps_the_scale_its_schema_declares() {
+        // A settlement rate is declared with 9 decimal places. Given a fixed scale of 4
+        // instead, every rate is silently ROUNDED on the way through - 1.106872543
+        // arrives as 1.1069 - and a rate is money, so the whole run is wrong by a
+        // rounding no one asked for and nothing reports.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <metadata connector="FLOW" name="m_1">
+              <column name="RATE" type="id_BigDecimal" length="18" precision="9" nullable="true"/>
+              <column name="AMOUNT" type="id_BigDecimal" length="12" precision="2" nullable="true"/>
+              <column name="PLAIN" type="id_BigDecimal" nullable="true"/>
+            </metadata>
+            <outputTables name="out1">
+              <mapperTableEntries name="RATE" expression="row1.RATE" type="id_BigDecimal"/>
+              <mapperTableEntries name="AMOUNT" expression="row1.AMOUNT" type="id_BigDecimal"/>
+              <mapperTableEntries name="PLAIN" expression="row1.PLAIN" type="id_BigDecimal"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes.iter().find(|n| n.id == "m_1").unwrap().data.properties.as_ref().unwrap();
+        let ex = |c: &str| p["expressions"][c].as_str().unwrap_or("").to_string();
+        // The declared WIDTH is never kept: a value wider than the database column it is
+        // bound for still has to survive the journey, and held to 13 digits a 16-digit
+        // charge casts to NULL and is simply gone.
+        //
+        // The declared SCALE is kept only where it is no deeper than the default. Deeper
+        // than that and the first multiplication overflows DuckDB's 38-digit decimal and
+        // ends the run, so a rate declared with 9 places is still rounded to 4.
+        assert!(ex("RATE").contains("DECIMAL(38,4)"), "a deeper scale is not taken: {}", ex("RATE"));
+        assert!(ex("AMOUNT").contains("DECIMAL(38,2)"), "got: {}", ex("AMOUNT"));
+        // Nothing declared, so the previous fixed scale still stands.
+        assert!(ex("PLAIN").contains("DECIMAL(38,4)"), "got: {}", ex("PLAIN"));
     }
 
     #[test]
