@@ -1170,6 +1170,7 @@ Every node has an **Advanced** tab with fields the engine honours at run time:
 | **Error traceback** | A failed stage reports the exact compiled SQL plus the underlying DuckDB message, in both the Run view and the NDJSON run log, so any component's failure is debuggable. |
 | **Column lineage** | A top-bar **Lineage** button shows, per node, each output column traced back to the source column(s) it derives from. |
 | **Dives + dashboards** | Local-first, live-querying, shareable data views, stitched into multi-chart dashboards. Generate a chart from a plain-language question, export a dive to a self-contained HTML file, open standalone `/dive/<id>` and `/dash/<id>` share pages, and find everything in the top-bar **Dives** gallery. |
+| **Run to a node** | `duckle-runner --target <node>` stops at that node and prints its rows; the MCP `run_pipeline` tool takes the same `target`. Nothing downstream runs, so no sink past it writes - the run-from-here the desktop preview uses, for checking one step without executing the rest |
 | **Run logs** | Every run writes component-level NDJSON to `<workspace>/logs/<pipeline name>/runtime.log` (start/finish per stage, row counts, durations, `ctl.log` / `ctl.warn` / `ctl.die` messages). Tail it straight into Splunk or Dynatrace. |
 | **Schedules** | Cron, fixed-interval, and file-watch triggers, driven by an in-process scheduler. |
 | **Context variables** | Per-environment variables; bind any field to one via a Manual / Context dropdown, or reference `${var}` inline. Resolved at run time. |

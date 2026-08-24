@@ -74,12 +74,13 @@ pub fn list_tools() -> Value {
                 "path": { "type": "string", "description": "Path to a pipeline .json (use instead of 'pipeline')." }
             }})),
         tool("run_pipeline",
-            "Run a pipeline headlessly through the DuckDB engine. Returns per-node status, row counts, errors and a small result preview. Needs a DuckDB binary.",
+            "Run a pipeline headlessly through the DuckDB engine. Returns per-node status, row counts, errors and a small result preview. Set 'target' to run only as far as one node and inspect it without executing the rest of the pipeline or any sink past it. Needs a DuckDB binary.",
             json!({ "type": "object", "properties": {
                 "pipeline": { "type": "object" },
                 "path": { "type": "string" },
                 "duckdb": { "type": "string", "description": "Path to the DuckDB CLI. Defaults to DUCKLE_DUCKDB_BIN or 'duckdb' on PATH." },
-                "workspace": { "type": "string", "description": "Workspace root for run logs + child-job resolution." }
+                "workspace": { "type": "string", "description": "Workspace root for run logs + child-job resolution." },
+                "target": { "type": "string", "description": "Node id to stop at. Only this node and what feeds it run, so nothing downstream executes and no sink past it writes. Its rows come back in 'preview'." }
             }})),
         tool("pipeline_lineage",
             "Resolve column-level lineage for a pipeline: for each node, map its output columns back to their root source columns. Read-only (writes nothing); needs a DuckDB binary.",
@@ -819,7 +820,12 @@ fn t_run_pipeline(args: &Value) -> Result<Value, String> {
     }
 
     let engine = DuckdbEngine::new(duckdb);
-    let result = engine.execute_pipeline_named(&doc, &name);
+    // Stopping at a node is the point of asking: an agent changing one step should not
+    // have to run everything after it, least of all the sinks, to see what it did.
+    let result = match arg_str(args, "target") {
+        Some(t) => engine.execute_pipeline_with_events(&doc, Some(t), Some(&name), |_| {}),
+        None => engine.execute_pipeline_named(&doc, &name),
+    };
 
     let mut out = serde_json::to_value(&result).map_err(|e| e.to_string())?;
     // Cap preview rows so the response stays small.

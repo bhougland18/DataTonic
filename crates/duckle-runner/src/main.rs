@@ -71,6 +71,11 @@ OPTIONS:
                          runner, then 'duckdb' on PATH.
     --log-dir <dir>      Run-log directory (default: <workspace>/logs)
     --name <label>       Run-log + state folder name (default: pipeline file stem)
+    --target <node>      Run only as far as this node, then stop and print its rows
+                         (tab-separated, header first). Nothing downstream runs, so
+                         no sink past it writes. The same run-from-here the desktop
+                         preview uses - useful for checking one step without running
+                         the rest of the pipeline.
     --manifest           After a successful run, write a signed .ducklock
                          provenance manifest under <workspace>/manifests/
                          (also enabled by the DUCKLE_MANIFEST env var).
@@ -94,6 +99,8 @@ struct Args {
     duckdb: Option<PathBuf>,
     log_dir: Option<PathBuf>,
     name: Option<String>,
+    /// Run only as far as this node, then stop and show what it produced.
+    target: Option<String>,
     list_watermarks: bool,
     // (node, value, sql_type) incremental sets, in order.
     set_watermarks: Vec<(String, String, String)>,
@@ -141,6 +148,7 @@ fn parse_args() -> Result<Args, String> {
     let mut duckdb = None;
     let mut log_dir = None;
     let mut name = None;
+    let mut target: Option<String> = None;
     let mut list_watermarks = false;
     let mut set_watermarks = Vec::new();
     let mut set_snapshots = Vec::new();
@@ -161,6 +169,7 @@ fn parse_args() -> Result<Args, String> {
             "--duckdb" => duckdb = Some(PathBuf::from(take("--duckdb")?)),
             "--log-dir" => log_dir = Some(PathBuf::from(take("--log-dir")?)),
             "--name" => name = Some(take("--name")?),
+            "--target" => target = Some(take("--target")?),
             "--list-watermarks" => list_watermarks = true,
             "--watermark-type" => pending_type = take("--watermark-type")?,
             "--set-watermark" => {
@@ -199,6 +208,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     Ok(Args {
+        target,
         pipeline,
         workspace,
         duckdb,
@@ -382,8 +392,18 @@ fn run() -> Result<bool, String> {
     eprintln!("duckle-runner: {} (workspace {})", pipeline.display(), workspace.display());
     // No canvas here, so per-node preview rows have nobody to show them to:
     // a headless run reads them off the wire only to drop them.
-    let engine = DuckdbEngine::new(duckdb).without_previews();
-    let result = engine.execute_pipeline_named(&doc, &name);
+    // Run only as far as one node, and SHOW what it produced. Without the rows there is
+    // nothing to look at, so this is the one case where a headless run keeps its
+    // previews: stopping early is only useful if you can see where you stopped.
+    let target = args.target.clone();
+    let engine = match target.is_some() {
+        true => DuckdbEngine::new(duckdb),
+        false => DuckdbEngine::new(duckdb).without_previews(),
+    };
+    let result = match target.as_deref() {
+        Some(t) => engine.execute_pipeline_with_events(&doc, Some(t), Some(&name), |_| {}),
+        None => engine.execute_pipeline_named(&doc, &name),
+    };
 
     println!("status   : {}", result.status);
     println!("duration : {} ms", result.duration_ms);
@@ -393,6 +413,35 @@ fn run() -> Result<bool, String> {
     for (id, st) in &result.nodes {
         let rows = st.rows.map(|r| format!(" ({r} rows)")).unwrap_or_default();
         println!("  {:20} {}{}", id, st.status, rows);
+    }
+
+    // Stopping at a node is only useful if you can see what it produced, so its rows go
+    // out here. Tab-separated, header first: enough for a person to read and for a
+    // script to cut on, without pretending to be a data format.
+    if let Some(t) = target.as_deref() {
+        match result.preview.iter().find(|p| p.node_id == t) {
+            Some(p) => {
+                println!();
+                println!("{}", p.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join("	"));
+                for row in &p.rows {
+                    let cells: Vec<String> = p
+                        .columns
+                        .iter()
+                        .map(|c| match row.get(&c.name) {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(serde_json::Value::Null) | None => String::new(),
+                            Some(v) => v.to_string(),
+                        })
+                        .collect();
+                    println!("{}", cells.join("	"));
+                }
+            }
+            None if result.status == "ok" => {
+                println!();
+                println!("(no rows to show for {t}: it produces no output relation)");
+            }
+            None => {}
+        }
     }
 
     // Emit a signed provenance manifest for a successful run when asked.
