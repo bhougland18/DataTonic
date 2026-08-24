@@ -1432,6 +1432,8 @@ function synthLakehouseSource(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'path', label: 'Catalog path', kind: 'text', required: true, placeholder: '/var/lakes/catalog.ducklake', description: 'Path to the DuckLake catalog (a .ducklake file or metadata DB DSN). A non-file catalog uses a DSN, e.g. postgres:dbname=lake host=localhost - set Data path alongside it.' },
                     { key: 'dataPath', label: 'Data path', kind: 'text', placeholder: 's3://bucket/lake/ or data_files/', description: 'Where the lake stores its Parquet files. DuckLake requires this when the catalog is a sqlite:/postgres:/mysql: DSN and the lake does not exist yet; an existing lake reads its own stored path, so leave blank for a local .ducklake file.' },
+                    { key: 'metadataSchema', label: 'Catalog schema', kind: 'text', placeholder: 'ducklake_catalog', description: 'Schema the catalog tables live in (METADATA_SCHEMA). A Postgres or MySQL catalog usually shares its database with other things, so the lake keeps its tables in a schema of its own. Leave blank for the database default.' },
+                    { key: 'attachOptions', label: 'Catalog parameters', kind: 'key-value', description: 'Anything else the catalog takes, passed to ATTACH as written: META_SECRET to point at a stored secret instead of spelling a password into the path, and the other META_* parameters.' },
                 ],
             },
             {
@@ -1454,6 +1456,8 @@ function synthLakehouseSource(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'path', label: 'Catalog path', kind: 'text', required: true, placeholder: '/var/lakes/catalog.ducklake', description: 'Path to the DuckLake catalog (a .ducklake file or metadata DB DSN). A non-file catalog uses a DSN, e.g. postgres:dbname=lake host=localhost - set Data path alongside it.' },
                     { key: 'dataPath', label: 'Data path', kind: 'text', placeholder: 's3://bucket/lake/ or data_files/', description: 'Where the lake stores its Parquet files. DuckLake requires this when the catalog is a sqlite:/postgres:/mysql: DSN and the lake does not exist yet; an existing lake reads its own stored path, so leave blank for a local .ducklake file.' },
+                    { key: 'metadataSchema', label: 'Catalog schema', kind: 'text', placeholder: 'ducklake_catalog', description: 'Schema the catalog tables live in (METADATA_SCHEMA). A Postgres or MySQL catalog usually shares its database with other things, so the lake keeps its tables in a schema of its own. Leave blank for the database default.' },
+                    { key: 'attachOptions', label: 'Catalog parameters', kind: 'key-value', description: 'Anything else the catalog takes, passed to ATTACH as written: META_SECRET to point at a stored secret instead of spelling a password into the path, and the other META_* parameters.' },
                 ],
             },
             {
@@ -1481,6 +1485,8 @@ function synthLakehouseSource(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'path', label: 'Catalog path', kind: 'text', required: true, placeholder: '/var/lakes/catalog.duckdb', description: 'Path to the DuckLake catalog file (DuckDB-format).' },
                     { key: 'dataPath', label: 'Data path', kind: 'text', placeholder: 's3://bucket/lake/ or data_files/', description: 'Where the lake stores its Parquet files. DuckLake requires this when the catalog is a sqlite:/postgres:/mysql: DSN and the lake does not exist yet; an existing lake reads its own stored path, so leave blank for a local .ducklake file.' },
+                    { key: 'metadataSchema', label: 'Catalog schema', kind: 'text', placeholder: 'ducklake_catalog', description: 'Schema the catalog tables live in (METADATA_SCHEMA). A Postgres or MySQL catalog usually shares its database with other things, so the lake keeps its tables in a schema of its own. Leave blank for the database default.' },
+                    { key: 'attachOptions', label: 'Catalog parameters', kind: 'key-value', description: 'Anything else the catalog takes, passed to ATTACH as written: META_SECRET to point at a stored secret instead of spelling a password into the path, and the other META_* parameters.' },
                 ],
             },
             {
@@ -1524,6 +1530,8 @@ function synthLakehouseSink(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'path', label: 'Catalog path', kind: 'text', required: true, placeholder: '/var/lakes/catalog.duckdb' },
                     { key: 'dataPath', label: 'Data path', kind: 'text', placeholder: 's3://bucket/lake/ or data_files/', description: 'Where the lake stores its Parquet files. DuckLake requires this when the catalog is a sqlite:/postgres:/mysql: DSN and the lake does not exist yet; an existing lake reads its own stored path, so leave blank for a local .ducklake file.' },
+                    { key: 'metadataSchema', label: 'Catalog schema', kind: 'text', placeholder: 'ducklake_catalog', description: 'Schema the catalog tables live in (METADATA_SCHEMA). A Postgres or MySQL catalog usually shares its database with other things, so the lake keeps its tables in a schema of its own. Leave blank for the database default.' },
+                    { key: 'attachOptions', label: 'Catalog parameters', kind: 'key-value', description: 'Anything else the catalog takes, passed to ATTACH as written: META_SECRET to point at a stored secret instead of spelling a password into the path, and the other META_* parameters.' },
                 ],
             },
             {

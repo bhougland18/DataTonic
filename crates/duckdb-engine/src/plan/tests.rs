@@ -2432,6 +2432,53 @@
     }
 
     #[test]
+    fn ducklake_attach_carries_the_catalog_options_a_lake_needs() {
+        // A Postgres-catalogued lake usually shares the database with other things, so
+        // the catalog tables live in a schema of their own - and the schema is named by
+        // METADATA_SCHEMA, which no property could reach. Nor could META_* parameters,
+        // which is how a catalog is pointed at a stored secret instead of a DSN with a
+        // password in it. Neither had a way through, so those lakes could not be attached
+        // at all.
+        use crate::plan::builders::ducklake_attach;
+        let pg = ducklake_attach(
+            &serde_json::json!({
+                "path": "postgres:dbname=lake host=localhost",
+                "dataPath": "s3://bucket/lake/",
+                "metadataSchema": "ducklake_catalog",
+                "attachOptions": [{ "key": "META_SECRET", "value": "postgres_secret" }]
+            }),
+            true,
+        );
+        assert!(pg.contains("METADATA_SCHEMA 'ducklake_catalog'"), "{pg}");
+        assert!(pg.contains("META_SECRET 'postgres_secret'"), "{pg}");
+
+        // A value with a quote in it is escaped, not passed through to end the string.
+        let odd = ducklake_attach(
+            &serde_json::json!({ "path": "postgres:dbname=l", "metadataSchema": "it's" }),
+            false,
+        );
+        assert!(odd.contains("METADATA_SCHEMA 'it''s'"), "{odd}");
+
+        // An option name is not a place to put SQL, so only a plain name is taken.
+        let bad = ducklake_attach(
+            &serde_json::json!({
+                "path": "postgres:dbname=l",
+                "attachOptions": [{ "key": "X'); DROP TABLE t; --", "value": "v" }]
+            }),
+            false,
+        );
+        assert!(!bad.contains("DROP TABLE"), "{bad}");
+
+        // Saying none of it reproduces the previous output exactly.
+        let plain = ducklake_attach(&serde_json::json!({ "path": "/lakes/a.ducklake" }), true);
+        assert_eq!(
+            plain,
+            "INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:/lakes/a.ducklake' \
+             AS duckle_src (READ_ONLY); "
+        );
+    }
+
+    #[test]
     fn ducklake_attach_emits_data_path_only_when_set() {
         // A postgres:/sqlite:/mysql: catalog carries no implied data location,
         // so DuckLake needs DATA_PATH. Omitting the property must reproduce the

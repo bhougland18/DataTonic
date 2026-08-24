@@ -5992,6 +5992,26 @@ pub(crate) fn ducklake_attach(props: &JsonValue, read_only: bool) -> String {
     if let Some(dp) = string_prop(props, "dataPath").filter(|s| !s.trim().is_empty()) {
         opts.push(format!("DATA_PATH '{}'", sql_escape(dp.trim())));
     }
+    // A Postgres-catalogued lake usually shares its database with other things, so the
+    // catalog tables live in a schema of their own. That schema is named by
+    // METADATA_SCHEMA and there was no way to reach it, so such a lake could not be
+    // attached at all.
+    if let Some(ms) = string_prop(props, "metadataSchema").filter(|s| !s.trim().is_empty()) {
+        opts.push(format!("METADATA_SCHEMA '{}'", sql_escape(ms.trim())));
+    }
+    // Anything else the catalog takes, as written: `META_SECRET` to point at a stored
+    // secret instead of spelling a password into the path, `META_*` for the rest. The
+    // NAME is checked rather than escaped - an option name is not a place to put SQL,
+    // and a name that is not a plain word is left out rather than quoted into one.
+    for (k, v) in kv_pairs(props, "attachOptions") {
+        let (k, v) = (k.trim(), v.trim());
+        let plain = !k.is_empty()
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !k.chars().next().is_some_and(|c| c.is_ascii_digit());
+        if plain && !v.is_empty() {
+            opts.push(format!("{} '{}'", k.to_uppercase(), sql_escape(v)));
+        }
+    }
     let tail = if opts.is_empty() {
         String::new()
     } else {

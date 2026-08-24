@@ -888,7 +888,7 @@ Duckle is not a CSV tool with extras. It reads a broad set of formats and source
 | **Geospatial files** | GeoJSON, Shapefile, GeoPackage, KML, GPX, GML via the `spatial` extension | Available (lazy-loaded) |
 | **File Geodatabase** | Esri File Geodatabase (`.gdb`) feature classes via `ST_Read` with a per-layer selector | Available (lazy-loaded) |
 | **Hugging Face** | Hugging Face Hub datasets over `hf://` (Parquet / CSV / JSON, globs, revisions); token for private or gated datasets | Available |
-| **Lakehouse table formats** | Apache Iceberg, Delta Lake, DuckLake | Available |
+| **Lakehouse table formats** | Apache Iceberg, Delta Lake, DuckLake (catalog in a local file or a `postgres:` / `mysql:` / `sqlite:` DSN, with the catalog schema and `META_*` parameters - including `META_SECRET` - settable on the node) | Available |
 | **Embedded databases** | SQLite (read tables), DuckDB (read tables or run a query) | Available |
 | **Network relational DBs** | PostgreSQL, MySQL, MariaDB, CockroachDB | Available (live CI for PG + MySQL) |
 | **Network relational DBs** | SQL Server (TDS), Oracle (Instant Client at runtime), ClickHouse (HTTP API) | Available |
