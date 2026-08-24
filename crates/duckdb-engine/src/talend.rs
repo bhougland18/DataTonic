@@ -2245,7 +2245,11 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes, ports: &PortMap) -> Option<Str
     // A value the loop put aside, used inside a larger expression rather than standing
     // alone. Alone it is handled where settings are; here it is one operand among others.
     if let Some(column) = loop_row_column(e) {
-        return Some(format!("${{ITER_ITEM_{}}}", column.to_uppercase()));
+        // Quoted, because here it is an operand in SQL and what the loop puts in its
+        // place is text. Left bare, `right(FILE_NAME_AS_TEXT, 5)` reads the filled-in
+        // name as the name of a COLUMN and the step fails to bind. Standing alone in a
+        // path or a file name it is not quoted, and that is handled where settings are.
+        return Some(format!("'${{ITER_ITEM_{}}}'", column.to_uppercase()));
     }
     // Dates. The tool writes its formats the Java way and SQL writes them another, so the
     // format is translated too rather than passed through to mean something else.
@@ -6411,9 +6415,12 @@ mod tests {
         let sql = |e: &str| java_expr_to_sql(e, &types, &Default::default());
 
         // A value the loop put aside, used inside a larger expression rather than alone.
+        // It is QUOTED here: the loop fills the name in as text before the run, and left
+        // bare the step reads that text as the name of a column and fails to bind. Alone,
+        // in a path or a file name, it is not quoted - that is handled where settings are.
         assert_eq!(
             sql(r#"StringHandling.RIGHT(((String)globalMap.get("out1.File_Name")),5)"#).as_deref(),
-            Some("right(${ITER_ITEM_FILE_NAME}, 5)")
+            Some("right('${ITER_ITEM_FILE_NAME}', 5)")
         );
         // Wrapping a number in an exact decimal is a change of type, not of value, so it
         // reads whenever what it wraps does.
