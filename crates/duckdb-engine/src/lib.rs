@@ -5027,11 +5027,42 @@ pub(crate) fn secret_statement(
         "gcs" => {
             let key = get("accessKey")?;
             let sec = get("secretKey")?;
+            let mut parts = vec![
+                "TYPE GCS".to_string(),
+                format!("KEY_ID '{}'", sql_escape(key)),
+                format!("SECRET '{}'", sql_escape(sec)),
+            ];
+            // A regional bucket has to be asked for in its own region. The form takes
+            // one and it was not put into the secret, so the request went out with no
+            // region and the store answered 404 for a bucket that is there.
+            //
+            // Only when given: a bucket that never needed one keeps working as before,
+            // and a blank is the same as not given - an empty region is the thing that
+            // was wrong in the first place.
+            if let Some(r) = get("region").map(str::trim).filter(|s| !s.is_empty()) {
+                parts.push(format!("REGION '{}'", sql_escape(r)));
+            }
+            // The rest of what the form already asks for, and none of which was reaching
+            // the secret either: an interoperability or private endpoint, the path/vhost
+            // style that goes with one, whether to use TLS, and a temporary token. DuckDB
+            // takes all of them on a GCS secret exactly as it does on an S3 one.
+            if let Some(e) = get("endpoint").map(str::trim).filter(|s| !s.is_empty()) {
+                parts.push(format!("ENDPOINT '{}'", sql_escape(e)));
+            }
+            if let Some(u) = get("urlStyle").map(str::trim).filter(|s| !s.is_empty()) {
+                parts.push(format!("URL_STYLE '{}'", sql_escape(u)));
+            }
+            if let Some(t) = get("sessionToken").map(str::trim).filter(|s| !s.is_empty()) {
+                parts.push(format!("SESSION_TOKEN '{}'", sql_escape(t)));
+            }
+            if let Some(v) = get("useSsl").map(str::trim).filter(|s| !s.is_empty()) {
+                // A bool literal, not a string - the same as the S3 secret takes.
+                parts.push(format!("USE_SSL {}", v));
+            }
             Some(format!(
-                "CREATE OR REPLACE SECRET secret_{} (TYPE GCS, KEY_ID '{}', SECRET '{}');",
+                "CREATE OR REPLACE SECRET secret_{} ({});",
                 sane,
-                sql_escape(key),
-                sql_escape(sec)
+                parts.join(", ")
             ))
         }
         "azureblob" => {
@@ -6006,6 +6037,63 @@ mod sql_literal_tests {
         for d in [Dialect::Oracle, Dialect::SqlServer, Dialect::Cassandra, Dialect::JsonNative] {
             assert_eq!(sql_literal(&json!("O'Brien"), None, d), "'O''Brien'");
         }
+    }
+}
+
+#[cfg(test)]
+mod cloud_secret_tests {
+    use super::secret_statement;
+
+    #[test]
+    fn a_gcs_bucket_keeps_the_region_it_was_given() {
+        // A regional bucket has to be asked for in its own region. The form takes one
+        // and it was never put into the secret, so the request went out with no region
+        // at all and the store answered 404 for a bucket that is there - and the error
+        // said region '', which is the only reason it was findable.
+        let with = secret_statement(
+            "gcs",
+            "src_gcs_1",
+            &serde_json::json!({ "accessKey": "k", "secretKey": "s", "region": "europe-west4" }),
+        )
+        .expect("a key and a secret are enough to make one");
+        assert!(with.contains("REGION 'europe-west4'"), "got: {with}");
+
+        // Everything else the form asks for reaches the secret too - it was all being
+        // dropped, region was just the one that named itself in the error.
+        let full = secret_statement(
+            "gcs",
+            "src_gcs_1",
+            &serde_json::json!({
+                "accessKey": "k", "secretKey": "s", "region": "europe-west4",
+                "endpoint": "storage.googleapis.com", "urlStyle": "path",
+                "sessionToken": "tok", "useSsl": "true"
+            }),
+        )
+        .expect("makes one");
+        assert!(full.contains("ENDPOINT 'storage.googleapis.com'"), "got: {full}");
+        assert!(full.contains("URL_STYLE 'path'"), "got: {full}");
+        assert!(full.contains("SESSION_TOKEN 'tok'"), "got: {full}");
+        assert!(full.contains("USE_SSL true"), "a bool, not a string: {full}");
+
+        // Not given, nothing is said about it - so a bucket that never needed one keeps
+        // working exactly as before.
+        let without = secret_statement(
+            "gcs",
+            "src_gcs_1",
+            &serde_json::json!({ "accessKey": "k", "secretKey": "s" }),
+        )
+        .expect("still makes one");
+        assert!(!without.contains("REGION"), "got: {without}");
+
+        // Blank is the same as not given: an empty region is what the store complained
+        // about in the first place.
+        let blank = secret_statement(
+            "gcs",
+            "src_gcs_1",
+            &serde_json::json!({ "accessKey": "k", "secretKey": "s", "region": "" }),
+        )
+        .expect("still makes one");
+        assert!(!blank.contains("REGION"), "got: {blank}");
     }
 }
 
