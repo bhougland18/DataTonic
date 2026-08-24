@@ -5089,18 +5089,73 @@ pub(crate) fn build_json_source(props: &JsonValue) -> String {
                 .map(|seg| quote_ident(seg.trim()))
                 .collect::<Vec<_>>()
                 .join(".");
+            // Flattening is a SETTING, and it was not read: the records branch always
+            // walked all the way down, so the only way to keep a nested object whole was
+            // to override the generated SQL. Unset it still flattens, so nothing that was
+            // saved before changes under anyone.
+            let flatten = props
+                .get("flatten")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true);
+            // A document whose objects each carry an `Id` flattens to Id, Id_1, Id_2 -
+            // names that say nothing about which object they came from. Keeping the
+            // parent gives Id, owner.Id, account.Id instead. Off unless asked, because
+            // it changes every nested column name.
+            let keep_parents = props
+                .get("keepParentNames")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            if !flatten {
+                // Records out as rows and their own keys as columns, with anything
+                // nested inside them left whole. Unnesting the list on its own would
+                // hand back a single struct column named after the expression, which is
+                // not a table anyone can use.
+                return format!(
+                    "SELECT unnest(r) FROM (SELECT unnest({}) AS r FROM read_json_auto('{}', maximum_object_size=104857600{}))",
+                    accessor,
+                    sql_escape(&path),
+                    extra
+                );
+            }
+            let parents = if keep_parents { ", keep_parent_names := true" } else { "" };
             format!(
-                "SELECT unnest({}, recursive := true) FROM read_json_auto('{}', maximum_object_size=104857600{})",
+                "SELECT unnest({}, recursive := true{}) FROM read_json_auto('{}', maximum_object_size=104857600{})",
                 accessor,
+                parents,
                 sql_escape(&path),
                 extra
             )
         }
-        None => format!(
-            "SELECT * FROM read_json_auto('{}', maximum_object_size=104857600{})",
-            sql_escape(&path),
-            extra
-        ),
+        None => {
+            // With no records path there was no flattening step at all, so the setting
+            // could not do anything here even once it was read. Asked for, the row itself
+            // is flattened. NOT asked for is the default, so the read is unchanged for
+            // everything saved before - which is also why the default differs from the
+            // records branch, where the unnest is what pulls the records out and has
+            // always flattened.
+            let flatten = props
+                .get("flatten")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            if !flatten {
+                return format!(
+                    "SELECT * FROM read_json_auto('{}', maximum_object_size=104857600{})",
+                    sql_escape(&path),
+                    extra
+                );
+            }
+            let keep = props
+                .get("keepParentNames")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let parents = if keep { ", keep_parent_names := true" } else { "" };
+            format!(
+                "SELECT unnest(t, recursive := true{}) FROM read_json_auto('{}', maximum_object_size=104857600{}) t",
+                parents,
+                sql_escape(&path),
+                extra
+            )
+        }
     }
 }
 

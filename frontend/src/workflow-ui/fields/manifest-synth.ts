@@ -1302,7 +1302,8 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                             { label: 'Single object', value: 'object' },
                         ],
                     },
-                    { key: 'flatten', label: 'Flatten nested objects', kind: 'bool', defaultValue: false },
+                    { key: 'flatten', label: 'Flatten nested objects', kind: 'bool', defaultValue: false, description: 'Expand nested objects into their own columns. With a records path set, the records are always expanded and this controls whether nesting inside them is expanded too (on unless you turn it off).' },
+                    { key: 'keepParentNames', label: 'Keep parent names', kind: 'bool', defaultValue: false, description: 'Name a flattened column after the object it came from: owner.Id and account.Id rather than Id_1 and Id_2. Useful when the same key repeats at several levels.' },
                     {
                         key: 'recordsPath',
                         label: 'Records path',

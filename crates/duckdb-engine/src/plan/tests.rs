@@ -2140,6 +2140,57 @@
     }
 
     #[test]
+    fn json_flatten_is_a_setting_and_repeated_keys_can_keep_their_parent() {
+        // #238. Two things, reported together.
+        //
+        // "Flatten nested objects" did nothing: the records branch always flattened all
+        // the way down and nothing ever read the setting, so the only way to stop it was
+        // to override the generated SQL.
+        let off = build_json_source(&serde_json::json!({
+            "path": "d.json", "recordsPath": "data", "flatten": false
+        }));
+        assert!(!off.contains("recursive"), "not asked for, not done: {off}");
+        // Still a usable table: the records are rows and their own keys are columns,
+        // with what is nested inside them left whole. Unnesting the list alone gives one
+        // struct column named after the expression, which is not a table.
+        assert!(off.contains("SELECT unnest(r) FROM (SELECT unnest("), "got: {off}");
+        let on = build_json_source(&serde_json::json!({
+            "path": "d.json", "recordsPath": "data", "flatten": true
+        }));
+        assert!(on.contains("recursive := true"), "got: {on}");
+        // Unset stays as it was, so saved pipelines do not change under anyone.
+        let unset = build_json_source(&serde_json::json!({
+            "path": "d.json", "recordsPath": "data"
+        }));
+        assert!(unset.contains("recursive := true"), "got: {unset}");
+
+        // And a document whose objects each carry an Id flattened to Id, Id_1, Id_2 -
+        // names that say nothing about where they came from. Keeping the parent gives
+        // Id, owner.Id, account.Id.
+        let kept = build_json_source(&serde_json::json!({
+            "path": "d.json", "recordsPath": "data", "keepParentNames": true
+        }));
+        assert!(kept.contains("keep_parent_names := true"), "got: {kept}");
+        assert!(!unset.contains("keep_parent_names"), "off unless asked: {unset}");
+
+        // With no records path there was no flattening step at all, so ticking the box
+        // did nothing whatever - which is the half of the report that reads as "the
+        // setting has no effect". Asked for, the whole row is flattened.
+        let whole = build_json_source(&serde_json::json!({
+            "path": "d.json", "flatten": true, "keepParentNames": true
+        }));
+        assert!(whole.contains("unnest("), "got: {whole}");
+        assert!(whole.contains("recursive := true"), "got: {whole}");
+        assert!(whole.contains("keep_parent_names := true"), "got: {whole}");
+        // Not asked for, the read is exactly what it was.
+        let flat_off = build_json_source(&serde_json::json!({ "path": "d.json" }));
+        assert_eq!(
+            flat_off,
+            "SELECT * FROM read_json_auto('d.json', maximum_object_size=104857600)"
+        );
+    }
+
+    #[test]
     fn json_ignore_errors_and_format() {
         // #101: skip malformed records instead of aborting + wire the Format dropdown.
         let sql = build_json_source(&serde_json::json!({
