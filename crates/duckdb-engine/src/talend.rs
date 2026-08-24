@@ -2492,11 +2492,21 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes, ports: &PortMap) -> Option<Str
         if args.len() != 1 {
             return None;
         }
-        return Some(format!(
-            "{} {op} {}",
+        let (left, right) = (
             numeric_operand(recv, types, ports)?,
-            numeric_operand(args[0], types, ports)?
-        ));
+            numeric_operand(args[0], types, ports)?,
+        );
+        // A file leaves a charge blank when there is none, and adding a blank as UNKNOWN
+        // makes the whole total unknown - one blank in a chain of five and the total is
+        // gone, which is the figure that gets loaded. Counted as nothing, the total comes
+        // out as the job it came from produces it.
+        //
+        // Multiplying is left alone: a blank there is not a nought, and saying it is
+        // would turn a product into zero rather than leaving it unanswered.
+        if op == "*" {
+            return Some(format!("{left} {op} {right}"));
+        }
+        return Some(format!("COALESCE({left}, 0) {op} COALESCE({right}, 0)"));
     }
     if let Some(arg) = single_arg(e, "String.valueOf") {
         return Some(format!("CAST({} AS VARCHAR)", java_expr_to_sql(arg, types, ports)?));
@@ -2570,6 +2580,20 @@ fn java_expr_to_sql(expr: &str, types: &ColTypes, ports: &PortMap) -> Option<Str
     })
 }
 
+/// Whether a piece of SQL is just a column being named: `COL`, `main.COL`, `"COL"`.
+fn is_plain_reference(sql: &str) -> bool {
+    let s = sql.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let part = s.rsplit_once('.').map(|(_, c)| c).unwrap_or(s);
+    let part = part.trim_matches('"');
+    !part.is_empty()
+        && !part.eq_ignore_ascii_case("NULL")
+        && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !part.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
 /// An output as the type the mapper says it is.
 ///
 /// A delimited file arrives as text, so a column passed straight through arrives as text
@@ -2606,6 +2630,14 @@ fn as_declared(sql: &str, declared: &str, width: Option<(u32, u32)>) -> String {
     };
     // Already said, or a literal that needs no saying.
     if sql.contains(&format!("AS {ty})")) || is_number(sql) {
+        return sql.to_string();
+    }
+    // A column passed straight through is left exactly as it is. A file arrives as text
+    // and leaves as text, arithmetic casts its own operands where it happens, and
+    // retyping here only destroys whatever will not parse - on a real file the later
+    // record types carry a different layout, so a place name sits in a column the first
+    // layout calls a charge, and casting turns it into NULL for good.
+    if is_plain_reference(sql) {
         return sql.to_string();
     }
     format!("TRY_CAST({sql} AS {ty})")
@@ -4913,11 +4945,16 @@ mod tests {
             sql(r#"m.d.equals("1")?"I":m.d.equals("2")?"O":"P""#).as_deref(),
             Some("CASE WHEN d = '1' THEN 'I' ELSE CASE WHEN d = '2' THEN 'O' ELSE 'P' END END")
         );
-        // subtract, and a choice nested inside one
-        assert_eq!(sql("row6.A.subtract(row6.B)").as_deref(), Some("(A) - (B)"));
+        // subtract, and a choice nested inside one. A missing side counts as nothing:
+        // a file leaves a charge blank when there is none, and treating that as UNKNOWN
+        // loses the whole total rather than the one charge.
+        assert_eq!(
+            sql("row6.A.subtract(row6.B)").as_deref(),
+            Some("COALESCE((A), 0) - COALESCE((B), 0)")
+        );
         assert_eq!(
             sql(r#"row6.T.subtract(row6.PCT.compareTo(new BigDecimal("100")) == 0 ? row6.A : row6.B)"#).as_deref(),
-            Some("(T) - (CASE WHEN PCT = 100 THEN A ELSE B END)")
+            Some("COALESCE((T), 0) - COALESCE((CASE WHEN PCT = 100 THEN A ELSE B END), 0)")
         );
         assert_eq!(
             sql("String.valueOf(row6.A)").as_deref(),
@@ -6130,6 +6167,62 @@ mod tests {
     }
 
     #[test]
+    fn adding_up_charges_counts_a_missing_one_as_nothing() {
+        // A file leaves a charge blank when there is none. Adding a blank as UNKNOWN
+        // makes the whole total unknown, so a row with five blank charges came out with
+        // no total at all where the job it came from totals them to zero. One blank
+        // charge is enough to lose the total, and the total is what gets loaded.
+        //
+        // Multiplying is left alone: a blank there is not a nought, and pretending it is
+        // would turn a product into zero rather than leaving it unanswered.
+        let mut types = ColTypes::new();
+        types.insert("A".into(), "id_BigDecimal".into());
+        types.insert("B".into(), "id_BigDecimal".into());
+        let sql = |e: &str| java_expr_to_sql(e, &types, &Default::default());
+        let added = sql("row1.A.add(row1.B)").unwrap();
+        assert!(added.starts_with("COALESCE("), "got: {added}");
+        assert_eq!(added.matches("COALESCE(").count(), 2, "both sides: {added}");
+        assert!(added.contains(" + "), "got: {added}");
+
+        let taken = sql("row1.A.subtract(row1.B)").unwrap();
+        assert_eq!(taken.matches("COALESCE(").count(), 2, "both sides: {taken}");
+
+        let times = sql("row1.A.multiply(row1.B)").unwrap();
+        assert!(!times.contains("COALESCE("), "a blank is not a nought here: {times}");
+    }
+
+    #[test]
+    fn a_column_passed_straight_through_is_not_retyped() {
+        // A file arrives as text and leaves as text. Retyping a column on the way through
+        // does not help anything - arithmetic casts its own operands where it happens -
+        // and it destroys whatever will not parse. On a real file the later record types
+        // carry a different layout, so a place name sits in a column the first layout
+        // calls a charge: cast, it becomes NULL and the value is gone for good.
+        //
+        // A value the mapper COMPUTES is different: there the declared type is the only
+        // thing that says what the result should be.
+        let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
+          <node componentName="tFileInputDelimited" posX="10" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="in_1"/>
+            <elementParameter name="FILENAME" value="&quot;/data/in.csv&quot;"/>
+          </node>
+          <node componentName="tMap" posX="120" posY="10">
+            <elementParameter name="UNIQUE_NAME" value="m_1"/>
+            <outputTables name="out1">
+              <mapperTableEntries name="THROUGH" expression="row1.CHARGE" type="id_BigDecimal"/>
+              <mapperTableEntries name="COMPUTED" expression="row1.A.add(row1.B)" type="id_BigDecimal"/>
+            </outputTables>
+          </node>
+          <connection connectorName="FLOW" source="in_1" target="m_1"/>
+        </talendfile:ProcessType>"#;
+        let im = import_item(xml, "j").unwrap();
+        let p = im.nodes.iter().find(|n| n.id == "m_1").unwrap().data.properties.as_ref().unwrap();
+        let ex = |c: &str| p["expressions"][c].as_str().unwrap_or("").to_string();
+        assert_eq!(ex("THROUGH"), "CHARGE", "passed through untouched, got: {}", ex("THROUGH"));
+        assert!(ex("COMPUTED").contains("DECIMAL"), "a computed value keeps its type: {}", ex("COMPUTED"));
+    }
+
+    #[test]
     fn a_decimal_keeps_the_scale_its_schema_declares() {
         // A settlement rate is declared with 9 decimal places. Given a fixed scale of 4
         // instead, every rate is silently ROUNDED on the way through - 1.106872543
@@ -6148,9 +6241,9 @@ mod tests {
               <column name="PLAIN" type="id_BigDecimal" nullable="true"/>
             </metadata>
             <outputTables name="out1">
-              <mapperTableEntries name="RATE" expression="row1.RATE" type="id_BigDecimal"/>
-              <mapperTableEntries name="AMOUNT" expression="row1.AMOUNT" type="id_BigDecimal"/>
-              <mapperTableEntries name="PLAIN" expression="row1.PLAIN" type="id_BigDecimal"/>
+              <mapperTableEntries name="RATE" expression="row1.RATE.add(row1.RATE)" type="id_BigDecimal"/>
+              <mapperTableEntries name="AMOUNT" expression="row1.AMOUNT.add(row1.AMOUNT)" type="id_BigDecimal"/>
+              <mapperTableEntries name="PLAIN" expression="row1.PLAIN.add(row1.PLAIN)" type="id_BigDecimal"/>
             </outputTables>
           </node>
           <connection connectorName="FLOW" source="in_1" target="m_1"/>
@@ -6672,9 +6765,16 @@ mod tests {
     #[test]
     fn a_mapper_output_carries_the_type_its_schema_declares() {
         // A delimited file arrives as text, so a column passed straight through a mapper
-        // arrives as text too - and the next step that multiplies it has a number on one
-        // side and text on the other. The mapper says what each output is, so it says so
-        // in the SQL rather than leaving every later step to work it out again.
+        // arrives as text too, and the next step that multiplies it has a number on one
+        // side and text on the other. That is fixed WHERE THE ARITHMETIC IS - every
+        // operand a mapper multiplies is cast there, from the same declared types - and
+        // not by retyping the column on its way through.
+        //
+        // Retyping on the way through looked equivalent and is not: it destroys whatever
+        // does not parse. A real file carries a different layout for its later record
+        // types, so a place name sits in a column the first layout calls a charge, and
+        // the cast turned it into NULL for good. Only a COMPUTED value is typed here,
+        // where the declared type is the one thing that says what the result should be.
         let xml = r#"<talendfile:ProcessType xmlns:talendfile="x">
           <node componentName="tFileInputDelimited" posX="10" posY="10">
             <elementParameter name="UNIQUE_NAME" value="in_1"/>
@@ -6693,8 +6793,8 @@ mod tests {
         let im = import_item(xml, "j").unwrap();
         let ex = &im.nodes.iter().find(|n| n.id == "m_1").unwrap()
             .data.properties.as_ref().unwrap()["expressions"];
-        assert_eq!(ex["RATE"].as_str(), Some("TRY_CAST(RATE AS DECIMAL(38,4))"));
-        assert_eq!(ex["COUNT"].as_str(), Some("TRY_CAST(C AS BIGINT)"));
+        assert_eq!(ex["RATE"].as_str(), Some("RATE"), "passed through, not retyped");
+        assert_eq!(ex["COUNT"].as_str(), Some("C"), "passed through, not retyped");
         assert_eq!(ex["NAME"].as_str(), Some("NAME"), "text is left as it is");
     }
 
