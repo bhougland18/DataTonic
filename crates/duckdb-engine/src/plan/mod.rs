@@ -4333,6 +4333,10 @@ fn build_stage(
             .unwrap_or_else(|| "/data".into());
         rest_source = Some(RestSourceSpec {
             node_id: node.id.clone(),
+            response_metadata: props
+                .get("responseMetadata")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
             url,
             method: "POST".into(),
             headers,
@@ -4568,6 +4572,10 @@ fn build_stage(
             .unwrap_or(100);
         rest_source = Some(RestSourceSpec {
             node_id: node.id.clone(),
+            response_metadata: props
+                .get("responseMetadata")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
             url,
             method,
             headers,

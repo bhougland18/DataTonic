@@ -1467,6 +1467,13 @@ pub struct RestSourceSpec {
     pub pagination: RestPagination,
     /// Hard cap on pages fetched (safety net against runaway loops).
     pub max_pages: u64,
+    /// Stamp each row with where it came from: the exact URL, the status the
+    /// server answered with, and when it was fetched.
+    ///
+    /// Parsed rows on their own cannot answer "did this change because the
+    /// source changed or because the parser did", and an API that quietly
+    /// starts paginating differently looks identical downstream.
+    pub response_metadata: bool,
     /// #166: when set (src.salesforce with OAuth client-credentials auth), the
     /// runner mints a fresh access token per run and injects
     /// `Authorization: Bearer <token>` before the request loop, overriding any

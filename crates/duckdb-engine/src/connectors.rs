@@ -10373,6 +10373,10 @@ impl DuckdbEngine {
             };
             // Capture Link header before consuming the response body.
             let link_header = response_raw.header("link").map(String::from);
+            // The same, for provenance: once the body is read the response is gone, so
+            // what answered and with what has to be taken here or not at all.
+            let page_status = response_raw.status();
+            let page_url = url.clone();
             // For XML, parse as text + walk row_path; pagination is
             // not meaningful (SOAP has no cross-envelope convention)
             // so we treat the JSON-pointer/cursor variants as no-ops
@@ -10414,6 +10418,28 @@ impl DuckdbEngine {
                 }
             };
             let row_count = rows.len();
+            // Stamp each row with where it came from. Underscore-prefixed, matching the
+            // audit stamp the rest of the tool writes, and only on a row that is an
+            // object - a scalar row has nowhere to put it.
+            let rows = match spec.response_metadata {
+                false => rows,
+                true => {
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    rows.into_iter()
+                        .map(|mut r| {
+                            if let Some(o) = r.as_object_mut() {
+                                o.insert("_http_url".into(), JsonValue::from(page_url.clone()));
+                                o.insert("_http_status".into(), JsonValue::from(page_status));
+                                o.insert("_fetched_at".into(), JsonValue::from(at));
+                            }
+                            r
+                        })
+                        .collect()
+                }
+            };
             all_rows.extend(rows);
             pages += 1;
             // Determine whether another page exists (and set up the next

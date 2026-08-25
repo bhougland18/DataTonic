@@ -3042,6 +3042,7 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                     kind: 'integer',
                     defaultValue: 100,
                 },
+                    { key: 'responseMetadata', label: 'Add response metadata', kind: 'bool', defaultValue: false, description: 'Stamp every row with where it came from: _http_url (the exact URL fetched, per page), _http_status and _fetched_at. Parsed rows alone cannot tell you whether something changed because the source changed or because the parser did.' },
             ],
         },
     ]);
