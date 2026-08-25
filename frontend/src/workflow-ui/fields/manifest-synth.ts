@@ -5004,6 +5004,19 @@ function synthPipelineControl(comp: ComponentDef): ComponentManifest {
             },
         ], 'upstream');
     }
+    if (comp.id === 'src.artifact') {
+        return base(comp, [
+            {
+                label: 'Artifacts',
+                fields: [
+                    { key: 'path', label: 'Folder or file', kind: 'file-path', required: true, description: 'A folder whose files you want described, or a single file.' },
+                    { key: 'glob', label: 'Pattern', kind: 'text', placeholder: '*.pdf', description: 'Which files to include. Everything, if left blank.' },
+                    { key: 'recursive', label: 'Include sub-folders', kind: 'bool', defaultValue: false },
+                    { key: 'hash', label: 'Compute sha256', kind: 'bool', defaultValue: false, description: 'Off by default because it reads every byte of every file, which is the one thing you do not want to do to a large model binary. Turn it on when you want a content hash for reproducibility or change detection.' },
+                ],
+            },
+        ], 'declared');
+    }
     if (comp.id === 'ctl.setvar') {
         return base(comp, [
             {

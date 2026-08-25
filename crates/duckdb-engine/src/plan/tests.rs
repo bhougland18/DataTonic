@@ -2140,6 +2140,37 @@
     }
 
     #[test]
+    fn an_artifact_is_described_without_reading_it() {
+        // #247. An artifact is a REFERENCE - uri, media type, size, hash - which is a
+        // ROW, so it travels through the joins, filters and loops that already exist
+        // rather than needing an edge type of its own.
+        use crate::plan::builders::build_artifact_source;
+
+        let plain = build_artifact_source(&serde_json::json!({ "path": "/docs", "glob": "*.pdf" }));
+        assert!(plain.contains("read_blob("), "got: {plain}");
+        assert!(plain.contains("/docs/*.pdf"), "got: {plain}");
+        assert!(plain.contains("AS uri"), "got: {plain}");
+        assert!(plain.contains("AS media_type"), "got: {plain}");
+        assert!(plain.contains("AS size_bytes"), "got: {plain}");
+        // Hashing reads every byte, which is what the issue says NOT to do to a large
+        // model file, so it is off until asked for - the column is still there so the
+        // shape does not change under anything downstream.
+        assert!(plain.contains("CAST(NULL AS VARCHAR) AS sha256"), "got: {plain}");
+        assert!(!plain.contains("sha256(content)"), "got: {plain}");
+
+        let hashed = build_artifact_source(
+            &serde_json::json!({ "path": "/docs", "glob": "*.pdf", "hash": true }),
+        );
+        assert!(hashed.contains("sha256(content) AS sha256"), "got: {hashed}");
+
+        // Sub-folders only when asked.
+        let deep = build_artifact_source(
+            &serde_json::json!({ "path": "/docs", "glob": "*.pdf", "recursive": true }),
+        );
+        assert!(deep.contains("/docs/**/*.pdf"), "got: {deep}");
+    }
+
+    #[test]
     fn a_cached_stage_is_written_once_and_read_back_after() {
         // #252. Some stages are expensive and deterministic - a big download, an OCR
         // pass, an embedding run - and re-running them because something DOWNSTREAM

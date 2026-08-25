@@ -223,6 +223,7 @@ pub(crate) fn build_view_sql(
         "src.excel" => Ok(build_excel_source(props, declared)),
         "src.inline" => Ok(build_inline_source(props)),
         "src.filelist" => Ok(build_filelist_source(props)),
+        "src.artifact" => Ok(build_artifact_source(props)),
         "src.iceberg" => Ok(build_iceberg_source(props)),
         "src.delta" => Ok(build_delta_source(props)),
         "src.spatial" => Ok(build_spatial_source(props)),
@@ -8304,6 +8305,59 @@ pub(crate) fn build_inline_source(props: &JsonValue) -> String {
 ///
 /// The nearest thing before this was an FTP listing, so "process every file in
 /// this folder" - the most ordinary batch shape there is - had no local answer.
+/// src.artifact: one row per file, described the way a pipeline can reason about it.
+///
+/// #247 asks for artifacts - PDFs, images, model binaries, OCR output - to be first
+/// class alongside tables. The issue also says the right thing about how: an artifact is
+/// a REFERENCE, not the bytes. And a reference - uri, media type, size, hash - is a ROW.
+///
+/// So this is a source, not a new kind of edge. It emits the shape the issue proposes,
+/// which then flows through every join, filter, foreach and sink that already exists.
+/// A node handing back "a table and an artifact" is two output ports, which the engine
+/// has had since reject ports.
+///
+/// The hash is optional and off by default, because computing it reads every byte - the
+/// one thing the issue says not to do to a large model file. Ask for it when you want
+/// reproducibility and can pay for it.
+pub(crate) fn build_artifact_source(props: &JsonValue) -> String {
+    let path = string_prop(props, "path").unwrap_or_default();
+    let pattern = string_prop(props, "glob")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "*".into());
+    let recursive = props
+        .get("recursive")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let trimmed = path.trim_end_matches(['/', '\\']).to_string();
+    // A path naming one file is that file; a folder gets the pattern applied to it.
+    let target = if trimmed.is_empty() {
+        pattern.clone()
+    } else if std::path::Path::new(&trimmed).is_file() {
+        trimmed.clone()
+    } else if recursive {
+        format!("{trimmed}/**/{pattern}")
+    } else {
+        format!("{trimmed}/{pattern}")
+    };
+    let hash = props
+        .get("hash")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    // Named from the extension. Enough to route a pipeline - a PDF one way, an image
+    // another - without pretending to sniff content.
+    let media = r"CASE lower(regexp_extract(filename, '\.([A-Za-z0-9]+)$', 1)) WHEN 'pdf' THEN 'application/pdf' WHEN 'png' THEN 'image/png' WHEN 'jpg' THEN 'image/jpeg' WHEN 'jpeg' THEN 'image/jpeg' WHEN 'tif' THEN 'image/tiff' WHEN 'tiff' THEN 'image/tiff' WHEN 'zip' THEN 'application/zip' WHEN 'json' THEN 'application/json' WHEN 'xml' THEN 'application/xml' WHEN 'csv' THEN 'text/csv' WHEN 'txt' THEN 'text/plain' WHEN 'html' THEN 'text/html' WHEN 'htm' THEN 'text/html' WHEN 'parquet' THEN 'application/vnd.apache.parquet' ELSE 'application/octet-stream' END";
+    let sha = if hash {
+        "sha256(content) AS sha256"
+    } else {
+        "CAST(NULL AS VARCHAR) AS sha256"
+    };
+    format!(
+        "SELECT filename AS uri, parse_filename(filename) AS name, {media} AS media_type,          size AS size_bytes, {sha}, last_modified AS modified_at          FROM read_blob('{}')",
+        sql_escape(&target)
+    )
+}
+
 pub(crate) fn build_filelist_source(props: &JsonValue) -> String {
     // An explicit `path` is used verbatim, which makes the component double as
     // an existence test: pointed at one file it yields one row, or none. That
