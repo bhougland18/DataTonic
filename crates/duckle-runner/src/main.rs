@@ -30,6 +30,7 @@ use duckle_duckdb_engine::context;
 mod drift;
 mod import;
 mod manifest;
+mod pipetest;
 mod selfextract;
 mod work;
 mod serve;
@@ -42,6 +43,19 @@ USAGE:
     duckle-runner validate [<file.json> ...] [--json]
     duckle-runner quickstart [--force]
     duckle-runner mcp                      (stdio MCP server for AI agents)
+    duckle-runner test [<file.test.json> ...]
+
+TEST:
+    Run a pipeline against a fixed input and assert the rows out of one node.
+    validate catches what will not compile; this catches a transform that
+    compiles and computes the wrong thing.
+
+    A case names the node it asserts on, so the run STOPS there: nothing
+    downstream executes and no sink writes. `given` maps a source node id to
+    the text it should read, so the case exercises the real reader.
+
+    With no path, every *.test.json under ./tests. Exit 1 on a failed
+    assertion, the same code a failed run uses.
 
 EXIT CODES (stable, safe to gate CI on):
     0    success
@@ -1496,6 +1510,16 @@ fn main() -> ExitCode {
         };
     }
     // `mcp` -> hand off to the MCP server, so agents use `uvx duckle mcp`.
+    // `test` -> run pipelines against fixed inputs and assert what comes out.
+    if std::env::args().nth(1).as_deref() == Some("test") {
+        return match resolve_duckdb(None) {
+            Ok(d) => pipetest::run(d),
+            Err(e) => {
+                eprintln!("duckle-runner test: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if std::env::args().nth(1).as_deref() == Some("mcp") {
         return run_mcp();
     }
