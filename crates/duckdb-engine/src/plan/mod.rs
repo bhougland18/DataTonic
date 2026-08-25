@@ -371,6 +371,131 @@ pub struct CompiledPipeline {
 /// Sinks downstream of the target are dropped - the target becomes the
 /// new "leaf" whose preview the caller can fetch. Used by the
 /// "Run from here" right-click action.
+/// Where a cached stage keeps its answer.
+///
+/// Under the workspace so it is per-project and easy to delete: removing the folder is
+/// the whole of "clear the cache".
+pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
+    let ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.is_empty())?;
+    Some(std::path::Path::new(&ws).join(".duckle").join("duckle_cache"))
+}
+
+/// The key for a stage: what it computes, and what it reads.
+///
+/// The stage's own SQL carries its query and, for a file source, its path. Everything
+/// upstream is folded in through `from`, so a change anywhere above invalidates
+/// everything below it.
+///
+/// A local file also contributes its size and modified time, because the SQL names the
+/// path and says nothing about the contents. That is a cheap check rather than a hash of
+/// the file: hashing gigabytes on every run is the cost the cache exists to avoid.
+///
+/// NOT a cryptographic hash and not stable across builds. A collision serves stale data,
+/// which is why this is opt-in per node rather than something applied on anyone's behalf.
+fn cache_key(stage: &Stage, upstream: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    stage.sql.hash(&mut h);
+    upstream.hash(&mut h);
+    for path in read_paths(&stage.sql) {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            meta.len().hash(&mut h);
+            if let Ok(t) = meta.modified() {
+                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                    d.as_secs().hash(&mut h);
+                }
+            }
+        }
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// The local file paths a piece of SQL reads, so their state can go into the key.
+fn read_paths(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for piece in sql.split('\'').skip(1).step_by(2) {
+        if piece.contains('/') && !piece.contains('*') && std::path::Path::new(piece).is_file() {
+            out.push(piece.to_string());
+        }
+    }
+    out
+}
+
+/// Materialise the stages that asked to be cached, and read back the ones already done.
+///
+/// The stage keeps its own relation name either way, so nothing downstream can tell the
+/// difference between a fresh answer and a kept one.
+fn apply_stage_cache(doc: &PipelineDoc, stages: &mut [Stage]) {
+    let Some(dir) = cache_dir() else { return };
+    apply_stage_cache_in(doc, stages, &dir);
+}
+
+/// The part that does not look at the environment, so a test can drive it with a folder
+/// of its own instead of setting a variable every other test can see.
+pub(crate) fn apply_stage_cache_in(doc: &PipelineDoc, stages: &mut [Stage], dir: &std::path::Path) {
+    let wants: std::collections::BTreeSet<&str> = doc
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.data
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("cache"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false)
+        })
+        .map(|n| n.id.as_str())
+        .collect();
+    if wants.is_empty() {
+        return;
+    }
+    let mut keys: std::collections::BTreeMap<String, String> = Default::default();
+    for i in 0..stages.len() {
+        let key = cache_key(&stages[i], stages[i].from.as_deref().and_then(|f| keys.get(f)).map(|s| s.as_str()));
+        keys.insert(stages[i].node_id.clone(), key.clone());
+        // Only a plain SQL view is cached. A sink is a side effect and caching one would
+        // skip the write it exists to do; anything with a runtime hook is not a query.
+        if !wants.contains(stages[i].node_id.as_str())
+            || stages[i].kind != StageKind::View
+            || stages[i].runtime.is_some()
+            || stages[i].no_output_relation
+        {
+            continue;
+        }
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let safe: String = stages[i]
+            .node_id
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let file = dir.join(format!("{safe}-{key}.parquet")).to_string_lossy().replace('\\', "/");
+        let esc = file.replace('\'', "''");
+        let view = format!(
+            "CREATE OR REPLACE VIEW {} AS SELECT * FROM read_parquet('{}')",
+            quote_ident(&stages[i].node_id),
+            esc
+        );
+        stages[i].sql = if std::path::Path::new(&file).exists() {
+            view
+        } else {
+            // The node's own SQL builds its relation as usual, then the answer is written
+            // out and read back, so the SAME statement list both fills the cache and
+            // leaves the relation the rest of the plan expects.
+            format!(
+                "{};
+COPY (SELECT * FROM {}) TO '{}' (FORMAT PARQUET);
+{}",
+                stages[i].sql,
+                quote_ident(&stages[i].node_id),
+                esc,
+                view
+            )
+        };
+    }
+}
+
 pub fn compile_partial(
     pipeline: &PipelineDoc,
     target_id: &str,
@@ -993,6 +1118,8 @@ fn compile_impl(pipeline: &PipelineDoc, allow_view_upgrade: bool) -> Result<Comp
             }
         }
     }
+
+    apply_stage_cache(pipeline, &mut stages);
 
     Ok(CompiledPipeline { stages, leaves })
 }

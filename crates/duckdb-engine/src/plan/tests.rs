@@ -2140,6 +2140,81 @@
     }
 
     #[test]
+    fn a_cached_stage_is_written_once_and_read_back_after() {
+        // #252. Some stages are expensive and deterministic - a big download, an OCR
+        // pass, an embedding run - and re-running them because something DOWNSTREAM
+        // changed is the slowest part of working on a pipeline.
+        //
+        // Opt-in per node, deliberately. A cache that decides for itself when it is
+        // still valid and gets it wrong serves stale data and says nothing, which is
+        // worse than being slow.
+        let doc = |cache: &str| {
+            pipeline_from_json(&format!(
+                r#"{{
+                  "nodes": [
+                    {{"id":"s","position":{{"x":0,"y":0}},"data":{{
+                      "label":"CSV","componentId":"src.csv",
+                      "properties":{{"path":"/tmp/a.csv","hasHeader":true{cache}}}}}}},
+                    {{"id":"f","position":{{"x":0,"y":0}},"data":{{
+                      "label":"Filter","componentId":"xf.filter",
+                      "properties":{{"predicate":"amt > 1"}}}}}}
+                  ],
+                  "edges":[{{"id":"e","source":"s","target":"f","data":{{"connectionType":"main"}}}}]
+                }}"#
+            ))
+        };
+        // Driven with a folder of its own rather than an environment variable, so it
+        // neither depends on how the suite was launched nor disturbs anything else.
+        let tmp = tempfile::tempdir().unwrap();
+        let sql_of = |d: &super::PipelineDoc, id: &str| {
+            let mut stages = compile(d).unwrap().stages;
+            crate::plan::apply_stage_cache_in(d, &mut stages, tmp.path());
+            stages.into_iter().find(|s| s.node_id == id).unwrap().sql
+        };
+
+        // Not asked for, nothing changes at all.
+        let plain = sql_of(&doc(""), "s");
+        assert!(!plain.contains("COPY ("), "not asked for, nothing added: {plain}");
+
+        // Asked for: the stage writes its output once and reads it back, so the node
+        // still hands on a relation of the same name and nothing downstream can tell.
+        let cached = sql_of(&doc(r#","cache":true"#), "s");
+        assert!(cached.contains("COPY ("), "it has to materialise: {cached}");
+        assert!(
+            cached.contains("read_parquet("),
+            "and be read back so the node keeps its shape: {cached}"
+        );
+        assert!(
+            cached.contains("CREATE OR REPLACE VIEW \"s\""),
+            "the relation keeps the node's name: {cached}"
+        );
+
+        // The key follows the SQL: change what the stage computes and it must not read
+        // back the old answer.
+        let other = pipeline_from_json(
+            r#"{"nodes":[{"id":"s","position":{"x":0,"y":0},"data":{
+                 "label":"CSV","componentId":"src.csv",
+                 "properties":{"path":"/tmp/DIFFERENT.csv","hasHeader":true,"cache":true}}}],
+               "edges":[]}"#,
+        );
+        let a = cached;
+        let b = sql_of(&other, "s");
+        // the file name the stage writes to, which carries the key
+        let key = |s: &str| {
+            let head = s.split(".parquet").next().unwrap_or("");
+            head.rsplit('/').next().unwrap_or("").to_string()
+        };
+        assert_ne!(key(&a), key(&b), "a different read is a different key");
+
+        // And in a real workspace it lands somewhere obvious and easy to throw away:
+        // deleting the folder is the whole of "clear the cache".
+        std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+        let dir = crate::plan::cache_dir().expect("a workspace gives a cache folder");
+        std::env::remove_var("DUCKLE_WORKSPACE");
+        assert!(dir.ends_with(std::path::Path::new(".duckle").join("duckle_cache")), "{dir:?}");
+    }
+
+    #[test]
     fn a_check_told_to_fail_the_run_fails_the_run() {
         // Every quality check offers "On failure: reject / warn / fail". Only reject ever
         // happened - the setting was never read, so a gate configured to STOP a load let

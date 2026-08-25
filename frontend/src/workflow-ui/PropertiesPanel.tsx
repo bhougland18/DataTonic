@@ -26,6 +26,13 @@ type TabId = 'basic' | 'schema' | 'preview' | 'advanced' | 'validation';
 // surfaced so users can encode intent and avoid future churn).
 const ADVANCED_FIELDS: Field[] = [
     {
+        key: 'cache',
+        label: 'Reuse this stage’s output',
+        kind: 'bool',
+        defaultValue: false,
+        description: 'Write this stage’s rows once and read them back on later runs, so a change further down the pipeline does not re-run it. The saved answer is used again only while this stage’s SQL, everything above it, and the size and modified time of any local file it reads are all unchanged. Off by default and per stage on purpose: a cache that decides for itself when it is still good and gets it wrong serves stale rows silently. Do not use it on a stage reading a database, whose contents can change without anything here changing. Delete .duckle/duckle_cache to clear it.',
+    },
+    {
         key: 'retryAttempts',
         label: 'Retry attempts',
         kind: 'integer',
