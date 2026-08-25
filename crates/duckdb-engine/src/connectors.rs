@@ -12178,11 +12178,43 @@ fn resolve_python_bin() -> String {
             return env;
         }
     }
+    // A workspace can carry its own interpreter, which is what makes a Python stage
+    // reproducible between a laptop, CI and a headless runner: the packages a pipeline
+    // needs are pinned beside the pipeline instead of being whatever the machine
+    // happens to have. `uv venv` and `python -m venv` both produce this layout, so this
+    // works with uv without depending on it, and nothing is installed at run time -
+    // which keeps an air-gapped box air-gapped.
+    if let Ok(ws) = std::env::var("DUCKLE_WORKSPACE") {
+        if !ws.trim().is_empty() {
+            if let Some(p) = python_in_workspace(Path::new(&ws)) {
+                return p;
+            }
+        }
+    }
     if cfg!(windows) {
         "python".to_string()
     } else {
         "python3".to_string()
     }
+}
+
+/// The interpreter inside a workspace's own virtual environment, if it has one.
+///
+/// Split from the environment lookup so it can be tested against a folder rather than
+/// by setting a variable the rest of the suite can see.
+pub(crate) fn python_in_workspace(ws: &Path) -> Option<String> {
+    for rel in [
+        // What uv and the stdlib venv module produce, on either platform.
+        "Scripts/python.exe",
+        "bin/python3",
+        "bin/python",
+    ] {
+        let p = ws.join(".venv").join(rel);
+        if p.is_file() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 /// Last `max` characters of `s` (UTF-8-safe) - used to keep the useful end
@@ -13333,6 +13365,26 @@ mod dhis2_summary_tests {
 mod connector_helper_tests {
     use super::{bson_flag_matches, jsonnative_quote_inner, python_temp_paths};
     use mongodb::bson::Bson;
+
+    #[test]
+    fn a_workspace_can_carry_its_own_python() {
+        // #246. A Python stage is only reproducible if the packages it needs are pinned
+        // beside the pipeline rather than being whatever the machine happens to have -
+        // which matters more now that transform(table) needs pyarrow. A workspace venv
+        // is the unit that travels with the project, and `uv venv` produces exactly this
+        // layout, so this works with uv without depending on it.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        assert!(super::python_in_workspace(ws).is_none(), "no venv, nothing claimed");
+
+        let (dir, exe) = if cfg!(windows) { ("Scripts", "python.exe") } else { ("bin", "python3") };
+        let bin = ws.join(".venv").join(dir);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(exe), b"").unwrap();
+        let found = super::python_in_workspace(ws).expect("a venv is found");
+        assert!(found.contains(".venv"), "got: {found}");
+        assert!(found.ends_with(exe), "got: {found}");
+    }
 
     #[test]
     fn the_entry_point_the_script_defines_picks_the_mode() {
