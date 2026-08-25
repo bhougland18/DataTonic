@@ -54,6 +54,8 @@ import WindowResizeHandles from './workflow-ui/WindowResizeHandles';
 import { engineStatus, seedSampleWorkspace, importJobFile } from './tauri-bridge';
 import ImportReportModal, { type ImportReport } from './workflow-ui/ImportReportModal';
 import HomeLauncher from './workflow-ui/HomeLauncher';
+import Rail from './rail/Rail';
+import { useAppMode } from './rail/useAppMode';
 import { copyText, saveTextFile } from './tauri-io';
 import { writeClipboard, readClipboard, instantiateClipboard } from './clipboard';
 import { RunStatusContext } from './canvas/run-status-context';
@@ -338,6 +340,8 @@ const EMPTY_PIPELINE: PipelineState = { nodes: [], edges: [] };
 export default function App() {
     const { t } = useTranslation();
     const { theme, toggle: toggleTheme } = useTheme();
+    // Rail mode switching (RAIL-1..RAIL-5), isolated from the main state block.
+    const { mode, setMode } = useAppMode();
     const [runtime, setRuntime] = useState<RuntimeState>('connecting');
     const [engine, setEngine] = useState<EngineId>(() =>
         normalizeEngineId(loadPersisted<EngineId>('engine', 'duckdb')),
@@ -2679,6 +2683,7 @@ export default function App() {
             />
 
             <main className="workspace">
+                <Rail mode={mode} onSelect={setMode} />
                 <LeftSidebar
                     repoItems={repo}
                     activeJobId={activeJobId}

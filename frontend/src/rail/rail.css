@@ -1,0 +1,45 @@
+/* Rail: persistent left mode-switcher. Own stylesheet (imported by Rail.tsx)
+   rather than appended to the shared styles.css, to keep upstream rebases
+   clean. Uses the app's theme tokens so light/dark work automatically. */
+
+.rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    width: 48px;
+    flex-shrink: 0;
+    padding: 8px 0;
+    background: var(--bg-1);
+    border-right: 1px solid var(--border);
+}
+
+.rail-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-3);
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+}
+
+.rail-btn:hover:not(:disabled) {
+    background: var(--bg-3);
+    color: var(--text-1);
+}
+
+.rail-btn--active {
+    color: var(--accent);
+    background: var(--accent-soft);
+    box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.rail-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
