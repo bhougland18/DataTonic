@@ -2140,6 +2140,70 @@
     }
 
     #[test]
+    fn a_check_told_to_fail_the_run_fails_the_run() {
+        // Every quality check offers "On failure: reject / warn / fail". Only reject ever
+        // happened - the setting was never read, so a gate configured to STOP a load let
+        // it through and dropped the offending rows on the way. A run that was asked to
+        // stop and did not is the worst of the three outcomes: it reports success.
+        use crate::plan::builders::build_quality;
+        let inputs = {
+            let mut ni = crate::plan::graph::NodeInputs::default();
+            ni.ports.insert("main".into(), vec!["up".into()]);
+            ni
+        };
+
+        let fail = build_quality(
+            &inputs,
+            &serde_json::json!({ "columns": "amt", "onFail": "fail" }),
+            "qa.notnull",
+            false,
+        )
+        .unwrap();
+        assert!(fail.contains("error("), "it has to raise: {fail}");
+        assert!(fail.contains("qa.notnull"), "and say which check: {fail}");
+
+        // reject is what it always did, and stays byte for byte what it was.
+        let reject = build_quality(
+            &inputs,
+            &serde_json::json!({ "columns": "amt", "onFail": "reject" }),
+            "qa.notnull",
+            false,
+        )
+        .unwrap();
+        let unset = build_quality(
+            &inputs,
+            &serde_json::json!({ "columns": "amt" }),
+            "qa.notnull",
+            false,
+        )
+        .unwrap();
+        assert_eq!(reject, unset, "reject is the default, unchanged");
+        assert!(!unset.contains("error("), "got: {unset}");
+
+        // warn does not stop the run either, so it must not raise.
+        let warn = build_quality(
+            &inputs,
+            &serde_json::json!({ "columns": "amt", "onFail": "warn" }),
+            "qa.notnull",
+            false,
+        )
+        .unwrap();
+        assert!(!warn.contains("error("), "got: {warn}");
+
+        // The reject PORT is unaffected whatever the setting says - it is what feeds a
+        // dead-letter branch, and raising there would break the branch that exists to
+        // catch these rows.
+        let port = build_quality(
+            &inputs,
+            &serde_json::json!({ "columns": "amt", "onFail": "fail" }),
+            "qa.notnull",
+            true,
+        )
+        .unwrap();
+        assert!(!port.contains("error("), "the reject port never raises: {port}");
+    }
+
+    #[test]
     fn the_geospatial_sink_writes_geoparquet_through_the_parquet_writer() {
         // #241. GeoParquet was asked for on the Geospatial sink, which writes through
         // GDAL. The bundled spatial extension has no GDAL Parquet driver - st_drivers()

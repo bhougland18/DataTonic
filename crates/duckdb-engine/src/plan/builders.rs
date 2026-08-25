@@ -3204,11 +3204,36 @@ pub(crate) fn build_quality(
         ));
     }
     let predicate = quality_pass_predicate(component_id, props)?;
-    Ok(if reject {
-        format!("SELECT * FROM {} WHERE NOT COALESCE(({}), FALSE)", from, predicate)
-    } else {
-        format!("SELECT * FROM {} WHERE COALESCE(({}), FALSE)", from, predicate)
-    })
+    if reject {
+        // The reject PORT is what feeds a dead-letter branch. It carries the failing
+        // rows whatever the setting says, and raising here would break the branch that
+        // exists to catch them.
+        return Ok(format!(
+            "SELECT * FROM {} WHERE NOT COALESCE(({}), FALSE)",
+            from, predicate
+        ));
+    }
+    // "On failure" offers reject / warn / fail, and only reject ever happened: the
+    // setting was never read, so a gate configured to STOP a load let it through and
+    // dropped the offending rows on the way. A run asked to stop and reporting success
+    // is the worst of the three, so `fail` now raises where the rows are counted.
+    //
+    // reject stays exactly what it was, which is also what an unset value does, so
+    // nothing saved changes. warn does not stop the run, so it does not raise either.
+    let stop = string_prop(props, "onFail")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .is_some_and(|s| s == "fail");
+    if stop {
+        let msg = format!("{component_id}: a row failed the check and On failure is set to fail");
+        return Ok(format!(
+            "SELECT * FROM {from} WHERE COALESCE(({predicate}), FALSE)              AND CASE WHEN (SELECT count(*) FROM {from} WHERE NOT COALESCE(({predicate}), FALSE)) > 0              THEN error('{}') ELSE TRUE END",
+            sql_escape(&msg)
+        ));
+    }
+    Ok(format!(
+        "SELECT * FROM {} WHERE COALESCE(({}), FALSE)",
+        from, predicate
+    ))
 }
 
 pub(crate) fn quality_pass_predicate(component_id: &str, props: &JsonValue) -> Result<String, String> {
