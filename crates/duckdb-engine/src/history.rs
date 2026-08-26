@@ -14,6 +14,12 @@ const MAX_RECORDS: usize = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
+    /// #259: the id an async run was accepted under, so a run started through
+    /// POST /api/run/async can still be found after the console restarts.
+    /// Absent for runs started before this existed, and for synchronous runs
+    /// whose caller already holds the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// RFC3339 timestamp of when the run started.
     pub at: String,
     pub status: String,
@@ -67,6 +73,7 @@ impl RunRecord {
             .filter_map(|n| n.rows)
             .sum();
         RunRecord {
+            run_id: None,
             at: Utc::now().to_rfc3339(),
             status: result.status.clone(),
             duration_ms: result.duration_ms,
@@ -237,6 +244,7 @@ mod tests {
 
     fn record(status: &str, duration_ms: u64, rows: u64) -> RunRecord {
         RunRecord {
+            run_id: None,
             at: Utc::now().to_rfc3339(),
             status: status.into(),
             duration_ms,

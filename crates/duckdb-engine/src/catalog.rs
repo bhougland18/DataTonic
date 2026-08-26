@@ -1615,6 +1615,7 @@ mod tests {
             error: None,
             category: None,
             assets: vec![AssetTouch { id: asset.into(), direction: dir.into(), rows }],
+            run_id: None,
         };
 
         std::fs::write(
