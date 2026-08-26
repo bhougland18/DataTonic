@@ -110,13 +110,13 @@ quick-xml = "0.41"
 # cssparser + selectors), no native toolchain, and already resolved in this
 # workspace's lockfile via tauri-utils and wry, so it adds no new dependency
 # tree - only the compile of those crates in the headless runner build.
-dom_query = "0.27"
+dom_query = "0.28"
 # PDF page text + geometry for src.pdf (#248). Both pure Rust - pdf-extract is
 # the font-encoding and character-mapping work, lopdf the page tree, MediaBox
 # and Info dictionary - so no native toolchain and no rendering engine. OCR is
 # deliberately not here: it would need exactly that.
-pdf-extract = "0.9"
-lopdf = "0.36"
+pdf-extract = "0.12"
+lopdf = "0.42"
 # Streaming gzip decoder for src.xml, so a .gz (or .xml.gz) XML file is
 # decompressed on the fly and never lands in RAM whole (issue #186). Pure Rust.
 flate2 = "1"
