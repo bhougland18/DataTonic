@@ -5220,6 +5220,137 @@ impl DuckdbEngine {
         Ok(format!("qvd: materialized {} records into {}", count, spec.node_id))
     }
 
+    /// src.pdf: one row per PAGE of a PDF document (#248).
+    ///
+    /// A lot of real data engineering starts from documents rather than tables:
+    /// filings, annual accounts, invoices, regulatory publications. This reads
+    /// the text layer a PDF already carries, alongside the page geometry and the
+    /// document's own metadata, so a page becomes a row a pipeline can filter,
+    /// join and hand to a Python or AI stage like any other.
+    ///
+    /// It does NOT do OCR, and deliberately: a scanned page has no text layer,
+    /// and rasterising one needs a native rendering engine plus per-language
+    /// trained data, which would end the self-contained cross-OS build this repo
+    /// protects everywhere else. `has_text_layer` is false for those pages, which
+    /// is what makes them findable - filter on it and route them wherever your
+    /// OCR lives.
+    pub(crate) fn run_pdf_source(
+        &self,
+        db: &Path,
+        spec: &PdfSourceSpec,
+    ) -> Result<String, EngineError> {
+        self.check_cancelled()?;
+        let files = expand_pdf_paths(&spec.path, spec.recursive);
+        if files.is_empty() {
+            return Err(EngineError::Config(format!(
+                "pdf: no .pdf files at {}",
+                spec.path
+            )));
+        }
+        let mut writer = match &spec.declared_schema {
+            Some(schema) if !schema.is_empty() => {
+                JsonLinesWriter::open_with_schema(&spec.node_id, Some(schema.clone()))?
+            }
+            _ => JsonLinesWriter::open(&spec.node_id)?,
+        };
+        let mut count: usize = 0;
+        for file in &files {
+            self.check_cancelled()?;
+            let doc = lopdf::Document::load(file)
+                .map_err(|e| EngineError::Query(format!("pdf: open {}: {}", file, e)))?;
+            let pages = doc.get_pages();
+            let page_count = pages.len();
+
+            // The document Info dictionary, when it has one. Missing entries are
+            // simply absent rather than empty strings: a PDF with no author and
+            // one with an empty author are different.
+            let mut meta = serde_json::Map::new();
+            if let Ok(lopdf::Object::Reference(id)) = doc.trailer.get(b"Info") {
+                if let Ok(info) = doc.get_dictionary(*id) {
+                    for (key, name) in [
+                        (&b"Title"[..], "title"),
+                        (&b"Author"[..], "author"),
+                        (&b"Creator"[..], "creator"),
+                        (&b"Producer"[..], "producer"),
+                        (&b"CreationDate"[..], "created"),
+                    ] {
+                        if let Ok(v) = info.get(key) {
+                            if let Ok(s) = v.as_str() {
+                                meta.insert(
+                                    name.to_string(),
+                                    JsonValue::String(String::from_utf8_lossy(s).into_owned()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            meta.insert("page_count".into(), JsonValue::from(page_count as u64));
+            let meta = JsonValue::Object(meta);
+
+            // pdf-extract has a reputation for panicking on malformed input, and
+            // a panic here would take the whole run down rather than failing one
+            // stage with a message naming the file.
+            let path_owned = file.clone();
+            let texts: Vec<String> =
+                match std::panic::catch_unwind(move || pdf_extract::extract_text_by_pages(&path_owned)) {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => {
+                        return Err(EngineError::Query(format!(
+                            "pdf: extract text from {}: {}",
+                            file, e
+                        )))
+                    }
+                    Err(_) => {
+                        return Err(EngineError::Query(format!(
+                            "pdf: {} could not be parsed (the file is malformed, or uses a feature the text extractor cannot read)",
+                            file
+                        )))
+                    }
+                };
+
+            for (idx, (page_number, page_id)) in pages.iter().enumerate() {
+                let (width, height) = page_media_box(&doc, *page_id);
+                let text = texts.get(idx).cloned().unwrap_or_default();
+                let mut row = serde_json::Map::new();
+                // Same value src.artifact puts in `uri`, so the two join.
+                row.insert("document_id".into(), JsonValue::String(file.clone()));
+                row.insert("page_number".into(), JsonValue::from(*page_number as u64));
+                // A page whose text is only whitespace has no usable text layer,
+                // which is the scanned-page case worth routing elsewhere.
+                row.insert(
+                    "has_text_layer".into(),
+                    JsonValue::Bool(!text.trim().is_empty()),
+                );
+                row.insert("text".into(), JsonValue::String(text));
+                match width {
+                    Some(w) => row.insert("width".into(), JsonValue::from(w)),
+                    None => row.insert("width".into(), JsonValue::Null),
+                };
+                match height {
+                    Some(h) => row.insert("height".into(), JsonValue::from(h)),
+                    None => row.insert("height".into(), JsonValue::Null),
+                };
+                row.insert("metadata".into(), meta.clone());
+                writer.write_row(&JsonValue::Object(row))?;
+                count += 1;
+            }
+        }
+        match &spec.declared_schema {
+            Some(schema) if !schema.is_empty() => {
+                let (columns_spec, select_list) = xml_declared_columns(schema);
+                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?;
+            }
+            _ => writer.finalize_into_table(&self.bin, db, &spec.node_id)?,
+        }
+        Ok(format!(
+            "pdf: materialized {} page(s) from {} file(s) into {}",
+            count,
+            files.len(),
+            spec.node_id
+        ))
+    }
+
     /// src.html: rows out of an HTML page, by CSS selector (#255).
     ///
     /// HTML is not XML. Real pages carry unclosed tags and unquoted attributes
@@ -15419,4 +15550,74 @@ fn percent_encode_path(s: &str) -> String {
         }
     }
     out
+}
+
+/// #248: the .pdf files at a path - the file itself, or the ones in a folder.
+/// Sorted, so a run over a folder is reproducible rather than filesystem order.
+fn expand_pdf_paths(path: &str, recursive: bool) -> Vec<String> {
+    let p = std::path::Path::new(path);
+    if p.is_file() {
+        return vec![path.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if recursive {
+                    stack.push(path);
+                }
+            } else if path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false)
+            {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// #248: a page's width and height in PDF points.
+///
+/// MediaBox is inheritable: a document may set it once on the page tree rather
+/// than on every page, so a page without one is not a page without a size - walk
+/// up to Parent before giving up.
+fn page_media_box(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> (Option<f64>, Option<f64>) {
+    let mut id = page_id;
+    for _ in 0..16 {
+        let Ok(dict) = doc.get_dictionary(id) else {
+            return (None, None);
+        };
+        if let Ok(obj) = dict.get(b"MediaBox") {
+            let resolved = doc.dereference(obj).map(|(_, o)| o).unwrap_or(obj);
+            if let Ok(arr) = resolved.as_array() {
+                if arr.len() == 4 {
+                    let num = |i: usize| -> Option<f64> {
+                        arr.get(i).and_then(|v| match v {
+                            lopdf::Object::Integer(n) => Some(*n as f64),
+                            lopdf::Object::Real(r) => Some(*r as f64),
+                            _ => None,
+                        })
+                    };
+                    if let (Some(x0), Some(y0), Some(x1), Some(y1)) =
+                        (num(0), num(1), num(2), num(3))
+                    {
+                        return (Some((x1 - x0).abs()), Some((y1 - y0).abs()));
+                    }
+                }
+            }
+        }
+        match dict.get(b"Parent") {
+            Ok(lopdf::Object::Reference(parent)) => id = *parent,
+            _ => return (None, None),
+        }
+    }
+    (None, None)
 }

@@ -509,6 +509,22 @@ pub struct PubSubSourceSpec {
     pub max_messages: u64,
 }
 
+/// src.pdf: one row per page of a PDF (#248).
+///
+/// The text layer a document already carries, plus page geometry and the Info
+/// dictionary, so a page is a row like any other. No OCR: a scanned page comes
+/// back with `has_text_layer` false, which is what makes it routable.
+#[derive(Debug, Clone)]
+pub struct PdfSourceSpec {
+    pub node_id: String,
+    /// A .pdf file, or a directory of them.
+    pub path: String,
+    /// Descend into sub-directories when `path` is a directory.
+    pub recursive: bool,
+    /// Optional declared output schema (the node's Schema tab).
+    pub declared_schema: Option<Vec<duckle_metadata::Column>>,
+}
+
 /// #255: one column extracted from a matched row element.
 ///
 /// `selector` is evaluated RELATIVE to the row element; empty means the row

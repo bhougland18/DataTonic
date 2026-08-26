@@ -14903,3 +14903,215 @@ fn src_rest_sends_the_user_agent_from_its_transport() {
         req
     );
 }
+
+/// Build a minimal, valid single-file PDF with one page per string, so the test
+/// does not depend on a binary fixture checked into the repo. Each page carries
+/// a MediaBox of 200x100 points and one text-showing operator.
+#[cfg(test)]
+fn minimal_pdf(pages: &[&str]) -> Vec<u8> {
+    use std::collections::BTreeMap;
+    let nkids = pages.len();
+    let font_id = 3 + nkids * 2;
+    let info_id = font_id + 1;
+    let kids: String = (0..nkids)
+        .map(|i| format!("{} 0 R", 3 + i * 2))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut objs: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    objs.insert(1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    objs.insert(
+        2,
+        format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids, nkids).into_bytes(),
+    );
+    for (i, text) in pages.iter().enumerate() {
+        let pid = 3 + i * 2;
+        let cid = pid + 1;
+        objs.insert(
+            pid,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents {} 0 R /Resources << /Font << /F1 {} 0 R >> >> >>",
+                cid, font_id
+            )
+            .into_bytes(),
+        );
+        let stream = format!("BT /F1 12 Tf 20 50 Td ({}) Tj ET", text);
+        let mut o = format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes();
+        o.extend_from_slice(stream.as_bytes());
+        o.extend_from_slice(b"\nendstream");
+        objs.insert(cid, o);
+    }
+    objs.insert(
+        font_id,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    );
+    objs.insert(
+        info_id,
+        b"<< /Title (Duckle Fixture) /Author (Duckle) >>".to_vec(),
+    );
+
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets: BTreeMap<usize, usize> = BTreeMap::new();
+    for (num, body) in &objs {
+        offsets.insert(*num, out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", num).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_at = out.len();
+    let n = objs.keys().max().unwrap() + 1;
+    out.extend_from_slice(format!("xref\n0 {}\n", n).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for num in 1..n {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&num]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info {} 0 R >>\nstartxref\n{}\n%%EOF\n",
+            n, info_id, xref_at
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// #248: a document becomes rows. One per page, carrying the text layer the PDF
+/// already has, the page geometry and the document's own metadata, so a filing
+/// or an invoice can be filtered and joined like any other table.
+#[test]
+fn src_pdf_emits_one_row_per_page_with_text_and_geometry() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("doc.pdf");
+    // The third page's text is empty: that is the scanned-page case, and the
+    // flag that makes it routable is the whole reason OCR can be left out.
+    std::fs::write(&pdf, minimal_pdf(&["Hello Duckle", "Second page here", ""])).unwrap();
+    let out = out_path(tmp.path(), "pages.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.pdf", json!({ "path": pdf.to_string_lossy() })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.pdf failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3);
+
+    // Page numbers are 1-based and in document order.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT string_agg(page_number::VARCHAR, ',' ORDER BY page_number) FROM read_csv_auto('{}')",
+            out
+        )),
+        "1,2,3"
+    );
+    // The text layer really is extracted, not merely counted.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE page_number = 1 AND text LIKE '%Hello Duckle%')",
+            out
+        )),
+        1
+    );
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE page_number = 2 AND text LIKE '%Second page here%')",
+            out
+        )),
+        1
+    );
+    // A page with no usable text is findable, which is what lets a pipeline
+    // route it to whatever OCR the user already has.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT string_agg(has_text_layer::VARCHAR, ',' ORDER BY page_number) FROM read_csv_auto('{}')",
+            out
+        )),
+        "true,true,false"
+    );
+    // Geometry, in PDF points, from the page's MediaBox.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT DISTINCT width::VARCHAR || 'x' || height::VARCHAR FROM read_csv_auto('{}')",
+            out
+        )),
+        "200.0x100.0"
+    );
+    // Document metadata travels with every page of that document.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE metadata LIKE '%Duckle Fixture%' AND metadata LIKE '%page_count%')",
+            out
+        )),
+        3
+    );
+    // document_id is the path, which is exactly what src.artifact puts in `uri`,
+    // so an artifact listing and its pages join without translation.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE document_id LIKE '%doc.pdf')",
+            out
+        )),
+        3
+    );
+}
+
+/// #248: a folder of documents is the normal case - a filings drop, a scan
+/// directory - so a path may name one, and the order must be stable.
+#[test]
+fn src_pdf_reads_every_document_in_a_folder() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("docs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.pdf"), minimal_pdf(&["Alpha one"])).unwrap();
+    std::fs::write(dir.join("b.pdf"), minimal_pdf(&["Bravo one", "Bravo two"])).unwrap();
+    // A non-PDF alongside them must simply be ignored, not fail the run.
+    std::fs::write(dir.join("notes.txt"), "not a pdf").unwrap();
+    let out = out_path(tmp.path(), "pages.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.pdf", json!({ "path": dir.to_string_lossy() })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.pdf over a folder failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3);
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE document_id LIKE '%b.pdf')",
+            out
+        )),
+        2
+    );
+    // Page numbers restart per document rather than running on across the set.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT string_agg(page_number::VARCHAR, ',' ORDER BY document_id, page_number) FROM read_csv_auto('{}')",
+            out
+        )),
+        "1,1,2"
+    );
+}
+
+/// #248: a file that is not a readable PDF must fail with the file named, and
+/// must not take the process down - the text extractor is known to panic on
+/// malformed input, and a panic would abort the whole run rather than the stage.
+#[test]
+fn src_pdf_reports_an_unreadable_document_without_panicking() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("broken.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\nthis is not really a pdf\n%%EOF\n").unwrap();
+    let out = out_path(tmp.path(), "pages.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.pdf", json!({ "path": pdf.to_string_lossy() })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "error", "a broken PDF should fail the stage");
+    let err = r.error.unwrap_or_default();
+    assert!(err.contains("broken.pdf"), "the error should name the file: {}", err);
+}

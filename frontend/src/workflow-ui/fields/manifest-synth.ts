@@ -980,11 +980,13 @@ function synthFileSource(comp: ComponentDef): ComponentManifest {
         ? 'A local file, an http(s):// URL, or an sftp://user@host/path URL. Remote paths are streamed (never fully buffered) and .gz files decompress transparently. For SFTP auth, set the fields below.'
         : comp.id === 'src.html'
         ? 'A local file, or an http(s):// URL fetched with the request settings below.'
+        : comp.id === 'src.pdf'
+        ? 'A .pdf file, or a folder of them.'
         : undefined;
     // #255: src.html reads one document, and its parser decides the encoding
     // from the markup. Offering Encoding and Glob here would be two more fields
     // the engine never reads.
-    const isSingleDocument = comp.id === 'src.html';
+    const isSingleDocument = comp.id === 'src.html' || comp.id === 'src.pdf';
     return base(comp, [
         {
             label: 'Source file',
@@ -1354,6 +1356,22 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                 fields: [
                     { key: 'sheet', label: 'Sheet name', kind: 'text', placeholder: 'Sheet1' },
                     { key: 'range', label: 'Cell range', kind: 'text', placeholder: 'A1:F1000' },
+                ],
+            },
+        ];
+    }
+    if (id.endsWith('.pdf')) {
+        return [
+            {
+                label: 'Documents',
+                fields: [
+                    {
+                        key: 'recursive',
+                        label: 'Include sub-folders',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description: 'When the path is a folder, also read PDFs in folders beneath it. Files are read in sorted order, so a run over a folder is reproducible.',
+                    },
                 ],
             },
         ];

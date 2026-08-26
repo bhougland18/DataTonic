@@ -301,6 +301,7 @@ pub enum RuntimeSpec {
     NatsSource(NatsSourceSpec),
     PubsubSink(PubSubSinkSpec),
     PubsubSource(PubSubSourceSpec),
+    PdfSource(PdfSourceSpec),
     HtmlSource(HtmlSourceSpec),
     XmlSource(XmlSourceSpec),
     XmlSink(XmlSinkSpec),
@@ -1411,6 +1412,7 @@ fn build_stage(
     let mut nats_source: Option<NatsSourceSpec> = None;
     let mut pubsub_sink: Option<PubSubSinkSpec> = None;
     let mut pubsub_source: Option<PubSubSourceSpec> = None;
+    let mut pdf_source: Option<PdfSourceSpec> = None;
     let mut html_source: Option<HtmlSourceSpec> = None;
     let mut xml_source: Option<XmlSourceSpec> = None;
     let mut xml_sink: Option<XmlSinkSpec> = None;
@@ -3967,6 +3969,22 @@ fn build_stage(
             });
         }
         (String::new(), StageKind::View, None)
+    } else if component_id == "src.pdf" {
+        // #248: pages out of a document. Not SQL - DuckDB cannot open a PDF -
+        // so this is a runtime hook that materialises the relation itself.
+        let path = string_prop(&props, "path")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: path required (a .pdf file, or a folder of them)", component_id)))?;
+        pdf_source = Some(PdfSourceSpec {
+            node_id: node.id.clone(),
+            path,
+            recursive: props
+                .get("recursive")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            declared_schema: node.data.schema.clone(),
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id == "src.html" {
         // #255: rows out of an HTML page. Not SQL - DuckDB cannot parse HTML -
         // so this is a runtime hook that materialises the relation itself, the
@@ -5544,6 +5562,7 @@ fn build_stage(
         .or_else(|| nats_source.map(RuntimeSpec::NatsSource))
         .or_else(|| pubsub_sink.map(RuntimeSpec::PubsubSink))
         .or_else(|| pubsub_source.map(RuntimeSpec::PubsubSource))
+        .or_else(|| pdf_source.map(RuntimeSpec::PdfSource))
         .or_else(|| html_source.map(RuntimeSpec::HtmlSource))
         .or_else(|| xml_source.map(RuntimeSpec::XmlSource))
         .or_else(|| xml_sink.map(RuntimeSpec::XmlSink))
