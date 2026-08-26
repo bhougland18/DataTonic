@@ -4033,6 +4033,7 @@ fn build_stage(
         let mut headers = headers_from_props(&props);
         push_rest_auth(&mut headers, &props);
         html_source = Some(HtmlSourceSpec {
+            transport: http_transport_from_props(&props),
             node_id: node.id.clone(),
             path,
             row_selector,
@@ -4408,6 +4409,7 @@ fn build_stage(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "/data".into());
         rest_source = Some(RestSourceSpec {
+            transport: http_transport_from_props(&props),
             node_id: node.id.clone(),
             response_metadata: props
                 .get("responseMetadata")
@@ -4664,6 +4666,7 @@ fn build_stage(
             None
         };
         rest_source = Some(RestSourceSpec {
+            transport: http_transport_from_props(&props),
             node_id: node.id.clone(),
             response_metadata: props
                 .get("responseMetadata")

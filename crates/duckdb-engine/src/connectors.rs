@@ -5239,7 +5239,10 @@ impl DuckdbEngine {
         self.check_cancelled()?;
         let lower = spec.path.to_ascii_lowercase();
         let html = if lower.starts_with("http://") || lower.starts_with("https://") {
-            let agent = crate::tls::http_agent();
+            let agent = match &spec.transport {
+                Some(t) => crate::tls::http_agent_with(t),
+                None => crate::tls::http_agent(),
+            };
             let mut req = agent.get(&spec.path);
             for (k, v) in &spec.headers {
                 req = req.set(k, v);
@@ -5265,8 +5268,12 @@ impl DuckdbEngine {
                 }
             }
         } else {
-            std::fs::read_to_string(&spec.path)
-                .map_err(|e| EngineError::Query(format!("html: read {}: {}", spec.path, e)))?
+            // Lossy rather than strict: plenty of real pages are still served
+            // as latin-1, and a replacement character in one cell beats
+            // refusing to read the document at all.
+            let bytes = std::fs::read(&spec.path)
+                .map_err(|e| EngineError::Query(format!("html: read {}: {}", spec.path, e)))?;
+            String::from_utf8_lossy(&bytes).into_owned()
         };
 
         let compile = |sel: &str| -> Result<dom_query::Matcher, EngineError> {
@@ -10759,7 +10766,13 @@ impl DuckdbEngine {
         // One Agent for the whole pagination walk so keep-alive connections
         // are reused across pages instead of a fresh TCP+TLS handshake each
         // request (ureq::request uses a throwaway agent per call).
-        let agent = crate::tls::http_agent();
+        // #256: one agent for the whole walk, built from this node's transport
+        // so a proxy, a timeout or a User-Agent set on a saved connection
+        // applies to every request the node makes.
+        let agent = match &spec.transport {
+            Some(t) => crate::tls::http_agent_with(t),
+            None => crate::tls::http_agent(),
+        };
         // #166: src.salesforce OAuth client-credentials. Mint a fresh token once
         // per run and inject it as the Authorization header (replacing any static
         // one), so the whole pagination walk uses the same short-lived token.

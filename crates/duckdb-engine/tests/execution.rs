@@ -14826,3 +14826,80 @@ fn src_html_rejects_an_invalid_css_selector() {
         "table mode with no matches should give the standard untypeable-empty error"
     );
 }
+
+/// #256: transport settings must actually reach the wire. A User-Agent is the
+/// one that is directly observable from the server side, and it is also the one
+/// that most often decides whether a public site answers at all.
+#[test]
+fn src_rest_sends_the_user_agent_from_its_transport() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let sv = seen.clone();
+    listener.set_nonblocking(true).ok();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).ok();
+            stream.set_read_timeout(Some(Duration::from_millis(300))).ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..32 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            *sv.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
+            let body = r#"[{"id":1}]"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            break;
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.rest", json!({
+                "url": format!("http://127.0.0.1:{}/things", port),
+                "httpUserAgent": "duckle-transport-test/1.0",
+                "httpConnectTimeoutSecs": 5,
+                "httpReadTimeoutSecs": 30,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    let _ = handle.join();
+    assert_eq!(r.status, "ok", "src.rest with a transport failed: {:?}", r.error);
+    let req = seen.lock().unwrap().clone();
+    assert!(
+        req.to_lowercase().contains("user-agent: duckle-transport-test/1.0"),
+        "the transport's User-Agent never reached the wire: {}",
+        req
+    );
+}

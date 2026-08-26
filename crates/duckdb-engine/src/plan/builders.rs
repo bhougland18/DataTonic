@@ -9295,6 +9295,27 @@ pub(crate) fn headers_from_props(props: &JsonValue) -> Vec<(String, String)> {
 /// - `bearer` -> `Authorization: Bearer <token>`
 /// - `apikey` -> `<header>: <token>` (header chosen by `api_key_header`)
 /// - anything else (incl. `none`) adds nothing.
+/// #256: the transport settings on an HTTP-backed node.
+///
+/// Flat props rather than a nested object because that is what a saved `http`
+/// connection flattens into, the same way a saved REST connection flattens into
+/// url / authType / authToken. Returns None when nothing is set, so a node
+/// without transport config builds the default shared agent exactly as before.
+pub(crate) fn http_transport_from_props(props: &JsonValue) -> Option<crate::tls::HttpTransport> {
+    let secs = |key: &str| props.get(key).and_then(|v| v.as_u64()).filter(|n| *n > 0);
+    let t = crate::tls::HttpTransport {
+        proxy: string_prop(props, "httpProxy").filter(|s| !s.trim().is_empty()),
+        read_timeout_secs: secs("httpReadTimeoutSecs"),
+        connect_timeout_secs: secs("httpConnectTimeoutSecs"),
+        user_agent: string_prop(props, "httpUserAgent").filter(|s| !s.trim().is_empty()),
+    };
+    if t == crate::tls::HttpTransport::default() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 pub(crate) fn push_rest_auth(headers: &mut Vec<(String, String)>, props: &JsonValue) {
     let auth_type = string_prop(props, "authType").unwrap_or_else(|| "none".into());
     let token = string_prop(props, "authToken").unwrap_or_default();

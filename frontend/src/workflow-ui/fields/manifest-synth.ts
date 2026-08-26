@@ -262,6 +262,17 @@ const connectionRefField = (acceptKind?: string): Field => ({
     description: 'Pick a connection from the Connections folder to auto-fill the fields below.',
 });
 
+// #256: transport is a SEPARATE picker from the auth connection. It has to use
+// its own key: on src.rest and its aliases `connectionRef` is already spent on
+// the kind:'rest' auth connection.
+const transportRefField = (): Field => ({
+    key: 'transportRef',
+    label: 'HTTP transport',
+    kind: 'connection-ref',
+    accepts: ['http'],
+    description: 'Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection.',
+});
+
 const credentialFields = (acceptKind?: string): Field[] => [
     connectionRefField(acceptKind),
     { key: 'username', label: 'Username', kind: 'text' },
@@ -967,7 +978,13 @@ function synthFileSource(comp: ComponentDef): ComponentManifest {
     // URL, or an sftp://user@host/path URL - all decompress .gz transparently.
     const pathDescription = comp.id === 'src.xml'
         ? 'A local file, an http(s):// URL, or an sftp://user@host/path URL. Remote paths are streamed (never fully buffered) and .gz files decompress transparently. For SFTP auth, set the fields below.'
+        : comp.id === 'src.html'
+        ? 'A local file, or an http(s):// URL fetched with the request settings below.'
         : undefined;
+    // #255: src.html reads one document, and its parser decides the encoding
+    // from the markup. Offering Encoding and Glob here would be two more fields
+    // the engine never reads.
+    const isSingleDocument = comp.id === 'src.html';
     return base(comp, [
         {
             label: 'Source file',
@@ -980,14 +997,18 @@ function synthFileSource(comp: ComponentDef): ComponentManifest {
                     filters,
                     ...(pathDescription ? { description: pathDescription } : {}),
                 },
-                encodingField(),
-                {
-                    key: 'glob',
-                    label: 'Glob pattern',
-                    kind: 'bool',
-                    defaultValue: false,
-                    description: 'Treat the path as a glob (e.g. data/*.csv) to read many files.',
-                },
+                ...(isSingleDocument
+                    ? []
+                    : [
+                          encodingField(),
+                          {
+                              key: 'glob' as const,
+                              label: 'Glob pattern',
+                              kind: 'bool' as const,
+                              defaultValue: false,
+                              description: 'Treat the path as a glob (e.g. data/*.csv) to read many files.',
+                          },
+                      ]),
             ],
         },
         ...fileFormatSection(comp),
@@ -1338,7 +1359,7 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
         ];
     }
     if (id.endsWith('.html')) {
-        return base(comp, [
+        return [
             {
                 label: 'Format',
                 fields: [
@@ -1361,6 +1382,7 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
             {
                 label: 'Request',
                 fields: [
+                    transportRefField(),
                     {
                         key: 'authType',
                         label: 'Auth',
@@ -1390,7 +1412,7 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                     },
                 ],
             },
-        ], 'declared');
+        ];
     }
     if (id.endsWith('.xml')) {
         const sections: FormSection[] = [
@@ -2944,6 +2966,7 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                 ...(isSalesforce
                     ? [salesforceConnectionRefField()]
                     : [connectionRefField('rest')]),
+                transportRefField(),
                 {
                     key: 'authType',
                     label: 'Auth type',
