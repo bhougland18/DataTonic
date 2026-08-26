@@ -353,6 +353,15 @@ pub fn requirement(method: &str, path: &str) -> (Role, &'static str) {
 
         // Causing work to happen, or changing when it happens.
         ("POST", "/api/run") => (Role::Operator, "pipeline.run"),
+        // #259: accepting a run is the same act as running one, so it takes the
+        // same role. Asking how a run is going only reads. Cancelling stops work
+        // an operator was allowed to start, so it belongs with starting it.
+        // These must stay in step with dispatch_console: a route served there
+        // and missing here falls through to the admin-only arm below and 403s
+        // every operator.
+        ("POST", "/api/run/async") => (Role::Operator, "pipeline.run"),
+        ("GET", "/api/run/status") => (Role::Viewer, "run.status"),
+        ("DELETE", "/api/run") => (Role::Operator, "pipeline.cancel"),
         ("POST", "/api/schedules") => (Role::Operator, "schedule.write"),
         // Rebuilding re-derives the graph from pipelines the caller can already
         // read, so it is not an admin act; it does write a file, so it is not a
@@ -398,6 +407,42 @@ pub fn requirement(method: &str, path: &str) -> (Role, &'static str) {
 
 #[cfg(test)]
 mod tests {
+
+    /// #259: every route dispatch_console serves needs a line in `requirement`.
+    /// One that is missing falls through to the admin-only arm and 403s every
+    /// operator, which compiles, serves, and only shows up in production.
+    #[test]
+    fn the_async_run_routes_are_not_admin_only_by_accident() {
+        assert_eq!(
+            requirement("POST", "/api/run/async"),
+            (Role::Operator, "pipeline.run"),
+            "accepting a run is the same act as running one"
+        );
+        assert_eq!(
+            requirement("GET", "/api/run/status"),
+            (Role::Viewer, "run.status"),
+            "asking how a run is going only reads"
+        );
+        assert_eq!(
+            requirement("DELETE", "/api/run"),
+            (Role::Operator, "pipeline.cancel"),
+            "stopping work belongs with starting it"
+        );
+        // The failure this guards against: falling through to the fallback.
+        for route in [
+            ("POST", "/api/run/async"),
+            ("GET", "/api/run/status"),
+            ("DELETE", "/api/run"),
+        ] {
+            assert_ne!(
+                requirement(route.0, route.1).1,
+                "unknown",
+                "{} {} fell through to the admin-only fallback",
+                route.0,
+                route.1
+            );
+        }
+    }
     use super::*;
 
     fn identity(label: &str, role: Role) -> Identity {

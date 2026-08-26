@@ -301,6 +301,9 @@ pub enum RuntimeSpec {
     NatsSource(NatsSourceSpec),
     PubsubSink(PubSubSinkSpec),
     PubsubSource(PubSubSourceSpec),
+    ModelCard(ModelCardSpec),
+    PdfSource(PdfSourceSpec),
+    HtmlSource(HtmlSourceSpec),
     XmlSource(XmlSourceSpec),
     XmlSink(XmlSinkSpec),
     AvroSink(AvroSinkSpec),
@@ -1410,6 +1413,9 @@ fn build_stage(
     let mut nats_source: Option<NatsSourceSpec> = None;
     let mut pubsub_sink: Option<PubSubSinkSpec> = None;
     let mut pubsub_source: Option<PubSubSourceSpec> = None;
+    let mut model_card: Option<ModelCardSpec> = None;
+    let mut pdf_source: Option<PdfSourceSpec> = None;
+    let mut html_source: Option<HtmlSourceSpec> = None;
     let mut xml_source: Option<XmlSourceSpec> = None;
     let mut xml_sink: Option<XmlSinkSpec> = None;
     let mut avro_sink: Option<AvroSinkSpec> = None;
@@ -2857,6 +2863,26 @@ fn build_stage(
             mode,
         });
         (String::new(), StageKind::Sink, Some(from_view.to_string()))
+    } else if component_id == "snk.model" {
+        // #253: the card comes from the upstream row's COLUMNS, so a training
+        // stage produces it the way it produces any table.
+        let from_view = inputs
+            .main()
+            .ok_or_else(|| EngineError::Config(format!("{}: upstream input required", component_id)))?;
+        let name = string_prop(&props, "name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: name required (the model's name; cards land under <path>/<name>/)", component_id)))?;
+        model_card = Some(ModelCardSpec {
+            node_id: node.id.clone(),
+            from_view: from_view.to_string(),
+            dir: string_prop(&props, "path")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "models".to_string()),
+            name,
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id.starts_with("snk.") {
         let from_view = inputs
             .main()
@@ -3965,6 +3991,97 @@ fn build_stage(
             });
         }
         (String::new(), StageKind::View, None)
+    } else if component_id == "src.pdf" {
+        // #248: pages out of a document. Not SQL - DuckDB cannot open a PDF -
+        // so this is a runtime hook that materialises the relation itself.
+        let path = string_prop(&props, "path")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: path required (a .pdf file, or a folder of them)", component_id)))?;
+        pdf_source = Some(PdfSourceSpec {
+            node_id: node.id.clone(),
+            path,
+            recursive: props
+                .get("recursive")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            declared_schema: node.data.schema.clone(),
+        });
+        (String::new(), StageKind::View, None)
+    } else if component_id == "src.html" {
+        // #255: rows out of an HTML page. Not SQL - DuckDB cannot parse HTML -
+        // so this is a runtime hook that materialises the relation itself, the
+        // same shape as src.xml below.
+        let path = string_prop(&props, "path")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: path required (a file, or an http(s) URL)", component_id)))?;
+        let row_selector = string_prop(&props, "rowSelector")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: rowSelector required (a CSS selector; every match is one row)", component_id)))?;
+        // Two shapes, the way headers_from_props already accepts two: an array of
+        // {name, selector, attr} for precision, and the object the GUI's
+        // key-value editor writes, where the value is `selector` or
+        // `selector@attribute`.
+        let columns = match props.get("columns") {
+            Some(JsonValue::Object(map)) => map
+                .iter()
+                .filter_map(|(name, v)| {
+                    let name = name.trim().to_string();
+                    let spec = v.as_str()?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    // Split on the LAST '@': CSS attribute selectors are written
+                    // [attr=value], so a bare '@' here is the attribute marker.
+                    let (selector, attr) = match spec.rsplit_once('@') {
+                        Some((sel, at)) if !at.is_empty() => (sel.trim(), Some(at.trim().to_string())),
+                        _ => (spec, None),
+                    };
+                    Some(HtmlColumn { name, selector: selector.to_string(), attr })
+                })
+                .collect::<Vec<_>>(),
+            _ => props
+            .get("columns")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let name = c.get("name").and_then(|v| v.as_str())?.trim().to_string();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        Some(HtmlColumn {
+                            name,
+                            selector: c
+                                .get("selector")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string(),
+                            attr: c
+                                .get("attr")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        };
+        let mut headers = headers_from_props(&props);
+        push_rest_auth(&mut headers, &props);
+        html_source = Some(HtmlSourceSpec {
+            transport: http_transport_from_props(&props),
+            node_id: node.id.clone(),
+            path,
+            row_selector,
+            columns,
+            headers,
+            declared_schema: node.data.schema.clone(),
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id == "src.xml" {
         // XML row-path source. rowPath is a slash-separated element
         // walk from the root (e.g. "library/books/book"). Each match
@@ -4332,6 +4449,7 @@ fn build_stage(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "/data".into());
         rest_source = Some(RestSourceSpec {
+            transport: http_transport_from_props(&props),
             node_id: node.id.clone(),
             response_metadata: props
                 .get("responseMetadata")
@@ -4346,6 +4464,10 @@ fn build_stage(
             pagination: RestPagination::None,
             max_pages: 1,
             oauth: None,
+            from_view: None,
+            url_template: None,
+            parent_key_column: None,
+            max_requests: 0,
             declared_schema: node.data.schema.clone(),
         });
         (String::new(), StageKind::View, None)
@@ -4393,9 +4515,15 @@ fn build_stage(
         // src.soap: defaults to POST + Content-Type text/xml + XML
         // response parsing (responsePath walks element names from the
         // SOAP envelope root, e.g. Envelope/Body/Foo/Bar).
+        // #257: a child endpoint is described by a URL template instead of a
+        // fixed URL, so the template stands in when `url` is not set. When both
+        // are given the template wins, because it is the more specific answer.
+        let rest_url_template =
+            string_prop(&props, "urlTemplate").filter(|s| !s.trim().is_empty());
         let url = string_prop(&props, "url")
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| EngineError::Config(format!("{}: url required", component_id)))?;
+            .or_else(|| rest_url_template.clone())
+            .ok_or_else(|| EngineError::Config(format!("{}: url or urlTemplate required", component_id)))?;
         // SAP native aliases. src.sap = SAP OData (v2 classic Gateway or v4
         // RAP); this covers OData services and CDS views published as OData.
         // src.sap.rfc = an RFC-enabled function module exposed over SOAP
@@ -4570,7 +4698,15 @@ fn build_stage(
             .and_then(|v| v.as_u64())
             .filter(|n| *n > 0)
             .unwrap_or(100);
+        // #257: only fan out when the user actually asked for it - a URL
+        // template AND an upstream to draw rows from.
+        let rest_from_view = if rest_url_template.is_some() {
+            inputs.main().map(|v| v.to_string())
+        } else {
+            None
+        };
         rest_source = Some(RestSourceSpec {
+            transport: http_transport_from_props(&props),
             node_id: node.id.clone(),
             response_metadata: props
                 .get("responseMetadata")
@@ -4586,6 +4722,17 @@ fn build_stage(
             max_pages,
             oauth,
             declared_schema: node.data.schema.clone(),
+            // #257: a URL template plus a main input turns this one node into a
+            // request per upstream row. Both absent = unchanged behaviour, which
+            // is what every existing pipeline and vendor alias relies on.
+            from_view: rest_from_view,
+            url_template: rest_url_template,
+            parent_key_column: string_prop(&props, "parentKeyColumn").filter(|s| !s.is_empty()),
+            max_requests: props
+                .get("maxRequests")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1000),
         });
         (String::new(), StageKind::View, None)
     } else if component_id == "src.snowflake" {
@@ -4927,6 +5074,19 @@ fn build_stage(
                 .unwrap_or_else(|| "https://api.openai.com".into()),
             headers: headers_from_props(&props),
             endpoint_path: string_prop(&props, "endpointPath").filter(|s| !s.is_empty()),
+            // #258: default 1 keeps every existing pipeline byte-identical.
+            concurrency: props
+                .get("concurrency")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1) as usize,
+            // #258: 0 disables retrying; the default gives a rate limit three
+            // chances before the stage gives up on the whole dataset.
+            max_retries: props
+                .get("maxRetries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32,
+
         });
         (String::new(), StageKind::View, None)
     } else if component_id == "xf.ai.llm" {
@@ -4967,6 +5127,25 @@ fn build_stage(
                 .unwrap_or(0.0),
             headers: headers_from_props(&props),
             endpoint_path: string_prop(&props, "endpointPath").filter(|s| !s.is_empty()),
+            // #258: default 1 keeps every existing pipeline byte-identical.
+            concurrency: props
+                .get("concurrency")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1) as usize,
+            // #258: 0 disables retrying; the default gives a rate limit three
+            // chances before the stage gives up on the whole dataset.
+            max_retries: props
+                .get("maxRetries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32,
+            // #258: only sent when the user actually set it, so a pipeline
+            // that never touched the field still sends no max_tokens.
+            max_tokens: props
+                .get("maxTokens")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .map(|n| n as u32),
         });
         (String::new(), StageKind::View, None)
     } else if component_id == "xf.ai.embed" {
@@ -5004,6 +5183,19 @@ fn build_stage(
                 .unwrap_or(100) as usize,
             headers: headers_from_props(&props),
             endpoint_path: string_prop(&props, "endpointPath").filter(|s| !s.is_empty()),
+            // #258: default 1 keeps every existing pipeline byte-identical.
+            concurrency: props
+                .get("concurrency")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1) as usize,
+            // #258: 0 disables retrying; the default gives a rate limit three
+            // chances before the stage gives up on the whole dataset.
+            max_retries: props
+                .get("maxRetries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32,
+
         });
         (String::new(), StageKind::View, None)
     } else if matches!(component_id, "code.sql" | "code.sqltemplate")
@@ -5392,6 +5584,9 @@ fn build_stage(
         .or_else(|| nats_source.map(RuntimeSpec::NatsSource))
         .or_else(|| pubsub_sink.map(RuntimeSpec::PubsubSink))
         .or_else(|| pubsub_source.map(RuntimeSpec::PubsubSource))
+        .or_else(|| model_card.map(RuntimeSpec::ModelCard))
+        .or_else(|| pdf_source.map(RuntimeSpec::PdfSource))
+        .or_else(|| html_source.map(RuntimeSpec::HtmlSource))
         .or_else(|| xml_source.map(RuntimeSpec::XmlSource))
         .or_else(|| xml_sink.map(RuntimeSpec::XmlSink))
         .or_else(|| avro_sink.map(RuntimeSpec::AvroSink))

@@ -315,6 +315,12 @@ pub fn resolve_connection_ref_props(
     component_id: &str,
     props: &mut JsonValue,
 ) -> Result<(), String> {
+    // #256: a transport connection is resolved FIRST and independently. It has
+    // to be its own key, because `connectionRef` on these nodes is already spent
+    // on the REST auth connection, and it has to be resolved before the early
+    // return below, or a node carrying a transport but no auth connection would
+    // silently keep neither.
+    resolve_transport_ref(workspace, props)?;
     let Some(ref_id) = props
         .get("connectionRef")
         .and_then(|v| v.as_str())
@@ -444,6 +450,60 @@ pub fn resolve_connection_ref_props(
 ///   opposite of "one datasource, a different query per node".
 ///
 /// Auth fields fill in the same way: only where the node left a blank.
+/// #256: flatten a saved `http` transport connection onto a node.
+///
+/// Proxies, timeouts and a User-Agent are transport, not credentials, and every
+/// HTTP-backed component wants the same four. Keeping them on a saved connection
+/// means setting a corporate proxy once rather than on every node, and the node
+/// still wins where it set a value itself - the same policy a saved REST
+/// connection already uses for url and auth.
+///
+/// A connection that has since been deleted is not fatal: the node keeps
+/// whatever it carries inline, exactly like every non-Salesforce kind.
+fn resolve_transport_ref(workspace: &Path, props: &mut JsonValue) -> Result<(), String> {
+    let Some(ref_id) = props
+        .get("transportRef")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+    else {
+        return Ok(());
+    };
+    let Ok(conn) = load_connection(workspace, &ref_id) else {
+        return Ok(());
+    };
+    let kind = conn.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind != "http" {
+        return Err(format!(
+            "transportRef '{}' is kind '{}', expected an HTTP transport connection",
+            ref_id, kind
+        ));
+    }
+    let Some(map) = props.as_object_mut() else {
+        return Ok(());
+    };
+    // Connection field -> the flat prop the engine reads.
+    for (from, to) in [
+        ("proxy", "httpProxy"),
+        ("readTimeoutSecs", "httpReadTimeoutSecs"),
+        ("connectTimeoutSecs", "httpConnectTimeoutSecs"),
+        ("userAgent", "httpUserAgent"),
+    ] {
+        let filled = |v: Option<&JsonValue>| -> bool {
+            !matches!(v, None | Some(JsonValue::Null)) && v.and_then(|x| x.as_str()) != Some("")
+        };
+        if filled(map.get(to)) {
+            continue; // the node said something specific; leave it alone
+        }
+        if let Some(v) = conn.get(from) {
+            if filled(Some(v)) {
+                map.insert(to.to_string(), v.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn merge_rest_connection(conn: &JsonValue, map: &mut serde_json::Map<String, JsonValue>) {
     let filled = |v: Option<&JsonValue>| -> bool {
         !matches!(v, None | Some(JsonValue::Null)) && v.and_then(|x| x.as_str()) != Some("")
@@ -653,6 +713,26 @@ mod tests {
 
     /// Secrets written before the binding must keep opening, or upgrading Duckle
     /// would lock people out of their own connections.
+    #[test]
+    fn a_secret_encrypted_by_an_older_build_still_decrypts() {
+        // The round-trip test below encrypts and decrypts with the SAME library,
+        // so it pins the blob layout but cannot notice if the cipher's own output
+        // ever changed - which is exactly what a crypto dependency bump risks,
+        // and it would silently strand every secret already on disk.
+        //
+        // This blob is therefore a fixed known answer, produced OUTSIDE this
+        // codebase (Python's cryptography / OpenSSL) for key = 32 bytes of 0x09,
+        // nonce = 12 bytes of 0x03, plaintext "legacy", no AAD. If a future
+        // aes-gcm release changes anything observable, this stops decrypting.
+        let key = [9u8; 32];
+        let blob = format!("{}{}", ENC_PREFIX, "AwMDAwMDAwMDAwMDvfGMEzbF51+cyZ2Z34DTOdLhyPAUOw==");
+        assert_eq!(
+            decrypt_value(&key, &aad_for("anything", "at-all"), &blob).unwrap(),
+            "legacy",
+            "a secret written by an older build no longer decrypts"
+        );
+    }
+
     #[test]
     fn a_v1_value_still_decrypts() {
         use aes_gcm::aead::Aead;

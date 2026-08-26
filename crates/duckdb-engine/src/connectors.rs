@@ -5220,6 +5220,413 @@ impl DuckdbEngine {
         Ok(format!("qvd: materialized {} records into {}", count, spec.node_id))
     }
 
+    /// snk.model: record one trained model's card (#253).
+    ///
+    /// The card IS the upstream row: whatever columns the training stage
+    /// produced - artifact URI, framework, metrics, the hashes it chose to
+    /// record - are what gets written, plus the model name and the moment it was
+    /// registered. That keeps the engine out of the business of deciding what a
+    /// model card should contain, which differs per team.
+    ///
+    /// The write is QUEUED, not done here. It happens at the end of the run and
+    /// only if the whole run succeeded, so a training pipeline that blows up
+    /// after this stage never leaves a registered model pointing at a model that
+    /// was never finished. That gate, and the `latest` pointer, are the two
+    /// things a plain file-writing convention cannot give you.
+    pub(crate) fn run_model_card(
+        &self,
+        db: &Path,
+        spec: &ModelCardSpec,
+        pending: &mut Vec<(std::path::PathBuf, JsonValue)>,
+    ) -> Result<String, EngineError> {
+        self.check_cancelled()?;
+        let rows = self.run_rows(
+            Some(db),
+            &format!("SELECT * FROM {};", quote_ident(&spec.from_view)),
+        )?;
+        // One model, one card. Silently taking the first of several rows would
+        // register a model chosen by whatever order the upstream happened to
+        // produce, which is not a decision the engine should make.
+        if rows.len() != 1 {
+            return Err(EngineError::Query(format!(
+                "snk.model: expected exactly one upstream row to register as a model card, got {}. Reduce the training stage's output to a single row first.",
+                rows.len()
+            )));
+        }
+        let mut card = match &rows[0] {
+            JsonValue::Object(m) => m.clone(),
+            other => {
+                return Err(EngineError::Query(format!(
+                    "snk.model: the upstream row is not a record: {}",
+                    other
+                )))
+            }
+        };
+        // The version names the file, so it has to be there and has to be
+        // something. Defaulting it would silently overwrite the previous card.
+        let version = match card.get("version") {
+            Some(JsonValue::String(v)) if !v.trim().is_empty() => v.trim().to_string(),
+            Some(JsonValue::Number(n)) => n.to_string(),
+            _ => {
+                return Err(EngineError::Query(
+                    "snk.model: the upstream row needs a non-empty `version` column - it names the card and is how an older model is still addressable after a retrain".into(),
+                ))
+            }
+        };
+        card.insert("name".into(), JsonValue::String(spec.name.clone()));
+        card.insert(
+            "registered_at".into(),
+            JsonValue::String(chrono::Utc::now().to_rfc3339()),
+        );
+        let card = JsonValue::Object(card);
+
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let dir = std::path::Path::new(&spec.dir).join(safe(&spec.name));
+        pending.push((dir.join(format!("{}.json", safe(&version))), card.clone()));
+        // The pointer is a copy of the card, not a reference to it, so reading
+        // `latest` is one read and cannot race with the versioned file moving.
+        pending.push((dir.join("latest.json"), card));
+        Ok(format!(
+            "model: {} version {} will be registered if this run succeeds",
+            spec.name, version
+        ))
+    }
+
+    /// src.pdf: one row per PAGE of a PDF document (#248).
+    ///
+    /// A lot of real data engineering starts from documents rather than tables:
+    /// filings, annual accounts, invoices, regulatory publications. This reads
+    /// the text layer a PDF already carries, alongside the page geometry and the
+    /// document's own metadata, so a page becomes a row a pipeline can filter,
+    /// join and hand to a Python or AI stage like any other.
+    ///
+    /// It does NOT do OCR, and deliberately: a scanned page has no text layer,
+    /// and rasterising one needs a native rendering engine plus per-language
+    /// trained data, which would end the self-contained cross-OS build this repo
+    /// protects everywhere else. `has_text_layer` is false for those pages, which
+    /// is what makes them findable - filter on it and route them wherever your
+    /// OCR lives.
+    pub(crate) fn run_pdf_source(
+        &self,
+        db: &Path,
+        spec: &PdfSourceSpec,
+    ) -> Result<String, EngineError> {
+        self.check_cancelled()?;
+        let files = expand_pdf_paths(&spec.path, spec.recursive);
+        if files.is_empty() {
+            return Err(EngineError::Config(format!(
+                "pdf: no .pdf files at {}",
+                spec.path
+            )));
+        }
+        let mut writer = match &spec.declared_schema {
+            Some(schema) if !schema.is_empty() => {
+                JsonLinesWriter::open_with_schema(&spec.node_id, Some(schema.clone()))?
+            }
+            _ => JsonLinesWriter::open(&spec.node_id)?,
+        };
+        let mut count: usize = 0;
+        for file in &files {
+            self.check_cancelled()?;
+            let doc = lopdf::Document::load(file)
+                .map_err(|e| EngineError::Query(format!("pdf: open {}: {}", file, e)))?;
+            let pages = doc.get_pages();
+            let page_count = pages.len();
+
+            // The document Info dictionary, when it has one. Missing entries are
+            // simply absent rather than empty strings: a PDF with no author and
+            // one with an empty author are different.
+            let mut meta = serde_json::Map::new();
+            if let Ok(lopdf::Object::Reference(id)) = doc.trailer.get(b"Info") {
+                if let Ok(info) = doc.get_dictionary(*id) {
+                    for (key, name) in [
+                        (&b"Title"[..], "title"),
+                        (&b"Author"[..], "author"),
+                        (&b"Creator"[..], "creator"),
+                        (&b"Producer"[..], "producer"),
+                        (&b"CreationDate"[..], "created"),
+                    ] {
+                        if let Ok(v) = info.get(key) {
+                            if let Ok(s) = v.as_str() {
+                                meta.insert(
+                                    name.to_string(),
+                                    JsonValue::String(String::from_utf8_lossy(s).into_owned()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            meta.insert("page_count".into(), JsonValue::from(page_count as u64));
+            let meta = JsonValue::Object(meta);
+
+            // pdf-extract has a reputation for panicking on malformed input, and
+            // a panic here would take the whole run down rather than failing one
+            // stage with a message naming the file.
+            let path_owned = file.clone();
+            let texts: Vec<String> =
+                match std::panic::catch_unwind(move || pdf_extract::extract_text_by_pages(&path_owned)) {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => {
+                        return Err(EngineError::Query(format!(
+                            "pdf: extract text from {}: {}",
+                            file, e
+                        )))
+                    }
+                    Err(_) => {
+                        return Err(EngineError::Query(format!(
+                            "pdf: {} could not be parsed (the file is malformed, or uses a feature the text extractor cannot read)",
+                            file
+                        )))
+                    }
+                };
+
+            for (idx, (page_number, page_id)) in pages.iter().enumerate() {
+                let (width, height) = page_media_box(&doc, *page_id);
+                let text = texts.get(idx).cloned().unwrap_or_default();
+                let mut row = serde_json::Map::new();
+                // Same value src.artifact puts in `uri`, so the two join.
+                row.insert("document_id".into(), JsonValue::String(file.clone()));
+                row.insert("page_number".into(), JsonValue::from(*page_number as u64));
+                // A page whose text is only whitespace has no usable text layer,
+                // which is the scanned-page case worth routing elsewhere.
+                row.insert(
+                    "has_text_layer".into(),
+                    JsonValue::Bool(!text.trim().is_empty()),
+                );
+                row.insert("text".into(), JsonValue::String(text));
+                match width {
+                    Some(w) => row.insert("width".into(), JsonValue::from(w)),
+                    None => row.insert("width".into(), JsonValue::Null),
+                };
+                match height {
+                    Some(h) => row.insert("height".into(), JsonValue::from(h)),
+                    None => row.insert("height".into(), JsonValue::Null),
+                };
+                row.insert("metadata".into(), meta.clone());
+                writer.write_row(&JsonValue::Object(row))?;
+                count += 1;
+            }
+        }
+        match &spec.declared_schema {
+            Some(schema) if !schema.is_empty() => {
+                let (columns_spec, select_list) = xml_declared_columns(schema);
+                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?;
+            }
+            _ => writer.finalize_into_table(&self.bin, db, &spec.node_id)?,
+        }
+        Ok(format!(
+            "pdf: materialized {} page(s) from {} file(s) into {}",
+            count,
+            files.len(),
+            spec.node_id
+        ))
+    }
+
+    /// src.html: rows out of an HTML page, by CSS selector (#255).
+    ///
+    /// HTML is not XML. Real pages carry unclosed tags and unquoted attributes
+    /// that the strict XML reader rejects outright, so this parses with a
+    /// tolerant HTML parser and selects with CSS rather than an element path.
+    ///
+    /// Selectors are compiled ONCE up front, so a typo fails the stage
+    /// immediately with the offending selector named, rather than silently
+    /// producing empty columns for every row. `Document::select` panics on a bad
+    /// selector and `try_select` cannot tell a bad selector from a page that
+    /// simply had no matches, so neither is used here.
+    pub(crate) fn run_html_source(
+        &self,
+        db: &Path,
+        spec: &HtmlSourceSpec,
+    ) -> Result<String, EngineError> {
+        self.check_cancelled()?;
+        let lower = spec.path.to_ascii_lowercase();
+        let html = if lower.starts_with("http://") || lower.starts_with("https://") {
+            let agent = match &spec.transport {
+                Some(t) => crate::tls::http_agent_with(t),
+                None => crate::tls::http_agent(),
+            };
+            let mut req = agent.get(&spec.path);
+            for (k, v) in &spec.headers {
+                req = req.set(k, v);
+            }
+            match req.call() {
+                Ok(r) => r
+                    .into_string()
+                    .map_err(|e| EngineError::Query(format!("html: read {}: {}", spec.path, e)))?,
+                Err(ureq::Error::Status(code, r)) => {
+                    let body = r.into_string().unwrap_or_default();
+                    return Err(EngineError::Query(format!(
+                        "html: HTTP {} from {}: {}",
+                        code,
+                        spec.path,
+                        body.chars().take(300).collect::<String>()
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!(
+                        "html: HTTP transport to {}: {}",
+                        spec.path, e
+                    )))
+                }
+            }
+        } else {
+            // Lossy rather than strict: plenty of real pages are still served
+            // as latin-1, and a replacement character in one cell beats
+            // refusing to read the document at all.
+            let bytes = std::fs::read(&spec.path)
+                .map_err(|e| EngineError::Query(format!("html: read {}: {}", spec.path, e)))?;
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+
+        let compile = |sel: &str| -> Result<dom_query::Matcher, EngineError> {
+            dom_query::Matcher::new(sel).map_err(|_| {
+                EngineError::Config(format!("html: {} is not a valid CSS selector", sel))
+            })
+        };
+        let row_matcher = compile(&spec.row_selector)?;
+        let mut col_matchers: Vec<Option<dom_query::Matcher>> = Vec::with_capacity(spec.columns.len());
+        for c in &spec.columns {
+            col_matchers.push(if c.selector.is_empty() {
+                None
+            } else {
+                Some(compile(&c.selector)?)
+            });
+        }
+
+        let doc = dom_query::Document::from(html);
+        let mut writer = match &spec.declared_schema {
+            Some(schema) if !schema.is_empty() => {
+                JsonLinesWriter::open_with_schema(&spec.node_id, Some(schema.clone()))?
+            }
+            _ => JsonLinesWriter::open(&spec.node_id)?,
+        };
+        let mut count: usize = 0;
+        let clean = |t: String| t.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        if spec.columns.is_empty() {
+            // Table mode: the row selector names a table, its header cells name
+            // the columns, and each body row is a row. This is the shape most
+            // "the data is only published as an HTML table" pages have, and
+            // making the user write a selector per column for it would be busy
+            // work.
+            let th = compile("th")?;
+            let td = compile("td")?;
+            let tr = compile("tr")?;
+            for table in doc.select_matcher(&row_matcher).iter() {
+                let headers: Vec<String> = table
+                    .select_matcher(&th)
+                    .iter()
+                    .map(|h| clean(h.text().to_string()))
+                    .collect();
+                for (ri, row) in table.select_matcher(&tr).iter().enumerate() {
+                    self.check_cancelled()?;
+                    let cells: Vec<String> = row
+                        .select_matcher(&td)
+                        .iter()
+                        .map(|c| clean(c.text().to_string()))
+                        .collect();
+                    // The header row itself has no td cells; skip it rather than
+                    // emitting a row of nulls.
+                    if cells.is_empty() {
+                        continue;
+                    }
+                    let mut obj = serde_json::Map::new();
+                    for (i, cell) in cells.iter().enumerate() {
+                        let name = headers
+                            .get(i)
+                            .filter(|h| !h.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| format!("column_{}", i + 1));
+                        obj.insert(name, JsonValue::String(cell.clone()));
+                    }
+                    let _ = ri;
+                    writer.write_row(&JsonValue::Object(obj))?;
+                    count += 1;
+                }
+            }
+        } else {
+            for row in doc.select_matcher(&row_matcher).iter() {
+                self.check_cancelled()?;
+                let mut obj = serde_json::Map::new();
+                for (col, matcher) in spec.columns.iter().zip(col_matchers.iter()) {
+                    // An empty selector means the row element itself, which is
+                    // how you read an attribute off the matched element.
+                    let value = match matcher {
+                        None => match &col.attr {
+                            Some(a) => row.attr(a).map(|v| v.to_string()),
+                            None => Some(row.text().to_string()),
+                        },
+                        Some(m) => {
+                            let found = row.select_matcher(m);
+                            if found.is_empty() {
+                                None
+                            } else {
+                                match &col.attr {
+                                    Some(a) => found.attr(a).map(|v| v.to_string()),
+                                    None => Some(found.text().to_string()),
+                                }
+                            }
+                        }
+                    };
+                    // A column that did not match is NULL, not an empty string:
+                    // a missing price and a blank price are different facts.
+                    obj.insert(
+                        col.name.clone(),
+                        match value {
+                            Some(v) => JsonValue::String(clean(v)),
+                            None => JsonValue::Null,
+                        },
+                    );
+                }
+                writer.write_row(&JsonValue::Object(obj))?;
+                count += 1;
+            }
+        }
+
+        match &spec.declared_schema {
+            Some(schema) if !schema.is_empty() => {
+                let (columns_spec, select_list) = xml_declared_columns(schema);
+                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?;
+            }
+            // A page that matched nothing is an ordinary outcome for a scrape,
+            // not a failure. With explicit columns the shape IS known even with
+            // no rows, so type the empty relation from them rather than failing
+            // the way an untypeable empty result has to (#170). Table mode has
+            // no such luxury: without a header row there is nothing to name.
+            _ if count == 0 && !spec.columns.is_empty() => {
+                let cols: Vec<duckle_metadata::Column> = spec
+                    .columns
+                    .iter()
+                    .map(|c| duckle_metadata::Column {
+                        name: c.name.clone(),
+                        data_type: duckle_metadata::DataType::String,
+                        nullable: true,
+                        format: None,
+                        primary_key: None,
+                    })
+                    .collect();
+                let (columns_spec, select_list) = xml_declared_columns(&cols);
+                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?;
+            }
+            _ => writer.finalize_into_table(&self.bin, db, &spec.node_id)?,
+        }
+        Ok(format!(
+            "html: materialized {} rows into {}",
+            count, spec.node_id
+        ))
+    }
+
     /// XML row-path source. Walks the document, builds a serde_json
     /// tree per element, and emits every element matching the
     /// trailing components of rowPath. Attributes become "@name"
@@ -5918,7 +6325,11 @@ impl DuckdbEngine {
         };
         let file = std::fs::File::create(&spec.path)
             .map_err(|e| EngineError::Query(format!("avro: create {}: {}", spec.path, e)))?;
-        let mut writer = apache_avro::Writer::new(&schema, file);
+        // apache-avro 0.22 returns a Result here: building a writer can fail on a
+        // schema it cannot encode against, which used to surface later as a
+        // confusing append error instead of at the point of the mistake.
+        let mut writer = apache_avro::Writer::new(&schema, file)
+            .map_err(|e| EngineError::Query(format!("avro: open writer: {}", e)))?;
         let mut total = 0_usize;
         for row in &rows {
             self.check_cancelled()?;
@@ -6003,8 +6414,10 @@ impl DuckdbEngine {
                     let payload = serde_json::to_vec(row).unwrap_or_default();
                     let confirm = channel
                         .basic_publish(
-                            &spec.exchange,
-                            &spec.routing_key,
+                            // lapin 4 takes the AMQP ShortString type rather
+                            // than a borrowed str for these fields.
+                            spec.exchange.as_str().into(),
+                            spec.routing_key.as_str().into(),
                             BasicPublishOptions::default(),
                             &payload,
                             props.clone(),
@@ -6065,7 +6478,7 @@ impl DuckdbEngine {
                     break;
                 }
                 let got = channel
-                    .basic_get(&spec.queue, BasicGetOptions::default())
+                    .basic_get(spec.queue.as_str().into(), BasicGetOptions::default())
                     .await
                     .map_err(|e| format!("basic_get: {}", e))?;
                 let Some(delivery) = got else {
@@ -7026,6 +7439,160 @@ impl DuckdbEngine {
         req
     }
 
+    /// #258: how long to wait before retry `attempt` (0-based).
+    ///
+    /// A `Retry-After` given in whole seconds is obeyed exactly - that is the
+    /// provider saying when it will serve again, and guessing shorter just
+    /// earns another 429. Without one the wait doubles from 500ms, capped so a
+    /// stalled provider cannot park a stage for an unbounded time.
+    pub(crate) fn ai_retry_wait_ms(retry_after: Option<&str>, attempt: u32) -> u64 {
+        if let Some(secs) = retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+            return (secs * 1000).min(300_000);
+        }
+        (500u64 << attempt.min(6)).min(30_000)
+    }
+
+    /// #258: sleep, but notice a cancelled run instead of sitting out a rate
+    /// limit for the full interval.
+    fn ai_sleep_cancellable(&self, ms: u64) -> Result<(), EngineError> {
+        let mut left = ms;
+        while left > 0 {
+            let slice = left.min(200);
+            std::thread::sleep(std::time::Duration::from_millis(slice));
+            left -= slice;
+            self.check_cancelled()?;
+        }
+        Ok(())
+    }
+
+    /// #258: send one AI request, retrying on HTTP 429 and 5xx.
+    ///
+    /// `make` rebuilds the request on each attempt because ureq consumes a
+    /// Request when it is sent. Before this, the first rate limit returned Err
+    /// and the stage threw away every row it had already paid for; the only
+    /// retry in the engine is per stage, which re-sends the whole dataset from
+    /// row 0. Transport errors are deliberately not retried, so a wrong host
+    /// still fails as fast as it always did.
+    fn ai_send_with_retry(
+        &self,
+        make: &dyn Fn() -> ureq::Request,
+        body: &str,
+        what: &str,
+        max_retries: u32,
+    ) -> Result<JsonValue, EngineError> {
+        let mut attempt = 0u32;
+        loop {
+            self.check_cancelled()?;
+            match make().send_string(body) {
+                Ok(r) => {
+                    return r
+                        .into_json()
+                        .map_err(|e| EngineError::Query(format!("{} parse: {}", what, e)))
+                }
+                Err(ureq::Error::Status(code, r)) => {
+                    let retryable = code == 429 || (500..600).contains(&code);
+                    if !retryable || attempt >= max_retries {
+                        let b = r.into_string().unwrap_or_default();
+                        return Err(EngineError::Query(format!(
+                            "{} HTTP {}: {}",
+                            what, code, b
+                        )));
+                    }
+                    let wait = Self::ai_retry_wait_ms(r.header("Retry-After"), attempt);
+                    self.ai_sleep_cancellable(wait)?;
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!("{} transport: {}", what, e)))
+                }
+            }
+            attempt += 1;
+        }
+    }
+
+    /// #258: map `n` items through `f` with at most `concurrency` requests in
+    /// flight, writing every result back BY INDEX.
+    ///
+    /// Order is the thing this must not break. The sequential loops this
+    /// replaces got row order for free; a dispatcher that pushed results as
+    /// they completed would pair every row with another row's answer, and
+    /// nothing downstream would report it. `concurrency` of 1 runs inline and
+    /// is byte for byte the loop it replaces.
+    fn ai_map_concurrent<T, F>(
+        &self,
+        n: usize,
+        concurrency: usize,
+        f: F,
+    ) -> Result<Vec<T>, EngineError>
+    where
+        T: Send,
+        F: Fn(&Self, usize) -> Result<T, EngineError> + Sync,
+    {
+        if concurrency <= 1 || n <= 1 {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                self.check_cancelled()?;
+                out.push(f(self, i)?);
+            }
+            return Ok(out);
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let workers = concurrency.min(n);
+        let next = AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Option<T>>> =
+            (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+        let failure: std::sync::Mutex<Option<(usize, EngineError)>> =
+            std::sync::Mutex::new(None);
+        // One engine clone per worker, matching run_parallel_branches: it keeps
+        // each worker's cancellation check its own.
+        let engines: Vec<Self> = (0..workers).map(|_| self.clone()).collect();
+        // Take references up front: each worker closure is `move`, and without
+        // these it would move the shared state into the first worker.
+        let (f, next, slots, failure) = (&f, &next, &slots, &failure);
+        std::thread::scope(|scope| {
+            for engine in &engines {
+                scope.spawn(move || loop {
+                    // Stop pulling work the moment any worker has failed, so a
+                    // rate-limited 500k-row job stops paying for requests.
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= n {
+                        return;
+                    }
+                    match engine.check_cancelled().and_then(|_| f(engine, i)) {
+                        Ok(v) => *slots[i].lock().unwrap() = Some(v),
+                        Err(e) => {
+                            let mut slot = failure.lock().unwrap();
+                            // Report the lowest-index failure, so the message
+                            // does not depend on which worker lost the race.
+                            if slot.as_ref().map_or(true, |(j, _)| i < *j) {
+                                *slot = Some((i, e));
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some((_, e)) = failure.lock().unwrap().take() {
+            return Err(e);
+        }
+        let mut out = Vec::with_capacity(n);
+        for (i, slot) in slots.iter().enumerate() {
+            match slot.lock().unwrap().take() {
+                Some(v) => out.push(v),
+                None => {
+                    return Err(EngineError::Query(format!(
+                        "ai: row {} produced no result",
+                        i
+                    )))
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// xf.ai.embed: per-row embedding via an OpenAI-compatible API.
     /// Reads the upstream view, batches rows into groups of
     /// batch_size, sends the input_column text array to /v1/embeddings,
@@ -7051,9 +7618,12 @@ impl DuckdbEngine {
             ));
         }
         let endpoint = Self::ai_endpoint(&spec.base_url, &spec.endpoint_path, "/v1/embeddings");
-        let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
-        for chunk in rows.chunks(spec.batch_size) {
-            self.check_cancelled()?;
+        // #258: one request per batch as before, but up to `concurrency`
+        // batches in flight. Results come back per chunk and are flattened in
+        // chunk order, so the output row order is exactly the input order.
+        let chunks: Vec<&[JsonValue]> = rows.chunks(spec.batch_size).collect();
+        let per_chunk = self.ai_map_concurrent(chunks.len(), spec.concurrency, |engine, ci| {
+            let chunk = chunks[ci];
             // Pull the text from each row; missing / non-string values
             // become empty strings so the API call doesn't fail on a
             // single bad row.
@@ -7070,26 +7640,12 @@ impl DuckdbEngine {
                 "model": spec.model,
                 "input": inputs,
             });
-            let resp = Self::ai_post(&endpoint, &spec.headers, &spec.api_key)
-                .send_string(&body.to_string());
-            let response: JsonValue = match resp {
-                Ok(r) => r
-                    .into_json()
-                    .map_err(|e| EngineError::Query(format!("ai.embed parse: {}", e)))?,
-                Err(ureq::Error::Status(code, r)) => {
-                    let body = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!(
-                        "ai.embed HTTP {}: {}",
-                        code, body
-                    )));
-                }
-                Err(e) => {
-                    return Err(EngineError::Query(format!(
-                        "ai.embed transport: {}",
-                        e
-                    )))
-                }
-            };
+            let response = engine.ai_send_with_retry(
+                &|| Self::ai_post(&endpoint, &spec.headers, &spec.api_key),
+                &body.to_string(),
+                "ai.embed",
+                spec.max_retries,
+            )?;
             // OpenAI shape: response.data is an array of {index, embedding: [...]}.
             // Order is guaranteed to match the input order per the API contract.
             let data = response
@@ -7104,6 +7660,7 @@ impl DuckdbEngine {
                     data.len()
                 )));
             }
+            let mut chunk_out = Vec::with_capacity(chunk.len());
             for (row, item) in chunk.iter().zip(data.iter()) {
                 let embedding = item.get("embedding").cloned().unwrap_or(JsonValue::Null);
                 let mut obj = match row {
@@ -7111,9 +7668,11 @@ impl DuckdbEngine {
                     _ => serde_json::Map::new(),
                 };
                 obj.insert(spec.output_column.clone(), embedding);
-                out.push(JsonValue::Object(obj));
+                chunk_out.push(JsonValue::Object(obj));
             }
-        }
+            Ok(chunk_out)
+        })?;
+        let out: Vec<JsonValue> = per_chunk.into_iter().flatten().collect();
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
         Ok(format!(
@@ -8446,9 +9005,8 @@ impl DuckdbEngine {
              Reply with only the category name and nothing else.",
             cat_list
         );
-        let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            self.check_cancelled()?;
+        let out = self.ai_map_concurrent(rows.len(), spec.concurrency, |engine, i| {
+            let row = &rows[i];
             let text = row
                 .get(&spec.input_column)
                 .and_then(|v| v.as_str())
@@ -8462,20 +9020,12 @@ impl DuckdbEngine {
                     {"role": "user", "content": text},
                 ],
             });
-            let resp = Self::ai_post(&endpoint, &spec.headers, &spec.api_key)
-                .send_string(&body.to_string());
-            let response: JsonValue = match resp {
-                Ok(r) => r
-                    .into_json()
-                    .map_err(|e| EngineError::Query(format!("ai.classify parse: {}", e)))?,
-                Err(ureq::Error::Status(code, r)) => {
-                    let b = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!("ai.classify HTTP {}: {}", code, b)));
-                }
-                Err(e) => {
-                    return Err(EngineError::Query(format!("ai.classify transport: {}", e)))
-                }
-            };
+            let response = engine.ai_send_with_retry(
+                &|| Self::ai_post(&endpoint, &spec.headers, &spec.api_key),
+                &body.to_string(),
+                "ai.classify",
+                spec.max_retries,
+            )?;
             let raw = response
                 .pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str())
@@ -8496,8 +9046,8 @@ impl DuckdbEngine {
                 _ => serde_json::Map::new(),
             };
             obj.insert(spec.output_column.clone(), JsonValue::String(chosen));
-            out.push(JsonValue::Object(obj));
-        }
+            Ok(JsonValue::Object(obj))
+        })?;
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
         Ok(format!(
@@ -8527,9 +9077,8 @@ impl DuckdbEngine {
             return Ok(format!("ai.llm: 0 upstream rows -> {}", spec.node_id));
         }
         let endpoint = Self::ai_endpoint(&spec.base_url, &spec.endpoint_path, "/v1/chat/completions");
-        let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            self.check_cancelled()?;
+        let out = self.ai_map_concurrent(rows.len(), spec.concurrency, |engine, i| {
+            let row = &rows[i];
             let user_text = if spec.prompt_template.is_empty() {
                 row.get(&spec.input_column)
                     .and_then(|v| v.as_str())
@@ -8543,25 +9092,22 @@ impl DuckdbEngine {
                 messages.push(serde_json::json!({"role": "system", "content": sys}));
             }
             messages.push(serde_json::json!({"role": "user", "content": user_text}));
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": spec.model,
                 "messages": messages,
                 "temperature": spec.temperature,
             });
-            let resp = Self::ai_post(&endpoint, &spec.headers, &spec.api_key)
-                .send_string(&body.to_string());
-            let response: JsonValue = match resp {
-                Ok(r) => r
-                    .into_json()
-                    .map_err(|e| EngineError::Query(format!("ai.llm parse: {}", e)))?,
-                Err(ureq::Error::Status(code, r)) => {
-                    let b = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!("ai.llm HTTP {}: {}", code, b)));
-                }
-                Err(e) => {
-                    return Err(EngineError::Query(format!("ai.llm transport: {}", e)))
-                }
-            };
+            // #258: the GUI has offered Max tokens since #142 while the request
+            // body never carried it, so every row was billed an unbounded reply.
+            if let Some(max) = spec.max_tokens {
+                body["max_tokens"] = serde_json::json!(max);
+            }
+            let response = engine.ai_send_with_retry(
+                &|| Self::ai_post(&endpoint, &spec.headers, &spec.api_key),
+                &body.to_string(),
+                "ai.llm",
+                spec.max_retries,
+            )?;
             let content = response
                 .pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str())
@@ -8572,8 +9118,8 @@ impl DuckdbEngine {
                 _ => serde_json::Map::new(),
             };
             obj.insert(spec.output_column.clone(), JsonValue::String(content));
-            out.push(JsonValue::Object(obj));
-        }
+            Ok(JsonValue::Object(obj))
+        })?;
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
         Ok(format!(
@@ -10434,28 +10980,18 @@ impl DuckdbEngine {
         db: &Path,
         spec: &RestSourceSpec,
     ) -> Result<String, EngineError> {
-        let mut url = spec.url.clone();
         let mut all_rows: Vec<JsonValue> = Vec::new();
         let mut pages = 0_u64;
-        let mut truncated = false;
-        // Mutable state for offset / page strategies; cursor uses
-        // per-response extraction inside the loop.
-        let mut offset = 0_u64;
-        let mut page_no = match &spec.pagination {
-            RestPagination::Page { start_page, .. } => *start_page,
-            _ => 1,
-        };
-        // Seed the FIRST request with the start page; the loop only appends the
-        // page param on subsequent requests, so without this the first call hit
-        // the server's default page and a non-default start_page was skipped.
-        if let RestPagination::Page { page_param, start_page } = &spec.pagination {
-            let sep = if url.contains('?') { '&' } else { '?' };
-            url = format!("{}{}{}={}", url, sep, page_param, start_page);
-        }
         // One Agent for the whole pagination walk so keep-alive connections
         // are reused across pages instead of a fresh TCP+TLS handshake each
         // request (ureq::request uses a throwaway agent per call).
-        let agent = crate::tls::http_agent();
+        // #256: one agent for the whole walk, built from this node's transport
+        // so a proxy, a timeout or a User-Agent set on a saved connection
+        // applies to every request the node makes.
+        let agent = match &spec.transport {
+            Some(t) => crate::tls::http_agent_with(t),
+            None => crate::tls::http_agent(),
+        };
         // #166: src.salesforce OAuth client-credentials. Mint a fresh token once
         // per run and inject it as the Authorization header (replacing any static
         // one), so the whole pagination walk uses the same short-lived token.
@@ -10466,218 +11002,282 @@ impl DuckdbEngine {
             eff_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
             eff_headers.push(("Authorization".into(), format!("Bearer {}", token)));
         }
-        loop {
+        // #257: a parent endpoint can feed a child endpoint. Without a URL
+        // template there is one pass and no substitution, exactly what this
+        // function did before, so every existing pipeline and all the vendor
+        // aliases are untouched. The agent, the once-per-run OAuth token, the
+        // headers, the row extraction and all five pagination strategies below
+        // are shared across the fan-out rather than redone per request.
+        let parents: Vec<JsonValue> = match (&spec.from_view, &spec.url_template) {
+            (Some(view), Some(_)) => self.run_rows(
+                Some(db),
+                &format!("SELECT * FROM {};", quote_ident(view)),
+            )?,
+            _ => vec![JsonValue::Null],
+        };
+        if spec.url_template.is_some() && parents.len() as u64 > spec.max_requests {
+            return Err(EngineError::Query(format!(
+                "rest: {} upstream rows would each make a request, past the cap of {}. Filter the upstream, or raise Max requests.",
+                parents.len(),
+                spec.max_requests
+            )));
+        }
+        for parent in &parents {
             self.check_cancelled()?;
-            // Build request
-            let mut req = agent.request(&spec.method, &url);
-            let has_ct = eff_headers
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
-            for (k, v) in &eff_headers {
-                req = req.set(k, v);
+            let mut url = match &spec.url_template {
+                Some(t) => render_url_template(t, parent)?,
+                None => spec.url.clone(),
+            };
+            let mut truncated = false;
+            // Mutable state for offset / page strategies; cursor uses
+            // per-response extraction inside the loop. Reset per parent row:
+            // each child endpoint paginates from its own beginning.
+            let mut offset = 0_u64;
+            let mut page_no = match &spec.pagination {
+                RestPagination::Page { start_page, .. } => *start_page,
+                _ => 1,
+            };
+            let mut parent_pages = 0_u64;
+            // Seed the FIRST request with the start page; the loop only appends the
+            // page param on subsequent requests, so without this the first call hit
+            // the server's default page and a non-default start_page was skipped.
+            if let RestPagination::Page { page_param, start_page } = &spec.pagination {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                url = format!("{}{}{}={}", url, sep, page_param, start_page);
             }
-            if spec.body.is_some() && !has_ct {
-                req = req.set("content-type", "application/json");
-            }
-            let resp_result = match &spec.body {
-                Some(b) => req.send_string(b),
-                None => req.call(),
-            };
-            let response_raw = match resp_result {
-                Ok(r) => r,
-                Err(ureq::Error::Status(code, r)) => {
-                    let body = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!(
-                        "REST HTTP {} from {}: {}",
-                        code,
-                        url,
-                        body.chars().take(300).collect::<String>()
-                    )));
+            loop {
+                self.check_cancelled()?;
+                // Build request
+                let mut req = agent.request(&spec.method, &url);
+                let has_ct = eff_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+                for (k, v) in &eff_headers {
+                    req = req.set(k, v);
                 }
-                Err(e) => {
-                    return Err(EngineError::Query(format!(
-                        "REST HTTP transport to {}: {}",
-                        url, e
-                    )));
+                if spec.body.is_some() && !has_ct {
+                    req = req.set("content-type", "application/json");
                 }
-            };
-            // Capture Link header before consuming the response body.
-            let link_header = response_raw.header("link").map(String::from);
-            // The same, for provenance: once the body is read the response is gone, so
-            // what answered and with what has to be taken here or not at all.
-            let page_status = response_raw.status();
-            let page_url = url.clone();
-            // For XML, parse as text + walk row_path; pagination is
-            // not meaningful (SOAP has no cross-envelope convention)
-            // so we treat the JSON-pointer/cursor variants as no-ops
-            // by returning a Null response from this branch.
-            let (rows, response): (Vec<JsonValue>, JsonValue) = match spec.response_format {
-                RestResponseFormat::Json => {
-                    let response: JsonValue = response_raw.into_json().map_err(|e| {
-                        EngineError::Query(format!("REST response not JSON: {}", e))
-                    })?;
-                    // Locate the rows: the whole response when no responsePath
-                    // is set, else the JSON pointer target. A located ARRAY is
-                    // the row set; a single OBJECT is one row (issue #13: APIs
-                    // like open-meteo return one JSON object, which previously
-                    // yielded zero rows + an empty file with no error). Scalars
-                    // / null / missing pointer are genuinely empty.
-                    let rows = {
-                        let located = if spec.response_path.is_empty() {
-                            Some(&response)
-                        } else {
-                            response.pointer(&spec.response_path)
-                        };
-                        match located {
-                            Some(JsonValue::Array(a)) => a.clone(),
-                            // An empty object means "no data" (like []), not a
-                            // single empty row.
-                            Some(JsonValue::Object(o)) if o.is_empty() => Vec::new(),
-                            Some(v @ JsonValue::Object(_)) => vec![v.clone()],
-                            _ => Vec::new(),
-                        }
-                    };
-                    (rows, response)
-                }
-                RestResponseFormat::Xml => {
-                    let body = response_raw.into_string().map_err(|e| {
-                        EngineError::Query(format!("REST XML response read: {}", e))
-                    })?;
-                    let rows = walk_xml_to_rows(&body, &spec.response_path, &self.cancel)?;
-                    (rows, JsonValue::Null)
-                }
-            };
-            let row_count = rows.len();
-            // Stamp each row with where it came from. Underscore-prefixed, matching the
-            // audit stamp the rest of the tool writes, and only on a row that is an
-            // object - a scalar row has nowhere to put it.
-            let rows = match spec.response_metadata {
-                false => rows,
-                true => {
-                    let at = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    rows.into_iter()
-                        .map(|mut r| {
-                            if let Some(o) = r.as_object_mut() {
-                                o.insert("_http_url".into(), JsonValue::from(page_url.clone()));
-                                o.insert("_http_status".into(), JsonValue::from(page_status));
-                                o.insert("_fetched_at".into(), JsonValue::from(at));
-                            }
-                            r
-                        })
-                        .collect()
-                }
-            };
-            all_rows.extend(rows);
-            pages += 1;
-            // Determine whether another page exists (and set up the next
-            // request URL as a side effect). Done BEFORE the page-cap
-            // check so we can tell "genuinely exhausted" (advanced=false)
-            // from "stopped at the cap with more to fetch" (advanced=true
-            // while pages >= max_pages).
-            let advanced = match &spec.pagination {
-                RestPagination::None => false,
-                RestPagination::Cursor { next_path, param } => {
-                    let next = response
-                        .pointer(next_path)
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(String::from);
-                    match next {
-                        Some(token) => {
-                            let sep = if spec.url.contains('?') { '&' } else { '?' };
-                            url = format!(
-                                "{}{}{}={}",
-                                spec.url,
-                                sep,
-                                param,
-                                urlencode_simple(&token)
-                            );
-                            true
-                        }
-                        None => false,
+                let resp_result = match &spec.body {
+                    Some(b) => req.send_string(b),
+                    None => req.call(),
+                };
+                let response_raw = match resp_result {
+                    Ok(r) => r,
+                    Err(ureq::Error::Status(code, r)) => {
+                        let body = r.into_string().unwrap_or_default();
+                        return Err(EngineError::Query(format!(
+                            "REST HTTP {} from {}: {}",
+                            code,
+                            url,
+                            body.chars().take(300).collect::<String>()
+                        )));
                     }
-                }
-                RestPagination::Offset { offset_param, page_size, total_path } => {
-                    // A short page means we have reached the end.
-                    if (row_count as u64) < *page_size {
-                        false
-                    } else {
-                        let next_offset = offset.saturating_add(*page_size);
-                        // Body-driven stop (issue #41): an API that reports a
-                        // total row count (e.g. Redmine `total_count`) returns
-                        // HTTP 200 + an empty array past the end, so the status
-                        // code cannot signal the end. Stop once the next offset
-                        // would be at or past the total.
-                        let reached_total = total_path
-                            .as_deref()
-                            .and_then(|p| response.pointer(p))
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    Err(e) => {
+                        return Err(EngineError::Query(format!(
+                            "REST HTTP transport to {}: {}",
+                            url, e
+                        )));
+                    }
+                };
+                // Capture Link header before consuming the response body.
+                let link_header = response_raw.header("link").map(String::from);
+                // The same, for provenance: once the body is read the response is gone, so
+                // what answered and with what has to be taken here or not at all.
+                let page_status = response_raw.status();
+                let page_url = url.clone();
+                // For XML, parse as text + walk row_path; pagination is
+                // not meaningful (SOAP has no cross-envelope convention)
+                // so we treat the JSON-pointer/cursor variants as no-ops
+                // by returning a Null response from this branch.
+                let (rows, response): (Vec<JsonValue>, JsonValue) = match spec.response_format {
+                    RestResponseFormat::Json => {
+                        let response: JsonValue = response_raw.into_json().map_err(|e| {
+                            EngineError::Query(format!("REST response not JSON: {}", e))
+                        })?;
+                        // Locate the rows: the whole response when no responsePath
+                        // is set, else the JSON pointer target. A located ARRAY is
+                        // the row set; a single OBJECT is one row (issue #13: APIs
+                        // like open-meteo return one JSON object, which previously
+                        // yielded zero rows + an empty file with no error). Scalars
+                        // / null / missing pointer are genuinely empty.
+                        let rows = {
+                            let located = if spec.response_path.is_empty() {
+                                Some(&response)
+                            } else {
+                                response.pointer(&spec.response_path)
+                            };
+                            match located {
+                                Some(JsonValue::Array(a)) => a.clone(),
+                                // An empty object means "no data" (like []), not a
+                                // single empty row.
+                                Some(JsonValue::Object(o)) if o.is_empty() => Vec::new(),
+                                Some(v @ JsonValue::Object(_)) => vec![v.clone()],
+                                _ => Vec::new(),
+                            }
+                        };
+                        (rows, response)
+                    }
+                    RestResponseFormat::Xml => {
+                        let body = response_raw.into_string().map_err(|e| {
+                            EngineError::Query(format!("REST XML response read: {}", e))
+                        })?;
+                        let rows = walk_xml_to_rows(&body, &spec.response_path, &self.cancel)?;
+                        (rows, JsonValue::Null)
+                    }
+                };
+                let row_count = rows.len();
+                // Stamp each row with where it came from. Underscore-prefixed, matching the
+                // audit stamp the rest of the tool writes, and only on a row that is an
+                // object - a scalar row has nowhere to put it.
+                let rows = match spec.response_metadata {
+                    false => rows,
+                    true => {
+                        let at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        rows.into_iter()
+                            .map(|mut r| {
+                                if let Some(o) = r.as_object_mut() {
+                                    o.insert("_http_url".into(), JsonValue::from(page_url.clone()));
+                                    o.insert("_http_status".into(), JsonValue::from(page_status));
+                                    o.insert("_fetched_at".into(), JsonValue::from(at));
+                                }
+                                r
                             })
-                            .map(|total| next_offset >= total)
-                            .unwrap_or(false);
-                        if reached_total {
+                            .collect()
+                    }
+                };
+                // #257: stamp the parent's key onto every row the child returned,
+                // so child rows can be joined back to the parent that produced them.
+                // The child rarely carries it: /companies/42/officers returns
+                // officers, with nothing in them saying 42.
+                let rows = match (&spec.parent_key_column, parent) {
+                    (Some(col), JsonValue::Object(pm)) => {
+                        let v = pm.get(col).cloned().unwrap_or(JsonValue::Null);
+                        rows.into_iter()
+                            .map(|r| match r {
+                                JsonValue::Object(mut m) => {
+                                    m.insert(col.clone(), v.clone());
+                                    JsonValue::Object(m)
+                                }
+                                other => other,
+                            })
+                            .collect()
+                    }
+                    _ => rows,
+                };
+                all_rows.extend(rows);
+                pages += 1;
+                parent_pages += 1;
+                // Determine whether another page exists (and set up the next
+                // request URL as a side effect). Done BEFORE the page-cap
+                // check so we can tell "genuinely exhausted" (advanced=false)
+                // from "stopped at the cap with more to fetch" (advanced=true
+                // while pages >= max_pages).
+                let advanced = match &spec.pagination {
+                    RestPagination::None => false,
+                    RestPagination::Cursor { next_path, param } => {
+                        let next = response
+                            .pointer(next_path)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                        match next {
+                            Some(token) => {
+                                let sep = if spec.url.contains('?') { '&' } else { '?' };
+                                url = format!(
+                                    "{}{}{}={}",
+                                    spec.url,
+                                    sep,
+                                    param,
+                                    urlencode_simple(&token)
+                                );
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    RestPagination::Offset { offset_param, page_size, total_path } => {
+                        // A short page means we have reached the end.
+                        if (row_count as u64) < *page_size {
                             false
                         } else {
-                            offset = next_offset;
+                            let next_offset = offset.saturating_add(*page_size);
+                            // Body-driven stop (issue #41): an API that reports a
+                            // total row count (e.g. Redmine `total_count`) returns
+                            // HTTP 200 + an empty array past the end, so the status
+                            // code cannot signal the end. Stop once the next offset
+                            // would be at or past the total.
+                            let reached_total = total_path
+                                .as_deref()
+                                .and_then(|p| response.pointer(p))
+                                .and_then(|v| {
+                                    v.as_u64()
+                                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                                })
+                                .map(|total| next_offset >= total)
+                                .unwrap_or(false);
+                            if reached_total {
+                                false
+                            } else {
+                                offset = next_offset;
+                                let sep = if spec.url.contains('?') { '&' } else { '?' };
+                                url = format!("{}{}{}={}", spec.url, sep, offset_param, offset);
+                                true
+                            }
+                        }
+                    }
+                    RestPagination::Page { page_param, .. } => {
+                        if row_count == 0 {
+                            false
+                        } else {
+                            page_no = page_no.saturating_add(1);
                             let sep = if spec.url.contains('?') { '&' } else { '?' };
-                            url = format!("{}{}{}={}", spec.url, sep, offset_param, offset);
+                            url = format!("{}{}{}={}", spec.url, sep, page_param, page_no);
                             true
                         }
                     }
-                }
-                RestPagination::Page { page_param, .. } => {
-                    if row_count == 0 {
-                        false
-                    } else {
-                        page_no = page_no.saturating_add(1);
-                        let sep = if spec.url.contains('?') { '&' } else { '?' };
-                        url = format!("{}{}{}={}", spec.url, sep, page_param, page_no);
-                        true
-                    }
-                }
-                RestPagination::Link => {
-                    match link_header.as_deref().and_then(parse_link_next) {
-                        Some(next_url) => {
-                            url = next_url;
-                            true
+                    RestPagination::Link => {
+                        match link_header.as_deref().and_then(parse_link_next) {
+                            Some(next_url) => {
+                                url = next_url;
+                                true
+                            }
+                            None => false,
                         }
-                        None => false,
                     }
-                }
-                RestPagination::NextUrl { next_path } => {
-                    let next = response
-                        .pointer(next_path)
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(String::from);
-                    match next {
-                        Some(next_url) => {
-                            url = next_url;
-                            true
+                    RestPagination::NextUrl { next_path } => {
+                        let next = response
+                            .pointer(next_path)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                        match next {
+                            Some(next_url) => {
+                                url = next_url;
+                                true
+                            }
+                            None => false,
                         }
-                        None => false,
                     }
+                };
+                if !advanced {
+                    break;
                 }
-            };
-            if !advanced {
-                break;
+                if parent_pages >= spec.max_pages {
+                    truncated = true;
+                    break;
+                }
             }
-            if pages >= spec.max_pages {
-                truncated = true;
-                break;
+            if truncated {
+                return Err(pagination_capped_err(
+                    "rest",
+                    all_rows.len(),
+                    spec.max_pages,
+                ));
             }
-        }
-        if truncated {
-            return Err(pagination_capped_err(
-                "rest",
-                all_rows.len(),
-                spec.max_pages,
-            ));
         }
         materialize_jsonobjects_as_table_typed(
             &self.bin,
@@ -13367,6 +13967,59 @@ mod connector_helper_tests {
     use mongodb::bson::Bson;
 
     #[test]
+    fn a_url_template_names_a_column_or_fails_loudly() {
+        // #257. A template naming a column the upstream does not have must fail
+        // loudly. Blanking it the way a prompt template does would silently
+        // request /companies//officers and the run would look like it worked.
+        let row = serde_json::json!({ "id": 7, "name": "Acme" });
+        assert_eq!(
+            super::render_url_template("/c/{id}/o", &row).unwrap(),
+            "/c/7/o"
+        );
+        // Values are percent-encoded, so an id carrying a slash or a space
+        // cannot change the shape of the request.
+        let odd = serde_json::json!({ "id": "a b/c?d" });
+        assert_eq!(
+            super::render_url_template("/c/{id}", &odd).unwrap(),
+            "/c/a%20b%2Fc%3Fd"
+        );
+        let err = super::render_url_template("/c/{nope}/o", &row)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "got: {}", err);
+        assert!(
+            err.contains("id"),
+            "the error should list the columns that ARE available: {}",
+            err
+        );
+        // An unclosed brace stays literal, so the user sees it rather than
+        // losing the tail of the URL.
+        assert_eq!(
+            super::render_url_template("/c/{id", &row).unwrap(),
+            "/c/{id"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_waits_as_long_as_the_provider_says() {
+        // #258. Retry-After is the provider stating when it will serve again;
+        // guessing shorter than that just earns another 429.
+        let w = crate::DuckdbEngine::ai_retry_wait_ms;
+        assert_eq!(w(Some("2"), 0), 2_000);
+        assert_eq!(w(Some(" 5 "), 3), 5_000, "surrounding space is not a parse failure");
+        // A silly Retry-After must not park a stage indefinitely.
+        assert_eq!(w(Some("99999"), 0), 300_000);
+        // With no header the wait doubles from 500ms, and is capped.
+        assert_eq!(w(None, 0), 500);
+        assert_eq!(w(None, 1), 1_000);
+        assert_eq!(w(None, 2), 2_000);
+        assert_eq!(w(None, 30), 30_000, "shifting by a large attempt must not overflow");
+        // An HTTP-date Retry-After is not a number: fall back to backoff
+        // rather than reading it as zero and hammering the provider.
+        assert_eq!(w(Some("Wed, 21 Oct 2026 07:28:00 GMT"), 1), 1_000);
+    }
+
+    #[test]
     fn a_workspace_can_carry_its_own_python() {
         // #246. A Python stage is only reproducible if the packages it needs are pinned
         // beside the pipeline rather than being whatever the machine happens to have -
@@ -14912,4 +15565,147 @@ mod incremental_state_tests {
         std::env::remove_var("DUCKLE_WORKSPACE");
         let _ = std::fs::remove_dir_all(&ws);
     }
+}
+
+/// #257: resolve `{column}` placeholders in a child endpoint's URL from one
+/// parent row.
+///
+/// Deliberately `{column}` and not `${column}`: `${...}` is already run
+/// variables and workspace context, and is substituted before a builder ever
+/// sees the property. This is the same syntax an xf.ai.llm prompt uses.
+///
+/// A name that is not a column of the parent row is an error rather than an
+/// empty string. render_prompt_template blanks a missing column, which is right
+/// for prose and wrong for a URL: it would silently request
+/// `/companies//officers` and the run would look like it worked.
+pub(crate) fn render_url_template(
+    template: &str,
+    row: &JsonValue,
+) -> Result<String, EngineError> {
+    let obj = match row {
+        JsonValue::Object(m) => m,
+        _ => {
+            return Err(EngineError::Query(
+                "rest: a URL template needs an upstream row to resolve it".into(),
+            ))
+        }
+    };
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = match after.find('}') {
+            // An unclosed brace stays literal, so the user sees it in the URL
+            // rather than losing the tail of their template.
+            None => {
+                out.push_str(&rest[open..]);
+                return Ok(out);
+            }
+            Some(c) => c,
+        };
+        let name = &after[..close];
+        let value = obj.get(name).ok_or_else(|| {
+            EngineError::Query(format!(
+                "rest: URL template refers to {{{}}}, which is not a column of the upstream row (have: {})",
+                name,
+                obj.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+        })?;
+        let text = match value {
+            JsonValue::String(s) => s.clone(),
+            JsonValue::Null => String::new(),
+            other => other.to_string(),
+        };
+        out.push_str(&percent_encode_path(&text));
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Percent-encode a value being spliced into a URL. Unreserved characters pass
+/// through; everything else is escaped, so an id containing a space, a slash or
+/// a question mark cannot change the shape of the request.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// #248: the .pdf files at a path - the file itself, or the ones in a folder.
+/// Sorted, so a run over a folder is reproducible rather than filesystem order.
+fn expand_pdf_paths(path: &str, recursive: bool) -> Vec<String> {
+    let p = std::path::Path::new(path);
+    if p.is_file() {
+        return vec![path.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if recursive {
+                    stack.push(path);
+                }
+            } else if path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false)
+            {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// #248: a page's width and height in PDF points.
+///
+/// MediaBox is inheritable: a document may set it once on the page tree rather
+/// than on every page, so a page without one is not a page without a size - walk
+/// up to Parent before giving up.
+fn page_media_box(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> (Option<f64>, Option<f64>) {
+    let mut id = page_id;
+    for _ in 0..16 {
+        let Ok(dict) = doc.get_dictionary(id) else {
+            return (None, None);
+        };
+        if let Ok(obj) = dict.get(b"MediaBox") {
+            let resolved = doc.dereference(obj).map(|(_, o)| o).unwrap_or(obj);
+            if let Ok(arr) = resolved.as_array() {
+                if arr.len() == 4 {
+                    let num = |i: usize| -> Option<f64> {
+                        arr.get(i).and_then(|v| match v {
+                            lopdf::Object::Integer(n) => Some(*n as f64),
+                            lopdf::Object::Real(r) => Some(*r as f64),
+                            _ => None,
+                        })
+                    };
+                    if let (Some(x0), Some(y0), Some(x1), Some(y1)) =
+                        (num(0), num(1), num(2), num(3))
+                    {
+                        return (Some((x1 - x0).abs()), Some((y1 - y0).abs()));
+                    }
+                }
+            }
+        }
+        match dict.get(b"Parent") {
+            Ok(lopdf::Object::Reference(parent)) => id = *parent,
+            _ => return (None, None),
+        }
+    }
+    (None, None)
 }

@@ -509,6 +509,82 @@ pub struct PubSubSourceSpec {
     pub max_messages: u64,
 }
 
+/// snk.model: register a trained model's card (#253).
+///
+/// Deliberately NOT a model store. The engine never touches the model bytes:
+/// the training script writes those wherever it likes and reports the URI as a
+/// column, and this records the card describing them. What the engine adds is
+/// the part a convention cannot give you - the card is written only if the run
+/// actually succeeded, and a `latest` pointer moves with it so downstream
+/// pipelines are not edited on every retrain.
+#[derive(Debug, Clone)]
+pub struct ModelCardSpec {
+    pub node_id: String,
+    pub from_view: String,
+    /// Directory the registry lives in, usually `${workspace}/models`.
+    pub dir: String,
+    /// Model name. Cards land under `<dir>/<name>/`.
+    pub name: String,
+}
+
+/// src.pdf: one row per page of a PDF (#248).
+///
+/// The text layer a document already carries, plus page geometry and the Info
+/// dictionary, so a page is a row like any other. No OCR: a scanned page comes
+/// back with `has_text_layer` false, which is what makes it routable.
+#[derive(Debug, Clone)]
+pub struct PdfSourceSpec {
+    pub node_id: String,
+    /// A .pdf file, or a directory of them.
+    pub path: String,
+    /// Descend into sub-directories when `path` is a directory.
+    pub recursive: bool,
+    /// Optional declared output schema (the node's Schema tab).
+    pub declared_schema: Option<Vec<duckle_metadata::Column>>,
+}
+
+/// #255: one column extracted from a matched row element.
+///
+/// `selector` is evaluated RELATIVE to the row element; empty means the row
+/// element itself. `attr` takes an attribute instead of the text, which is how
+/// a link's href or a data- value is read.
+#[derive(Debug, Clone)]
+pub struct HtmlColumn {
+    pub name: String,
+    pub selector: String,
+    pub attr: Option<String>,
+}
+
+/// src.html: rows out of an HTML page, by CSS selector.
+///
+/// A lot of public data is only published as HTML - registries, filing pages,
+/// results tables - and getting at it used to mean shelling out to Python
+/// before anything could enter a pipeline. HTML is not XML: real pages carry
+/// unclosed tags and unquoted attributes that the strict XML reader rejects
+/// outright, so this parses with a tolerant HTML parser instead.
+#[derive(Debug, Clone)]
+pub struct HtmlSourceSpec {
+    /// #256: per-node transport (proxy, timeouts, User-Agent), usually filled
+    /// from a saved `http` connection. None uses the shared default agent.
+    pub transport: Option<crate::tls::HttpTransport>,
+    pub node_id: String,
+    /// A local filesystem path, or an `http(s)://` URL fetched through the
+    /// shared proxy- and CA-aware agent.
+    pub path: String,
+    /// CSS selector: every match is one row.
+    pub row_selector: String,
+    /// How to fill each column. Empty means table mode: the row selector names
+    /// a table, its `th` cells become the column names and each `tr` a row.
+    pub columns: Vec<HtmlColumn>,
+    /// Request headers for the http(s) case, including any auth the REST
+    /// helpers build.
+    pub headers: Vec<(String, String)>,
+    /// Optional declared output schema (the node's Schema tab). When set, the
+    /// result is pinned to exactly these columns and types, so a daily scrape
+    /// keeps a stable shape even on a day the page renders a column empty.
+    pub declared_schema: Option<Vec<duckle_metadata::Column>>,
+}
+
 /// src.xml: walk an XML document, find every element matching a
 /// slash-separated path (e.g. "library/books/book"), and emit each
 /// match as a JSON object. Attributes prefix with '@'; text content
@@ -966,6 +1042,14 @@ pub struct AiEmbedSpec {
     /// #142: override the request path (default `/v1/embeddings`) for custom
     /// OpenAI-compatible gateways. None = default path.
     pub endpoint_path: Option<String>,
+    /// #258: at most this many requests in flight. 1 = sequential, byte for
+    /// byte what this stage did before. Results are written back BY INDEX, so
+    /// the output row order never depends on which request finishes first.
+    pub concurrency: usize,
+    /// #258: retries for a single request on HTTP 429 and 5xx, honouring
+    /// Retry-After. A rate limit at row 400,000 must not discard the 399,999
+    /// rows already paid for.
+    pub max_retries: u32,
 }
 
 /// code.wasm: per-row WASM transform. The user supplies bytes (via
@@ -1087,6 +1171,18 @@ pub struct AiLlmSpec {
     pub headers: Vec<(String, String)>,
     /// #142: override the request path (default `/v1/chat/completions`).
     pub endpoint_path: Option<String>,
+    /// #258: at most this many requests in flight. 1 = sequential, byte for
+    /// byte what this stage did before. Results are written back BY INDEX, so
+    /// the output row order never depends on which request finishes first.
+    pub concurrency: usize,
+    /// #258: retries for a single request on HTTP 429 and 5xx, honouring
+    /// Retry-After. A rate limit at row 400,000 must not discard the 399,999
+    /// rows already paid for.
+    pub max_retries: u32,
+    /// #258: OpenAI `max_tokens`. The GUI has offered this field since #142
+    /// while the request body never carried it, so an unbounded reply was
+    /// billed on every row. None = send no max_tokens, exactly as before.
+    pub max_tokens: Option<u32>,
 }
 
 /// xf.ai.classify: per-row LLM-backed classifier. Pins each row's
@@ -1109,6 +1205,14 @@ pub struct AiClassifySpec {
     pub headers: Vec<(String, String)>,
     /// #142: override the request path (default `/v1/chat/completions`).
     pub endpoint_path: Option<String>,
+    /// #258: at most this many requests in flight. 1 = sequential, byte for
+    /// byte what this stage did before. Results are written back BY INDEX, so
+    /// the output row order never depends on which request finishes first.
+    pub concurrency: usize,
+    /// #258: retries for a single request on HTTP 429 and 5xx, honouring
+    /// Retry-After. A rate limit at row 400,000 must not discard the 399,999
+    /// rows already paid for.
+    pub max_retries: u32,
 }
 
 /// xf.ai.dedupe: semantic dedupe via cosine similarity over a
@@ -1452,7 +1556,26 @@ pub enum RestResponseFormat {
 /// Materializes the accumulated rows as a DuckDB table via read_json_auto.
 #[derive(Debug, Clone)]
 pub struct RestSourceSpec {
+    /// #256: per-node transport (proxy, timeouts, User-Agent), usually filled
+    /// from a saved `http` connection. None uses the shared default agent.
+    pub transport: Option<crate::tls::HttpTransport>,
     pub node_id: String,
+    /// #257: the upstream relation whose rows each drive one request. None is
+    /// exactly one endpoint, which is every pipeline that existed before.
+    pub from_view: Option<String>,
+    /// #257: a URL carrying `{column}` placeholders resolved from each upstream
+    /// row, so a parent endpoint can feed a child endpoint
+    /// (`/companies` then `/companies/{id}/officers`). The same `{column}`
+    /// syntax xf.ai.llm prompts use, deliberately not `${...}`, which belongs
+    /// to run variables and workspace context and is resolved before this.
+    pub url_template: Option<String>,
+    /// #257: an upstream column stamped onto every row the child returns, so
+    /// child rows can be joined back to the parent that produced them.
+    pub parent_key_column: Option<String>,
+    /// #257: cap on how many upstream rows may each fire a request, so a
+    /// careless upstream cannot turn into an unbounded request storm. Only
+    /// applies when fanning out.
+    pub max_requests: u64,
     pub url: String,
     pub method: String,
     pub headers: Vec<(String, String)>,

@@ -5430,7 +5430,7 @@ fn snk_snowflake_jwt_auth_signs_request() {
     //  - JWT payload claims have iss = "ACCOUNT.USER.SHA256:<fp>" and
     //    sub = "ACCOUNT.USER".
     use base64::Engine as _;
-    use rand::rngs::OsRng;
+    use rsa::rand_core::OsRng;
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
     use rsa::RsaPrivateKey;
     use std::io::{Read, Write};
@@ -5545,7 +5545,7 @@ fn snk_snowflake_jwt_uses_account_locator_for_privatelink() {
     // this isolates exactly what the account value controls: the JWT claims.
     // We capture the real request and decode the JWT actually sent on the wire.
     use base64::Engine as _;
-    use rand::rngs::OsRng;
+    use rsa::rand_core::OsRng;
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
     use rsa::RsaPrivateKey;
     use std::io::{Read, Write};
@@ -8833,7 +8833,7 @@ fn src_avro_reads_container_file_records() {
     let schema = Schema::parse_str(schema_json).expect("schema parse");
     let file = std::fs::File::create(&avro_path).expect("create avro file");
     {
-        let mut writer = Writer::new(&schema, file);
+        let mut writer = Writer::new(&schema, file).expect("open avro writer");
         for (id, name, active) in [(1i64, "alice", true), (2, "bob", false), (3, "carol", true)] {
             let mut rec = Record::new(&schema).unwrap();
             rec.put("id", id);
@@ -14144,5 +14144,1148 @@ fn src_salesforce_bulk_non_advancing_locator_errors() {
         err.contains("non-advancing") && err.contains("QJOB1") && err.contains("STUCK"),
         "error should name the job and the stuck locator, got: {}",
         err
+    );
+}
+
+/// #258: a rate-limited provider must not throw away the rows already paid
+/// for. The mock answers 429 twice with `Retry-After: 0`, then 200 - the stage
+/// should ride through it and still produce its row.
+///
+/// Before #258 the first 429 returned Err and the whole stage died, so a rate
+/// limit at row 400,000 discarded 399,999 completed rows; the only retry in
+/// the engine is per stage, which re-sends the entire dataset from row 0.
+#[test]
+fn xf_ai_llm_retries_a_rate_limit_instead_of_discarding_the_run() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    // Bounded accept loop: if the engine stops retrying, fewer than 3 requests
+    // arrive, and a blocking take(3) would deadlock the join below instead of
+    // failing the assertion. A regression must fail, not hang.
+    listener.set_nonblocking(true).ok();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut idx = 0usize;
+        while idx < 3 && std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).ok();
+            idx += 1;
+            let idx = idx - 1;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..32 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            h.fetch_add(1, Ordering::SeqCst);
+            // Retry-After: 0 keeps the test quick while still driving the
+            // header path rather than the exponential-backoff path.
+            let (head, body) = if idx < 2 {
+                (
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n",
+                    "{\"error\":\"slow down\"}".to_string(),
+                )
+            } else {
+                (
+                    "HTTP/1.1 200 OK\r\n",
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"survived\"}}]}"
+                        .to_string(),
+                )
+            };
+            let resp = format!(
+                "{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                head,
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("l", "xf.ai.llm", json!({
+                "promptTemplate": "Greet {name}",
+                "outputColumn": "reply",
+                "model": "mock",
+                "apiKey": "sk-test",
+                "baseUrl": base_url,
+                "maxRetries": 3,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "l"), main_edge("e2", "l", "k")]),
+    ));
+    let _ = handle.join();
+    assert_eq!(r.status, "ok", "a retried rate limit still failed: {:?}", r.error);
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "expected 2 retries then a success");
+    assert_eq!(
+        scalar_string(&format!("SELECT reply FROM read_csv_auto('{}')", out)),
+        "survived"
+    );
+}
+
+/// #258: with requests genuinely in flight at once, every row must still be
+/// paired with its OWN answer.
+///
+/// The mock sleeps a different amount per row, so a dispatcher that appended
+/// results as they completed would hand row 3 row 7's answer - and nothing
+/// downstream would report it. The peak-in-flight gauge is what stops this
+/// passing vacuously: if `concurrency` were ignored the peak would be 1.
+#[test]
+fn xf_ai_llm_keeps_row_order_when_requests_run_concurrently() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const ROWS: usize = 12;
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (ifc, pk) = (inflight.clone(), peak.clone());
+    // Bounded accept loop, same reasoning as the retry test: a regression that
+    // sends fewer requests must fail the assertion rather than hang the join.
+    listener.set_nonblocking(true).ok();
+    let handle = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut served = 0usize;
+        while served < ROWS && std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).ok();
+            served += 1;
+            let (ifc, pk) = (ifc.clone(), pk.clone());
+            // A thread per connection, so the mock can actually hold several
+            // requests open at once - a sequential server would hide the bug.
+            workers.push(std::thread::spawn(move || {
+                let cur = ifc.fetch_add(1, Ordering::SeqCst) + 1;
+                pk.fetch_max(cur, Ordering::SeqCst);
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(300)))
+                    .ok();
+                stream.set_nodelay(true).ok();
+                let mut buf = Vec::with_capacity(4096);
+                let mut chunk = [0u8; 4096];
+                for _ in 0..32 {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let tok: String = req
+                    .split("Echo r")
+                    .nth(1)
+                    .map(|t| t.chars().take(2).collect())
+                    .unwrap_or_default();
+                // A different, deterministic delay per row: completion order
+                // deliberately does not match request order.
+                let n: u64 = tok.parse().unwrap_or(0);
+                std::thread::sleep(Duration::from_millis((n * 7) % 23));
+                let body = format!(
+                    "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"got-r{}\"}}}}]}}",
+                    tok
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                ifc.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+
+    let mut csv = String::from("id,name\n");
+    for i in 0..ROWS {
+        csv.push_str(&format!("{},r{:02}\n", i, i));
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(tmp.path(), "in.csv", &csv);
+    let out = out_path(tmp.path(), "out.csv");
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("l", "xf.ai.llm", json!({
+                "promptTemplate": "Echo {name}",
+                "outputColumn": "reply",
+                "model": "mock",
+                "apiKey": "sk-test",
+                "baseUrl": base_url,
+                "concurrency": 8,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "l"), main_edge("e2", "l", "k")]),
+    ));
+    let _ = handle.join();
+    assert_eq!(r.status, "ok", "concurrent xf.ai.llm failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), ROWS as i64);
+    // Each row must carry the answer to its own request. This one holds by
+    // construction (the reply is inserted into the row object itself), so it
+    // is a cheap guard, not the point of the test.
+    let mispaired = count(&format!(
+        "(SELECT 1 FROM read_csv_auto('{}') WHERE reply <> 'got-' || name)",
+        out
+    ));
+    assert_eq!(mispaired, 0, "a row carried another row's answer");
+    // THE POINT: output row order must still be input row order. A dispatcher
+    // that stored results as they completed would emit the rows sorted by how
+    // fast the provider answered, and nothing downstream would report it.
+    let out_of_order = count(&format!(
+        "(SELECT 1 FROM (SELECT id, row_number() OVER () AS rn FROM read_csv_auto('{}')) t WHERE t.id <> t.rn - 1)",
+        out
+    ));
+    assert_eq!(
+        out_of_order, 0,
+        "rows came back in completion order instead of input order"
+    );
+    assert!(
+        peak.load(Ordering::SeqCst) >= 2,
+        "requests never overlapped, so this proved nothing about ordering"
+    );
+}
+
+/// #249: blocking is the piece that makes the rest of the qa.* entity
+/// resolution family usable at real sizes. qa.link CROSS JOINs its two inputs,
+/// so the comparison set grows with the product of the row counts; qa.block
+/// only proposes pairs that already agree on something cheap.
+#[test]
+fn qa_block_compares_only_records_that_share_a_block() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(
+        tmp.path(),
+        "people.csv",
+        "id,name,postcode\n1,John Smith,AB1\n2,Jon Smith,AB1\n3,Jane Doe,XY9\n4,Janet Doe,XY9\n5,Bob Jones,ZZ0\n",
+    );
+    let out = out_path(tmp.path(), "pairs.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("b", "qa.block", json!({
+                "leftId": "id",
+                "rules": { "postcode": "postcode" },
+                "carryColumns": ["name"],
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "b"), main_edge("e2", "b", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "qa.block failed: {:?}", r.error);
+    // All-pairs over 5 records is 10 comparisons. Blocking on postcode leaves
+    // 2, and that reduction IS the feature.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+    // The carried columns are what a downstream comparison expression reads,
+    // and they must come from the right side of the pair.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT a_name || ' | ' || b_name FROM read_csv_auto('{}') WHERE id_a = 1",
+            out
+        )),
+        "John Smith | Jon Smith"
+    );
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT DISTINCT blocking_rule FROM read_csv_auto('{}')",
+            out
+        )),
+        "postcode"
+    );
+    // Bob Jones is alone in his postcode, so he is in no candidate pair at all.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE id_a = 5 OR id_b = 5)",
+            out
+        )),
+        0
+    );
+}
+
+/// #249: the point of emitting `id_a` / `id_b` is that qa.matchgroup already
+/// defaults to exactly those column names, so pairs feed clustering with
+/// nothing to configure. If either side's naming drifts, this test fails.
+#[test]
+fn qa_block_feeds_matchgroup_with_no_configuration() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(
+        tmp.path(),
+        "people.csv",
+        "id,name,postcode\n1,John Smith,AB1\n2,Jon Smith,AB1\n3,Jane Doe,XY9\n4,Janet Doe,XY9\n5,Bob Jones,ZZ0\n",
+    );
+    let out = out_path(tmp.path(), "clusters.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("b", "qa.block", json!({
+                "leftId": "id",
+                "rules": { "postcode": "postcode" },
+            })),
+            // No props at all: it reads id_a / id_b by default.
+            node("g", "qa.matchgroup", json!({})),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "s", "b"),
+            main_edge("e2", "b", "g"),
+            main_edge("e3", "g", "k"),
+        ]),
+    ));
+    assert_eq!(r.status, "ok", "qa.block -> qa.matchgroup failed: {:?}", r.error);
+    // The four ids that appear in a pair, in two clusters.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 4);
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT count(DISTINCT cluster_id)::VARCHAR FROM read_csv_auto('{}')",
+            out
+        )),
+        "2"
+    );
+    // The two Smiths must land together, and not with the Does.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT CASE WHEN (SELECT cluster_id FROM read_csv_auto('{o}') WHERE id = '1') = (SELECT cluster_id FROM read_csv_auto('{o}') WHERE id = '2') THEN 'same' ELSE 'split' END",
+            o = out
+        )),
+        "same"
+    );
+}
+
+/// #249: several rules will often propose the same pair. Comparing it once per
+/// rule that caught it would multiply the downstream work the node exists to
+/// reduce, so a pair survives once, labelled with the first rule that found it.
+#[test]
+fn qa_block_keeps_a_pair_once_when_several_rules_catch_it() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(
+        tmp.path(),
+        "people.csv",
+        "id,name,postcode\n1,John Smith,AB1\n2,Jon Smith,AB1\n3,Bob Jones,ZZ0\n",
+    );
+    let out = out_path(tmp.path(), "pairs.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("b", "qa.block", json!({
+                "leftId": "id",
+                // Both rules catch the (1,2) pair.
+                "rules": { "postcode": "postcode", "also_postcode": "postcode" },
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "b"), main_edge("e2", "b", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "qa.block failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 1);
+    // Deterministic label: the first rule by name, so a re-run does not churn.
+    assert_eq!(
+        scalar_string(&format!("SELECT blocking_rule FROM read_csv_auto('{}')", out)),
+        "also_postcode"
+    );
+}
+
+/// #257: a parent endpoint feeding a child endpoint, which is what most real
+/// APIs look like: GET /companies, then GET /companies/{id}/officers.
+///
+/// Asserts on the CAPTURED REQUEST LINES, not just the row count, because the
+/// row count alone cannot tell you the parent's value ever reached the URL.
+#[test]
+fn src_rest_fans_a_child_endpoint_out_over_parent_rows() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sv = seen.clone();
+    listener.set_nonblocking(true).ok();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        // 1 parent request + 2 child requests.
+        let mut served = 0usize;
+        while served < 3 && std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).ok();
+            served += 1;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..32 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
+            let line = req.lines().next().unwrap_or("").to_string();
+            sv.lock().unwrap().push(line.clone());
+            let body = if line.contains("/companies/1/officers") {
+                r#"[{"officer":"ada"},{"officer":"grace"}]"#.to_string()
+            } else if line.contains("/companies/2/officers") {
+                r#"[{"officer":"linus"}]"#.to_string()
+            } else {
+                r#"[{"id":1,"name":"Acme"},{"id":2,"name":"Globex"}]"#.to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "officers.csv");
+    let base = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("companies", "src.rest", json!({ "url": format!("{}/companies", base) })),
+            node("officers", "src.rest", json!({
+                "urlTemplate": format!("{}/companies/{{id}}/officers", base),
+                "parentKeyColumn": "id",
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "companies", "officers"),
+            main_edge("e2", "officers", "k"),
+        ]),
+    ));
+    let _ = handle.join();
+    assert_eq!(r.status, "ok", "REST fan-out failed: {:?}", r.error);
+
+    // One request per parent row, with the parent's value actually in the path.
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 3, "expected 1 parent + 2 child requests, got: {:?}", reqs);
+    assert!(reqs[0].contains("GET /companies "), "got: {}", reqs[0]);
+    assert!(
+        reqs.iter().any(|l| l.contains("/companies/1/officers")),
+        "the parent's id never reached the child URL: {:?}",
+        reqs
+    );
+    assert!(
+        reqs.iter().any(|l| l.contains("/companies/2/officers")),
+        "only one parent row fanned out: {:?}",
+        reqs
+    );
+
+    // Every child row from both parents, unioned into one relation.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3);
+    // And each child row carries the parent key, so it can be joined back.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT string_agg(officer, ',' ORDER BY officer) FROM read_csv_auto('{}') WHERE id = 1",
+            out
+        )),
+        "ada,grace"
+    );
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT officer FROM read_csv_auto('{}') WHERE id = 2",
+            out
+        )),
+        "linus"
+    );
+}
+
+/// #255: a lot of public data is published only as an HTML table. Table mode
+/// takes the header cells as column names and each body row as a row, so the
+/// common case needs a single selector rather than one per column.
+///
+/// The fixture is deliberately malformed the way real pages are - an unclosed
+/// <br>, an unquoted attribute, a stray &nbsp; - which is exactly what the
+/// strict XML reader rejects outright.
+#[test]
+fn src_html_reads_a_table_the_xml_reader_would_reject() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = write_file(
+        tmp.path(),
+        "registry.html",
+        "<html><body>\n<p>Preamble<br>\n<table id=companies>\n<tr><th>Name</th><th>Town</th></tr>\n<tr><td>Acme&nbsp;Ltd</td><td>Leeds</td></tr>\n<tr><td>Globex   plc</td><td>Hull</td></tr>\n</table>\n</body></html>\n",
+    );
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({ "path": page, "rowSelector": "table#companies" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.html failed: {:?}", r.error);
+    // The header row has no td cells and must not become a row of nulls.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+    assert_eq!(
+        scalar_string(&format!("SELECT Town FROM read_csv_auto('{}') WHERE Name LIKE 'Acme%'", out)),
+        "Leeds"
+    );
+    // Runs of whitespace inside a cell collapse, so a value is comparable.
+    assert_eq!(
+        scalar_string(&format!("SELECT Name FROM read_csv_auto('{}') WHERE Town = 'Hull'", out)),
+        "Globex plc"
+    );
+}
+
+/// #255: the general case - one selector picks the rows, and a selector per
+/// column picks what to read out of each, including attributes.
+#[test]
+fn src_html_extracts_columns_by_selector_including_attributes() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = write_file(
+        tmp.path(),
+        "list.html",
+        "<html><body><ul>\n<li class=item><a href=/c/1>Acme</a><span class=town>Leeds</span></li>\n<li class=item><a href=/c/2>Globex</a></li>\n</ul></body></html>\n",
+    );
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": page,
+                "rowSelector": "li.item",
+                "columns": [
+                    { "name": "name", "selector": "a" },
+                    { "name": "link", "selector": "a", "attr": "href" },
+                    { "name": "town", "selector": "span.town" },
+                ],
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.html failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+    assert_eq!(
+        scalar_string(&format!("SELECT link FROM read_csv_auto('{}') WHERE name = 'Acme'", out)),
+        "/c/1"
+    );
+    // A column that did not match is NULL, not an empty string: a missing town
+    // and a blank town are different facts.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE name = 'Globex' AND town IS NULL)",
+            out
+        )),
+        1
+    );
+}
+
+/// #255: the GUI writes its column list as a key-value map, so the engine has
+/// to read that shape too - otherwise the form works and the run produces
+/// nothing, which is the silent-bug class this repo keeps finding.
+#[test]
+fn src_html_reads_the_key_value_column_shape_the_gui_writes() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = write_file(
+        tmp.path(),
+        "list.html",
+        "<html><body><ul>
+<li class=item><a href=/c/1>Acme</a></li>
+</ul></body></html>
+",
+    );
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": page,
+                "rowSelector": "li.item",
+                // name -> selector, with @attr to read an attribute.
+                "columns": { "name": "a", "link": "a@href" },
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.html failed: {:?}", r.error);
+    assert_eq!(
+        scalar_string(&format!("SELECT name || ' ' || link FROM read_csv_auto('{}')", out)),
+        "Acme /c/1"
+    );
+}
+
+/// #255: a typo in a selector must fail the stage naming the selector, not
+/// quietly produce a table of nulls for every row.
+#[test]
+fn src_html_rejects_an_invalid_css_selector() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = write_file(tmp.path(), "p.html", "<html><body><p>hi</p></body></html>");
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({ "path": page, "rowSelector": "p[" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "error", "an invalid selector should fail the run");
+    let err = r.error.unwrap_or_default();
+    assert!(err.contains("p["), "the error should name the selector: {}", err);
+
+    // A VALID selector that simply matches nothing is a different thing: with
+    // explicit columns the shape is known even with no rows, so a scrape of a
+    // page that happens to be empty today produces an empty typed table rather
+    // than failing.
+    let out2 = out_path(tmp.path(), "out2.csv");
+    let ok = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": page,
+                "rowSelector": "li.nope",
+                "columns": [ { "name": "name", "selector": "a" } ],
+            })),
+            node("k", "snk.csv", json!({ "path": out2, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(ok.status, "ok", "no matches is not a failure: {:?}", ok.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out2)), 0);
+    // Table mode cannot do the same, and should not pretend to: with no header
+    // row there is nothing to name the columns after, so it falls to the same
+    // untypeable-empty-result error every other source gives (#170).
+    let out3 = out_path(tmp.path(), "out3.csv");
+    let empty_table = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({ "path": page, "rowSelector": "table.nope" })),
+            node("k", "snk.csv", json!({ "path": out3, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(empty_table.status, "error");
+    assert!(
+        empty_table.error.unwrap_or_default().contains("no schema is declared"),
+        "table mode with no matches should give the standard untypeable-empty error"
+    );
+}
+
+/// #256: transport settings must actually reach the wire. A User-Agent is the
+/// one that is directly observable from the server side, and it is also the one
+/// that most often decides whether a public site answers at all.
+#[test]
+fn src_rest_sends_the_user_agent_from_its_transport() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let sv = seen.clone();
+    listener.set_nonblocking(true).ok();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).ok();
+            stream.set_read_timeout(Some(Duration::from_millis(300))).ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..32 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            *sv.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
+            let body = r#"[{"id":1}]"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            break;
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.rest", json!({
+                "url": format!("http://127.0.0.1:{}/things", port),
+                "httpUserAgent": "duckle-transport-test/1.0",
+                "httpConnectTimeoutSecs": 5,
+                "httpReadTimeoutSecs": 30,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    let _ = handle.join();
+    assert_eq!(r.status, "ok", "src.rest with a transport failed: {:?}", r.error);
+    let req = seen.lock().unwrap().clone();
+    assert!(
+        req.to_lowercase().contains("user-agent: duckle-transport-test/1.0"),
+        "the transport's User-Agent never reached the wire: {}",
+        req
+    );
+}
+
+/// Build a minimal, valid single-file PDF with one page per string, so the test
+/// does not depend on a binary fixture checked into the repo. Each page carries
+/// a MediaBox of 200x100 points and one text-showing operator.
+#[cfg(test)]
+fn minimal_pdf(pages: &[&str]) -> Vec<u8> {
+    use std::collections::BTreeMap;
+    let nkids = pages.len();
+    let font_id = 3 + nkids * 2;
+    let info_id = font_id + 1;
+    let kids: String = (0..nkids)
+        .map(|i| format!("{} 0 R", 3 + i * 2))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut objs: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    objs.insert(1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    objs.insert(
+        2,
+        format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids, nkids).into_bytes(),
+    );
+    for (i, text) in pages.iter().enumerate() {
+        let pid = 3 + i * 2;
+        let cid = pid + 1;
+        objs.insert(
+            pid,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents {} 0 R /Resources << /Font << /F1 {} 0 R >> >> >>",
+                cid, font_id
+            )
+            .into_bytes(),
+        );
+        let stream = format!("BT /F1 12 Tf 20 50 Td ({}) Tj ET", text);
+        let mut o = format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes();
+        o.extend_from_slice(stream.as_bytes());
+        o.extend_from_slice(b"\nendstream");
+        objs.insert(cid, o);
+    }
+    objs.insert(
+        font_id,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    );
+    objs.insert(
+        info_id,
+        b"<< /Title (Duckle Fixture) /Author (Duckle) >>".to_vec(),
+    );
+
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets: BTreeMap<usize, usize> = BTreeMap::new();
+    for (num, body) in &objs {
+        offsets.insert(*num, out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", num).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_at = out.len();
+    let n = objs.keys().max().unwrap() + 1;
+    out.extend_from_slice(format!("xref\n0 {}\n", n).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for num in 1..n {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&num]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info {} 0 R >>\nstartxref\n{}\n%%EOF\n",
+            n, info_id, xref_at
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// #248: a document becomes rows. One per page, carrying the text layer the PDF
+/// already has, the page geometry and the document's own metadata, so a filing
+/// or an invoice can be filtered and joined like any other table.
+#[test]
+fn src_pdf_emits_one_row_per_page_with_text_and_geometry() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("doc.pdf");
+    // The third page's text is empty: that is the scanned-page case, and the
+    // flag that makes it routable is the whole reason OCR can be left out.
+    std::fs::write(&pdf, minimal_pdf(&["Hello Duckle", "Second page here", ""])).unwrap();
+    let out = out_path(tmp.path(), "pages.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.pdf", json!({ "path": pdf.to_string_lossy() })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.pdf failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3);
+
+    // Page numbers are 1-based and in document order.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT string_agg(page_number::VARCHAR, ',' ORDER BY page_number) FROM read_csv_auto('{}')",
+            out
+        )),
+        "1,2,3"
+    );
+    // The text layer really is extracted, not merely counted.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE page_number = 1 AND text LIKE '%Hello Duckle%')",
+            out
+        )),
+        1
+    );
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE page_number = 2 AND text LIKE '%Second page here%')",
+            out
+        )),
+        1
+    );
+    // A page with no usable text is findable, which is what lets a pipeline
+    // route it to whatever OCR the user already has.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT string_agg(has_text_layer::VARCHAR, ',' ORDER BY page_number) FROM read_csv_auto('{}')",
+            out
+        )),
+        "true,true,false"
+    );
+    // Geometry, in PDF points, from the page's MediaBox.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT DISTINCT width::VARCHAR || 'x' || height::VARCHAR FROM read_csv_auto('{}')",
+            out
+        )),
+        "200.0x100.0"
+    );
+    // Document metadata travels with every page of that document.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE metadata LIKE '%Duckle Fixture%' AND metadata LIKE '%page_count%')",
+            out
+        )),
+        3
+    );
+    // document_id is the path, which is exactly what src.artifact puts in `uri`,
+    // so an artifact listing and its pages join without translation.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE document_id LIKE '%doc.pdf')",
+            out
+        )),
+        3
+    );
+}
+
+/// #248: a folder of documents is the normal case - a filings drop, a scan
+/// directory - so a path may name one, and the order must be stable.
+#[test]
+fn src_pdf_reads_every_document_in_a_folder() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("docs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.pdf"), minimal_pdf(&["Alpha one"])).unwrap();
+    std::fs::write(dir.join("b.pdf"), minimal_pdf(&["Bravo one", "Bravo two"])).unwrap();
+    // A non-PDF alongside them must simply be ignored, not fail the run.
+    std::fs::write(dir.join("notes.txt"), "not a pdf").unwrap();
+    let out = out_path(tmp.path(), "pages.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.pdf", json!({ "path": dir.to_string_lossy() })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.pdf over a folder failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3);
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE document_id LIKE '%b.pdf')",
+            out
+        )),
+        2
+    );
+    // Page numbers restart per document rather than running on across the set.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT string_agg(page_number::VARCHAR, ',' ORDER BY document_id, page_number) FROM read_csv_auto('{}')",
+            out
+        )),
+        "1,1,2"
+    );
+}
+
+/// #248: a file that is not a readable PDF must fail with the file named, and
+/// must not take the process down - the text extractor is known to panic on
+/// malformed input, and a panic would abort the whole run rather than the stage.
+#[test]
+fn src_pdf_reports_an_unreadable_document_without_panicking() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("broken.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\nthis is not really a pdf\n%%EOF\n").unwrap();
+    let out = out_path(tmp.path(), "pages.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.pdf", json!({ "path": pdf.to_string_lossy() })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "error", "a broken PDF should fail the stage");
+    let err = r.error.unwrap_or_default();
+    assert!(err.contains("broken.pdf"), "the error should name the file: {}", err);
+}
+
+/// #253: register a model card, then read it back by name and by version.
+///
+/// The card is the upstream row, so whatever the training stage produced is
+/// what gets recorded; the engine only adds the name and the registration time.
+#[test]
+fn snk_model_registers_a_card_that_src_model_reads_back() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let models = tmp.path().join("models").to_string_lossy().replace('\\', "/");
+    let in_csv = write_file(
+        tmp.path(),
+        "metrics.csv",
+        "version,artifact,framework,mae\nrun-1,s3://models/churn/model.pkl,lightgbm,171242\n",
+    );
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "ok", "snk.model failed: {:?}", r.error);
+
+    // Both the versioned card and the pointer exist after a successful run.
+    let versioned = tmp.path().join("models").join("churn").join("run-1.json");
+    let latest = tmp.path().join("models").join("churn").join("latest.json");
+    assert!(versioned.is_file(), "no versioned card at {:?}", versioned);
+    assert!(latest.is_file(), "no latest pointer at {:?}", latest);
+    let card: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&latest).unwrap()).unwrap();
+    assert_eq!(card.get("name").and_then(|v| v.as_str()), Some("churn"));
+    assert_eq!(card.get("framework").and_then(|v| v.as_str()), Some("lightgbm"));
+    assert!(card.get("registered_at").is_some(), "card has no registration time");
+
+    // Read it back through the component, by the pointer.
+    let out = out_path(tmp.path(), "model.csv");
+    let back = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.model", json!({ "path": models, "model": "churn@latest" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(back.status, "ok", "src.model failed: {:?}", back.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 1);
+    assert_eq!(
+        scalar_string(&format!("SELECT artifact FROM read_csv_auto('{}')", out)),
+        "s3://models/churn/model.pkl"
+    );
+
+    // And by an explicit version, which is the point of keeping both files: an
+    // older model is still addressable after a retrain has moved the pointer.
+    let out2 = out_path(tmp.path(), "model2.csv");
+    let pinned = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.model", json!({ "path": models, "model": "churn@run-1" })),
+            node("k", "snk.csv", json!({ "path": out2, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(pinned.status, "ok", "src.model by version failed: {:?}", pinned.error);
+    assert_eq!(
+        scalar_string(&format!("SELECT version FROM read_csv_auto('{}')", out2)),
+        "run-1"
+    );
+}
+
+/// #253: THE reason this is a component rather than a documented convention.
+///
+/// A training pipeline that fails after the registration stage must not leave a
+/// registered model behind, and a retrain that fails must not move the pointer
+/// off the model that still works. A script writing its own card cannot know
+/// whether the rest of the run succeeded.
+#[test]
+fn a_failed_run_neither_registers_a_model_nor_moves_the_pointer() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let models = tmp.path().join("models").to_string_lossy().replace('\\', "/");
+    let good = write_file(
+        tmp.path(),
+        "good.csv",
+        "version,artifact,mae\nrun-1,s3://models/churn/v1.pkl,171242\n",
+    );
+    // First, a run that succeeds: this is the model in production.
+    let first = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": good, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(first.status, "ok", "setup run failed: {:?}", first.error);
+    let latest = tmp.path().join("models").join("churn").join("latest.json");
+    let before = std::fs::read_to_string(&latest).unwrap();
+
+    // Now a retrain whose card would register run-2, but whose run fails after
+    // the registration stage - here because a later stage reads a table that
+    // does not exist.
+    let retrain = write_file(
+        tmp.path(),
+        "retrain.csv",
+        "version,artifact,mae\nrun-2,s3://models/churn/v2.pkl,999999\n",
+    );
+    let out = out_path(tmp.path(), "never.csv");
+    let failed = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": retrain, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+            node("boom", "code.sql", json!({ "sql": "SELECT * FROM a_table_that_does_not_exist" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "s", "m"),
+            main_edge("e2", "m", "boom"),
+            main_edge("e3", "boom", "k"),
+        ]),
+    ));
+    assert_eq!(failed.status, "error", "the retrain was supposed to fail");
+
+    // run-2 was never registered, and the pointer still names run-1.
+    assert!(
+        !tmp.path().join("models").join("churn").join("run-2.json").is_file(),
+        "a failed run registered a model card"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&latest).unwrap(),
+        before,
+        "a failed retrain moved the latest pointer off a working model"
+    );
+}
+
+/// #253: a card names one model version. Registering several rows at once would
+/// pick one by whatever order the upstream produced, which is not the engine's
+/// decision to make.
+#[test]
+fn snk_model_refuses_an_ambiguous_or_unversioned_card() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let models = tmp.path().join("models").to_string_lossy().replace('\\', "/");
+
+    let two = write_file(
+        tmp.path(),
+        "two.csv",
+        "version,artifact\nrun-1,a.pkl\nrun-2,b.pkl\n",
+    );
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": two, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "error");
+    assert!(
+        r.error.unwrap_or_default().contains("exactly one"),
+        "the error should say a card is one row"
+    );
+
+    // No version column: the card would silently overwrite the previous one.
+    let noversion = write_file(tmp.path(), "nv.csv", "artifact,mae\na.pkl,1\n");
+    let r2 = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": noversion, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r2.status, "error");
+    assert!(
+        r2.error.unwrap_or_default().contains("version"),
+        "the error should name the missing column"
     );
 }

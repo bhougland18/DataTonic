@@ -29,13 +29,16 @@ fn build_root_store() -> rustls::RootCertStore {
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     // 2. OS trust store - adds enterprise / proxy-inspection CAs. Best effort.
-    match rustls_native_certs::load_native_certs() {
-        Ok(certs) => {
-            let _ = roots.add_parsable_certificates(certs);
-        }
-        Err(e) => {
-            eprintln!("duckle: could not read OS certificate store: {e}");
-        }
+    // rustls-native-certs 0.8 reports partial success: a store can yield usable
+    // certificates AND errors at once, where the old Result made it all or
+    // nothing. Take whatever loaded and report the rest, so one unreadable
+    // certificate no longer costs the machine its whole OS trust store.
+    let native = rustls_native_certs::load_native_certs();
+    if !native.certs.is_empty() {
+        let _ = roots.add_parsable_certificates(native.certs);
+    }
+    for e in &native.errors {
+        eprintln!("duckle: could not read part of the OS certificate store: {e}");
     }
 
     // 3. Optional explicit PEM bundle, for split-tunnel setups or where the
@@ -105,7 +108,46 @@ static PROXY_OVERRIDE: RwLock<Option<String>> = RwLock::new(None);
 /// cache on the resolved proxy means a proxy set AFTER startup rebuilds the
 /// agent, instead of being frozen no-proxy at first use (the old OnceLock bug:
 /// the startup update-check built the agent before any proxy was known, #80).
-static AGENT_CACHE: Mutex<Option<(Option<String>, ureq::Agent)>> = Mutex::new(None);
+static AGENT_CACHE: Mutex<Option<Vec<(HttpTransport, ureq::Agent)>>> = Mutex::new(None);
+
+/// #256: the transport settings an HTTP request can vary, in one place.
+///
+/// These used to be either global (the proxy, one value for the whole process)
+/// or absent entirely (timeouts, User-Agent). One global proxy is demonstrably
+/// the wrong granularity - the desktop's local llama-server calls deliberately
+/// bypass the shared agent because the proxy would apply to them too - and no
+/// timeout at all means a hung socket parks a stage forever, which matters more
+/// now that AI stages keep several requests in flight at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct HttpTransport {
+    /// Proxy URL for this transport. None falls back to the Settings override
+    /// and then the environment, which is the behaviour every caller had.
+    pub proxy: Option<String>,
+    /// Seconds a single read may stall before the request fails. This is a
+    /// per-read deadline, not a deadline on the whole transfer, so streaming a
+    /// large file is unaffected as long as bytes keep arriving.
+    pub read_timeout_secs: Option<u64>,
+    /// Seconds to wait for the connection itself.
+    pub connect_timeout_secs: Option<u64>,
+    /// User-Agent sent on every request. Some public sites answer 403 to the
+    /// default one.
+    pub user_agent: Option<String>,
+}
+
+/// A read that has delivered nothing for this long is stalled, not slow. Set
+/// generously: the point is that a dead socket cannot park a stage forever, not
+/// to police how long a server may take. Override with DUCKLE_HTTP_READ_TIMEOUT.
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 300;
+/// A connection that has not been established by now is not going to be.
+/// Override with DUCKLE_HTTP_CONNECT_TIMEOUT.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+fn env_secs(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
 
 /// Set (or clear) the HTTP/HTTPS proxy at run time, from the desktop Settings.
 /// Mirrors the value into HTTPS_PROXY / HTTP_PROXY so the reqwest clients (engine
@@ -134,24 +176,70 @@ pub fn current_proxy() -> Option<String> {
 /// it per request is cheap. It is cached keyed by the resolved proxy, so a proxy
 /// set after startup rebuilds it rather than being frozen at first use.
 pub fn http_agent() -> ureq::Agent {
-    let want = current_proxy();
+    http_agent_with(&HttpTransport::default())
+}
+
+/// #256: the agent for one set of transport settings.
+///
+/// Every HTTP-backed component in the engine goes through here, so a timeout or
+/// a proxy set once applies to all of them rather than being re-implemented per
+/// connector. Agents are cached by their effective settings: they are internally
+/// reference-counted and hold the connection pool, so building one per request
+/// would throw away keep-alive.
+pub fn http_agent_with(transport: &HttpTransport) -> ureq::Agent {
+    // Resolve everything BEFORE the cache lookup, so the key is what the agent
+    // was actually built with. A proxy set after startup then rebuilds rather
+    // than being frozen at first use (#80).
+    let want = HttpTransport {
+        proxy: transport.proxy.clone().or_else(current_proxy),
+        read_timeout_secs: Some(
+            transport
+                .read_timeout_secs
+                .or_else(|| env_secs("DUCKLE_HTTP_READ_TIMEOUT"))
+                .unwrap_or(DEFAULT_READ_TIMEOUT_SECS),
+        ),
+        connect_timeout_secs: Some(
+            transport
+                .connect_timeout_secs
+                .or_else(|| env_secs("DUCKLE_HTTP_CONNECT_TIMEOUT"))
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+        ),
+        user_agent: transport.user_agent.clone(),
+    };
     {
         let cache = AGENT_CACHE.lock().unwrap();
-        if let Some((have, agent)) = cache.as_ref() {
-            if *have == want {
+        if let Some(entries) = cache.as_ref() {
+            if let Some((_, agent)) = entries.iter().find(|(have, _)| *have == want) {
                 return agent.clone();
             }
         }
     }
     let mut builder = ureq::AgentBuilder::new().tls_config(Arc::new(build_client_config()));
-    if let Some(url) = &want {
+    if let Some(url) = &want.proxy {
         match ureq::Proxy::new(url) {
             Ok(p) => builder = builder.proxy(p),
             Err(e) => eprintln!("duckle: ignoring invalid proxy '{url}': {e}"),
         }
     }
+    if let Some(secs) = want.read_timeout_secs {
+        builder = builder.timeout_read(std::time::Duration::from_secs(secs));
+    }
+    if let Some(secs) = want.connect_timeout_secs {
+        builder = builder.timeout_connect(std::time::Duration::from_secs(secs));
+    }
+    if let Some(ua) = &want.user_agent {
+        builder = builder.user_agent(ua);
+    }
     let agent = builder.build();
-    *AGENT_CACHE.lock().unwrap() = Some((want, agent.clone()));
+    let mut cache = AGENT_CACHE.lock().unwrap();
+    let entries = cache.get_or_insert_with(Vec::new);
+    // A pipeline has a handful of distinct transports, not hundreds. Cap it so a
+    // pathological one cannot grow this without bound; dropping the oldest only
+    // costs a rebuild.
+    if entries.len() >= 16 {
+        entries.remove(0);
+    }
+    entries.push((want, agent.clone()));
     agent
 }
 

@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 392,
+  "componentCount": 397,
   "components": [
     {
       "id": "src.csv",
@@ -650,6 +650,315 @@
                 "kind": "text",
                 "placeholder": "data   or   response.records",
                 "description": "Dotted key path to the array of records inside the JSON, for API-style responses where the rows live under a key (e.g. {\"data\":[...]} -> 'data', or {\"response\":{\"records\":[...]}} -> 'response.records'). Each record is unnested and nested fields are flattened into columns. Leave blank for a plain top-level array or JSON Lines."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.model",
+      "label": "Model Card",
+      "kind": "source",
+      "availability": "available",
+      "summary": "Read a registered model card back as one row: name, version, the artifact URI the training script wrote, and whatever metrics and hashes it recorded. Address it as name@version, or name@latest to follow the pointer that moves on every successful retrain, so a scoring pipeline stays unedited. The engine never loads the model - the row carries the URI and your Python stage loads it.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.model",
+        "kind": "source",
+        "label": "Model Card",
+        "description": "Read a registered model card back as one row: name, version, the artifact URI the training script wrote, and whatever metrics and hashes it recorded. Address it as name@version, or name@latest to follow the pointer that moves on every successful retrain, so a scoring pipeline stays unedited. The engine never loads the model - the row carries the URI and your Python stage loads it.",
+        "schemaSource": "declared",
+        "sections": [
+          {
+            "label": "Model",
+            "fields": [
+              {
+                "key": "model",
+                "label": "Model",
+                "kind": "text",
+                "required": true,
+                "placeholder": "churn@latest",
+                "description": "name@version, or name@latest to follow the pointer that moves on every successful retrain. A bare name means latest."
+              },
+              {
+                "key": "path",
+                "label": "Registry folder",
+                "kind": "text",
+                "defaultValue": "${workspace}/models",
+                "description": "Where cards live. Must match the folder the registering pipeline writes to."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.pdf",
+      "label": "PDF Pages",
+      "kind": "source",
+      "availability": "available",
+      "summary": "One row per PAGE of a PDF: document_id, page_number, text, has_text_layer, width, height and the document metadata. Point it at a file or a folder. Reads the text layer a document already carries, so filings, accounts and invoices become a table you can filter, join and hand to a Python or AI stage. No OCR: a scanned page comes back with has_text_layer false, which is exactly what lets you route those pages to whatever OCR you already run. document_id is the same value src.artifact puts in uri, so the two join.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.pdf",
+        "kind": "source",
+        "label": "PDF Pages",
+        "description": "One row per PAGE of a PDF: document_id, page_number, text, has_text_layer, width, height and the document metadata. Point it at a file or a folder. Reads the text layer a document already carries, so filings, accounts and invoices become a table you can filter, join and hand to a Python or AI stage. No OCR: a scanned page comes back with has_text_layer false, which is exactly what lets you route those pages to whatever OCR you already run. document_id is the same value src.artifact puts in uri, so the two join.",
+        "schemaSource": "autodetect",
+        "sections": [
+          {
+            "label": "Source file",
+            "fields": [
+              {
+                "key": "path",
+                "label": "Path",
+                "kind": "file-path",
+                "required": true,
+                "filters": [
+                  {
+                    "name": "PDF Pages",
+                    "extensions": [
+                      "pdf"
+                    ]
+                  },
+                  {
+                    "name": "All files",
+                    "extensions": [
+                      "*"
+                    ]
+                  }
+                ],
+                "description": "A .pdf file, or a folder of them."
+              }
+            ]
+          },
+          {
+            "label": "Documents",
+            "fields": [
+              {
+                "key": "recursive",
+                "label": "Include sub-folders",
+                "kind": "bool",
+                "defaultValue": false,
+                "description": "When the path is a folder, also read PDFs in folders beneath it. Files are read in sorted order, so a run over a folder is reproducible."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.html",
+      "label": "HTML",
+      "kind": "source",
+      "availability": "available",
+      "summary": "Rows out of an HTML page, by CSS selector. Point it at a local file or an http(s) URL, give a row selector, and either name a column per sub-selector (with an optional attribute, so a link href or a data- value is readable) or leave the columns empty and let a table become a table: the th cells name the columns and each tr is a row. Parsed with a tolerant HTML parser, so the unclosed tags and unquoted attributes that real pages carry - and that the strict XML reader rejects outright - are fine.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.html",
+        "kind": "source",
+        "label": "HTML",
+        "description": "Rows out of an HTML page, by CSS selector. Point it at a local file or an http(s) URL, give a row selector, and either name a column per sub-selector (with an optional attribute, so a link href or a data- value is readable) or leave the columns empty and let a table become a table: the th cells name the columns and each tr is a row. Parsed with a tolerant HTML parser, so the unclosed tags and unquoted attributes that real pages carry - and that the strict XML reader rejects outright - are fine.",
+        "schemaSource": "autodetect",
+        "sections": [
+          {
+            "label": "Source file",
+            "fields": [
+              {
+                "key": "path",
+                "label": "Path",
+                "kind": "file-path",
+                "required": true,
+                "filters": [
+                  {
+                    "name": "HTML",
+                    "extensions": [
+                      "html"
+                    ]
+                  },
+                  {
+                    "name": "All files",
+                    "extensions": [
+                      "*"
+                    ]
+                  }
+                ],
+                "description": "A local file, or an http(s):// URL fetched with the request settings below."
+              }
+            ]
+          },
+          {
+            "label": "Format",
+            "fields": [
+              {
+                "key": "rowSelector",
+                "label": "Row selector",
+                "kind": "text",
+                "required": true,
+                "placeholder": "table#results",
+                "description": "A CSS selector. Every element it matches becomes one row. A selector that does not parse fails the run naming it, rather than quietly producing empty columns."
+              },
+              {
+                "key": "columns",
+                "label": "Columns",
+                "kind": "key-value",
+                "description": "One entry per column: the name, and a selector evaluated INSIDE the row. Add @attribute to read an attribute instead of the text, e.g. a@href for a link. An empty selector means the row element itself. Leave this whole list empty for table mode, where the row selector names a table, its th cells become the column names and each tr is a row."
+              }
+            ]
+          },
+          {
+            "label": "Request",
+            "fields": [
+              {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
+                "key": "authType",
+                "label": "Auth",
+                "kind": "select",
+                "defaultValue": "none",
+                "options": [
+                  {
+                    "label": "None",
+                    "value": "none"
+                  },
+                  {
+                    "label": "Bearer token",
+                    "value": "bearer"
+                  },
+                  {
+                    "label": "API key header",
+                    "value": "apikey"
+                  },
+                  {
+                    "label": "Basic (user:password)",
+                    "value": "basic"
+                  }
+                ]
+              },
+              {
+                "key": "authToken",
+                "label": "Credential",
+                "kind": "text",
+                "secret": true,
+                "placeholder": "${ENV:SITE_TOKEN}",
+                "description": "Use ${ENV:...} so no secret lands in the pipeline JSON. For Basic this is user:password, encoded for you.",
+                "visibleWhen": [
+                  {
+                    "key": "authType",
+                    "equals": [
+                      "bearer",
+                      "apikey",
+                      "basic"
+                    ]
+                  }
+                ]
+              },
+              {
+                "key": "headers",
+                "label": "Headers",
+                "kind": "key-value",
+                "description": "Sent only when the path is an http(s) URL. A User-Agent is often what stands between you and a 403."
               }
             ]
           }
@@ -7952,7 +8261,13 @@
       "availability": "available",
       "summary": "Generic HTTP GET/POST source. Parses JSON response, optionally walks a JSON pointer (responsePath) to find the row array, and follows cursor-style pagination if configured (cursorNextPath + cursorParam).",
       "ports": {
-        "inputs": [],
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
         "outputs": [
           {
             "id": "main",
@@ -8032,6 +8347,15 @@
                   "rest"
                 ],
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
+              },
+              {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
               },
               {
                 "key": "authType",
@@ -8251,6 +8575,27 @@
                 "defaultValue": 100
               },
               {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
+              },
+              {
                 "key": "responseMetadata",
                 "label": "Add response metadata",
                 "kind": "bool",
@@ -8261,7 +8606,13 @@
           }
         ],
         "ports": {
-          "inputs": [],
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
           "outputs": [
             {
               "id": "main",
@@ -8367,6 +8718,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -8582,6 +8942,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -8700,6 +9081,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -8915,6 +9305,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -9115,6 +9526,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -9330,6 +9750,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -9448,6 +9889,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -9663,6 +10113,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -9810,6 +10281,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -10025,6 +10505,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -10143,6 +10644,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -10358,6 +10868,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -10476,6 +11007,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -10691,6 +11231,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -11791,6 +12352,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -12006,6 +12576,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -24808,6 +25399,20 @@
                 "defaultValue": 64
               },
               {
+                "key": "concurrency",
+                "label": "Parallel requests",
+                "kind": "integer",
+                "defaultValue": 1,
+                "description": "How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way."
+              },
+              {
+                "key": "maxRetries",
+                "label": "Retries on rate limit",
+                "kind": "integer",
+                "defaultValue": 3,
+                "description": "Retries for a single request on HTTP 429 or 5xx, honouring Retry-After. Without this one rate limit throws away every row the stage already paid for. 0 disables retrying."
+              },
+              {
                 "key": "baseUrl",
                 "label": "Base URL",
                 "kind": "text",
@@ -24989,6 +25594,20 @@
                 "label": "Max tokens",
                 "kind": "integer",
                 "defaultValue": 256
+              },
+              {
+                "key": "concurrency",
+                "label": "Parallel requests",
+                "kind": "integer",
+                "defaultValue": 1,
+                "description": "How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way."
+              },
+              {
+                "key": "maxRetries",
+                "label": "Retries on rate limit",
+                "kind": "integer",
+                "defaultValue": 3,
+                "description": "Retries for a single request on HTTP 429 or 5xx, honouring Retry-After. Without this one rate limit throws away every row the stage already paid for. 0 disables retrying."
               }
             ]
           }
@@ -25353,6 +25972,20 @@
                 "label": "Custom headers",
                 "kind": "key-value",
                 "description": "Extra request headers (e.g. a gateway token). A custom Authorization header overrides the API key."
+              },
+              {
+                "key": "concurrency",
+                "label": "Parallel requests",
+                "kind": "integer",
+                "defaultValue": 1,
+                "description": "How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way."
+              },
+              {
+                "key": "maxRetries",
+                "label": "Retries on rate limit",
+                "kind": "integer",
+                "defaultValue": 3,
+                "description": "Retries for a single request on HTTP 429 or 5xx, honouring Retry-After. Without this one rate limit throws away every row the stage already paid for. 0 disables retrying."
               }
             ]
           }
@@ -28458,6 +29091,62 @@
                     "value": "snappy"
                   }
                 ]
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": []
+        }
+      }
+    },
+    {
+      "id": "snk.model",
+      "label": "Model Card",
+      "kind": "sink",
+      "availability": "available",
+      "summary": "Register a trained model. The card IS the upstream row - the artifact URI your training script wrote, plus whatever metrics, framework and hashes it recorded - written to <path>/<name>/<version>.json with a latest.json pointer beside it. It needs exactly one row and a version column. The write happens only if the whole run succeeds, so a training pipeline that fails later never registers a model, and a failed retrain never moves the pointer off the model that still works.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": []
+      },
+      "manifest": {
+        "id": "snk.model",
+        "kind": "sink",
+        "label": "Model Card",
+        "description": "Register a trained model. The card IS the upstream row - the artifact URI your training script wrote, plus whatever metrics, framework and hashes it recorded - written to <path>/<name>/<version>.json with a latest.json pointer beside it. It needs exactly one row and a version column. The write happens only if the whole run succeeds, so a training pipeline that fails later never registers a model, and a failed retrain never moves the pointer off the model that still works.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Register",
+            "fields": [
+              {
+                "key": "name",
+                "label": "Model name",
+                "kind": "text",
+                "required": true,
+                "placeholder": "churn",
+                "description": "Cards land under <registry folder>/<name>/."
+              },
+              {
+                "key": "path",
+                "label": "Registry folder",
+                "kind": "text",
+                "defaultValue": "${workspace}/models",
+                "description": "Where cards are written. Point Model Card sources at the same folder."
               }
             ]
           }
@@ -40751,6 +41440,95 @@
       }
     },
     {
+      "id": "qa.block",
+      "label": "Candidate Pairs (Blocking)",
+      "kind": "quality",
+      "availability": "available",
+      "summary": "Cut an entity-resolution job down to the pairs worth comparing. Every fuzzy match compares pairs, and comparing all of them grows with the product of the row counts, so blocking proposes only records that already agree on something cheap and discriminating (same postcode, same surname). One input dedupes within a table; wire the lookup port to link two. Rules are named and can overlap - a pair caught by several is still emitted once. Output: id_a, id_b, blocking_rule, and a_<col>/b_<col> for carried columns, which is exactly what Match Grouping reads by default.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "lookup",
+            "label": "reference",
+            "type": "lookup"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "qa.block",
+        "kind": "transform",
+        "label": "Candidate Pairs (Blocking)",
+        "description": "Cut an entity-resolution job down to the pairs worth comparing. Every fuzzy match compares pairs, and comparing all of them grows with the product of the row counts, so blocking proposes only records that already agree on something cheap and discriminating (same postcode, same surname). One input dedupes within a table; wire the lookup port to link two. Rules are named and can overlap - a pair caught by several is still emitted once. Output: id_a, id_b, blocking_rule, and a_<col>/b_<col> for carried columns, which is exactly what Match Grouping reads by default.",
+        "schemaSource": "declared",
+        "sections": [
+          {
+            "label": "Candidate pairs",
+            "fields": [
+              {
+                "key": "leftId",
+                "label": "Id column",
+                "kind": "column",
+                "required": true,
+                "description": "The column that identifies a record on the main input. It comes out as id_a."
+              },
+              {
+                "key": "rightId",
+                "label": "Id column (reference)",
+                "kind": "text",
+                "description": "Only needed when the reference input names its id differently. Comes out as id_b."
+              },
+              {
+                "key": "rules",
+                "label": "Blocking rules",
+                "kind": "key-value",
+                "required": true,
+                "description": "A name, and the column(s) that must be EQUAL for a pair to be worth comparing, comma-separated. For example postcode_surname = postcode, surname. Each rule is one pass; a pair caught by several rules is still compared once."
+              },
+              {
+                "key": "carryColumns",
+                "label": "Carry columns",
+                "kind": "columns",
+                "description": "Attribute columns to bring along on both sides, as a_<col> and b_<col>, so the next node can compare them without joining back."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "lookup",
+              "label": "reference",
+              "type": "lookup"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ]
+        }
+      }
+    },
+    {
       "id": "qa.link",
       "label": "Record Linkage",
       "kind": "quality",
@@ -42357,6 +43135,15 @@
                 "description": "Pick a saved Salesforce connection (Connections folder). Resolved and decrypted at run time; inline auth fields hide while one is set."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -42563,6 +43350,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -42914,6 +43722,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -43129,6 +43946,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -43247,6 +44085,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -43462,6 +44309,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -43580,6 +44448,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -43795,6 +44672,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -43913,6 +44811,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -44128,6 +45035,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -44246,6 +45174,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -44461,6 +45398,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -44579,6 +45537,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -44794,6 +45761,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -44912,6 +45900,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -45127,6 +46124,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -45245,6 +46263,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -45460,6 +46487,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -45578,6 +46626,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -45793,6 +46850,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -45911,6 +46989,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -46126,6 +47213,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -46244,6 +47352,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -46459,6 +47576,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -46577,6 +47715,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -46792,6 +47939,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -46910,6 +48078,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -47125,6 +48302,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -47243,6 +48441,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -47458,6 +48665,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -47576,6 +48804,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -47791,6 +49028,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -47909,6 +49167,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -48124,6 +49391,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -48242,6 +49530,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -48457,6 +49754,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -48575,6 +49893,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -48790,6 +50117,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -48908,6 +50256,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -49123,6 +50480,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -49241,6 +50619,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -49456,6 +50843,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -49574,6 +50982,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -49789,6 +51206,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -49907,6 +51345,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -50122,6 +51569,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -50240,6 +51708,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -50455,6 +51932,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -50573,6 +52071,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -50788,6 +52295,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -50906,6 +52434,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -51121,6 +52658,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -51239,6 +52797,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -51454,6 +53021,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",
@@ -51572,6 +53160,15 @@
                 "description": "Pick a connection from the Connections folder to auto-fill the fields below."
               },
               {
+                "key": "transportRef",
+                "label": "HTTP transport",
+                "kind": "connection-ref",
+                "accepts": [
+                  "http"
+                ],
+                "description": "Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection."
+              },
+              {
                 "key": "authType",
                 "label": "Auth type",
                 "kind": "select",
@@ -51787,6 +53384,27 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
+              },
+              {
+                "key": "urlTemplate",
+                "label": "URL per upstream row",
+                "kind": "text",
+                "placeholder": "https://api.example.com/companies/{id}/officers",
+                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
+              },
+              {
+                "key": "parentKeyColumn",
+                "label": "Carry upstream column",
+                "kind": "text",
+                "placeholder": "id",
+                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
+              },
+              {
+                "key": "maxRequests",
+                "label": "Max requests (safety cap)",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
               },
               {
                 "key": "responseMetadata",

@@ -429,7 +429,10 @@ pub(crate) fn walk_xml_to_rows(
             }
             Event::Text(e) => {
                 let text = String::from_utf8_lossy(
-                    e.unescape().unwrap_or_default().as_ref().as_bytes(),
+                    e.xml_content(quick_xml::XmlVersion::Implicit1_0)
+                        .unwrap_or_default()
+                        .as_ref()
+                        .as_bytes(),
                 )
                 .to_string();
                 if let Some(last) = stack.last_mut() {
@@ -555,7 +558,10 @@ pub(crate) fn stream_xml_rows<R: std::io::BufRead>(
             }
             Event::Text(e) => {
                 let text = String::from_utf8_lossy(
-                    e.unescape().unwrap_or_default().as_ref().as_bytes(),
+                    e.xml_content(quick_xml::XmlVersion::Implicit1_0)
+                        .unwrap_or_default()
+                        .as_ref()
+                        .as_bytes(),
                 )
                 .to_string();
                 if let Some(last) = stack.last_mut() {

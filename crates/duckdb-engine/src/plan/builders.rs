@@ -293,6 +293,8 @@ pub(crate) fn build_view_sql(
         "qa.refintegrity" => build_refintegrity(inputs, props, false),
         "qa.profile.adv" => build_profile_adv(inputs, props),
         "qa.link" => build_record_link(inputs, props),
+        "qa.block" => build_er_block(inputs, props),
+        "src.model" => Ok(build_model_source(props)?),
         "qa.reconcile" => build_reconcile(inputs, props),
         "qa.classify" => build_classify(inputs, props),
         "qa.dedupe" => build_fuzzy_dedupe(inputs, props),
@@ -2695,6 +2697,135 @@ pub(crate) fn build_record_link(inputs: &NodeInputs, props: &JsonValue) -> Resul
         r = quote_ident(reference),
         score = score,
         threshold = threshold,
+    ))
+}
+
+/// One blocking rule: a label, and the columns that must be equal for a pair
+/// to be a candidate. Accepts either shape the GUI key-value field can write.
+fn blocking_rules(props: &JsonValue) -> Vec<(String, Vec<String>)> {
+    let split = |label: &str, spec: &str| -> Option<(String, Vec<String>)> {
+        let cols: Vec<String> = spec
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.is_empty() {
+            None
+        } else {
+            Some((label.trim().to_string(), cols))
+        }
+    };
+    match props.get("rules") {
+        Some(JsonValue::Object(obj)) => obj
+            .iter()
+            .filter_map(|(k, v)| split(k, v.as_str()?))
+            .collect(),
+        Some(JsonValue::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| {
+                let k = item.get("key").and_then(|x| x.as_str())?;
+                let v = item.get("value").and_then(|x| x.as_str())?;
+                split(k, v)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// qa.block: candidate-pair generation (blocking) for entity resolution.
+///
+/// Fuzzy matching is expensive because it compares every pair: qa.link CROSS
+/// JOINs its two inputs, so linking 100k rows against 100k rows is 10^10
+/// comparisons. Blocking is the standard answer - only compare records that
+/// already agree on something cheap and discriminating, like the same postcode
+/// or the same surname initial - and it is the piece the qa.* family did not
+/// have, which is what made the rest of it unusable at real sizes.
+///
+/// Main input alone is dedupe mode: pairs come from the one table and each
+/// unordered pair is kept once. Wire the lookup port and it links two tables.
+///
+/// Emits `id_a`, `id_b`, `blocking_rule`, and `a_<col>` / `b_<col>` for every
+/// carried column. `id_a` / `id_b` are exactly the column names qa.matchgroup
+/// already defaults to, so pairs feed clustering with nothing to configure,
+/// and the carried columns are what an xf.addcol comparison expression reads
+/// (`jaro_winkler_similarity(a_name, b_name)`, `abs(a_amount - b_amount)`).
+pub(crate) fn build_er_block(inputs: &NodeInputs, props: &JsonValue) -> Result<String, String> {
+    let main = inputs.main().ok_or_else(|| missing_input_msg("qa.block"))?;
+    let reference = inputs.first_lookup();
+    let self_mode = reference.is_none();
+    let right_rel = reference.unwrap_or(main);
+
+    let left_id = string_prop(props, "leftId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "Blocking needs the id column on the main input (leftId) so each pair can be identified"
+                .to_string()
+        })?;
+    // Linking two tables whose id columns share a name is the common case, so
+    // rightId defaults to the same name rather than erroring.
+    let right_id = if self_mode {
+        left_id.clone()
+    } else {
+        string_prop(props, "rightId")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| left_id.clone())
+    };
+
+    let rules = blocking_rules(props);
+    if rules.is_empty() {
+        return Err("Blocking needs at least one rule: a label, and the column(s) that must be equal for a pair to be worth comparing (for example postcode_surname = postcode, surname)".to_string());
+    }
+    let carry = columns_list(props, "carryColumns");
+
+    let lq = quote_ident(&left_id);
+    let rq = quote_ident(&right_id);
+    let mut selects: Vec<String> = Vec::with_capacity(rules.len());
+    for (label, keys) in &rules {
+        let mut on: Vec<String> = keys
+            .iter()
+            .map(|k| {
+                let k = quote_ident(k);
+                // An equi-join drops NULL keys by itself, which is what we want:
+                // blocking on a NULL would put every unfilled record in one
+                // block and undo the whole point.
+                format!("l.{k} = r.{k}")
+            })
+            .collect();
+        if self_mode {
+            // Keep each unordered pair once and drop self-pairs. CAST so id
+            // columns of any type share one comparable type, the same way
+            // qa.matchgroup normalises its edge ids.
+            on.push(format!(
+                "CAST(l.{lq} AS VARCHAR) < CAST(r.{rq} AS VARCHAR)"
+            ));
+        }
+        let mut cols = vec![
+            format!("l.{lq} AS id_a"),
+            format!("r.{rq} AS id_b"),
+            format!("'{}' AS blocking_rule", label.replace("'", "''")),
+        ];
+        for c in &carry {
+            let cq = quote_ident(c);
+            cols.push(format!("l.{cq} AS {}", quote_ident(&format!("a_{c}"))));
+            cols.push(format!("r.{cq} AS {}", quote_ident(&format!("b_{c}"))));
+        }
+        selects.push(format!(
+            "SELECT {cols} FROM {m} l JOIN {r} r ON {on}",
+            cols = cols.join(", "),
+            m = quote_ident(main),
+            r = quote_ident(right_rel),
+            on = on.join(" AND "),
+        ));
+    }
+
+    // Several rules will often propose the same pair. UNION ALL then keep one
+    // row per pair, labelled with the first rule that produced it, so a pair is
+    // compared once downstream instead of once per rule that caught it.
+    Ok(format!(
+        "SELECT * FROM ({}) QUALIFY row_number() OVER (PARTITION BY id_a, id_b ORDER BY blocking_rule) = 1",
+        selects.join(" UNION ALL ")
     ))
 }
 
@@ -9165,6 +9296,77 @@ pub(crate) fn headers_from_props(props: &JsonValue) -> Vec<(String, String)> {
 /// - `bearer` -> `Authorization: Bearer <token>`
 /// - `apikey` -> `<header>: <token>` (header chosen by `api_key_header`)
 /// - anything else (incl. `none`) adds nothing.
+/// src.model: read one model card back (#253).
+///
+/// Pure SQL, because a card is just a JSON file: the only work is turning
+/// `name@version` into a path. `@latest` (or no version at all) reads the
+/// pointer snk.model moves on every successful registration, which is what lets
+/// a scoring pipeline stay unedited across retrains.
+///
+/// The row it produces carries the artifact URI, so a downstream code.python
+/// stage joins it to its feature table and loads the model itself. The engine
+/// deliberately does not load models: that would mean an ML runtime in Rust for
+/// something the workspace's own virtualenv already does.
+pub(crate) fn build_model_source(props: &JsonValue) -> Result<String, String> {
+    let dir = string_prop(props, "path")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "models".to_string());
+    let reference = string_prop(props, "model")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "Model needs a model to read, as name or name@version (name@latest reads the current one)".to_string()
+        })?;
+    let (name, version) = match reference.rsplit_once('@') {
+        Some((n, v)) if !n.trim().is_empty() && !v.trim().is_empty() => (n.trim(), v.trim()),
+        _ => (reference.as_str(), "latest"),
+    };
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    // Forward slashes so the path is a valid SQL string literal on Windows too.
+    let path = format!(
+        "{}/{}/{}.json",
+        dir.trim_end_matches(['/', '\\']).replace('\\', "/"),
+        safe(name),
+        safe(version)
+    );
+    Ok(format!(
+        "SELECT * FROM read_json_auto('{}')",
+        path.replace('\'', "''")
+    ))
+}
+
+/// #256: the transport settings on an HTTP-backed node.
+///
+/// Flat props rather than a nested object because that is what a saved `http`
+/// connection flattens into, the same way a saved REST connection flattens into
+/// url / authType / authToken. Returns None when nothing is set, so a node
+/// without transport config builds the default shared agent exactly as before.
+pub(crate) fn http_transport_from_props(props: &JsonValue) -> Option<crate::tls::HttpTransport> {
+    let secs = |key: &str| props.get(key).and_then(|v| v.as_u64()).filter(|n| *n > 0);
+    let t = crate::tls::HttpTransport {
+        proxy: string_prop(props, "httpProxy").filter(|s| !s.trim().is_empty()),
+        read_timeout_secs: secs("httpReadTimeoutSecs"),
+        connect_timeout_secs: secs("httpConnectTimeoutSecs"),
+        user_agent: string_prop(props, "httpUserAgent").filter(|s| !s.trim().is_empty()),
+    };
+    if t == crate::tls::HttpTransport::default() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 pub(crate) fn push_rest_auth(headers: &mut Vec<(String, String)>, props: &JsonValue) {
     let auth_type = string_prop(props, "authType").unwrap_or_else(|| "none".into());
     let token = string_prop(props, "authToken").unwrap_or_default();

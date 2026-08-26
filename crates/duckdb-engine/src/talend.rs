@@ -4165,7 +4165,7 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                 let attr = |k: &str| -> Option<String> {
                     e.attributes().flatten().find_map(|a| {
                         (a.key.local_name().as_ref() == k.as_bytes()).then(|| {
-                            a.unescape_value()
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .map(|v| v.into_owned())
                                 .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).to_string())
                         })

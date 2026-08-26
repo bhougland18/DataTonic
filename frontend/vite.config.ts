@@ -42,7 +42,13 @@ export default defineConfig({
         target: 'es2022',
         outDir: web ? 'dist-web' : 'dist',
         // Smaller bundles; Tauri ships the webview which already supports modern JS.
-        minify: 'esbuild',
+        //
+        // `true` rather than naming a minifier: Vite 8 stopped bundling esbuild
+        // in favour of Oxc, so asking for esbuild by name makes the build fail
+        // with "it now requires esbuild to be installed separately" (#239).
+        // `true` takes whichever minifier the installed Vite ships with, which
+        // is what we actually want and works on both.
+        minify: true,
         sourcemap: false,
     },
 });

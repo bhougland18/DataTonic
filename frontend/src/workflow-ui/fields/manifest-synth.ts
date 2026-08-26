@@ -262,6 +262,17 @@ const connectionRefField = (acceptKind?: string): Field => ({
     description: 'Pick a connection from the Connections folder to auto-fill the fields below.',
 });
 
+// #256: transport is a SEPARATE picker from the auth connection. It has to use
+// its own key: on src.rest and its aliases `connectionRef` is already spent on
+// the kind:'rest' auth connection.
+const transportRefField = (): Field => ({
+    key: 'transportRef',
+    label: 'HTTP transport',
+    kind: 'connection-ref',
+    accepts: ['http'],
+    description: 'Pick a saved HTTP transport to apply a proxy, timeouts and a User-Agent without setting them on every node. Anything you set here on the node wins over the connection.',
+});
+
 const credentialFields = (acceptKind?: string): Field[] => [
     connectionRefField(acceptKind),
     { key: 'username', label: 'Username', kind: 'text' },
@@ -739,7 +750,7 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
 
     // Record linkage + reconcile - main input + a reference (lookup) input,
     // single output (matched pairs / a report).
-    if (id === 'qa.link' || id === 'qa.reconcile') {
+    if (id === 'qa.link' || id === 'qa.reconcile' || id === 'qa.block') {
         return {
             inputs: [MAIN_IN, { id: 'lookup', label: 'reference', type: 'lookup' }],
             outputs: [MAIN_OUT],
@@ -794,6 +805,15 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
                 REJECT_OUT,
             ],
         };
+    }
+
+    // #257: src.rest can take an OPTIONAL main input. Wire a parent endpoint's
+    // rows into it and the node makes one request per row from its URL
+    // template; leave it unconnected and it is the ordinary source it has
+    // always been. Only the generic component gets the port - the vendor
+    // aliases keep their plain source shape.
+    if (id === 'src.rest') {
+        return { inputs: [MAIN_IN], outputs: [MAIN_OUT, REJECT_OUT] };
     }
 
     // Sources: outputs only
@@ -958,7 +978,15 @@ function synthFileSource(comp: ComponentDef): ComponentManifest {
     // URL, or an sftp://user@host/path URL - all decompress .gz transparently.
     const pathDescription = comp.id === 'src.xml'
         ? 'A local file, an http(s):// URL, or an sftp://user@host/path URL. Remote paths are streamed (never fully buffered) and .gz files decompress transparently. For SFTP auth, set the fields below.'
+        : comp.id === 'src.html'
+        ? 'A local file, or an http(s):// URL fetched with the request settings below.'
+        : comp.id === 'src.pdf'
+        ? 'A .pdf file, or a folder of them.'
         : undefined;
+    // #255: src.html reads one document, and its parser decides the encoding
+    // from the markup. Offering Encoding and Glob here would be two more fields
+    // the engine never reads.
+    const isSingleDocument = comp.id === 'src.html' || comp.id === 'src.pdf';
     return base(comp, [
         {
             label: 'Source file',
@@ -971,14 +999,18 @@ function synthFileSource(comp: ComponentDef): ComponentManifest {
                     filters,
                     ...(pathDescription ? { description: pathDescription } : {}),
                 },
-                encodingField(),
-                {
-                    key: 'glob',
-                    label: 'Glob pattern',
-                    kind: 'bool',
-                    defaultValue: false,
-                    description: 'Treat the path as a glob (e.g. data/*.csv) to read many files.',
-                },
+                ...(isSingleDocument
+                    ? []
+                    : [
+                          encodingField(),
+                          {
+                              key: 'glob' as const,
+                              label: 'Glob pattern',
+                              kind: 'bool' as const,
+                              defaultValue: false,
+                              description: 'Treat the path as a glob (e.g. data/*.csv) to read many files.',
+                          },
+                      ]),
             ],
         },
         ...fileFormatSection(comp),
@@ -1324,6 +1356,78 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                 fields: [
                     { key: 'sheet', label: 'Sheet name', kind: 'text', placeholder: 'Sheet1' },
                     { key: 'range', label: 'Cell range', kind: 'text', placeholder: 'A1:F1000' },
+                ],
+            },
+        ];
+    }
+    if (id.endsWith('.pdf')) {
+        return [
+            {
+                label: 'Documents',
+                fields: [
+                    {
+                        key: 'recursive',
+                        label: 'Include sub-folders',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description: 'When the path is a folder, also read PDFs in folders beneath it. Files are read in sorted order, so a run over a folder is reproducible.',
+                    },
+                ],
+            },
+        ];
+    }
+    if (id.endsWith('.html')) {
+        return [
+            {
+                label: 'Format',
+                fields: [
+                    {
+                        key: 'rowSelector',
+                        label: 'Row selector',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'table#results',
+                        description: 'A CSS selector. Every element it matches becomes one row. A selector that does not parse fails the run naming it, rather than quietly producing empty columns.',
+                    },
+                    {
+                        key: 'columns',
+                        label: 'Columns',
+                        kind: 'key-value',
+                        description: 'One entry per column: the name, and a selector evaluated INSIDE the row. Add @attribute to read an attribute instead of the text, e.g. a@href for a link. An empty selector means the row element itself. Leave this whole list empty for table mode, where the row selector names a table, its th cells become the column names and each tr is a row.',
+                    },
+                ],
+            },
+            {
+                label: 'Request',
+                fields: [
+                    transportRefField(),
+                    {
+                        key: 'authType',
+                        label: 'Auth',
+                        kind: 'select',
+                        defaultValue: 'none',
+                        options: [
+                            { label: 'None', value: 'none' },
+                            { label: 'Bearer token', value: 'bearer' },
+                            { label: 'API key header', value: 'apikey' },
+                            { label: 'Basic (user:password)', value: 'basic' },
+                        ],
+                    },
+                    {
+                        key: 'authToken',
+                        label: 'Credential',
+                        kind: 'text',
+                        secret: true,
+                        placeholder: '${ENV:SITE_TOKEN}',
+                        description: 'Use ${ENV:...} so no secret lands in the pipeline JSON. For Basic this is user:password, encoded for you.',
+                        visibleWhen: [{ key: 'authType', equals: ['bearer', 'apikey', 'basic'] }],
+                    },
+                    {
+                        key: 'headers',
+                        label: 'Headers',
+                        kind: 'key-value',
+                        description: 'Sent only when the path is an http(s) URL. A User-Agent is often what stands between you and a 403.',
+                    },
                 ],
             },
         ];
@@ -2880,6 +2984,7 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                 ...(isSalesforce
                     ? [salesforceConnectionRefField()]
                     : [connectionRefField('rest')]),
+                transportRefField(),
                 {
                     key: 'authType',
                     label: 'Auth type',
@@ -3041,6 +3146,27 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                     label: 'Max pages (safety cap)',
                     kind: 'integer',
                     defaultValue: 100,
+                },
+                {
+                    key: 'urlTemplate',
+                    label: 'URL per upstream row',
+                    kind: 'text',
+                    placeholder: 'https://api.example.com/companies/{id}/officers',
+                    description: 'Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path.',
+                },
+                {
+                    key: 'parentKeyColumn',
+                    label: 'Carry upstream column',
+                    kind: 'text',
+                    placeholder: 'id',
+                    description: 'Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42.',
+                },
+                {
+                    key: 'maxRequests',
+                    label: 'Max requests (safety cap)',
+                    kind: 'integer',
+                    defaultValue: 1000,
+                    description: 'How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm.',
                 },
                     { key: 'responseMetadata', label: 'Add response metadata', kind: 'bool', defaultValue: false, description: 'Stamp every row with where it came from: _http_url (the exact URL fetched, per page), _http_status and _fetched_at. Parsed rows alone cannot tell you whether something changed because the source changed or because the parser did.' },
             ],
@@ -5359,6 +5485,60 @@ function synthQualityGeometry(comp: ComponentDef): ComponentManifest {
     ], 'upstream');
 }
 
+// #253: routed by id, not by palette group. Both components sit in the file
+// groups so they appear beside the other sources and sinks, and the group
+// synthesisers would otherwise hand them Path / Encoding / Glob and never
+// show the fields the engine actually reads.
+function synthModelSource(comp: ComponentDef): ComponentManifest {
+        return base(comp, [
+            {
+                label: 'Model',
+                fields: [
+                    {
+                        key: 'model',
+                        label: 'Model',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'churn@latest',
+                        description: 'name@version, or name@latest to follow the pointer that moves on every successful retrain. A bare name means latest.',
+                    },
+                    {
+                        key: 'path',
+                        label: 'Registry folder',
+                        kind: 'text',
+                        defaultValue: '${workspace}/models',
+                        description: 'Where cards live. Must match the folder the registering pipeline writes to.',
+                    },
+                ],
+            },
+        ], 'declared');
+}
+
+function synthModelSink(comp: ComponentDef): ComponentManifest {
+        return base(comp, [
+            {
+                label: 'Register',
+                fields: [
+                    {
+                        key: 'name',
+                        label: 'Model name',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'churn',
+                        description: 'Cards land under <registry folder>/<name>/.',
+                    },
+                    {
+                        key: 'path',
+                        label: 'Registry folder',
+                        kind: 'text',
+                        defaultValue: '${workspace}/models',
+                        description: 'Where cards are written. Point Model Card sources at the same folder.',
+                    },
+                ],
+            },
+        ], 'upstream');
+}
+
 function synthQualityCleanse(comp: ComponentDef): ComponentManifest {
     const id = comp.id;
     if (id === 'qa.standardize') {
@@ -5433,6 +5613,41 @@ function synthQualityCleanse(comp: ComponentDef): ComponentManifest {
                 ],
             },
         ], 'upstream');
+    }
+    if (id === 'qa.block') {
+        return base(comp, [
+            {
+                label: 'Candidate pairs',
+                fields: [
+                    {
+                        key: 'leftId',
+                        label: 'Id column',
+                        kind: 'column',
+                        required: true,
+                        description: 'The column that identifies a record on the main input. It comes out as id_a.',
+                    },
+                    {
+                        key: 'rightId',
+                        label: 'Id column (reference)',
+                        kind: 'text',
+                        description: 'Only needed when the reference input names its id differently. Comes out as id_b.',
+                    },
+                    {
+                        key: 'rules',
+                        label: 'Blocking rules',
+                        kind: 'key-value',
+                        required: true,
+                        description: 'A name, and the column(s) that must be EQUAL for a pair to be worth comparing, comma-separated. For example postcode_surname = postcode, surname. Each rule is one pass; a pair caught by several rules is still compared once.',
+                    },
+                    {
+                        key: 'carryColumns',
+                        label: 'Carry columns',
+                        kind: 'columns',
+                        description: 'Attribute columns to bring along on both sides, as a_<col> and b_<col>, so the next node can compare them without joining back.',
+                    },
+                ],
+            },
+        ], 'declared');
     }
     if (id === 'qa.link') {
         return base(comp, [
@@ -5730,6 +5945,29 @@ const aiProviderField = (): Field => ({
         { label: 'Custom (OpenAI-compatible)', value: 'custom' },
     ],
 });
+
+// #258: the two knobs that decide how a batch-inference stage behaves at
+// scale. Parallel requests defaults to 1, which is exactly the sequential
+// behaviour these stages had before, so an existing pipeline does not change
+// until someone raises it.
+const aiThroughputFields = (): Field[] => [
+    {
+        key: 'concurrency',
+        label: 'Parallel requests',
+        kind: 'integer',
+        defaultValue: 1,
+        description:
+            'How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way.',
+    },
+    {
+        key: 'maxRetries',
+        label: 'Retries on rate limit',
+        kind: 'integer',
+        defaultValue: 3,
+        description:
+            'Retries for a single request on HTTP 429 or 5xx, honouring Retry-After. Without this one rate limit throws away every row the stage already paid for. 0 disables retrying.',
+    },
+];
 
 // #142: fields for pointing an AI transform at a custom OpenAI-compatible
 // endpoint (vLLM, LiteLLM, a private gateway, etc). All optional: blank keeps
@@ -6221,6 +6459,7 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                     { key: 'outputColumn', label: 'Output column', kind: 'text', defaultValue: 'embedding' },
                     { key: 'dimension', label: 'Dimensions', kind: 'integer', defaultValue: 1536 },
                     { key: 'batchSize', label: 'Batch size', kind: 'integer', defaultValue: 64 },
+                    ...aiThroughputFields(),
                     ...aiCustomEndpointFields(),
                 ],
             },
@@ -6253,6 +6492,7 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                     { key: 'outputColumn', label: 'Output column', kind: 'text', required: true, defaultValue: 'ai_result' },
                     { key: 'temperature', label: 'Temperature', kind: 'number', defaultValue: 0 },
                     { key: 'maxTokens', label: 'Max tokens', kind: 'integer', defaultValue: 256 },
+                    ...aiThroughputFields(),
                 ],
             },
         ], 'declared');
@@ -6317,6 +6557,7 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                     { key: 'apiKey', label: 'API key', kind: 'text', placeholder: '••••••••' },
                     { key: 'outputColumn', label: 'Output column', kind: 'text', defaultValue: 'label' },
                     ...aiCustomEndpointFields(),
+                    ...aiThroughputFields(),
                 ],
             },
         ], 'declared');
@@ -6827,6 +7068,8 @@ function dispatchManifest(componentId: string): ComponentManifest | undefined {
     // source (it drives the Bulk API 2.0 query-job lifecycle with the
     // sink-shaped auth keys); route by id ahead of the group checks.
     if (comp.id === 'src.salesforce.bulk') return synthSalesforceBulkSource(comp);
+    if (comp.id === 'src.model') return synthModelSource(comp);
+    if (comp.id === 'snk.model') return synthModelSink(comp);
     if (groupId === 'src.files') return synthFileSource(comp);
     if (groupId === 'src.lakehouse') return synthLakehouseSource(comp);
     if (groupId === 'snk.lakehouse') return synthLakehouseSink(comp);

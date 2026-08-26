@@ -193,6 +193,45 @@ struct State {
     /// Scheduler poll cadence (issue #135). Default 15s; overridable via
     /// --tick-interval or DUCKLE_TICK_INTERVAL.
     tick_interval: Duration,
+    /// #259: runs accepted through POST /api/run/async, by run id. Holds the
+    /// engine handle so the run can be cancelled, and the result once it is
+    /// done. `running` above is pipeline ids only and cannot answer "how is
+    /// run X going" - a different question.
+    runs: Mutex<std::collections::HashMap<String, LiveRun>>,
+}
+
+/// #259: one asynchronous run. `finished` is None while it is queued or
+/// executing, and carries the same summary POST /api/run returns once it ends.
+struct LiveRun {
+    pipeline_id: String,
+    started_at: String,
+    /// The handle the run executes on, kept so DELETE /api/run can cancel it.
+    /// Cancellation is polled at every stage boundary and kills the active
+    /// DuckDB child, so even a long query stops promptly.
+    engine: DuckdbEngine,
+    finished: Option<Value>,
+}
+
+/// How many finished runs to remember in memory. The durable answer is the run
+/// history on disk, which every record now carries a run id in; this only keeps
+/// the common case - polling straight after a run ends - off the filesystem.
+const MAX_REMEMBERED_RUNS: usize = 200;
+
+/// #259: mint an id for an accepted run. The counter distinguishes two runs of
+/// the same pipeline inside one millisecond.
+fn new_run_id(pipeline_id: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let safe: String = pipeline_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    format!(
+        "run-{}-{}-{}",
+        safe,
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3f"),
+        n
+    )
 }
 
 pub fn run() -> Result<(), String> {
@@ -239,6 +278,7 @@ pub fn run() -> Result<(), String> {
         duckdb: duckdb.clone(),
         run_lock: RunGate::new(max_concurrent_runs()),
         running: Mutex::new(std::collections::HashSet::new()),
+        runs: Mutex::new(std::collections::HashMap::new()),
         console,
         host: args.host.clone(),
         tick_interval: args.tick_interval,
@@ -1355,7 +1395,7 @@ fn respond_403(msg: &str) -> Reply {
     respond("403 Forbidden", "text/plain", msg.as_bytes())
 }
 
-fn handle(mut stream: TcpStream, state: &State) -> Result<(), String> {
+fn handle(mut stream: TcpStream, state: &Arc<State>) -> Result<(), String> {
     let req = read_request(&mut stream)?;
     let reply = route_console(&req, state);
     write_reply(&mut stream, &reply)
@@ -1485,7 +1525,7 @@ fn public_route(req: &Request, state: &State) -> Reply {
     sign_in(state, req)
 }
 
-fn route_console(req: &Request, state: &State) -> Reply {
+fn route_console(req: &Request, state: &Arc<State>) -> Reply {
     match authorize(req, state) {
         Access::Refused(reply) => reply,
         Access::Public => public_route(req, state),
@@ -1497,7 +1537,7 @@ fn route_console(req: &Request, state: &State) -> Reply {
 ///
 /// Split from [`route_console`] so the axum path does not authorise a second time:
 /// authorising twice would write two audit entries for one request.
-fn dispatch_console(req: &Request, state: &State, who: console_auth::Identity) -> Reply {
+fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identity) -> Reply {
     let route = (req.method.as_str(), req.path.as_str());
 
     if route == ("DELETE", "/api/session") {
@@ -1766,6 +1806,101 @@ fn dispatch_console(req: &Request, state: &State, who: console_auth::Identity) -
                 Err(e) => respond_err("400 Bad Request", &e),
             }
         }
+        // #259: the same run, but the HTTP request does not wait for it. A
+        // backfill can outlive any reverse proxy's idle timeout, and a client
+        // that gives up mid-run should not take the run down with it.
+        ("POST", "/api/run/async") => {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+            let file = match body.get("file").and_then(|v| v.as_str()) {
+                Some(f) => f.to_string(),
+                None => return respond_err("400 Bad Request", "missing file"),
+            };
+            let params = parse_run_params(body.get("params"));
+            // Resolve before accepting: a 202 for a run that can never start is
+            // worse than a 400, because the caller then polls for a run that
+            // will never appear.
+            let path = match resolve_in_workspace(&state.workspace, &file) {
+                Ok(p) => p,
+                Err(e) => return respond_err("400 Bad Request", &e),
+            };
+            let pipeline_id = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "pipeline".into());
+            let run_id = new_run_id(&pipeline_id);
+            let engine = DuckdbEngine::new(state.duckdb.clone());
+            if let Ok(mut runs) = state.runs.lock() {
+                runs.insert(
+                    run_id.clone(),
+                    LiveRun {
+                        pipeline_id: pipeline_id.clone(),
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        engine: engine.clone(),
+                        finished: None,
+                    },
+                );
+            }
+            let bg = Arc::clone(state);
+            let rid = run_id.clone();
+            std::thread::spawn(move || {
+                let outcome =
+                    execute_one_with(&bg, &file, "manual", &params, Some(engine), Some(&rid));
+                if let Ok(mut runs) = bg.runs.lock() {
+                    let pid = runs.get(&rid).map(|r| r.pipeline_id.clone()).unwrap_or_default();
+                    if let Some(live) = runs.get_mut(&rid) {
+                        live.finished = Some(match outcome {
+                            Ok(v) => v,
+                            // execute_one answers Err only when the run could
+                            // not START, which the poller still has to see.
+                            Err(e) => json!({ "id": pid, "status": "error", "error": e }),
+                        });
+                    }
+                    forget_oldest_finished_runs(&mut runs);
+                }
+            });
+            respond(
+                "202 Accepted",
+                "application/json",
+                json!({
+                    "runId": run_id,
+                    "pipelineId": pipeline_id,
+                    "status": "queued",
+                })
+                .to_string()
+                .as_bytes(),
+            )
+        }
+        ("GET", "/api/run/status") => match req.query.get("runId") {
+            Some(rid) => match run_status(state, rid) {
+                Some(v) => respond_json(&v),
+                None => respond_err("404 Not Found", "no such run"),
+            },
+            None => respond_err("400 Bad Request", "missing runId"),
+        },
+        // Cancellation is polled at every stage boundary and kills the active
+        // DuckDB child, so this answers at once and the run stops shortly after
+        // rather than at the end of whatever it was doing.
+        ("DELETE", "/api/run") => match req.query.get("runId") {
+            Some(rid) => {
+                let hit = state.runs.lock().ok().and_then(|runs| {
+                    runs.get(rid).map(|live| {
+                        live.engine.request_cancel();
+                        (live.pipeline_id.clone(), live.finished.is_some())
+                    })
+                });
+                match hit {
+                    Some((pid, done)) => respond_json(&json!({
+                        "runId": rid,
+                        "pipelineId": pid,
+                        // Reporting "cancelling" for a run that already ended
+                        // would be a lie the caller acts on.
+                        "cancelling": !done,
+                    })),
+                    None => respond_err("404 Not Found", "no such run"),
+                }
+            }
+            None => respond_err("400 Bad Request", "missing runId"),
+        },
         _ => respond_err("404 Not Found", "not found"),
     }
 }
@@ -1976,6 +2111,84 @@ fn api_summary(state: &State) -> Value {
 
 /// Run history across all pipelines (or one, when `id` is given), newest first,
 /// each record tagged with its pipeline id/name.
+/// #259: what is known about one run id.
+///
+/// In memory while the run is live and for a while after it ends; then from the
+/// run history on disk, which is what lets an answer survive a console restart.
+/// None means no run was ever accepted under that id.
+fn run_status(state: &State, run_id: &str) -> Option<Value> {
+    // Copy out from under the lock rather than holding it while also touching
+    // `running`: two locks held at once is how deadlocks start.
+    let live = state.runs.lock().ok().and_then(|runs| {
+        runs.get(run_id)
+            .map(|r| (r.pipeline_id.clone(), r.started_at.clone(), r.finished.clone()))
+    });
+    if let Some((pipeline_id, started_at, finished)) = live {
+        if let Some(done) = finished {
+            return Some(json!({
+                "runId": run_id,
+                "pipelineId": pipeline_id,
+                "state": "finished",
+                "startedAt": started_at,
+                // The pipeline's own status, NOT whether the call succeeded: a
+                // pipeline that ran and failed still finished.
+                "status": done.get("status").cloned().unwrap_or(json!("unknown")),
+                "result": done,
+            }));
+        }
+        // The run gate defaults to one at a time, so an accepted run is often
+        // waiting rather than executing. `running` gains the pipeline id the
+        // moment the gate is acquired, which is exactly that distinction.
+        let executing = state
+            .running
+            .lock()
+            .map(|set| set.contains(&pipeline_id))
+            .unwrap_or(false);
+        return Some(json!({
+            "runId": run_id,
+            "pipelineId": pipeline_id,
+            "state": if executing { "running" } else { "queued" },
+            "startedAt": started_at,
+        }));
+    }
+    for (_path, id, _v) in discover_pipelines(&state.workspace) {
+        for r in load_run_history(&state.workspace, &id) {
+            if r.run_id.as_deref() == Some(run_id) {
+                return Some(json!({
+                    "runId": run_id,
+                    "pipelineId": id,
+                    "state": "finished",
+                    "startedAt": r.at,
+                    "status": r.status,
+                    "durationMs": r.duration_ms,
+                    "rows": r.rows,
+                    "error": r.error,
+                }));
+            }
+        }
+    }
+    None
+}
+
+/// Keep the in-memory run map bounded. Only FINISHED runs are dropped: a live
+/// run has to stay, or its cancel handle goes with it.
+fn forget_oldest_finished_runs(runs: &mut std::collections::HashMap<String, LiveRun>) {
+    let mut done: Vec<(String, String)> = runs
+        .iter()
+        .filter(|(_, r)| r.finished.is_some())
+        .map(|(id, r)| (r.started_at.clone(), id.clone()))
+        .collect();
+    if done.len() <= MAX_REMEMBERED_RUNS {
+        return;
+    }
+    // started_at is RFC3339 UTC, so a string sort orders by time; oldest first.
+    done.sort();
+    let excess = done.len() - MAX_REMEMBERED_RUNS;
+    for (_, id) in done.into_iter().take(excess) {
+        runs.remove(&id);
+    }
+}
+
 fn api_runs(state: &State, only: Option<&str>) -> Value {
     let mut rows: Vec<Value> = Vec::new();
     let names = repo_names(&state.workspace);
@@ -2573,6 +2786,24 @@ fn execute_one(
     trigger: &str,
     params: &HashMap<String, String>,
 ) -> Result<Value, String> {
+    execute_one_with(state, file, trigger, params, None, None)
+}
+
+/// #259: the body of `execute_one`, with the engine handle and the run id
+/// supplied by the caller.
+///
+/// An asynchronous run registers its engine handle BEFORE the run starts, or a
+/// cancel arriving early has nothing to cancel, and it records the id it was
+/// accepted under so the run can still be found after a restart. Both callers
+/// otherwise take exactly the same path.
+fn execute_one_with(
+    state: &State,
+    file: &str,
+    trigger: &str,
+    params: &HashMap<String, String>,
+    engine: Option<DuckdbEngine>,
+    run_id: Option<&str>,
+) -> Result<Value, String> {
     let path = resolve_in_workspace(&state.workspace, file)?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let mut doc: PipelineDoc = serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e))?;
@@ -2609,14 +2840,14 @@ fn execute_one(
     // so file-loaded pipelines (manual /api/run + scheduled runs) work too.
     duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
 
-    let engine = DuckdbEngine::new(state.duckdb.clone());
+    let engine = engine.unwrap_or_else(|| DuckdbEngine::new(state.duckdb.clone()));
     let result = engine.execute_pipeline_named(&doc, &id);
 
-    let _ = append_run_record(
-        &state.workspace,
-        &id,
-        RunRecord::from_result_in(&state.workspace, &id, &result, trigger),
-    );
+    let mut record = RunRecord::from_result_in(&state.workspace, &id, &result, trigger);
+    // #259: stamp the id the caller was handed, so a finished async run is
+    // still answerable once it has left memory.
+    record.run_id = run_id.map(str::to_string);
+    let _ = append_run_record(&state.workspace, &id, record);
     // After the run is recorded, so an unreachable channel can never cost a
     // run its history entry, and never changes the outcome reported below.
     duckle_duckdb_engine::alerts::notify(&state.workspace, &id, &result);
@@ -2883,7 +3114,8 @@ impl axum::response::IntoResponse for Reply {
 /// there is no longer a call site at which to forget to consult it.
 pub struct Caller(pub console_auth::Identity);
 
-#[axum::async_trait]
+// axum 0.8 dropped its async_trait re-export: the trait now uses a native
+// async fn, so the attribute is not only unnecessary but absent.
 impl axum::extract::FromRequestParts<Arc<State>> for Caller {
     type Rejection = axum::response::Response;
 
@@ -3292,16 +3524,119 @@ mod tests {
         }
     }
 
-    fn guarded_state(ws: &std::path::Path) -> State {
-        State {
+    fn guarded_state(ws: &std::path::Path) -> std::sync::Arc<State> {
+        std::sync::Arc::new(State {
             workspace: ws.to_path_buf(),
             duckdb: std::path::PathBuf::from("duckdb"),
             run_lock: RunGate::new(1),
             running: Mutex::new(std::collections::HashSet::new()),
+            runs: Mutex::new(std::collections::HashMap::new()),
             console: console_auth::Console::configure(ws, "0.0.0.0", Some("s3cret")).unwrap(),
             host: "0.0.0.0".into(),
             tick_interval: std::time::Duration::from_secs(15),
+        })
+    }
+
+    /// #259: the whole asynchronous contract, end to end without a socket.
+    ///
+    /// Accept a run, get an id back straight away, poll it to completion, and
+    /// find it in the durable run history under the same id. The last part is
+    /// what makes the id worth handing out: a console that restarts mid-run can
+    /// still answer for it.
+    #[test]
+    fn an_async_run_is_accepted_polled_and_recorded_under_its_id() {
+        let duckdb = match std::env::var("DUCKLE_DUCKDB_BIN") {
+            Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v),
+            _ => return, // no engine binary here; the engine suite skips the same way
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(ws.join("pipelines")).unwrap();
+        std::fs::write(ws.join("in.csv"), "id,name\n1,alice\n2,bob\n").unwrap();
+        let doc = serde_json::json!({
+            "nodes": [
+                { "id": "s", "position": {"x":0,"y":0}, "data": { "label": "in", "componentId": "src.csv",
+                  "properties": { "path": ws.join("in.csv").to_string_lossy(), "hasHeader": true } } },
+                { "id": "k", "position": {"x":200,"y":0}, "data": { "label": "out", "componentId": "snk.csv",
+                  "properties": { "path": ws.join("out.csv").to_string_lossy(), "hasHeader": true } } }
+            ],
+            "edges": [ { "id": "e1", "source": "s", "target": "k", "data": { "connectionType": "main" } } ]
+        });
+        std::fs::write(
+            ws.join("pipelines").join("async_demo.json"),
+            serde_json::to_string(&doc).unwrap(),
+        )
+        .unwrap();
+
+        let mut state = guarded_state(&ws);
+        // guarded_state points at a placeholder binary; this test actually runs.
+        std::sync::Arc::get_mut(&mut state).unwrap().duckdb = duckdb;
+        let state = state;
+
+        let mut accept = request("POST", "/api/run/async", Some("Bearer s3cret"));
+        accept.body = serde_json::json!({ "file": "pipelines/async_demo.json" })
+            .to_string()
+            .into_bytes();
+        let reply = route_console(&accept, &state);
+        assert_eq!(reply.code(), 202, "an async run must be ACCEPTED, not awaited");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let run_id = body.get("runId").and_then(|v| v.as_str()).unwrap().to_string();
+        assert!(!run_id.is_empty());
+        assert_eq!(body.get("pipelineId").and_then(|v| v.as_str()), Some("async_demo"));
+
+        // Poll the way a client would.
+        let mut status = serde_json::Value::Null;
+        for _ in 0..200 {
+            let mut q = request("GET", "/api/run/status", Some("Bearer s3cret"));
+            q.query.insert("runId".into(), run_id.clone());
+            let r = route_console(&q, &state);
+            assert_eq!(r.code(), 200, "status must answer for an accepted run");
+            status = serde_json::from_slice(&r.body).unwrap();
+            if status.get("state").and_then(|v| v.as_str()) == Some("finished") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        assert_eq!(
+            status.get("state").and_then(|v| v.as_str()),
+            Some("finished"),
+            "run did not finish in time: {status}"
+        );
+        // The pipeline's own status, not merely that the call worked.
+        assert_eq!(
+            status.get("status").and_then(|v| v.as_str()),
+            Some("ok"),
+            "run reported: {status}"
+        );
+        assert!(ws.join("out.csv").is_file(), "the run should have written its sink");
+
+        // Durable: the history record carries the id the 202 handed out, so the
+        // answer survives losing the in-memory registry.
+        let recorded = duckle_duckdb_engine::history::load_run_history(&ws, "async_demo");
+        assert!(
+            recorded.iter().any(|r| r.run_id.as_deref() == Some(run_id.as_str())),
+            "no run record carried run_id {run_id}"
+        );
+
+        // An id nobody was given is a 404, not an empty success.
+        let mut unknown = request("GET", "/api/run/status", Some("Bearer s3cret"));
+        unknown.query.insert("runId".into(), "run-nope-0".into());
+        assert_eq!(route_console(&unknown, &state).code(), 404);
+    }
+
+    /// #259: cancelling an id that is not live is a 404 rather than a cheerful
+    /// "cancelling" for a run that does not exist.
+    #[test]
+    fn cancelling_an_unknown_run_is_not_reported_as_cancelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let state = guarded_state(&ws);
+        let mut req = request("DELETE", "/api/run", Some("Bearer s3cret"));
+        req.query.insert("runId".into(), "run-missing-0".into());
+        assert_eq!(route_console(&req, &state).code(), 404);
+        // And with no id at all it is a bad request, not a 404.
+        let bare = request("DELETE", "/api/run", Some("Bearer s3cret"));
+        assert_eq!(route_console(&bare, &state).code(), 400);
     }
 
     /// The point of routing to a value rather than a socket: the authorisation decisions
@@ -3591,6 +3926,7 @@ mod tests {
             duckdb: std::path::PathBuf::from("duckdb"),
             run_lock: RunGate::new(1),
             running: Mutex::new(std::collections::HashSet::new()),
+            runs: Mutex::new(std::collections::HashMap::new()),
             console: console_auth::Console::configure(&ws_canon, "127.0.0.1", None).unwrap(),
             host: "127.0.0.1".into(),
             tick_interval: std::time::Duration::from_secs(15),
