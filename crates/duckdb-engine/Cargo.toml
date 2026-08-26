@@ -75,7 +75,7 @@ oracle = { version = "0.6", optional = true }
 # manager at build time (odbc32 on Windows - always present; unixODBC on
 # Linux/macOS). Off by default so a plain engine build/test needs no ODBC; the
 # shipped binaries (desktop, runner, mcp) turn it on.
-odbc-api = { version = "28", optional = true }
+odbc-api = { version = "29", optional = true }
 # Direct (optional) handle on odbc-api's ODBC FFI crate so the `teradata-static`
 # feature can flip it to static linking. Base entry carries no static features;
 # the Linux override below adds them (see that table + build.rs + issue #131).
