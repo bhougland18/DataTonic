@@ -1,34 +1,51 @@
 version: 2
-# Quiet config: at most one grouped PR per ecosystem per month. The first run
-# opened ~19 PRs (each major bump is its own PR and weekly is aggressive), so
-# everything below is grouped (major + minor + patch) and the cadence is monthly.
+# Quiet, but not so quiet that nothing can land.
+#
+# Everything used to be one grouped PR per ecosystem with majors included. That
+# kept the noise down but produced a single 32-crate pull request carrying
+# thiserror 1->2, axum 0.7->0.8, zip 2->8 and redis 0.27->1.6 - a migration
+# rather than an update - and every safe patch in it had to wait for that work.
+#
+# So: two groups per ecosystem. Minor and patch travel together and can be
+# merged as soon as CI is green, which is where security patches live. Majors
+# are grouped on their own, so a red build there blocks only the majors. The
+# cadence stays monthly and the PR count stays small.
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "monthly"
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 3
     groups:
-      cargo:
+      cargo-safe:
         patterns: ["*"]
-        update-types: ["major", "minor", "patch"]
+        update-types: ["minor", "patch"]
+      cargo-major:
+        patterns: ["*"]
+        update-types: ["major"]
 
   - package-ecosystem: "npm"
     directory: "/frontend"
     schedule:
       interval: "monthly"
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 3
     groups:
-      npm:
+      npm-safe:
         patterns: ["*"]
-        update-types: ["major", "minor", "patch"]
+        update-types: ["minor", "patch"]
+      npm-major:
+        patterns: ["*"]
+        update-types: ["major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "monthly"
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 2
     groups:
-      actions:
+      actions-safe:
         patterns: ["*"]
-        update-types: ["major", "minor", "patch"]
+        update-types: ["minor", "patch"]
+      actions-major:
+        patterns: ["*"]
+        update-types: ["major"]
