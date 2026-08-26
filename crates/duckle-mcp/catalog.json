@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 392,
+  "componentCount": 393,
   "components": [
     {
       "id": "src.csv",
@@ -24808,6 +24808,20 @@
                 "defaultValue": 64
               },
               {
+                "key": "concurrency",
+                "label": "Parallel requests",
+                "kind": "integer",
+                "defaultValue": 1,
+                "description": "How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way."
+              },
+              {
+                "key": "maxRetries",
+                "label": "Retries on rate limit",
+                "kind": "integer",
+                "defaultValue": 3,
+                "description": "Retries for a single request on HTTP 429 or 5xx, honouring Retry-After. Without this one rate limit throws away every row the stage already paid for. 0 disables retrying."
+              },
+              {
                 "key": "baseUrl",
                 "label": "Base URL",
                 "kind": "text",
@@ -24989,6 +25003,20 @@
                 "label": "Max tokens",
                 "kind": "integer",
                 "defaultValue": 256
+              },
+              {
+                "key": "concurrency",
+                "label": "Parallel requests",
+                "kind": "integer",
+                "defaultValue": 1,
+                "description": "How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way."
+              },
+              {
+                "key": "maxRetries",
+                "label": "Retries on rate limit",
+                "kind": "integer",
+                "defaultValue": 3,
+                "description": "Retries for a single request on HTTP 429 or 5xx, honouring Retry-After. Without this one rate limit throws away every row the stage already paid for. 0 disables retrying."
               }
             ]
           }
@@ -25353,6 +25381,20 @@
                 "label": "Custom headers",
                 "kind": "key-value",
                 "description": "Extra request headers (e.g. a gateway token). A custom Authorization header overrides the API key."
+              },
+              {
+                "key": "concurrency",
+                "label": "Parallel requests",
+                "kind": "integer",
+                "defaultValue": 1,
+                "description": "How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way."
+              },
+              {
+                "key": "maxRetries",
+                "label": "Retries on rate limit",
+                "kind": "integer",
+                "defaultValue": 3,
+                "description": "Retries for a single request on HTTP 429 or 5xx, honouring Retry-After. Without this one rate limit throws away every row the stage already paid for. 0 disables retrying."
               }
             ]
           }
@@ -40745,6 +40787,95 @@
               "id": "reject",
               "label": "orphans",
               "type": "reject"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "qa.block",
+      "label": "Candidate Pairs (Blocking)",
+      "kind": "quality",
+      "availability": "available",
+      "summary": "Cut an entity-resolution job down to the pairs worth comparing. Every fuzzy match compares pairs, and comparing all of them grows with the product of the row counts, so blocking proposes only records that already agree on something cheap and discriminating (same postcode, same surname). One input dedupes within a table; wire the lookup port to link two. Rules are named and can overlap - a pair caught by several is still emitted once. Output: id_a, id_b, blocking_rule, and a_<col>/b_<col> for carried columns, which is exactly what Match Grouping reads by default.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "lookup",
+            "label": "reference",
+            "type": "lookup"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "qa.block",
+        "kind": "transform",
+        "label": "Candidate Pairs (Blocking)",
+        "description": "Cut an entity-resolution job down to the pairs worth comparing. Every fuzzy match compares pairs, and comparing all of them grows with the product of the row counts, so blocking proposes only records that already agree on something cheap and discriminating (same postcode, same surname). One input dedupes within a table; wire the lookup port to link two. Rules are named and can overlap - a pair caught by several is still emitted once. Output: id_a, id_b, blocking_rule, and a_<col>/b_<col> for carried columns, which is exactly what Match Grouping reads by default.",
+        "schemaSource": "declared",
+        "sections": [
+          {
+            "label": "Candidate pairs",
+            "fields": [
+              {
+                "key": "leftId",
+                "label": "Id column",
+                "kind": "column",
+                "required": true,
+                "description": "The column that identifies a record on the main input. It comes out as id_a."
+              },
+              {
+                "key": "rightId",
+                "label": "Id column (reference)",
+                "kind": "text",
+                "description": "Only needed when the reference input names its id differently. Comes out as id_b."
+              },
+              {
+                "key": "rules",
+                "label": "Blocking rules",
+                "kind": "key-value",
+                "required": true,
+                "description": "A name, and the column(s) that must be EQUAL for a pair to be worth comparing, comma-separated. For example postcode_surname = postcode, surname. Each rule is one pass; a pair caught by several rules is still compared once."
+              },
+              {
+                "key": "carryColumns",
+                "label": "Carry columns",
+                "kind": "columns",
+                "description": "Attribute columns to bring along on both sides, as a_<col> and b_<col>, so the next node can compare them without joining back."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "lookup",
+              "label": "reference",
+              "type": "lookup"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
             }
           ]
         }

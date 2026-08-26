@@ -104,6 +104,7 @@ mod tests {
         "qa.refintegrity",
         "qa.link",
         "qa.reconcile",
+        "qa.block",
         "xf.geo.clip",
         "xf.geo.erase",
     ];

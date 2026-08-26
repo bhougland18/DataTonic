@@ -14393,3 +14393,143 @@ fn xf_ai_llm_keeps_row_order_when_requests_run_concurrently() {
         "requests never overlapped, so this proved nothing about ordering"
     );
 }
+
+/// #249: blocking is the piece that makes the rest of the qa.* entity
+/// resolution family usable at real sizes. qa.link CROSS JOINs its two inputs,
+/// so the comparison set grows with the product of the row counts; qa.block
+/// only proposes pairs that already agree on something cheap.
+#[test]
+fn qa_block_compares_only_records_that_share_a_block() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(
+        tmp.path(),
+        "people.csv",
+        "id,name,postcode\n1,John Smith,AB1\n2,Jon Smith,AB1\n3,Jane Doe,XY9\n4,Janet Doe,XY9\n5,Bob Jones,ZZ0\n",
+    );
+    let out = out_path(tmp.path(), "pairs.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("b", "qa.block", json!({
+                "leftId": "id",
+                "rules": { "postcode": "postcode" },
+                "carryColumns": ["name"],
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "b"), main_edge("e2", "b", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "qa.block failed: {:?}", r.error);
+    // All-pairs over 5 records is 10 comparisons. Blocking on postcode leaves
+    // 2, and that reduction IS the feature.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+    // The carried columns are what a downstream comparison expression reads,
+    // and they must come from the right side of the pair.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT a_name || ' | ' || b_name FROM read_csv_auto('{}') WHERE id_a = 1",
+            out
+        )),
+        "John Smith | Jon Smith"
+    );
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT DISTINCT blocking_rule FROM read_csv_auto('{}')",
+            out
+        )),
+        "postcode"
+    );
+    // Bob Jones is alone in his postcode, so he is in no candidate pair at all.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE id_a = 5 OR id_b = 5)",
+            out
+        )),
+        0
+    );
+}
+
+/// #249: the point of emitting `id_a` / `id_b` is that qa.matchgroup already
+/// defaults to exactly those column names, so pairs feed clustering with
+/// nothing to configure. If either side's naming drifts, this test fails.
+#[test]
+fn qa_block_feeds_matchgroup_with_no_configuration() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(
+        tmp.path(),
+        "people.csv",
+        "id,name,postcode\n1,John Smith,AB1\n2,Jon Smith,AB1\n3,Jane Doe,XY9\n4,Janet Doe,XY9\n5,Bob Jones,ZZ0\n",
+    );
+    let out = out_path(tmp.path(), "clusters.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("b", "qa.block", json!({
+                "leftId": "id",
+                "rules": { "postcode": "postcode" },
+            })),
+            // No props at all: it reads id_a / id_b by default.
+            node("g", "qa.matchgroup", json!({})),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "s", "b"),
+            main_edge("e2", "b", "g"),
+            main_edge("e3", "g", "k"),
+        ]),
+    ));
+    assert_eq!(r.status, "ok", "qa.block -> qa.matchgroup failed: {:?}", r.error);
+    // The four ids that appear in a pair, in two clusters.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 4);
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT count(DISTINCT cluster_id)::VARCHAR FROM read_csv_auto('{}')",
+            out
+        )),
+        "2"
+    );
+    // The two Smiths must land together, and not with the Does.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT CASE WHEN (SELECT cluster_id FROM read_csv_auto('{o}') WHERE id = '1') = (SELECT cluster_id FROM read_csv_auto('{o}') WHERE id = '2') THEN 'same' ELSE 'split' END",
+            o = out
+        )),
+        "same"
+    );
+}
+
+/// #249: several rules will often propose the same pair. Comparing it once per
+/// rule that caught it would multiply the downstream work the node exists to
+/// reduce, so a pair survives once, labelled with the first rule that found it.
+#[test]
+fn qa_block_keeps_a_pair_once_when_several_rules_catch_it() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(
+        tmp.path(),
+        "people.csv",
+        "id,name,postcode\n1,John Smith,AB1\n2,Jon Smith,AB1\n3,Bob Jones,ZZ0\n",
+    );
+    let out = out_path(tmp.path(), "pairs.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("b", "qa.block", json!({
+                "leftId": "id",
+                // Both rules catch the (1,2) pair.
+                "rules": { "postcode": "postcode", "also_postcode": "postcode" },
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "b"), main_edge("e2", "b", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "qa.block failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 1);
+    // Deterministic label: the first rule by name, so a re-run does not churn.
+    assert_eq!(
+        scalar_string(&format!("SELECT blocking_rule FROM read_csv_auto('{}')", out)),
+        "also_postcode"
+    );
+}

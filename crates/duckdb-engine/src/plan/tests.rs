@@ -1504,6 +1504,68 @@
     }
 
     #[test]
+    fn block_joins_within_a_rule_and_keeps_each_pair_once() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["up".into()]);
+        let sql = build_er_block(
+            &ni,
+            &serde_json::json!({
+                "leftId": "id",
+                "rules": { "postcode": "postcode, surname" },
+                "carryColumns": ["name"],
+            }),
+        )
+        .unwrap();
+        // Every column in the rule must be equal, not just the first.
+        assert!(sql.contains("l.\"postcode\" = r.\"postcode\""), "got: {}", sql);
+        assert!(sql.contains("l.\"surname\" = r.\"surname\""), "got: {}", sql);
+        // Self mode: each unordered pair once, and no record paired with itself.
+        assert!(
+            sql.contains("CAST(l.\"id\" AS VARCHAR) < CAST(r.\"id\" AS VARCHAR)"),
+            "got: {}",
+            sql
+        );
+        // The output contract qa.matchgroup reads by default.
+        assert!(sql.contains("l.\"id\" AS id_a"), "got: {}", sql);
+        assert!(sql.contains("r.\"id\" AS id_b"), "got: {}", sql);
+        assert!(sql.contains("l.\"name\" AS \"a_name\""), "got: {}", sql);
+        assert!(sql.contains("r.\"name\" AS \"b_name\""), "got: {}", sql);
+        assert!(
+            sql.contains("QUALIFY row_number() OVER (PARTITION BY id_a, id_b"),
+            "got: {}",
+            sql
+        );
+
+        // Link mode: two inputs, so the self-pair guard would throw away half
+        // the legitimate pairs and must not be applied.
+        let mut two = NodeInputs::default();
+        two.ports.insert("main".into(), vec!["left".into()]);
+        two.ports.insert("lookup".into(), vec!["right".into()]);
+        let linked = build_er_block(
+            &two,
+            &serde_json::json!({ "leftId": "id", "rules": { "pc": "postcode" } }),
+        )
+        .unwrap();
+        assert!(
+            !linked.contains("AS VARCHAR) <"),
+            "link mode must not drop half the pairs: {}",
+            linked
+        );
+        assert!(linked.contains("FROM \"left\" l JOIN \"right\" r"), "got: {}", linked);
+
+        // A missing id or no usable rule is a configuration error the user can
+        // read, not empty SQL that silently produces nothing.
+        assert!(build_er_block(&ni, &serde_json::json!({ "leftId": "id" })).is_err());
+        assert!(build_er_block(&ni, &serde_json::json!({ "rules": { "a": "b" } })).is_err());
+        assert!(build_er_block(
+            &ni,
+            &serde_json::json!({ "leftId": "id", "rules": { "empty": "  ,  " } })
+        )
+        .is_err());
+        assert!(build_er_block(&NodeInputs::default(), &serde_json::json!({})).is_err());
+    }
+
+    #[test]
     fn matchgroup_builds_recursive_cluster_sql() {
         let mut ni = NodeInputs::default();
         ni.ports.insert("main".into(), vec!["up".into()]);

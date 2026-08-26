@@ -739,7 +739,7 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
 
     // Record linkage + reconcile - main input + a reference (lookup) input,
     // single output (matched pairs / a report).
-    if (id === 'qa.link' || id === 'qa.reconcile') {
+    if (id === 'qa.link' || id === 'qa.reconcile' || id === 'qa.block') {
         return {
             inputs: [MAIN_IN, { id: 'lookup', label: 'reference', type: 'lookup' }],
             outputs: [MAIN_OUT],
@@ -5433,6 +5433,41 @@ function synthQualityCleanse(comp: ComponentDef): ComponentManifest {
                 ],
             },
         ], 'upstream');
+    }
+    if (id === 'qa.block') {
+        return base(comp, [
+            {
+                label: 'Candidate pairs',
+                fields: [
+                    {
+                        key: 'leftId',
+                        label: 'Id column',
+                        kind: 'column',
+                        required: true,
+                        description: 'The column that identifies a record on the main input. It comes out as id_a.',
+                    },
+                    {
+                        key: 'rightId',
+                        label: 'Id column (reference)',
+                        kind: 'text',
+                        description: 'Only needed when the reference input names its id differently. Comes out as id_b.',
+                    },
+                    {
+                        key: 'rules',
+                        label: 'Blocking rules',
+                        kind: 'key-value',
+                        required: true,
+                        description: 'A name, and the column(s) that must be EQUAL for a pair to be worth comparing, comma-separated. For example postcode_surname = postcode, surname. Each rule is one pass; a pair caught by several rules is still compared once.',
+                    },
+                    {
+                        key: 'carryColumns',
+                        label: 'Carry columns',
+                        kind: 'columns',
+                        description: 'Attribute columns to bring along on both sides, as a_<col> and b_<col>, so the next node can compare them without joining back.',
+                    },
+                ],
+            },
+        ], 'declared');
     }
     if (id === 'qa.link') {
         return base(comp, [
