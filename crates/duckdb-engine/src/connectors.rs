@@ -5220,6 +5220,193 @@ impl DuckdbEngine {
         Ok(format!("qvd: materialized {} records into {}", count, spec.node_id))
     }
 
+    /// src.html: rows out of an HTML page, by CSS selector (#255).
+    ///
+    /// HTML is not XML. Real pages carry unclosed tags and unquoted attributes
+    /// that the strict XML reader rejects outright, so this parses with a
+    /// tolerant HTML parser and selects with CSS rather than an element path.
+    ///
+    /// Selectors are compiled ONCE up front, so a typo fails the stage
+    /// immediately with the offending selector named, rather than silently
+    /// producing empty columns for every row. `Document::select` panics on a bad
+    /// selector and `try_select` cannot tell a bad selector from a page that
+    /// simply had no matches, so neither is used here.
+    pub(crate) fn run_html_source(
+        &self,
+        db: &Path,
+        spec: &HtmlSourceSpec,
+    ) -> Result<String, EngineError> {
+        self.check_cancelled()?;
+        let lower = spec.path.to_ascii_lowercase();
+        let html = if lower.starts_with("http://") || lower.starts_with("https://") {
+            let agent = crate::tls::http_agent();
+            let mut req = agent.get(&spec.path);
+            for (k, v) in &spec.headers {
+                req = req.set(k, v);
+            }
+            match req.call() {
+                Ok(r) => r
+                    .into_string()
+                    .map_err(|e| EngineError::Query(format!("html: read {}: {}", spec.path, e)))?,
+                Err(ureq::Error::Status(code, r)) => {
+                    let body = r.into_string().unwrap_or_default();
+                    return Err(EngineError::Query(format!(
+                        "html: HTTP {} from {}: {}",
+                        code,
+                        spec.path,
+                        body.chars().take(300).collect::<String>()
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!(
+                        "html: HTTP transport to {}: {}",
+                        spec.path, e
+                    )))
+                }
+            }
+        } else {
+            std::fs::read_to_string(&spec.path)
+                .map_err(|e| EngineError::Query(format!("html: read {}: {}", spec.path, e)))?
+        };
+
+        let compile = |sel: &str| -> Result<dom_query::Matcher, EngineError> {
+            dom_query::Matcher::new(sel).map_err(|_| {
+                EngineError::Config(format!("html: {} is not a valid CSS selector", sel))
+            })
+        };
+        let row_matcher = compile(&spec.row_selector)?;
+        let mut col_matchers: Vec<Option<dom_query::Matcher>> = Vec::with_capacity(spec.columns.len());
+        for c in &spec.columns {
+            col_matchers.push(if c.selector.is_empty() {
+                None
+            } else {
+                Some(compile(&c.selector)?)
+            });
+        }
+
+        let doc = dom_query::Document::from(html);
+        let mut writer = match &spec.declared_schema {
+            Some(schema) if !schema.is_empty() => {
+                JsonLinesWriter::open_with_schema(&spec.node_id, Some(schema.clone()))?
+            }
+            _ => JsonLinesWriter::open(&spec.node_id)?,
+        };
+        let mut count: usize = 0;
+        let clean = |t: String| t.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        if spec.columns.is_empty() {
+            // Table mode: the row selector names a table, its header cells name
+            // the columns, and each body row is a row. This is the shape most
+            // "the data is only published as an HTML table" pages have, and
+            // making the user write a selector per column for it would be busy
+            // work.
+            let th = compile("th")?;
+            let td = compile("td")?;
+            let tr = compile("tr")?;
+            for table in doc.select_matcher(&row_matcher).iter() {
+                let headers: Vec<String> = table
+                    .select_matcher(&th)
+                    .iter()
+                    .map(|h| clean(h.text().to_string()))
+                    .collect();
+                for (ri, row) in table.select_matcher(&tr).iter().enumerate() {
+                    self.check_cancelled()?;
+                    let cells: Vec<String> = row
+                        .select_matcher(&td)
+                        .iter()
+                        .map(|c| clean(c.text().to_string()))
+                        .collect();
+                    // The header row itself has no td cells; skip it rather than
+                    // emitting a row of nulls.
+                    if cells.is_empty() {
+                        continue;
+                    }
+                    let mut obj = serde_json::Map::new();
+                    for (i, cell) in cells.iter().enumerate() {
+                        let name = headers
+                            .get(i)
+                            .filter(|h| !h.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| format!("column_{}", i + 1));
+                        obj.insert(name, JsonValue::String(cell.clone()));
+                    }
+                    let _ = ri;
+                    writer.write_row(&JsonValue::Object(obj))?;
+                    count += 1;
+                }
+            }
+        } else {
+            for row in doc.select_matcher(&row_matcher).iter() {
+                self.check_cancelled()?;
+                let mut obj = serde_json::Map::new();
+                for (col, matcher) in spec.columns.iter().zip(col_matchers.iter()) {
+                    // An empty selector means the row element itself, which is
+                    // how you read an attribute off the matched element.
+                    let value = match matcher {
+                        None => match &col.attr {
+                            Some(a) => row.attr(a).map(|v| v.to_string()),
+                            None => Some(row.text().to_string()),
+                        },
+                        Some(m) => {
+                            let found = row.select_matcher(m);
+                            if found.is_empty() {
+                                None
+                            } else {
+                                match &col.attr {
+                                    Some(a) => found.attr(a).map(|v| v.to_string()),
+                                    None => Some(found.text().to_string()),
+                                }
+                            }
+                        }
+                    };
+                    // A column that did not match is NULL, not an empty string:
+                    // a missing price and a blank price are different facts.
+                    obj.insert(
+                        col.name.clone(),
+                        match value {
+                            Some(v) => JsonValue::String(clean(v)),
+                            None => JsonValue::Null,
+                        },
+                    );
+                }
+                writer.write_row(&JsonValue::Object(obj))?;
+                count += 1;
+            }
+        }
+
+        match &spec.declared_schema {
+            Some(schema) if !schema.is_empty() => {
+                let (columns_spec, select_list) = xml_declared_columns(schema);
+                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?;
+            }
+            // A page that matched nothing is an ordinary outcome for a scrape,
+            // not a failure. With explicit columns the shape IS known even with
+            // no rows, so type the empty relation from them rather than failing
+            // the way an untypeable empty result has to (#170). Table mode has
+            // no such luxury: without a header row there is nothing to name.
+            _ if count == 0 && !spec.columns.is_empty() => {
+                let cols: Vec<duckle_metadata::Column> = spec
+                    .columns
+                    .iter()
+                    .map(|c| duckle_metadata::Column {
+                        name: c.name.clone(),
+                        data_type: duckle_metadata::DataType::String,
+                        nullable: true,
+                        format: None,
+                        primary_key: None,
+                    })
+                    .collect();
+                let (columns_spec, select_list) = xml_declared_columns(&cols);
+                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?;
+            }
+            _ => writer.finalize_into_table(&self.bin, db, &spec.node_id)?,
+        }
+        Ok(format!(
+            "html: materialized {} rows into {}",
+            count, spec.node_id
+        ))
+    }
+
     /// XML row-path source. Walks the document, builds a serde_json
     /// tree per element, and emits every element matching the
     /// trailing components of rowPath. Attributes become "@name"

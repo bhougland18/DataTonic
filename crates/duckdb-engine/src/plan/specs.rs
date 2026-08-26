@@ -509,6 +509,45 @@ pub struct PubSubSourceSpec {
     pub max_messages: u64,
 }
 
+/// #255: one column extracted from a matched row element.
+///
+/// `selector` is evaluated RELATIVE to the row element; empty means the row
+/// element itself. `attr` takes an attribute instead of the text, which is how
+/// a link's href or a data- value is read.
+#[derive(Debug, Clone)]
+pub struct HtmlColumn {
+    pub name: String,
+    pub selector: String,
+    pub attr: Option<String>,
+}
+
+/// src.html: rows out of an HTML page, by CSS selector.
+///
+/// A lot of public data is only published as HTML - registries, filing pages,
+/// results tables - and getting at it used to mean shelling out to Python
+/// before anything could enter a pipeline. HTML is not XML: real pages carry
+/// unclosed tags and unquoted attributes that the strict XML reader rejects
+/// outright, so this parses with a tolerant HTML parser instead.
+#[derive(Debug, Clone)]
+pub struct HtmlSourceSpec {
+    pub node_id: String,
+    /// A local filesystem path, or an `http(s)://` URL fetched through the
+    /// shared proxy- and CA-aware agent.
+    pub path: String,
+    /// CSS selector: every match is one row.
+    pub row_selector: String,
+    /// How to fill each column. Empty means table mode: the row selector names
+    /// a table, its `th` cells become the column names and each `tr` a row.
+    pub columns: Vec<HtmlColumn>,
+    /// Request headers for the http(s) case, including any auth the REST
+    /// helpers build.
+    pub headers: Vec<(String, String)>,
+    /// Optional declared output schema (the node's Schema tab). When set, the
+    /// result is pinned to exactly these columns and types, so a daily scrape
+    /// keeps a stable shape even on a day the page renders a column empty.
+    pub declared_schema: Option<Vec<duckle_metadata::Column>>,
+}
+
 /// src.xml: walk an XML document, find every element matching a
 /// slash-separated path (e.g. "library/books/book"), and emit each
 /// match as a JSON object. Attributes prefix with '@'; text content

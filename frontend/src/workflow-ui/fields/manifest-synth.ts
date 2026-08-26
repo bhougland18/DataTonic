@@ -1337,6 +1337,61 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
             },
         ];
     }
+    if (id.endsWith('.html')) {
+        return base(comp, [
+            {
+                label: 'Format',
+                fields: [
+                    {
+                        key: 'rowSelector',
+                        label: 'Row selector',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'table#results',
+                        description: 'A CSS selector. Every element it matches becomes one row. A selector that does not parse fails the run naming it, rather than quietly producing empty columns.',
+                    },
+                    {
+                        key: 'columns',
+                        label: 'Columns',
+                        kind: 'key-value',
+                        description: 'One entry per column: the name, and a selector evaluated INSIDE the row. Add @attribute to read an attribute instead of the text, e.g. a@href for a link. An empty selector means the row element itself. Leave this whole list empty for table mode, where the row selector names a table, its th cells become the column names and each tr is a row.',
+                    },
+                ],
+            },
+            {
+                label: 'Request',
+                fields: [
+                    {
+                        key: 'authType',
+                        label: 'Auth',
+                        kind: 'select',
+                        defaultValue: 'none',
+                        options: [
+                            { label: 'None', value: 'none' },
+                            { label: 'Bearer token', value: 'bearer' },
+                            { label: 'API key header', value: 'apikey' },
+                            { label: 'Basic (user:password)', value: 'basic' },
+                        ],
+                    },
+                    {
+                        key: 'authToken',
+                        label: 'Credential',
+                        kind: 'text',
+                        secret: true,
+                        placeholder: '${ENV:SITE_TOKEN}',
+                        description: 'Use ${ENV:...} so no secret lands in the pipeline JSON. For Basic this is user:password, encoded for you.',
+                        visibleWhen: [{ key: 'authType', equals: ['bearer', 'apikey', 'basic'] }],
+                    },
+                    {
+                        key: 'headers',
+                        label: 'Headers',
+                        kind: 'key-value',
+                        description: 'Sent only when the path is an http(s) URL. A User-Agent is often what stands between you and a 403.',
+                    },
+                ],
+            },
+        ], 'declared');
+    }
     if (id.endsWith('.xml')) {
         const sections: FormSection[] = [
             {

@@ -301,6 +301,7 @@ pub enum RuntimeSpec {
     NatsSource(NatsSourceSpec),
     PubsubSink(PubSubSinkSpec),
     PubsubSource(PubSubSourceSpec),
+    HtmlSource(HtmlSourceSpec),
     XmlSource(XmlSourceSpec),
     XmlSink(XmlSinkSpec),
     AvroSink(AvroSinkSpec),
@@ -1410,6 +1411,7 @@ fn build_stage(
     let mut nats_source: Option<NatsSourceSpec> = None;
     let mut pubsub_sink: Option<PubSubSinkSpec> = None;
     let mut pubsub_source: Option<PubSubSourceSpec> = None;
+    let mut html_source: Option<HtmlSourceSpec> = None;
     let mut xml_source: Option<XmlSourceSpec> = None;
     let mut xml_sink: Option<XmlSinkSpec> = None;
     let mut avro_sink: Option<AvroSinkSpec> = None;
@@ -3965,6 +3967,80 @@ fn build_stage(
             });
         }
         (String::new(), StageKind::View, None)
+    } else if component_id == "src.html" {
+        // #255: rows out of an HTML page. Not SQL - DuckDB cannot parse HTML -
+        // so this is a runtime hook that materialises the relation itself, the
+        // same shape as src.xml below.
+        let path = string_prop(&props, "path")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: path required (a file, or an http(s) URL)", component_id)))?;
+        let row_selector = string_prop(&props, "rowSelector")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: rowSelector required (a CSS selector; every match is one row)", component_id)))?;
+        // Two shapes, the way headers_from_props already accepts two: an array of
+        // {name, selector, attr} for precision, and the object the GUI's
+        // key-value editor writes, where the value is `selector` or
+        // `selector@attribute`.
+        let columns = match props.get("columns") {
+            Some(JsonValue::Object(map)) => map
+                .iter()
+                .filter_map(|(name, v)| {
+                    let name = name.trim().to_string();
+                    let spec = v.as_str()?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    // Split on the LAST '@': CSS attribute selectors are written
+                    // [attr=value], so a bare '@' here is the attribute marker.
+                    let (selector, attr) = match spec.rsplit_once('@') {
+                        Some((sel, at)) if !at.is_empty() => (sel.trim(), Some(at.trim().to_string())),
+                        _ => (spec, None),
+                    };
+                    Some(HtmlColumn { name, selector: selector.to_string(), attr })
+                })
+                .collect::<Vec<_>>(),
+            _ => props
+            .get("columns")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let name = c.get("name").and_then(|v| v.as_str())?.trim().to_string();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        Some(HtmlColumn {
+                            name,
+                            selector: c
+                                .get("selector")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string(),
+                            attr: c
+                                .get("attr")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        };
+        let mut headers = headers_from_props(&props);
+        push_rest_auth(&mut headers, &props);
+        html_source = Some(HtmlSourceSpec {
+            node_id: node.id.clone(),
+            path,
+            row_selector,
+            columns,
+            headers,
+            declared_schema: node.data.schema.clone(),
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id == "src.xml" {
         // XML row-path source. rowPath is a slash-separated element
         // walk from the root (e.g. "library/books/book"). Each match
@@ -5465,6 +5541,7 @@ fn build_stage(
         .or_else(|| nats_source.map(RuntimeSpec::NatsSource))
         .or_else(|| pubsub_sink.map(RuntimeSpec::PubsubSink))
         .or_else(|| pubsub_source.map(RuntimeSpec::PubsubSource))
+        .or_else(|| html_source.map(RuntimeSpec::HtmlSource))
         .or_else(|| xml_source.map(RuntimeSpec::XmlSource))
         .or_else(|| xml_sink.map(RuntimeSpec::XmlSink))
         .or_else(|| avro_sink.map(RuntimeSpec::AvroSink))

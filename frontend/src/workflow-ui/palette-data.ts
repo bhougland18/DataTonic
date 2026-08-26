@@ -103,6 +103,7 @@ export const PALETTE: Category[] = [
                     src('tsv', 'TSV', 'available', 'Read tab-separated files'),
                     src('json', 'JSON', 'available', 'Read JSON files'),
                     src('jsonl', 'JSONL / NDJSON', 'available', 'Read newline-delimited JSON'),
+                    src('html', 'HTML', 'available', 'Rows out of an HTML page, by CSS selector. Point it at a local file or an http(s) URL, give a row selector, and either name a column per sub-selector (with an optional attribute, so a link href or a data- value is readable) or leave the columns empty and let a table become a table: the th cells name the columns and each tr is a row. Parsed with a tolerant HTML parser, so the unclosed tags and unquoted attributes that real pages carry - and that the strict XML reader rejects outright - are fine.'),
                     src('xml', 'XML', 'available', 'Read XML files via the pure-Rust `quick-xml` parser. rowPath is a slash-separated element walk (e.g. `library/books/book`); every matching element becomes one row. Attributes prefix with `@`, text content goes to `_text`, nested children nest; repeated same-name siblings collapse to arrays.'),
                     src('excel', 'Excel (XLSX)', 'available', 'Read .xlsx via the DuckDB excel extension'),
                     src('avro', 'Avro', 'available', 'Apache Avro container files (.avro / .ocf) via the pure-Rust `apache-avro` crate. The file carries its own schema; engine doesn\'t need any schema config. Pairs with Kafka topics that publish Avro-encoded payloads.'),

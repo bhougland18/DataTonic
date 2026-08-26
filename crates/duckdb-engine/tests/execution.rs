@@ -14654,3 +14654,175 @@ fn src_rest_fans_a_child_endpoint_out_over_parent_rows() {
         "linus"
     );
 }
+
+/// #255: a lot of public data is published only as an HTML table. Table mode
+/// takes the header cells as column names and each body row as a row, so the
+/// common case needs a single selector rather than one per column.
+///
+/// The fixture is deliberately malformed the way real pages are - an unclosed
+/// <br>, an unquoted attribute, a stray &nbsp; - which is exactly what the
+/// strict XML reader rejects outright.
+#[test]
+fn src_html_reads_a_table_the_xml_reader_would_reject() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = write_file(
+        tmp.path(),
+        "registry.html",
+        "<html><body>\n<p>Preamble<br>\n<table id=companies>\n<tr><th>Name</th><th>Town</th></tr>\n<tr><td>Acme&nbsp;Ltd</td><td>Leeds</td></tr>\n<tr><td>Globex   plc</td><td>Hull</td></tr>\n</table>\n</body></html>\n",
+    );
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({ "path": page, "rowSelector": "table#companies" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.html failed: {:?}", r.error);
+    // The header row has no td cells and must not become a row of nulls.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+    assert_eq!(
+        scalar_string(&format!("SELECT Town FROM read_csv_auto('{}') WHERE Name LIKE 'Acme%'", out)),
+        "Leeds"
+    );
+    // Runs of whitespace inside a cell collapse, so a value is comparable.
+    assert_eq!(
+        scalar_string(&format!("SELECT Name FROM read_csv_auto('{}') WHERE Town = 'Hull'", out)),
+        "Globex plc"
+    );
+}
+
+/// #255: the general case - one selector picks the rows, and a selector per
+/// column picks what to read out of each, including attributes.
+#[test]
+fn src_html_extracts_columns_by_selector_including_attributes() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = write_file(
+        tmp.path(),
+        "list.html",
+        "<html><body><ul>\n<li class=item><a href=/c/1>Acme</a><span class=town>Leeds</span></li>\n<li class=item><a href=/c/2>Globex</a></li>\n</ul></body></html>\n",
+    );
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": page,
+                "rowSelector": "li.item",
+                "columns": [
+                    { "name": "name", "selector": "a" },
+                    { "name": "link", "selector": "a", "attr": "href" },
+                    { "name": "town", "selector": "span.town" },
+                ],
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.html failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+    assert_eq!(
+        scalar_string(&format!("SELECT link FROM read_csv_auto('{}') WHERE name = 'Acme'", out)),
+        "/c/1"
+    );
+    // A column that did not match is NULL, not an empty string: a missing town
+    // and a blank town are different facts.
+    assert_eq!(
+        count(&format!(
+            "(SELECT 1 FROM read_csv_auto('{}') WHERE name = 'Globex' AND town IS NULL)",
+            out
+        )),
+        1
+    );
+}
+
+/// #255: the GUI writes its column list as a key-value map, so the engine has
+/// to read that shape too - otherwise the form works and the run produces
+/// nothing, which is the silent-bug class this repo keeps finding.
+#[test]
+fn src_html_reads_the_key_value_column_shape_the_gui_writes() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = write_file(
+        tmp.path(),
+        "list.html",
+        "<html><body><ul>
+<li class=item><a href=/c/1>Acme</a></li>
+</ul></body></html>
+",
+    );
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": page,
+                "rowSelector": "li.item",
+                // name -> selector, with @attr to read an attribute.
+                "columns": { "name": "a", "link": "a@href" },
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.html failed: {:?}", r.error);
+    assert_eq!(
+        scalar_string(&format!("SELECT name || ' ' || link FROM read_csv_auto('{}')", out)),
+        "Acme /c/1"
+    );
+}
+
+/// #255: a typo in a selector must fail the stage naming the selector, not
+/// quietly produce a table of nulls for every row.
+#[test]
+fn src_html_rejects_an_invalid_css_selector() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = write_file(tmp.path(), "p.html", "<html><body><p>hi</p></body></html>");
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({ "path": page, "rowSelector": "p[" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "error", "an invalid selector should fail the run");
+    let err = r.error.unwrap_or_default();
+    assert!(err.contains("p["), "the error should name the selector: {}", err);
+
+    // A VALID selector that simply matches nothing is a different thing: with
+    // explicit columns the shape is known even with no rows, so a scrape of a
+    // page that happens to be empty today produces an empty typed table rather
+    // than failing.
+    let out2 = out_path(tmp.path(), "out2.csv");
+    let ok = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": page,
+                "rowSelector": "li.nope",
+                "columns": [ { "name": "name", "selector": "a" } ],
+            })),
+            node("k", "snk.csv", json!({ "path": out2, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(ok.status, "ok", "no matches is not a failure: {:?}", ok.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out2)), 0);
+    // Table mode cannot do the same, and should not pretend to: with no header
+    // row there is nothing to name the columns after, so it falls to the same
+    // untypeable-empty-result error every other source gives (#170).
+    let out3 = out_path(tmp.path(), "out3.csv");
+    let empty_table = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({ "path": page, "rowSelector": "table.nope" })),
+            node("k", "snk.csv", json!({ "path": out3, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(empty_table.status, "error");
+    assert!(
+        empty_table.error.unwrap_or_default().contains("no schema is declared"),
+        "table mode with no matches should give the standard untypeable-empty error"
+    );
+}
