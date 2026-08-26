@@ -20,6 +20,7 @@
 <img alt="typescript" src="https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white"/>
 <img alt="duckdb" src="https://img.shields.io/badge/DuckDB-FFF000?logo=duckdb&logoColor=black"/>
 <img alt="stars" src="https://img.shields.io/github/stars/slothflowlabs/duckle?style=social"/>
+<a href="https://discord.com/invite/rUeAStJbWb"><img alt="discord" src="https://img.shields.io/discord/1498599942246109265?logo=discord&amp;logoColor=white&amp;label=Discord&amp;color=5865F2"/></a>
 <a href="https://mcptoplist.com/server/glama%2Fslothflowlabs%2Fduckle"><img src="https://mcptoplist.com/badge/glama%2Fslothflowlabs%2Fduckle.svg" alt="MCP Toplist: Top 1% of 98,291" /></a>
 </p>
 
