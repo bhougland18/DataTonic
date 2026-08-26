@@ -2821,13 +2821,14 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "cron"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5877d3fbf742507b66bc2a1945106bd30dd8504019d596901ddd012a4dd01740"
+checksum = "a5dcd6f69605c2956916ce24e8af637b754964c9a83f4662d3a2361654cdba09"
 dependencies = [
  "chrono",
  "once_cell",
- "winnow 0.6.26",
+ "phf 0.11.3",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -4354,7 +4355,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -4375,7 +4376,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tar",
  "tauri",
  "tauri-build",
@@ -4404,7 +4405,7 @@ dependencies = [
  "arrow-flight",
  "arrow-schema 59.2.0",
  "async-nats",
- "base64 0.22.1",
+ "base64 0.23.1",
  "boa_engine",
  "chrono",
  "dom_query",
@@ -4450,7 +4451,7 @@ dependencies = [
  "sha2 0.11.0",
  "suppaftp",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tiberius",
  "tokio",
  "tokio-tungstenite",
@@ -4460,7 +4461,7 @@ dependencies = [
  "ureq",
  "wasmi",
  "wat",
- "webpki-roots 0.26.11",
+ "webpki-roots 1.0.9",
  "zip",
 ]
 
@@ -4469,7 +4470,7 @@ name = "duckle-execution-core"
 version = "0.0.1"
 dependencies = [
  "async-trait",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4511,7 +4512,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
@@ -4523,7 +4524,7 @@ dependencies = [
  "duckle-metadata",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4533,7 +4534,7 @@ dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
  "axum 0.7.9",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "cron",
  "duckle-duckdb-engine",
@@ -4556,7 +4557,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -4574,7 +4575,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -4585,7 +4586,7 @@ name = "duckle-secrets"
 version = "0.0.1"
 dependencies = [
  "aes-gcm 0.10.3",
- "base64 0.22.1",
+ "base64 0.23.1",
  "duckle-duckdb-engine",
  "duckle-metadata",
  "getrandom 0.3.4",
@@ -4597,7 +4598,7 @@ dependencies = [
 name = "duckle-slothdb-engine"
 version = "0.0.1"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4605,7 +4606,7 @@ name = "duckle-stream-engine"
 version = "0.0.1"
 dependencies = [
  "futures",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -4613,7 +4614,7 @@ dependencies = [
 name = "duckle-transform-engine"
 version = "0.0.1"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4621,7 +4622,7 @@ name = "duckle-workflow-engine"
 version = "0.0.1"
 dependencies = [
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8773,9 +8774,9 @@ dependencies = [
 
 [[package]]
 name = "notify-debouncer-mini"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a689eb4262184d9a1727f9087cd03883ea716682ab03ed24efec57d7716dccb8"
+checksum = "17849edfaabd9a5fef1c606d99cfc615a8e99f7ac4366406d86c7942a3184cf2"
 dependencies = [
  "log",
  "notify",
@@ -10195,6 +10196,16 @@ dependencies = [
 
 [[package]]
 name = "phf"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+dependencies = [
+ "phf_macros 0.11.3",
+ "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
@@ -10208,7 +10219,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
 dependencies = [
- "phf_macros",
+ "phf_macros 0.13.1",
  "phf_shared 0.13.1",
  "serde",
 ]
@@ -10219,8 +10230,18 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49aa7f9d80421bca176ca8dbfebe668cc7a2684708594ec9f3c0db0805d5d6e1"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.13.1",
  "phf_shared 0.13.1",
+]
+
+[[package]]
+name = "phf_generator"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
+dependencies = [
+ "phf_shared 0.11.3",
+ "rand 0.8.7",
 ]
 
 [[package]]
@@ -10235,15 +10256,37 @@ dependencies = [
 
 [[package]]
 name = "phf_macros"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
+dependencies = [
+ "phf_generator 0.11.3",
+ "phf_shared 0.11.3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "phf_macros"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.13.1",
  "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher",
 ]
 
 [[package]]
@@ -13219,7 +13262,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "585635e46db231059f76c5849798146164652513eb9e8ab2685939dd90f29b69"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.13.1",
  "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
@@ -16625,18 +16668,12 @@ dependencies = [
 
 [[package]]
 name = "winnow"
-version = "0.6.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e90edd2ac1aa278a5c4599b1d89cf03074b610800f866d4026dc199d7929a28"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winnow"
