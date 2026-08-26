@@ -509,6 +509,24 @@ pub struct PubSubSourceSpec {
     pub max_messages: u64,
 }
 
+/// snk.model: register a trained model's card (#253).
+///
+/// Deliberately NOT a model store. The engine never touches the model bytes:
+/// the training script writes those wherever it likes and reports the URI as a
+/// column, and this records the card describing them. What the engine adds is
+/// the part a convention cannot give you - the card is written only if the run
+/// actually succeeded, and a `latest` pointer moves with it so downstream
+/// pipelines are not edited on every retrain.
+#[derive(Debug, Clone)]
+pub struct ModelCardSpec {
+    pub node_id: String,
+    pub from_view: String,
+    /// Directory the registry lives in, usually `${workspace}/models`.
+    pub dir: String,
+    /// Model name. Cards land under `<dir>/<name>/`.
+    pub name: String,
+}
+
 /// src.pdf: one row per page of a PDF (#248).
 ///
 /// The text layer a document already carries, plus page geometry and the Info

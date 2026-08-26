@@ -5485,6 +5485,60 @@ function synthQualityGeometry(comp: ComponentDef): ComponentManifest {
     ], 'upstream');
 }
 
+// #253: routed by id, not by palette group. Both components sit in the file
+// groups so they appear beside the other sources and sinks, and the group
+// synthesisers would otherwise hand them Path / Encoding / Glob and never
+// show the fields the engine actually reads.
+function synthModelSource(comp: ComponentDef): ComponentManifest {
+        return base(comp, [
+            {
+                label: 'Model',
+                fields: [
+                    {
+                        key: 'model',
+                        label: 'Model',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'churn@latest',
+                        description: 'name@version, or name@latest to follow the pointer that moves on every successful retrain. A bare name means latest.',
+                    },
+                    {
+                        key: 'path',
+                        label: 'Registry folder',
+                        kind: 'text',
+                        defaultValue: '${workspace}/models',
+                        description: 'Where cards live. Must match the folder the registering pipeline writes to.',
+                    },
+                ],
+            },
+        ], 'declared');
+}
+
+function synthModelSink(comp: ComponentDef): ComponentManifest {
+        return base(comp, [
+            {
+                label: 'Register',
+                fields: [
+                    {
+                        key: 'name',
+                        label: 'Model name',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'churn',
+                        description: 'Cards land under <registry folder>/<name>/.',
+                    },
+                    {
+                        key: 'path',
+                        label: 'Registry folder',
+                        kind: 'text',
+                        defaultValue: '${workspace}/models',
+                        description: 'Where cards are written. Point Model Card sources at the same folder.',
+                    },
+                ],
+            },
+        ], 'upstream');
+}
+
 function synthQualityCleanse(comp: ComponentDef): ComponentManifest {
     const id = comp.id;
     if (id === 'qa.standardize') {
@@ -7014,6 +7068,8 @@ function dispatchManifest(componentId: string): ComponentManifest | undefined {
     // source (it drives the Bulk API 2.0 query-job lifecycle with the
     // sink-shaped auth keys); route by id ahead of the group checks.
     if (comp.id === 'src.salesforce.bulk') return synthSalesforceBulkSource(comp);
+    if (comp.id === 'src.model') return synthModelSource(comp);
+    if (comp.id === 'snk.model') return synthModelSink(comp);
     if (groupId === 'src.files') return synthFileSource(comp);
     if (groupId === 'src.lakehouse') return synthLakehouseSource(comp);
     if (groupId === 'snk.lakehouse') return synthLakehouseSink(comp);

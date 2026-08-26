@@ -294,6 +294,7 @@ pub(crate) fn build_view_sql(
         "qa.profile.adv" => build_profile_adv(inputs, props),
         "qa.link" => build_record_link(inputs, props),
         "qa.block" => build_er_block(inputs, props),
+        "src.model" => Ok(build_model_source(props)?),
         "qa.reconcile" => build_reconcile(inputs, props),
         "qa.classify" => build_classify(inputs, props),
         "qa.dedupe" => build_fuzzy_dedupe(inputs, props),
@@ -9295,6 +9296,56 @@ pub(crate) fn headers_from_props(props: &JsonValue) -> Vec<(String, String)> {
 /// - `bearer` -> `Authorization: Bearer <token>`
 /// - `apikey` -> `<header>: <token>` (header chosen by `api_key_header`)
 /// - anything else (incl. `none`) adds nothing.
+/// src.model: read one model card back (#253).
+///
+/// Pure SQL, because a card is just a JSON file: the only work is turning
+/// `name@version` into a path. `@latest` (or no version at all) reads the
+/// pointer snk.model moves on every successful registration, which is what lets
+/// a scoring pipeline stay unedited across retrains.
+///
+/// The row it produces carries the artifact URI, so a downstream code.python
+/// stage joins it to its feature table and loads the model itself. The engine
+/// deliberately does not load models: that would mean an ML runtime in Rust for
+/// something the workspace's own virtualenv already does.
+pub(crate) fn build_model_source(props: &JsonValue) -> Result<String, String> {
+    let dir = string_prop(props, "path")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "models".to_string());
+    let reference = string_prop(props, "model")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "Model needs a model to read, as name or name@version (name@latest reads the current one)".to_string()
+        })?;
+    let (name, version) = match reference.rsplit_once('@') {
+        Some((n, v)) if !n.trim().is_empty() && !v.trim().is_empty() => (n.trim(), v.trim()),
+        _ => (reference.as_str(), "latest"),
+    };
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    // Forward slashes so the path is a valid SQL string literal on Windows too.
+    let path = format!(
+        "{}/{}/{}.json",
+        dir.trim_end_matches(['/', '\\']).replace('\\', "/"),
+        safe(name),
+        safe(version)
+    );
+    Ok(format!(
+        "SELECT * FROM read_json_auto('{}')",
+        path.replace('\'', "''")
+    ))
+}
+
 /// #256: the transport settings on an HTTP-backed node.
 ///
 /// Flat props rather than a nested object because that is what a saved `http`

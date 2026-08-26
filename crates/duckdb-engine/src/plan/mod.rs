@@ -301,6 +301,7 @@ pub enum RuntimeSpec {
     NatsSource(NatsSourceSpec),
     PubsubSink(PubSubSinkSpec),
     PubsubSource(PubSubSourceSpec),
+    ModelCard(ModelCardSpec),
     PdfSource(PdfSourceSpec),
     HtmlSource(HtmlSourceSpec),
     XmlSource(XmlSourceSpec),
@@ -1412,6 +1413,7 @@ fn build_stage(
     let mut nats_source: Option<NatsSourceSpec> = None;
     let mut pubsub_sink: Option<PubSubSinkSpec> = None;
     let mut pubsub_source: Option<PubSubSourceSpec> = None;
+    let mut model_card: Option<ModelCardSpec> = None;
     let mut pdf_source: Option<PdfSourceSpec> = None;
     let mut html_source: Option<HtmlSourceSpec> = None;
     let mut xml_source: Option<XmlSourceSpec> = None;
@@ -2861,6 +2863,26 @@ fn build_stage(
             mode,
         });
         (String::new(), StageKind::Sink, Some(from_view.to_string()))
+    } else if component_id == "snk.model" {
+        // #253: the card comes from the upstream row's COLUMNS, so a training
+        // stage produces it the way it produces any table.
+        let from_view = inputs
+            .main()
+            .ok_or_else(|| EngineError::Config(format!("{}: upstream input required", component_id)))?;
+        let name = string_prop(&props, "name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: name required (the model's name; cards land under <path>/<name>/)", component_id)))?;
+        model_card = Some(ModelCardSpec {
+            node_id: node.id.clone(),
+            from_view: from_view.to_string(),
+            dir: string_prop(&props, "path")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "models".to_string()),
+            name,
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id.starts_with("snk.") {
         let from_view = inputs
             .main()
@@ -5562,6 +5584,7 @@ fn build_stage(
         .or_else(|| nats_source.map(RuntimeSpec::NatsSource))
         .or_else(|| pubsub_sink.map(RuntimeSpec::PubsubSink))
         .or_else(|| pubsub_source.map(RuntimeSpec::PubsubSource))
+        .or_else(|| model_card.map(RuntimeSpec::ModelCard))
         .or_else(|| pdf_source.map(RuntimeSpec::PdfSource))
         .or_else(|| html_source.map(RuntimeSpec::HtmlSource))
         .or_else(|| xml_source.map(RuntimeSpec::XmlSource))

@@ -58,7 +58,7 @@ use plan::{
     DbtSpec, DynamoDbSourceSpec, ElasticSourceSpec, EmailSinkSpec, EmailSourceSpec,
     FormatFileSinkSpec,
     FormatFileSourceSpec, FormatKind, FtpSinkSpec, FtpSourceSpec, GitSourceSpec,
-    GizmoSqlSinkSpec, GizmoSqlSourceSpec, HtmlSourceSpec, PdfSourceSpec, HuggingFaceSinkSpec,
+    GizmoSqlSinkSpec, GizmoSqlSourceSpec, HtmlSourceSpec, ModelCardSpec, PdfSourceSpec, HuggingFaceSinkSpec,
     JavaScriptSpec, JqSpec, PythonSpec,
     KafkaSinkSpec, KafkaSourceSpec, KinesisSourceSpec, LanceSinkSpec, LanceSourceSpec,
     PixeltableSinkSpec, PixeltableSourceSpec,
@@ -1035,7 +1035,7 @@ impl DuckdbEngine {
         // xf.incremental high-water marks to persist - but only if the WHOLE
         // run succeeds, so a later-stage failure never advances the mark past
         // rows that were never actually delivered. (state file path, json).
-        let mut pending_watermarks: Vec<(std::path::PathBuf, JsonValue)> = Vec::new();
+        let mut pending_writes: Vec<(std::path::PathBuf, JsonValue)> = Vec::new();
 
         // Fast path: if every stage is pure-SQL with no per-stage
         // hooks, pipe the whole pipeline as one SQL stream into a
@@ -1894,11 +1894,16 @@ impl DuckdbEngine {
                     }
                     // Watermark incremental load: materialize only rows past
                     // the saved mark; queue the new mark for persist-on-success.
+                    // #253: queue the model card rather than writing it, so a
+                    // training run that fails later never registers a model.
+                    Some(RuntimeSpec::ModelCard(spec)) => {
+                        self.run_model_card(&db_path, spec, &mut pending_writes)
+                    }
                     Some(RuntimeSpec::Incremental(spec)) => self.run_incremental(
                         &db_path,
                         spec,
                         pipeline_name,
-                        &mut pending_watermarks,
+                        &mut pending_writes,
                     ),
                     // DuckLake change-data-feed source: materialize table_changes
                     // since the saved snapshot; persist the new snapshot on success.
@@ -1906,7 +1911,7 @@ impl DuckdbEngine {
                         &db_path,
                         spec,
                         pipeline_name,
-                        &mut pending_watermarks,
+                        &mut pending_writes,
                     ),
                     // Control-flow variants (RunJob / InstallFallback /
                     // Iterate / Foreach / Log / Warn / non-firing Die) already
@@ -2134,20 +2139,32 @@ impl DuckdbEngine {
             "ok"
         };
 
-        // Persist xf.incremental / DuckLake-CDC high-water marks ONLY on a
-        // fully successful, FULL run. If anything failed or was cancelled we
-        // drop them, so the next run re-reads the same window rather than
-        // skipping undelivered rows. We also skip a partial "Run from here"
-        // run (target.is_some()): it loads rows into a throwaway temp DB and
-        // may stop before the sink, so advancing the watermark there would make
-        // the next full run skip rows that were never written to any sink.
+        // Persist deferred state - xf.incremental / DuckLake-CDC high-water
+        // marks, and snk.model cards (#253) - ONLY on a fully successful, FULL
+        // run. If anything failed or was cancelled we drop them, so the next run
+        // re-reads the same window rather than skipping undelivered rows, and a
+        // failed training run does not register a model. We also skip a partial
+        // "Run from here" run (target.is_some()): it loads rows into a throwaway
+        // temp DB and may stop before the sink, so advancing a watermark there
+        // would make the next full run skip rows that were never written to any
+        // sink, and registering a model there would publish one from a run that
+        // never reached its sink either.
         if final_status == "ok" && target.is_none() {
-            for (path, value) in &pending_watermarks {
+            for (path, value) in &pending_writes {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 if let Ok(text) = serde_json::to_string_pretty(value) {
-                    let _ = std::fs::write(path, text);
+                    // Write to a temp file and rename over the target, so a
+                    // reader never sees a half-written file. A model pointer is
+                    // read by other pipelines while this one is running, and a
+                    // torn read there is a wrong answer rather than an error.
+                    // On Windows rename replaces the destination, so removing
+                    // it first would only open a window where it does not exist.
+                    let tmp = path.with_extension("json.tmp");
+                    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
                 }
             }
         }

@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 395,
+  "componentCount": 397,
   "components": [
     {
       "id": "src.csv",
@@ -650,6 +650,74 @@
                 "kind": "text",
                 "placeholder": "data   or   response.records",
                 "description": "Dotted key path to the array of records inside the JSON, for API-style responses where the rows live under a key (e.g. {\"data\":[...]} -> 'data', or {\"response\":{\"records\":[...]}} -> 'response.records'). Each record is unnested and nested fields are flattened into columns. Leave blank for a plain top-level array or JSON Lines."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.model",
+      "label": "Model Card",
+      "kind": "source",
+      "availability": "available",
+      "summary": "Read a registered model card back as one row: name, version, the artifact URI the training script wrote, and whatever metrics and hashes it recorded. Address it as name@version, or name@latest to follow the pointer that moves on every successful retrain, so a scoring pipeline stays unedited. The engine never loads the model - the row carries the URI and your Python stage loads it.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.model",
+        "kind": "source",
+        "label": "Model Card",
+        "description": "Read a registered model card back as one row: name, version, the artifact URI the training script wrote, and whatever metrics and hashes it recorded. Address it as name@version, or name@latest to follow the pointer that moves on every successful retrain, so a scoring pipeline stays unedited. The engine never loads the model - the row carries the URI and your Python stage loads it.",
+        "schemaSource": "declared",
+        "sections": [
+          {
+            "label": "Model",
+            "fields": [
+              {
+                "key": "model",
+                "label": "Model",
+                "kind": "text",
+                "required": true,
+                "placeholder": "churn@latest",
+                "description": "name@version, or name@latest to follow the pointer that moves on every successful retrain. A bare name means latest."
+              },
+              {
+                "key": "path",
+                "label": "Registry folder",
+                "kind": "text",
+                "defaultValue": "${workspace}/models",
+                "description": "Where cards live. Must match the folder the registering pipeline writes to."
               }
             ]
           }
@@ -29023,6 +29091,62 @@
                     "value": "snappy"
                   }
                 ]
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": []
+        }
+      }
+    },
+    {
+      "id": "snk.model",
+      "label": "Model Card",
+      "kind": "sink",
+      "availability": "available",
+      "summary": "Register a trained model. The card IS the upstream row - the artifact URI your training script wrote, plus whatever metrics, framework and hashes it recorded - written to <path>/<name>/<version>.json with a latest.json pointer beside it. It needs exactly one row and a version column. The write happens only if the whole run succeeds, so a training pipeline that fails later never registers a model, and a failed retrain never moves the pointer off the model that still works.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": []
+      },
+      "manifest": {
+        "id": "snk.model",
+        "kind": "sink",
+        "label": "Model Card",
+        "description": "Register a trained model. The card IS the upstream row - the artifact URI your training script wrote, plus whatever metrics, framework and hashes it recorded - written to <path>/<name>/<version>.json with a latest.json pointer beside it. It needs exactly one row and a version column. The write happens only if the whole run succeeds, so a training pipeline that fails later never registers a model, and a failed retrain never moves the pointer off the model that still works.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Register",
+            "fields": [
+              {
+                "key": "name",
+                "label": "Model name",
+                "kind": "text",
+                "required": true,
+                "placeholder": "churn",
+                "description": "Cards land under <registry folder>/<name>/."
+              },
+              {
+                "key": "path",
+                "label": "Registry folder",
+                "kind": "text",
+                "defaultValue": "${workspace}/models",
+                "description": "Where cards are written. Point Model Card sources at the same folder."
               }
             ]
           }

@@ -5220,6 +5220,88 @@ impl DuckdbEngine {
         Ok(format!("qvd: materialized {} records into {}", count, spec.node_id))
     }
 
+    /// snk.model: record one trained model's card (#253).
+    ///
+    /// The card IS the upstream row: whatever columns the training stage
+    /// produced - artifact URI, framework, metrics, the hashes it chose to
+    /// record - are what gets written, plus the model name and the moment it was
+    /// registered. That keeps the engine out of the business of deciding what a
+    /// model card should contain, which differs per team.
+    ///
+    /// The write is QUEUED, not done here. It happens at the end of the run and
+    /// only if the whole run succeeded, so a training pipeline that blows up
+    /// after this stage never leaves a registered model pointing at a model that
+    /// was never finished. That gate, and the `latest` pointer, are the two
+    /// things a plain file-writing convention cannot give you.
+    pub(crate) fn run_model_card(
+        &self,
+        db: &Path,
+        spec: &ModelCardSpec,
+        pending: &mut Vec<(std::path::PathBuf, JsonValue)>,
+    ) -> Result<String, EngineError> {
+        self.check_cancelled()?;
+        let rows = self.run_rows(
+            Some(db),
+            &format!("SELECT * FROM {};", quote_ident(&spec.from_view)),
+        )?;
+        // One model, one card. Silently taking the first of several rows would
+        // register a model chosen by whatever order the upstream happened to
+        // produce, which is not a decision the engine should make.
+        if rows.len() != 1 {
+            return Err(EngineError::Query(format!(
+                "snk.model: expected exactly one upstream row to register as a model card, got {}. Reduce the training stage's output to a single row first.",
+                rows.len()
+            )));
+        }
+        let mut card = match &rows[0] {
+            JsonValue::Object(m) => m.clone(),
+            other => {
+                return Err(EngineError::Query(format!(
+                    "snk.model: the upstream row is not a record: {}",
+                    other
+                )))
+            }
+        };
+        // The version names the file, so it has to be there and has to be
+        // something. Defaulting it would silently overwrite the previous card.
+        let version = match card.get("version") {
+            Some(JsonValue::String(v)) if !v.trim().is_empty() => v.trim().to_string(),
+            Some(JsonValue::Number(n)) => n.to_string(),
+            _ => {
+                return Err(EngineError::Query(
+                    "snk.model: the upstream row needs a non-empty `version` column - it names the card and is how an older model is still addressable after a retrain".into(),
+                ))
+            }
+        };
+        card.insert("name".into(), JsonValue::String(spec.name.clone()));
+        card.insert(
+            "registered_at".into(),
+            JsonValue::String(chrono::Utc::now().to_rfc3339()),
+        );
+        let card = JsonValue::Object(card);
+
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let dir = std::path::Path::new(&spec.dir).join(safe(&spec.name));
+        pending.push((dir.join(format!("{}.json", safe(&version))), card.clone()));
+        // The pointer is a copy of the card, not a reference to it, so reading
+        // `latest` is one read and cannot race with the versioned file moving.
+        pending.push((dir.join("latest.json"), card));
+        Ok(format!(
+            "model: {} version {} will be registered if this run succeeds",
+            spec.name, version
+        ))
+    }
+
     /// src.pdf: one row per PAGE of a PDF document (#248).
     ///
     /// A lot of real data engineering starts from documents rather than tables:

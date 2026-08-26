@@ -15115,3 +15115,177 @@ fn src_pdf_reports_an_unreadable_document_without_panicking() {
     let err = r.error.unwrap_or_default();
     assert!(err.contains("broken.pdf"), "the error should name the file: {}", err);
 }
+
+/// #253: register a model card, then read it back by name and by version.
+///
+/// The card is the upstream row, so whatever the training stage produced is
+/// what gets recorded; the engine only adds the name and the registration time.
+#[test]
+fn snk_model_registers_a_card_that_src_model_reads_back() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let models = tmp.path().join("models").to_string_lossy().replace('\\', "/");
+    let in_csv = write_file(
+        tmp.path(),
+        "metrics.csv",
+        "version,artifact,framework,mae\nrun-1,s3://models/churn/model.pkl,lightgbm,171242\n",
+    );
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "ok", "snk.model failed: {:?}", r.error);
+
+    // Both the versioned card and the pointer exist after a successful run.
+    let versioned = tmp.path().join("models").join("churn").join("run-1.json");
+    let latest = tmp.path().join("models").join("churn").join("latest.json");
+    assert!(versioned.is_file(), "no versioned card at {:?}", versioned);
+    assert!(latest.is_file(), "no latest pointer at {:?}", latest);
+    let card: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&latest).unwrap()).unwrap();
+    assert_eq!(card.get("name").and_then(|v| v.as_str()), Some("churn"));
+    assert_eq!(card.get("framework").and_then(|v| v.as_str()), Some("lightgbm"));
+    assert!(card.get("registered_at").is_some(), "card has no registration time");
+
+    // Read it back through the component, by the pointer.
+    let out = out_path(tmp.path(), "model.csv");
+    let back = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.model", json!({ "path": models, "model": "churn@latest" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(back.status, "ok", "src.model failed: {:?}", back.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 1);
+    assert_eq!(
+        scalar_string(&format!("SELECT artifact FROM read_csv_auto('{}')", out)),
+        "s3://models/churn/model.pkl"
+    );
+
+    // And by an explicit version, which is the point of keeping both files: an
+    // older model is still addressable after a retrain has moved the pointer.
+    let out2 = out_path(tmp.path(), "model2.csv");
+    let pinned = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.model", json!({ "path": models, "model": "churn@run-1" })),
+            node("k", "snk.csv", json!({ "path": out2, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(pinned.status, "ok", "src.model by version failed: {:?}", pinned.error);
+    assert_eq!(
+        scalar_string(&format!("SELECT version FROM read_csv_auto('{}')", out2)),
+        "run-1"
+    );
+}
+
+/// #253: THE reason this is a component rather than a documented convention.
+///
+/// A training pipeline that fails after the registration stage must not leave a
+/// registered model behind, and a retrain that fails must not move the pointer
+/// off the model that still works. A script writing its own card cannot know
+/// whether the rest of the run succeeded.
+#[test]
+fn a_failed_run_neither_registers_a_model_nor_moves_the_pointer() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let models = tmp.path().join("models").to_string_lossy().replace('\\', "/");
+    let good = write_file(
+        tmp.path(),
+        "good.csv",
+        "version,artifact,mae\nrun-1,s3://models/churn/v1.pkl,171242\n",
+    );
+    // First, a run that succeeds: this is the model in production.
+    let first = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": good, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(first.status, "ok", "setup run failed: {:?}", first.error);
+    let latest = tmp.path().join("models").join("churn").join("latest.json");
+    let before = std::fs::read_to_string(&latest).unwrap();
+
+    // Now a retrain whose card would register run-2, but whose run fails after
+    // the registration stage - here because a later stage reads a table that
+    // does not exist.
+    let retrain = write_file(
+        tmp.path(),
+        "retrain.csv",
+        "version,artifact,mae\nrun-2,s3://models/churn/v2.pkl,999999\n",
+    );
+    let out = out_path(tmp.path(), "never.csv");
+    let failed = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": retrain, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+            node("boom", "code.sql", json!({ "sql": "SELECT * FROM a_table_that_does_not_exist" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "s", "m"),
+            main_edge("e2", "m", "boom"),
+            main_edge("e3", "boom", "k"),
+        ]),
+    ));
+    assert_eq!(failed.status, "error", "the retrain was supposed to fail");
+
+    // run-2 was never registered, and the pointer still names run-1.
+    assert!(
+        !tmp.path().join("models").join("churn").join("run-2.json").is_file(),
+        "a failed run registered a model card"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&latest).unwrap(),
+        before,
+        "a failed retrain moved the latest pointer off a working model"
+    );
+}
+
+/// #253: a card names one model version. Registering several rows at once would
+/// pick one by whatever order the upstream produced, which is not the engine's
+/// decision to make.
+#[test]
+fn snk_model_refuses_an_ambiguous_or_unversioned_card() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let models = tmp.path().join("models").to_string_lossy().replace('\\', "/");
+
+    let two = write_file(
+        tmp.path(),
+        "two.csv",
+        "version,artifact\nrun-1,a.pkl\nrun-2,b.pkl\n",
+    );
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": two, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "error");
+    assert!(
+        r.error.unwrap_or_default().contains("exactly one"),
+        "the error should say a card is one row"
+    );
+
+    // No version column: the card would silently overwrite the previous one.
+    let noversion = write_file(tmp.path(), "nv.csv", "artifact,mae\na.pkl,1\n");
+    let r2 = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": noversion, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r2.status, "error");
+    assert!(
+        r2.error.unwrap_or_default().contains("version"),
+        "the error should name the missing column"
+    );
+}
