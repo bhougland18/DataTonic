@@ -29,13 +29,16 @@ fn build_root_store() -> rustls::RootCertStore {
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     // 2. OS trust store - adds enterprise / proxy-inspection CAs. Best effort.
-    match rustls_native_certs::load_native_certs() {
-        Ok(certs) => {
-            let _ = roots.add_parsable_certificates(certs);
-        }
-        Err(e) => {
-            eprintln!("duckle: could not read OS certificate store: {e}");
-        }
+    // rustls-native-certs 0.8 reports partial success: a store can yield usable
+    // certificates AND errors at once, where the old Result made it all or
+    // nothing. Take whatever loaded and report the rest, so one unreadable
+    // certificate no longer costs the machine its whole OS trust store.
+    let native = rustls_native_certs::load_native_certs();
+    if !native.certs.is_empty() {
+        let _ = roots.add_parsable_certificates(native.certs);
+    }
+    for e in &native.errors {
+        eprintln!("duckle: could not read part of the OS certificate store: {e}");
     }
 
     // 3. Optional explicit PEM bundle, for split-tunnel setups or where the

@@ -4431,7 +4431,7 @@ dependencies = [
  "parquet 59.2.0",
  "pdf-extract",
  "prost 0.13.5",
- "quick-xml 0.36.2",
+ "quick-xml 0.41.0",
  "rand 0.8.7",
  "redis",
  "regex",
@@ -4441,7 +4441,7 @@ dependencies = [
  "russh-sftp",
  "rustls 0.23.43",
  "rustls-connector 0.21.11",
- "rustls-native-certs 0.7.3",
+ "rustls-native-certs 0.8.4",
  "rustls-pemfile 2.2.0",
  "scylla",
  "serde",
@@ -10857,15 +10857,6 @@ name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
-
-[[package]]
-name = "quick-xml"
-version = "0.36.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "quick-xml"

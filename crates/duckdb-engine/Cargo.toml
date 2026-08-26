@@ -32,7 +32,7 @@ ureq = { version = "2.10", default-features = false, features = ["tls", "json", 
 # so this adds no new crypto backend and no extra build cost. See src/tls.rs.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
-rustls-native-certs = "0.7"
+rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 # Snowflake JWT RS256 auth path. Reads a PEM-encoded private key,
 # derives the public-key fingerprint, and signs the standard
@@ -105,7 +105,7 @@ async-nats = "0.50"
 # XML reader/writer. Used by src.xml (walks a row path, emits each
 # match as a JSON object) and snk.xml (wraps rows in row elements).
 # Pure Rust.
-quick-xml = "0.36"
+quick-xml = "0.41"
 # HTML parsing + CSS selection for src.html (#255). Pure Rust (html5ever +
 # cssparser + selectors), no native toolchain, and already resolved in this
 # workspace's lockfile via tauri-utils and wry, so it adds no new dependency

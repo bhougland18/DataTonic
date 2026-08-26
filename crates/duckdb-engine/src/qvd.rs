@@ -210,7 +210,13 @@ fn parse_header(xml: &str) -> Result<(usize, usize, Vec<FieldMeta>), String> {
                 cur.clear();
             }
             Ok(Event::Text(t)) => {
-                let raw = t.unescape().map_err(|e| e.to_string())?;
+                // quick-xml 0.41 replaced unescape() with xml_content(), which
+                // decodes and unescapes for a stated XML version. Implicit1_0 is
+                // what the parser assumes for a document with no declaration,
+                // which is what these files are.
+                let raw = t
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(|e| e.to_string())?;
                 let txt = raw.trim();
                 // Whitespace-only text events sit between pretty-printed tags;
                 // skip them. FieldName uses the RAW text so a column named with
