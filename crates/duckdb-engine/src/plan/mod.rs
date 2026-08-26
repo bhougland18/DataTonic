@@ -4927,6 +4927,19 @@ fn build_stage(
                 .unwrap_or_else(|| "https://api.openai.com".into()),
             headers: headers_from_props(&props),
             endpoint_path: string_prop(&props, "endpointPath").filter(|s| !s.is_empty()),
+            // #258: default 1 keeps every existing pipeline byte-identical.
+            concurrency: props
+                .get("concurrency")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1) as usize,
+            // #258: 0 disables retrying; the default gives a rate limit three
+            // chances before the stage gives up on the whole dataset.
+            max_retries: props
+                .get("maxRetries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32,
+
         });
         (String::new(), StageKind::View, None)
     } else if component_id == "xf.ai.llm" {
@@ -4967,6 +4980,25 @@ fn build_stage(
                 .unwrap_or(0.0),
             headers: headers_from_props(&props),
             endpoint_path: string_prop(&props, "endpointPath").filter(|s| !s.is_empty()),
+            // #258: default 1 keeps every existing pipeline byte-identical.
+            concurrency: props
+                .get("concurrency")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1) as usize,
+            // #258: 0 disables retrying; the default gives a rate limit three
+            // chances before the stage gives up on the whole dataset.
+            max_retries: props
+                .get("maxRetries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32,
+            // #258: only sent when the user actually set it, so a pipeline
+            // that never touched the field still sends no max_tokens.
+            max_tokens: props
+                .get("maxTokens")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .map(|n| n as u32),
         });
         (String::new(), StageKind::View, None)
     } else if component_id == "xf.ai.embed" {
@@ -5004,6 +5036,19 @@ fn build_stage(
                 .unwrap_or(100) as usize,
             headers: headers_from_props(&props),
             endpoint_path: string_prop(&props, "endpointPath").filter(|s| !s.is_empty()),
+            // #258: default 1 keeps every existing pipeline byte-identical.
+            concurrency: props
+                .get("concurrency")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1) as usize,
+            // #258: 0 disables retrying; the default gives a rate limit three
+            // chances before the stage gives up on the whole dataset.
+            max_retries: props
+                .get("maxRetries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32,
+
         });
         (String::new(), StageKind::View, None)
     } else if matches!(component_id, "code.sql" | "code.sqltemplate")

@@ -5731,6 +5731,29 @@ const aiProviderField = (): Field => ({
     ],
 });
 
+// #258: the two knobs that decide how a batch-inference stage behaves at
+// scale. Parallel requests defaults to 1, which is exactly the sequential
+// behaviour these stages had before, so an existing pipeline does not change
+// until someone raises it.
+const aiThroughputFields = (): Field[] => [
+    {
+        key: 'concurrency',
+        label: 'Parallel requests',
+        kind: 'integer',
+        defaultValue: 1,
+        description:
+            'How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way.',
+    },
+    {
+        key: 'maxRetries',
+        label: 'Retries on rate limit',
+        kind: 'integer',
+        defaultValue: 3,
+        description:
+            'Retries for a single request on HTTP 429 or 5xx, honouring Retry-After. Without this one rate limit throws away every row the stage already paid for. 0 disables retrying.',
+    },
+];
+
 // #142: fields for pointing an AI transform at a custom OpenAI-compatible
 // endpoint (vLLM, LiteLLM, a private gateway, etc). All optional: blank keeps
 // the OpenAI default, so existing pipelines are unaffected.
@@ -6221,6 +6244,7 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                     { key: 'outputColumn', label: 'Output column', kind: 'text', defaultValue: 'embedding' },
                     { key: 'dimension', label: 'Dimensions', kind: 'integer', defaultValue: 1536 },
                     { key: 'batchSize', label: 'Batch size', kind: 'integer', defaultValue: 64 },
+                    ...aiThroughputFields(),
                     ...aiCustomEndpointFields(),
                 ],
             },
@@ -6253,6 +6277,7 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                     { key: 'outputColumn', label: 'Output column', kind: 'text', required: true, defaultValue: 'ai_result' },
                     { key: 'temperature', label: 'Temperature', kind: 'number', defaultValue: 0 },
                     { key: 'maxTokens', label: 'Max tokens', kind: 'integer', defaultValue: 256 },
+                    ...aiThroughputFields(),
                 ],
             },
         ], 'declared');
@@ -6317,6 +6342,7 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                     { key: 'apiKey', label: 'API key', kind: 'text', placeholder: '••••••••' },
                     { key: 'outputColumn', label: 'Output column', kind: 'text', defaultValue: 'label' },
                     ...aiCustomEndpointFields(),
+                    ...aiThroughputFields(),
                 ],
             },
         ], 'declared');

@@ -966,6 +966,14 @@ pub struct AiEmbedSpec {
     /// #142: override the request path (default `/v1/embeddings`) for custom
     /// OpenAI-compatible gateways. None = default path.
     pub endpoint_path: Option<String>,
+    /// #258: at most this many requests in flight. 1 = sequential, byte for
+    /// byte what this stage did before. Results are written back BY INDEX, so
+    /// the output row order never depends on which request finishes first.
+    pub concurrency: usize,
+    /// #258: retries for a single request on HTTP 429 and 5xx, honouring
+    /// Retry-After. A rate limit at row 400,000 must not discard the 399,999
+    /// rows already paid for.
+    pub max_retries: u32,
 }
 
 /// code.wasm: per-row WASM transform. The user supplies bytes (via
@@ -1087,6 +1095,18 @@ pub struct AiLlmSpec {
     pub headers: Vec<(String, String)>,
     /// #142: override the request path (default `/v1/chat/completions`).
     pub endpoint_path: Option<String>,
+    /// #258: at most this many requests in flight. 1 = sequential, byte for
+    /// byte what this stage did before. Results are written back BY INDEX, so
+    /// the output row order never depends on which request finishes first.
+    pub concurrency: usize,
+    /// #258: retries for a single request on HTTP 429 and 5xx, honouring
+    /// Retry-After. A rate limit at row 400,000 must not discard the 399,999
+    /// rows already paid for.
+    pub max_retries: u32,
+    /// #258: OpenAI `max_tokens`. The GUI has offered this field since #142
+    /// while the request body never carried it, so an unbounded reply was
+    /// billed on every row. None = send no max_tokens, exactly as before.
+    pub max_tokens: Option<u32>,
 }
 
 /// xf.ai.classify: per-row LLM-backed classifier. Pins each row's
@@ -1109,6 +1129,14 @@ pub struct AiClassifySpec {
     pub headers: Vec<(String, String)>,
     /// #142: override the request path (default `/v1/chat/completions`).
     pub endpoint_path: Option<String>,
+    /// #258: at most this many requests in flight. 1 = sequential, byte for
+    /// byte what this stage did before. Results are written back BY INDEX, so
+    /// the output row order never depends on which request finishes first.
+    pub concurrency: usize,
+    /// #258: retries for a single request on HTTP 429 and 5xx, honouring
+    /// Retry-After. A rate limit at row 400,000 must not discard the 399,999
+    /// rows already paid for.
+    pub max_retries: u32,
 }
 
 /// xf.ai.dedupe: semantic dedupe via cosine similarity over a

@@ -14146,3 +14146,250 @@ fn src_salesforce_bulk_non_advancing_locator_errors() {
         err
     );
 }
+
+/// #258: a rate-limited provider must not throw away the rows already paid
+/// for. The mock answers 429 twice with `Retry-After: 0`, then 200 - the stage
+/// should ride through it and still produce its row.
+///
+/// Before #258 the first 429 returned Err and the whole stage died, so a rate
+/// limit at row 400,000 discarded 399,999 completed rows; the only retry in
+/// the engine is per stage, which re-sends the entire dataset from row 0.
+#[test]
+fn xf_ai_llm_retries_a_rate_limit_instead_of_discarding_the_run() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    // Bounded accept loop: if the engine stops retrying, fewer than 3 requests
+    // arrive, and a blocking take(3) would deadlock the join below instead of
+    // failing the assertion. A regression must fail, not hang.
+    listener.set_nonblocking(true).ok();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut idx = 0usize;
+        while idx < 3 && std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).ok();
+            idx += 1;
+            let idx = idx - 1;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..32 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            h.fetch_add(1, Ordering::SeqCst);
+            // Retry-After: 0 keeps the test quick while still driving the
+            // header path rather than the exponential-backoff path.
+            let (head, body) = if idx < 2 {
+                (
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n",
+                    "{\"error\":\"slow down\"}".to_string(),
+                )
+            } else {
+                (
+                    "HTTP/1.1 200 OK\r\n",
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"survived\"}}]}"
+                        .to_string(),
+                )
+            };
+            let resp = format!(
+                "{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                head,
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("l", "xf.ai.llm", json!({
+                "promptTemplate": "Greet {name}",
+                "outputColumn": "reply",
+                "model": "mock",
+                "apiKey": "sk-test",
+                "baseUrl": base_url,
+                "maxRetries": 3,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "l"), main_edge("e2", "l", "k")]),
+    ));
+    let _ = handle.join();
+    assert_eq!(r.status, "ok", "a retried rate limit still failed: {:?}", r.error);
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "expected 2 retries then a success");
+    assert_eq!(
+        scalar_string(&format!("SELECT reply FROM read_csv_auto('{}')", out)),
+        "survived"
+    );
+}
+
+/// #258: with requests genuinely in flight at once, every row must still be
+/// paired with its OWN answer.
+///
+/// The mock sleeps a different amount per row, so a dispatcher that appended
+/// results as they completed would hand row 3 row 7's answer - and nothing
+/// downstream would report it. The peak-in-flight gauge is what stops this
+/// passing vacuously: if `concurrency` were ignored the peak would be 1.
+#[test]
+fn xf_ai_llm_keeps_row_order_when_requests_run_concurrently() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const ROWS: usize = 12;
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (ifc, pk) = (inflight.clone(), peak.clone());
+    // Bounded accept loop, same reasoning as the retry test: a regression that
+    // sends fewer requests must fail the assertion rather than hang the join.
+    listener.set_nonblocking(true).ok();
+    let handle = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut served = 0usize;
+        while served < ROWS && std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).ok();
+            served += 1;
+            let (ifc, pk) = (ifc.clone(), pk.clone());
+            // A thread per connection, so the mock can actually hold several
+            // requests open at once - a sequential server would hide the bug.
+            workers.push(std::thread::spawn(move || {
+                let cur = ifc.fetch_add(1, Ordering::SeqCst) + 1;
+                pk.fetch_max(cur, Ordering::SeqCst);
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(300)))
+                    .ok();
+                stream.set_nodelay(true).ok();
+                let mut buf = Vec::with_capacity(4096);
+                let mut chunk = [0u8; 4096];
+                for _ in 0..32 {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let tok: String = req
+                    .split("Echo r")
+                    .nth(1)
+                    .map(|t| t.chars().take(2).collect())
+                    .unwrap_or_default();
+                // A different, deterministic delay per row: completion order
+                // deliberately does not match request order.
+                let n: u64 = tok.parse().unwrap_or(0);
+                std::thread::sleep(Duration::from_millis((n * 7) % 23));
+                let body = format!(
+                    "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"got-r{}\"}}}}]}}",
+                    tok
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                ifc.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+
+    let mut csv = String::from("id,name\n");
+    for i in 0..ROWS {
+        csv.push_str(&format!("{},r{:02}\n", i, i));
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(tmp.path(), "in.csv", &csv);
+    let out = out_path(tmp.path(), "out.csv");
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("l", "xf.ai.llm", json!({
+                "promptTemplate": "Echo {name}",
+                "outputColumn": "reply",
+                "model": "mock",
+                "apiKey": "sk-test",
+                "baseUrl": base_url,
+                "concurrency": 8,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "l"), main_edge("e2", "l", "k")]),
+    ));
+    let _ = handle.join();
+    assert_eq!(r.status, "ok", "concurrent xf.ai.llm failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), ROWS as i64);
+    // Each row must carry the answer to its own request. This one holds by
+    // construction (the reply is inserted into the row object itself), so it
+    // is a cheap guard, not the point of the test.
+    let mispaired = count(&format!(
+        "(SELECT 1 FROM read_csv_auto('{}') WHERE reply <> 'got-' || name)",
+        out
+    ));
+    assert_eq!(mispaired, 0, "a row carried another row's answer");
+    // THE POINT: output row order must still be input row order. A dispatcher
+    // that stored results as they completed would emit the rows sorted by how
+    // fast the provider answered, and nothing downstream would report it.
+    let out_of_order = count(&format!(
+        "(SELECT 1 FROM (SELECT id, row_number() OVER () AS rn FROM read_csv_auto('{}')) t WHERE t.id <> t.rn - 1)",
+        out
+    ));
+    assert_eq!(
+        out_of_order, 0,
+        "rows came back in completion order instead of input order"
+    );
+    assert!(
+        peak.load(Ordering::SeqCst) >= 2,
+        "requests never overlapped, so this proved nothing about ordering"
+    );
+}

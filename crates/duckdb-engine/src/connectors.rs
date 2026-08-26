@@ -7026,6 +7026,160 @@ impl DuckdbEngine {
         req
     }
 
+    /// #258: how long to wait before retry `attempt` (0-based).
+    ///
+    /// A `Retry-After` given in whole seconds is obeyed exactly - that is the
+    /// provider saying when it will serve again, and guessing shorter just
+    /// earns another 429. Without one the wait doubles from 500ms, capped so a
+    /// stalled provider cannot park a stage for an unbounded time.
+    pub(crate) fn ai_retry_wait_ms(retry_after: Option<&str>, attempt: u32) -> u64 {
+        if let Some(secs) = retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+            return (secs * 1000).min(300_000);
+        }
+        (500u64 << attempt.min(6)).min(30_000)
+    }
+
+    /// #258: sleep, but notice a cancelled run instead of sitting out a rate
+    /// limit for the full interval.
+    fn ai_sleep_cancellable(&self, ms: u64) -> Result<(), EngineError> {
+        let mut left = ms;
+        while left > 0 {
+            let slice = left.min(200);
+            std::thread::sleep(std::time::Duration::from_millis(slice));
+            left -= slice;
+            self.check_cancelled()?;
+        }
+        Ok(())
+    }
+
+    /// #258: send one AI request, retrying on HTTP 429 and 5xx.
+    ///
+    /// `make` rebuilds the request on each attempt because ureq consumes a
+    /// Request when it is sent. Before this, the first rate limit returned Err
+    /// and the stage threw away every row it had already paid for; the only
+    /// retry in the engine is per stage, which re-sends the whole dataset from
+    /// row 0. Transport errors are deliberately not retried, so a wrong host
+    /// still fails as fast as it always did.
+    fn ai_send_with_retry(
+        &self,
+        make: &dyn Fn() -> ureq::Request,
+        body: &str,
+        what: &str,
+        max_retries: u32,
+    ) -> Result<JsonValue, EngineError> {
+        let mut attempt = 0u32;
+        loop {
+            self.check_cancelled()?;
+            match make().send_string(body) {
+                Ok(r) => {
+                    return r
+                        .into_json()
+                        .map_err(|e| EngineError::Query(format!("{} parse: {}", what, e)))
+                }
+                Err(ureq::Error::Status(code, r)) => {
+                    let retryable = code == 429 || (500..600).contains(&code);
+                    if !retryable || attempt >= max_retries {
+                        let b = r.into_string().unwrap_or_default();
+                        return Err(EngineError::Query(format!(
+                            "{} HTTP {}: {}",
+                            what, code, b
+                        )));
+                    }
+                    let wait = Self::ai_retry_wait_ms(r.header("Retry-After"), attempt);
+                    self.ai_sleep_cancellable(wait)?;
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!("{} transport: {}", what, e)))
+                }
+            }
+            attempt += 1;
+        }
+    }
+
+    /// #258: map `n` items through `f` with at most `concurrency` requests in
+    /// flight, writing every result back BY INDEX.
+    ///
+    /// Order is the thing this must not break. The sequential loops this
+    /// replaces got row order for free; a dispatcher that pushed results as
+    /// they completed would pair every row with another row's answer, and
+    /// nothing downstream would report it. `concurrency` of 1 runs inline and
+    /// is byte for byte the loop it replaces.
+    fn ai_map_concurrent<T, F>(
+        &self,
+        n: usize,
+        concurrency: usize,
+        f: F,
+    ) -> Result<Vec<T>, EngineError>
+    where
+        T: Send,
+        F: Fn(&Self, usize) -> Result<T, EngineError> + Sync,
+    {
+        if concurrency <= 1 || n <= 1 {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                self.check_cancelled()?;
+                out.push(f(self, i)?);
+            }
+            return Ok(out);
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let workers = concurrency.min(n);
+        let next = AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Option<T>>> =
+            (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+        let failure: std::sync::Mutex<Option<(usize, EngineError)>> =
+            std::sync::Mutex::new(None);
+        // One engine clone per worker, matching run_parallel_branches: it keeps
+        // each worker's cancellation check its own.
+        let engines: Vec<Self> = (0..workers).map(|_| self.clone()).collect();
+        // Take references up front: each worker closure is `move`, and without
+        // these it would move the shared state into the first worker.
+        let (f, next, slots, failure) = (&f, &next, &slots, &failure);
+        std::thread::scope(|scope| {
+            for engine in &engines {
+                scope.spawn(move || loop {
+                    // Stop pulling work the moment any worker has failed, so a
+                    // rate-limited 500k-row job stops paying for requests.
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= n {
+                        return;
+                    }
+                    match engine.check_cancelled().and_then(|_| f(engine, i)) {
+                        Ok(v) => *slots[i].lock().unwrap() = Some(v),
+                        Err(e) => {
+                            let mut slot = failure.lock().unwrap();
+                            // Report the lowest-index failure, so the message
+                            // does not depend on which worker lost the race.
+                            if slot.as_ref().map_or(true, |(j, _)| i < *j) {
+                                *slot = Some((i, e));
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some((_, e)) = failure.lock().unwrap().take() {
+            return Err(e);
+        }
+        let mut out = Vec::with_capacity(n);
+        for (i, slot) in slots.iter().enumerate() {
+            match slot.lock().unwrap().take() {
+                Some(v) => out.push(v),
+                None => {
+                    return Err(EngineError::Query(format!(
+                        "ai: row {} produced no result",
+                        i
+                    )))
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// xf.ai.embed: per-row embedding via an OpenAI-compatible API.
     /// Reads the upstream view, batches rows into groups of
     /// batch_size, sends the input_column text array to /v1/embeddings,
@@ -7051,9 +7205,12 @@ impl DuckdbEngine {
             ));
         }
         let endpoint = Self::ai_endpoint(&spec.base_url, &spec.endpoint_path, "/v1/embeddings");
-        let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
-        for chunk in rows.chunks(spec.batch_size) {
-            self.check_cancelled()?;
+        // #258: one request per batch as before, but up to `concurrency`
+        // batches in flight. Results come back per chunk and are flattened in
+        // chunk order, so the output row order is exactly the input order.
+        let chunks: Vec<&[JsonValue]> = rows.chunks(spec.batch_size).collect();
+        let per_chunk = self.ai_map_concurrent(chunks.len(), spec.concurrency, |engine, ci| {
+            let chunk = chunks[ci];
             // Pull the text from each row; missing / non-string values
             // become empty strings so the API call doesn't fail on a
             // single bad row.
@@ -7070,26 +7227,12 @@ impl DuckdbEngine {
                 "model": spec.model,
                 "input": inputs,
             });
-            let resp = Self::ai_post(&endpoint, &spec.headers, &spec.api_key)
-                .send_string(&body.to_string());
-            let response: JsonValue = match resp {
-                Ok(r) => r
-                    .into_json()
-                    .map_err(|e| EngineError::Query(format!("ai.embed parse: {}", e)))?,
-                Err(ureq::Error::Status(code, r)) => {
-                    let body = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!(
-                        "ai.embed HTTP {}: {}",
-                        code, body
-                    )));
-                }
-                Err(e) => {
-                    return Err(EngineError::Query(format!(
-                        "ai.embed transport: {}",
-                        e
-                    )))
-                }
-            };
+            let response = engine.ai_send_with_retry(
+                &|| Self::ai_post(&endpoint, &spec.headers, &spec.api_key),
+                &body.to_string(),
+                "ai.embed",
+                spec.max_retries,
+            )?;
             // OpenAI shape: response.data is an array of {index, embedding: [...]}.
             // Order is guaranteed to match the input order per the API contract.
             let data = response
@@ -7104,6 +7247,7 @@ impl DuckdbEngine {
                     data.len()
                 )));
             }
+            let mut chunk_out = Vec::with_capacity(chunk.len());
             for (row, item) in chunk.iter().zip(data.iter()) {
                 let embedding = item.get("embedding").cloned().unwrap_or(JsonValue::Null);
                 let mut obj = match row {
@@ -7111,9 +7255,11 @@ impl DuckdbEngine {
                     _ => serde_json::Map::new(),
                 };
                 obj.insert(spec.output_column.clone(), embedding);
-                out.push(JsonValue::Object(obj));
+                chunk_out.push(JsonValue::Object(obj));
             }
-        }
+            Ok(chunk_out)
+        })?;
+        let out: Vec<JsonValue> = per_chunk.into_iter().flatten().collect();
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
         Ok(format!(
@@ -8446,9 +8592,8 @@ impl DuckdbEngine {
              Reply with only the category name and nothing else.",
             cat_list
         );
-        let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            self.check_cancelled()?;
+        let out = self.ai_map_concurrent(rows.len(), spec.concurrency, |engine, i| {
+            let row = &rows[i];
             let text = row
                 .get(&spec.input_column)
                 .and_then(|v| v.as_str())
@@ -8462,20 +8607,12 @@ impl DuckdbEngine {
                     {"role": "user", "content": text},
                 ],
             });
-            let resp = Self::ai_post(&endpoint, &spec.headers, &spec.api_key)
-                .send_string(&body.to_string());
-            let response: JsonValue = match resp {
-                Ok(r) => r
-                    .into_json()
-                    .map_err(|e| EngineError::Query(format!("ai.classify parse: {}", e)))?,
-                Err(ureq::Error::Status(code, r)) => {
-                    let b = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!("ai.classify HTTP {}: {}", code, b)));
-                }
-                Err(e) => {
-                    return Err(EngineError::Query(format!("ai.classify transport: {}", e)))
-                }
-            };
+            let response = engine.ai_send_with_retry(
+                &|| Self::ai_post(&endpoint, &spec.headers, &spec.api_key),
+                &body.to_string(),
+                "ai.classify",
+                spec.max_retries,
+            )?;
             let raw = response
                 .pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str())
@@ -8496,8 +8633,8 @@ impl DuckdbEngine {
                 _ => serde_json::Map::new(),
             };
             obj.insert(spec.output_column.clone(), JsonValue::String(chosen));
-            out.push(JsonValue::Object(obj));
-        }
+            Ok(JsonValue::Object(obj))
+        })?;
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
         Ok(format!(
@@ -8527,9 +8664,8 @@ impl DuckdbEngine {
             return Ok(format!("ai.llm: 0 upstream rows -> {}", spec.node_id));
         }
         let endpoint = Self::ai_endpoint(&spec.base_url, &spec.endpoint_path, "/v1/chat/completions");
-        let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            self.check_cancelled()?;
+        let out = self.ai_map_concurrent(rows.len(), spec.concurrency, |engine, i| {
+            let row = &rows[i];
             let user_text = if spec.prompt_template.is_empty() {
                 row.get(&spec.input_column)
                     .and_then(|v| v.as_str())
@@ -8543,25 +8679,22 @@ impl DuckdbEngine {
                 messages.push(serde_json::json!({"role": "system", "content": sys}));
             }
             messages.push(serde_json::json!({"role": "user", "content": user_text}));
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": spec.model,
                 "messages": messages,
                 "temperature": spec.temperature,
             });
-            let resp = Self::ai_post(&endpoint, &spec.headers, &spec.api_key)
-                .send_string(&body.to_string());
-            let response: JsonValue = match resp {
-                Ok(r) => r
-                    .into_json()
-                    .map_err(|e| EngineError::Query(format!("ai.llm parse: {}", e)))?,
-                Err(ureq::Error::Status(code, r)) => {
-                    let b = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!("ai.llm HTTP {}: {}", code, b)));
-                }
-                Err(e) => {
-                    return Err(EngineError::Query(format!("ai.llm transport: {}", e)))
-                }
-            };
+            // #258: the GUI has offered Max tokens since #142 while the request
+            // body never carried it, so every row was billed an unbounded reply.
+            if let Some(max) = spec.max_tokens {
+                body["max_tokens"] = serde_json::json!(max);
+            }
+            let response = engine.ai_send_with_retry(
+                &|| Self::ai_post(&endpoint, &spec.headers, &spec.api_key),
+                &body.to_string(),
+                "ai.llm",
+                spec.max_retries,
+            )?;
             let content = response
                 .pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str())
@@ -8572,8 +8705,8 @@ impl DuckdbEngine {
                 _ => serde_json::Map::new(),
             };
             obj.insert(spec.output_column.clone(), JsonValue::String(content));
-            out.push(JsonValue::Object(obj));
-        }
+            Ok(JsonValue::Object(obj))
+        })?;
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
         Ok(format!(
@@ -13365,6 +13498,25 @@ mod dhis2_summary_tests {
 mod connector_helper_tests {
     use super::{bson_flag_matches, jsonnative_quote_inner, python_temp_paths};
     use mongodb::bson::Bson;
+
+    #[test]
+    fn a_rate_limit_waits_as_long_as_the_provider_says() {
+        // #258. Retry-After is the provider stating when it will serve again;
+        // guessing shorter than that just earns another 429.
+        let w = crate::DuckdbEngine::ai_retry_wait_ms;
+        assert_eq!(w(Some("2"), 0), 2_000);
+        assert_eq!(w(Some(" 5 "), 3), 5_000, "surrounding space is not a parse failure");
+        // A silly Retry-After must not park a stage indefinitely.
+        assert_eq!(w(Some("99999"), 0), 300_000);
+        // With no header the wait doubles from 500ms, and is capped.
+        assert_eq!(w(None, 0), 500);
+        assert_eq!(w(None, 1), 1_000);
+        assert_eq!(w(None, 2), 2_000);
+        assert_eq!(w(None, 30), 30_000, "shifting by a large attempt must not overflow");
+        // An HTTP-date Retry-After is not a number: fall back to backoff
+        // rather than reading it as zero and hammering the provider.
+        assert_eq!(w(Some("Wed, 21 Oct 2026 07:28:00 GMT"), 1), 1_000);
+    }
 
     #[test]
     fn a_workspace_can_carry_its_own_python() {
