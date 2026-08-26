@@ -5430,7 +5430,7 @@ fn snk_snowflake_jwt_auth_signs_request() {
     //  - JWT payload claims have iss = "ACCOUNT.USER.SHA256:<fp>" and
     //    sub = "ACCOUNT.USER".
     use base64::Engine as _;
-    use rand::rngs::OsRng;
+    use rsa::rand_core::OsRng;
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
     use rsa::RsaPrivateKey;
     use std::io::{Read, Write};
@@ -5545,7 +5545,7 @@ fn snk_snowflake_jwt_uses_account_locator_for_privatelink() {
     // this isolates exactly what the account value controls: the JWT claims.
     // We capture the real request and decode the JWT actually sent on the wire.
     use base64::Engine as _;
-    use rand::rngs::OsRng;
+    use rsa::rand_core::OsRng;
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
     use rsa::RsaPrivateKey;
     use std::io::{Read, Write};

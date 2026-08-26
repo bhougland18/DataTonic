@@ -582,7 +582,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures",
- "prost 0.14.4",
+ "prost",
  "prost-types",
  "tonic",
  "tonic-prost",
@@ -601,7 +601,7 @@ dependencies = [
  "arrow-select 58.4.0",
  "flatbuffers",
  "lz4_flex 0.13.1",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -4390,7 +4390,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "zip",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -4431,9 +4431,8 @@ dependencies = [
  "oracle",
  "parquet 59.2.0",
  "pdf-extract",
- "prost 0.13.5",
+ "prost",
  "quick-xml 0.41.0",
- "rand 0.8.7",
  "redis",
  "regex",
  "rsa 0.9.10",
@@ -4540,7 +4539,7 @@ dependencies = [
  "duckle-duckdb-engine",
  "duckle-secrets",
  "ed25519-dalek 2.2.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "regex",
  "rusqlite",
  "serde",
@@ -4589,7 +4588,7 @@ dependencies = [
  "base64 0.23.1",
  "duckle-duckdb-engine",
  "duckle-metadata",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "serde_json",
  "tempfile",
 ]
@@ -7168,7 +7167,7 @@ dependencies = [
  "object_store",
  "permutation",
  "pin-project",
- "prost 0.14.4",
+ "prost",
  "prost-build",
  "prost-types",
  "rand 0.9.5",
@@ -7243,7 +7242,7 @@ dependencies = [
  "num_cpus",
  "object_store",
  "pin-project",
- "prost 0.14.4",
+ "prost",
  "rand 0.9.5",
  "roaring",
  "serde_json",
@@ -7282,7 +7281,7 @@ dependencies = [
  "lance-datagen",
  "log",
  "pin-project",
- "prost 0.14.4",
+ "prost",
  "prost-build",
  "tokio",
  "tracing",
@@ -7335,14 +7334,14 @@ dependencies = [
  "log",
  "lz4",
  "num-traits",
- "prost 0.14.4",
+ "prost",
  "prost-build",
  "rand 0.9.5",
  "strum 0.26.3",
  "tokio",
  "tracing",
  "xxhash-rust",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -7371,7 +7370,7 @@ dependencies = [
  "log",
  "num-traits",
  "object_store",
- "prost 0.14.4",
+ "prost",
  "prost-build",
  "prost-types",
  "tokio",
@@ -7426,7 +7425,7 @@ dependencies = [
  "ndarray",
  "num-traits",
  "object_store",
- "prost 0.14.4",
+ "prost",
  "prost-build",
  "prost-types",
  "rand 0.9.5",
@@ -7479,7 +7478,7 @@ dependencies = [
  "opendal",
  "path_abs",
  "pin-project",
- "prost 0.14.4",
+ "prost",
  "rand 0.9.5",
  "serde",
  "tempfile",
@@ -7594,7 +7593,7 @@ dependencies = [
  "lance-io",
  "log",
  "object_store",
- "prost 0.14.4",
+ "prost",
  "prost-build",
  "prost-types",
  "rand 0.9.5",
@@ -9995,7 +9994,7 @@ dependencies = [
  "snap",
  "thrift",
  "twox-hash",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -10026,7 +10025,7 @@ dependencies = [
  "simdutf8",
  "snap",
  "twox-hash",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -10537,9 +10536,9 @@ dependencies = [
 
 [[package]]
 name = "pollster"
-version = "0.4.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
 
 [[package]]
 name = "polonius-the-crab"
@@ -10791,22 +10790,12 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "prost"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
-dependencies = [
- "bytes",
- "prost-derive 0.13.5",
-]
-
-[[package]]
-name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
  "bytes",
- "prost-derive 0.14.4",
+ "prost-derive",
 ]
 
 [[package]]
@@ -10821,24 +10810,11 @@ dependencies = [
  "multimap",
  "petgraph",
  "prettyplease",
- "prost 0.14.4",
+ "prost",
  "prost-types",
  "regex",
  "syn 2.0.119",
  "tempfile",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
-dependencies = [
- "anyhow",
- "itertools 0.14.0",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -10860,7 +10836,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
- "prost 0.14.4",
+ "prost",
 ]
 
 [[package]]
@@ -11724,12 +11700,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "rskafka"
-version = "0.5.0"
+name = "rsasl"
+version = "2.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "132ecfa3cd9c3825208524a80881f115337762904ad3f0174e87975b2d79162c"
+checksum = "ed828a88913fd477c73bc3768b05d4b335ee775e29f2397bb59b9a4dd69ffb83"
 dependencies = [
- "async-trait",
+ "base64 0.22.1",
+ "digest 0.10.7",
+ "hmac 0.12.1",
+ "pbkdf2 0.12.2",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "stringprep",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rskafka"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "849b87417a191e37e16b8893eba8928bbd10e1989e6b57c4f8531549eaa29bdc"
+dependencies = [
  "bytes",
  "chrono",
  "crc32c",
@@ -11738,13 +11731,13 @@ dependencies = [
  "integer-encoding 4.1.0",
  "lz4",
  "parking_lot",
- "pin-project-lite",
  "rand 0.8.7",
+ "rsasl",
  "snap",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "zstd 0.12.4",
+ "zstd",
 ]
 
 [[package]]
@@ -14138,9 +14131,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
@@ -14347,7 +14340,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
- "prost 0.14.4",
+ "prost",
  "tonic",
 ]
 
@@ -14535,19 +14528,19 @@ dependencies = [
 
 [[package]]
 name = "tungstenite"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
 dependencies = [
  "bytes",
  "data-encoding",
  "http 1.5.0",
  "httparse",
  "log",
- "rand 0.9.5",
+ "rand 0.10.2",
  "rustls 0.23.43",
  "rustls-pki-types",
- "sha1 0.10.7",
+ "sha1 0.11.0",
  "thiserror 2.0.20",
 ]
 
@@ -14914,7 +14907,7 @@ checksum = "6f1c242a300d0bef65ebcbaaf0086ccff778ac45e62f0bdcefbfcea5b078c979"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
- "prost 0.14.4",
+ "prost",
  "rustc-hash 2.1.3",
  "vortex-array",
  "vortex-buffer",
@@ -14958,7 +14951,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "pin-project-lite",
- "prost 0.14.4",
+ "prost",
  "rand 0.10.2",
  "rustc-hash 2.1.3",
  "simdutf8",
@@ -15070,7 +15063,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bade3b947e68b638ad184e24b1367c3146e394e4dc837486444eb0bab7cf578"
 dependencies = [
  "num-traits",
- "prost 0.14.4",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -15085,7 +15078,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "196c22cb318d0cf2a67eb7cf9b93550eb394a0f4f56775c119abbc3fa5e9c4c2"
 dependencies = [
  "num-traits",
- "prost 0.14.4",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -15102,7 +15095,7 @@ dependencies = [
  "arrow-schema 58.4.0",
  "flatbuffers",
  "jiff",
- "prost 0.14.4",
+ "prost",
  "tokio",
 ]
 
@@ -15116,7 +15109,7 @@ dependencies = [
  "itertools 0.14.0",
  "lending-iterator",
  "num-traits",
- "prost 0.14.4",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -15186,7 +15179,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "570382994bd8bc21836550f04427a8d85f419f9e897c9ec042c1486ab34aa063"
 dependencies = [
  "fsst-rs",
- "prost 0.14.4",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -15263,7 +15256,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "pin-project-lite",
- "prost 0.14.4",
+ "prost",
  "rustc-hash 2.1.3",
  "sketches-ddsketch",
  "termtree",
@@ -15312,7 +15305,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8902b2df3068b37267c927cdec8905ea4e0e693d81274ba9713000929d1e514e"
 dependencies = [
  "pco",
- "prost 0.14.4",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -15326,7 +15319,7 @@ version = "0.75.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4f018abac72332c320ba3b8b59b6ce72f6c8a6caf0552b0b5c255f336b7f502"
 dependencies = [
- "prost 0.14.4",
+ "prost",
  "prost-types",
 ]
 
@@ -15339,7 +15332,7 @@ dependencies = [
  "arrow-array 58.4.0",
  "itertools 0.14.0",
  "num-traits",
- "prost 0.14.4",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -15371,7 +15364,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "933091989818d88836430fb68ca0b3ef9e054bf2740f94051377231cc287d427"
 dependencies = [
  "num-traits",
- "prost 0.14.4",
+ "prost",
  "smallvec",
  "vortex-array",
  "vortex-buffer",
@@ -15402,7 +15395,7 @@ checksum = "fe0d321f522d325a811bfc6506b320db12f57bd7710d558520d75dd7313b9dd1"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
- "prost 0.14.4",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -15442,13 +15435,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8dc464ba75cff8510a7f31e8c5aa7ca4f3ce34d15e87e80a91880d3afa7458df"
 dependencies = [
  "itertools 0.14.0",
- "prost 0.14.4",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
  "vortex-mask",
  "vortex-session",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -17147,7 +17140,7 @@ dependencies = [
  "xz2",
  "zeroize",
  "zopfli",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -17176,30 +17169,11 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a27595e173641171fc74a1232b7b1c7a7cb6e18222c11e9dfb9888fa424c53c"
-dependencies = [
- "zstd-safe 6.0.6",
-]
-
-[[package]]
-name = "zstd"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
- "zstd-safe 7.2.1",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "6.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee98ffd0b48ee95e6c5168188e44a54550b1564d9d530ee21d5f0eaed1069581"
-dependencies = [
- "libc",
- "zstd-sys",
+ "zstd-safe",
 ]
 
 [[package]]
