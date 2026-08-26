@@ -38,7 +38,7 @@ rustls-pemfile = "2"
 # derives the public-key fingerprint, and signs the standard
 # Snowflake claims (iss / sub / iat / exp). PAT bearer auth is also
 # supported and doesn't pull these in.
-jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.11"
 # HMAC-SHA256 for AWS SigV4 signing in src.dynamodb (and any future
@@ -83,7 +83,7 @@ odbc-sys = { version = "0.31", optional = true }
 # Redis sync client. Tokio-async is optional and off; we use the blocking
 # Connection / Pipeline API to fit the per-stage CLI shell-out model.
 # Small dep (~300kb).
-redis = { version = "0.27", default-features = false }
+redis = { version = "1.6", default-features = false }
 # YAML and TOML format readers/writers. Small pure-Rust deps. Used by
 # src.yaml / snk.yaml / src.toml / snk.toml - we parse to serde_json::Value
 # then either materialize as a DuckDB JSON table or write the JSON back
@@ -125,7 +125,7 @@ flate2 = "1"
 # leading/trailing whitespace from those cells on load. We reopen the written
 # .xlsx (which is a zip), add the attribute, and repack (#141). Deflate only -
 # no need for the bzip2 / zstd / aes backends.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # RabbitMQ / AMQP 0.9.1 client. Pure Rust, async. Same block_on
 # pattern as Kafka/NATS. Publishes to an exchange + routing key;
 # pulls from a queue with a per-message timeout for batch ETL.
@@ -133,7 +133,7 @@ lapin = { version = "2", default-features = false, features = ["rustls"] }
 # FTP / FTPS client. Pure Rust, synchronous API (fits the per-stage
 # blocking model - no block_on dance). Rustls-backed TLS keeps the
 # build self-contained on every OS.
-suppaftp = { version = "8", default-features = false, features = ["rustls-ring"] }
+suppaftp = { version = "10", default-features = false, features = ["rustls-ring"] }
 # SFTP (SSH-based) source, src.sftp. russh + russh-sftp on the `ring`
 # crypto backend (default-features=false drops aws-lc-rs, so NO NASM and
 # NO C toolchain - the same ring 0.17 stack the rest of our TLS already
@@ -179,7 +179,7 @@ glob = "0.3"
 # accompanying mail-parser decodes RFC 822 envelopes + MIME bodies.
 imap = { version = "=3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 mail-parser = "0.11"
-rustls-connector = { version = "0.21", default-features = false, features = ["rustls--ring"] }
+rustls-connector = { version = "0.23", default-features = false, features = ["rustls--ring"] }
 # SMTP client for snk.email. Pure Rust with rustls-tls. Symmetric
 # to src.email (the IMAP reader). Builder + smtp-transport features;
 # default native-tls disabled so we don't drag OpenSSL on Linux.
