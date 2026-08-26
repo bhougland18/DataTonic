@@ -714,6 +714,26 @@ mod tests {
     /// Secrets written before the binding must keep opening, or upgrading Duckle
     /// would lock people out of their own connections.
     #[test]
+    fn a_secret_encrypted_by_an_older_build_still_decrypts() {
+        // The round-trip test below encrypts and decrypts with the SAME library,
+        // so it pins the blob layout but cannot notice if the cipher's own output
+        // ever changed - which is exactly what a crypto dependency bump risks,
+        // and it would silently strand every secret already on disk.
+        //
+        // This blob is therefore a fixed known answer, produced OUTSIDE this
+        // codebase (Python's cryptography / OpenSSL) for key = 32 bytes of 0x09,
+        // nonce = 12 bytes of 0x03, plaintext "legacy", no AAD. If a future
+        // aes-gcm release changes anything observable, this stops decrypting.
+        let key = [9u8; 32];
+        let blob = format!("{}{}", ENC_PREFIX, "AwMDAwMDAwMDAwMDvfGMEzbF51+cyZ2Z34DTOdLhyPAUOw==");
+        assert_eq!(
+            decrypt_value(&key, &aad_for("anything", "at-all"), &blob).unwrap(),
+            "legacy",
+            "a secret written by an older build no longer decrypts"
+        );
+    }
+
+    #[test]
     fn a_v1_value_still_decrypts() {
         use aes_gcm::aead::Aead;
         let key = [9u8; 32];
