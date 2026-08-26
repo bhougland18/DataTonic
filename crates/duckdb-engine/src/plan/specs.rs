@@ -1481,6 +1481,22 @@ pub enum RestResponseFormat {
 #[derive(Debug, Clone)]
 pub struct RestSourceSpec {
     pub node_id: String,
+    /// #257: the upstream relation whose rows each drive one request. None is
+    /// exactly one endpoint, which is every pipeline that existed before.
+    pub from_view: Option<String>,
+    /// #257: a URL carrying `{column}` placeholders resolved from each upstream
+    /// row, so a parent endpoint can feed a child endpoint
+    /// (`/companies` then `/companies/{id}/officers`). The same `{column}`
+    /// syntax xf.ai.llm prompts use, deliberately not `${...}`, which belongs
+    /// to run variables and workspace context and is resolved before this.
+    pub url_template: Option<String>,
+    /// #257: an upstream column stamped onto every row the child returns, so
+    /// child rows can be joined back to the parent that produced them.
+    pub parent_key_column: Option<String>,
+    /// #257: cap on how many upstream rows may each fire a request, so a
+    /// careless upstream cannot turn into an unbounded request storm. Only
+    /// applies when fanning out.
+    pub max_requests: u64,
     pub url: String,
     pub method: String,
     pub headers: Vec<(String, String)>,

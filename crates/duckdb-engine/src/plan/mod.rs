@@ -4346,6 +4346,10 @@ fn build_stage(
             pagination: RestPagination::None,
             max_pages: 1,
             oauth: None,
+            from_view: None,
+            url_template: None,
+            parent_key_column: None,
+            max_requests: 0,
             declared_schema: node.data.schema.clone(),
         });
         (String::new(), StageKind::View, None)
@@ -4393,9 +4397,15 @@ fn build_stage(
         // src.soap: defaults to POST + Content-Type text/xml + XML
         // response parsing (responsePath walks element names from the
         // SOAP envelope root, e.g. Envelope/Body/Foo/Bar).
+        // #257: a child endpoint is described by a URL template instead of a
+        // fixed URL, so the template stands in when `url` is not set. When both
+        // are given the template wins, because it is the more specific answer.
+        let rest_url_template =
+            string_prop(&props, "urlTemplate").filter(|s| !s.trim().is_empty());
         let url = string_prop(&props, "url")
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| EngineError::Config(format!("{}: url required", component_id)))?;
+            .or_else(|| rest_url_template.clone())
+            .ok_or_else(|| EngineError::Config(format!("{}: url or urlTemplate required", component_id)))?;
         // SAP native aliases. src.sap = SAP OData (v2 classic Gateway or v4
         // RAP); this covers OData services and CDS views published as OData.
         // src.sap.rfc = an RFC-enabled function module exposed over SOAP
@@ -4570,6 +4580,13 @@ fn build_stage(
             .and_then(|v| v.as_u64())
             .filter(|n| *n > 0)
             .unwrap_or(100);
+        // #257: only fan out when the user actually asked for it - a URL
+        // template AND an upstream to draw rows from.
+        let rest_from_view = if rest_url_template.is_some() {
+            inputs.main().map(|v| v.to_string())
+        } else {
+            None
+        };
         rest_source = Some(RestSourceSpec {
             node_id: node.id.clone(),
             response_metadata: props
@@ -4586,6 +4603,17 @@ fn build_stage(
             max_pages,
             oauth,
             declared_schema: node.data.schema.clone(),
+            // #257: a URL template plus a main input turns this one node into a
+            // request per upstream row. Both absent = unchanged behaviour, which
+            // is what every existing pipeline and vendor alias relies on.
+            from_view: rest_from_view,
+            url_template: rest_url_template,
+            parent_key_column: string_prop(&props, "parentKeyColumn").filter(|s| !s.is_empty()),
+            max_requests: props
+                .get("maxRequests")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1000),
         });
         (String::new(), StageKind::View, None)
     } else if component_id == "src.snowflake" {

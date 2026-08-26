@@ -10567,24 +10567,8 @@ impl DuckdbEngine {
         db: &Path,
         spec: &RestSourceSpec,
     ) -> Result<String, EngineError> {
-        let mut url = spec.url.clone();
         let mut all_rows: Vec<JsonValue> = Vec::new();
         let mut pages = 0_u64;
-        let mut truncated = false;
-        // Mutable state for offset / page strategies; cursor uses
-        // per-response extraction inside the loop.
-        let mut offset = 0_u64;
-        let mut page_no = match &spec.pagination {
-            RestPagination::Page { start_page, .. } => *start_page,
-            _ => 1,
-        };
-        // Seed the FIRST request with the start page; the loop only appends the
-        // page param on subsequent requests, so without this the first call hit
-        // the server's default page and a non-default start_page was skipped.
-        if let RestPagination::Page { page_param, start_page } = &spec.pagination {
-            let sep = if url.contains('?') { '&' } else { '?' };
-            url = format!("{}{}{}={}", url, sep, page_param, start_page);
-        }
         // One Agent for the whole pagination walk so keep-alive connections
         // are reused across pages instead of a fresh TCP+TLS handshake each
         // request (ureq::request uses a throwaway agent per call).
@@ -10599,218 +10583,282 @@ impl DuckdbEngine {
             eff_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
             eff_headers.push(("Authorization".into(), format!("Bearer {}", token)));
         }
-        loop {
+        // #257: a parent endpoint can feed a child endpoint. Without a URL
+        // template there is one pass and no substitution, exactly what this
+        // function did before, so every existing pipeline and all the vendor
+        // aliases are untouched. The agent, the once-per-run OAuth token, the
+        // headers, the row extraction and all five pagination strategies below
+        // are shared across the fan-out rather than redone per request.
+        let parents: Vec<JsonValue> = match (&spec.from_view, &spec.url_template) {
+            (Some(view), Some(_)) => self.run_rows(
+                Some(db),
+                &format!("SELECT * FROM {};", quote_ident(view)),
+            )?,
+            _ => vec![JsonValue::Null],
+        };
+        if spec.url_template.is_some() && parents.len() as u64 > spec.max_requests {
+            return Err(EngineError::Query(format!(
+                "rest: {} upstream rows would each make a request, past the cap of {}. Filter the upstream, or raise Max requests.",
+                parents.len(),
+                spec.max_requests
+            )));
+        }
+        for parent in &parents {
             self.check_cancelled()?;
-            // Build request
-            let mut req = agent.request(&spec.method, &url);
-            let has_ct = eff_headers
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
-            for (k, v) in &eff_headers {
-                req = req.set(k, v);
+            let mut url = match &spec.url_template {
+                Some(t) => render_url_template(t, parent)?,
+                None => spec.url.clone(),
+            };
+            let mut truncated = false;
+            // Mutable state for offset / page strategies; cursor uses
+            // per-response extraction inside the loop. Reset per parent row:
+            // each child endpoint paginates from its own beginning.
+            let mut offset = 0_u64;
+            let mut page_no = match &spec.pagination {
+                RestPagination::Page { start_page, .. } => *start_page,
+                _ => 1,
+            };
+            let mut parent_pages = 0_u64;
+            // Seed the FIRST request with the start page; the loop only appends the
+            // page param on subsequent requests, so without this the first call hit
+            // the server's default page and a non-default start_page was skipped.
+            if let RestPagination::Page { page_param, start_page } = &spec.pagination {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                url = format!("{}{}{}={}", url, sep, page_param, start_page);
             }
-            if spec.body.is_some() && !has_ct {
-                req = req.set("content-type", "application/json");
-            }
-            let resp_result = match &spec.body {
-                Some(b) => req.send_string(b),
-                None => req.call(),
-            };
-            let response_raw = match resp_result {
-                Ok(r) => r,
-                Err(ureq::Error::Status(code, r)) => {
-                    let body = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!(
-                        "REST HTTP {} from {}: {}",
-                        code,
-                        url,
-                        body.chars().take(300).collect::<String>()
-                    )));
+            loop {
+                self.check_cancelled()?;
+                // Build request
+                let mut req = agent.request(&spec.method, &url);
+                let has_ct = eff_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+                for (k, v) in &eff_headers {
+                    req = req.set(k, v);
                 }
-                Err(e) => {
-                    return Err(EngineError::Query(format!(
-                        "REST HTTP transport to {}: {}",
-                        url, e
-                    )));
+                if spec.body.is_some() && !has_ct {
+                    req = req.set("content-type", "application/json");
                 }
-            };
-            // Capture Link header before consuming the response body.
-            let link_header = response_raw.header("link").map(String::from);
-            // The same, for provenance: once the body is read the response is gone, so
-            // what answered and with what has to be taken here or not at all.
-            let page_status = response_raw.status();
-            let page_url = url.clone();
-            // For XML, parse as text + walk row_path; pagination is
-            // not meaningful (SOAP has no cross-envelope convention)
-            // so we treat the JSON-pointer/cursor variants as no-ops
-            // by returning a Null response from this branch.
-            let (rows, response): (Vec<JsonValue>, JsonValue) = match spec.response_format {
-                RestResponseFormat::Json => {
-                    let response: JsonValue = response_raw.into_json().map_err(|e| {
-                        EngineError::Query(format!("REST response not JSON: {}", e))
-                    })?;
-                    // Locate the rows: the whole response when no responsePath
-                    // is set, else the JSON pointer target. A located ARRAY is
-                    // the row set; a single OBJECT is one row (issue #13: APIs
-                    // like open-meteo return one JSON object, which previously
-                    // yielded zero rows + an empty file with no error). Scalars
-                    // / null / missing pointer are genuinely empty.
-                    let rows = {
-                        let located = if spec.response_path.is_empty() {
-                            Some(&response)
-                        } else {
-                            response.pointer(&spec.response_path)
-                        };
-                        match located {
-                            Some(JsonValue::Array(a)) => a.clone(),
-                            // An empty object means "no data" (like []), not a
-                            // single empty row.
-                            Some(JsonValue::Object(o)) if o.is_empty() => Vec::new(),
-                            Some(v @ JsonValue::Object(_)) => vec![v.clone()],
-                            _ => Vec::new(),
-                        }
-                    };
-                    (rows, response)
-                }
-                RestResponseFormat::Xml => {
-                    let body = response_raw.into_string().map_err(|e| {
-                        EngineError::Query(format!("REST XML response read: {}", e))
-                    })?;
-                    let rows = walk_xml_to_rows(&body, &spec.response_path, &self.cancel)?;
-                    (rows, JsonValue::Null)
-                }
-            };
-            let row_count = rows.len();
-            // Stamp each row with where it came from. Underscore-prefixed, matching the
-            // audit stamp the rest of the tool writes, and only on a row that is an
-            // object - a scalar row has nowhere to put it.
-            let rows = match spec.response_metadata {
-                false => rows,
-                true => {
-                    let at = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    rows.into_iter()
-                        .map(|mut r| {
-                            if let Some(o) = r.as_object_mut() {
-                                o.insert("_http_url".into(), JsonValue::from(page_url.clone()));
-                                o.insert("_http_status".into(), JsonValue::from(page_status));
-                                o.insert("_fetched_at".into(), JsonValue::from(at));
-                            }
-                            r
-                        })
-                        .collect()
-                }
-            };
-            all_rows.extend(rows);
-            pages += 1;
-            // Determine whether another page exists (and set up the next
-            // request URL as a side effect). Done BEFORE the page-cap
-            // check so we can tell "genuinely exhausted" (advanced=false)
-            // from "stopped at the cap with more to fetch" (advanced=true
-            // while pages >= max_pages).
-            let advanced = match &spec.pagination {
-                RestPagination::None => false,
-                RestPagination::Cursor { next_path, param } => {
-                    let next = response
-                        .pointer(next_path)
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(String::from);
-                    match next {
-                        Some(token) => {
-                            let sep = if spec.url.contains('?') { '&' } else { '?' };
-                            url = format!(
-                                "{}{}{}={}",
-                                spec.url,
-                                sep,
-                                param,
-                                urlencode_simple(&token)
-                            );
-                            true
-                        }
-                        None => false,
+                let resp_result = match &spec.body {
+                    Some(b) => req.send_string(b),
+                    None => req.call(),
+                };
+                let response_raw = match resp_result {
+                    Ok(r) => r,
+                    Err(ureq::Error::Status(code, r)) => {
+                        let body = r.into_string().unwrap_or_default();
+                        return Err(EngineError::Query(format!(
+                            "REST HTTP {} from {}: {}",
+                            code,
+                            url,
+                            body.chars().take(300).collect::<String>()
+                        )));
                     }
-                }
-                RestPagination::Offset { offset_param, page_size, total_path } => {
-                    // A short page means we have reached the end.
-                    if (row_count as u64) < *page_size {
-                        false
-                    } else {
-                        let next_offset = offset.saturating_add(*page_size);
-                        // Body-driven stop (issue #41): an API that reports a
-                        // total row count (e.g. Redmine `total_count`) returns
-                        // HTTP 200 + an empty array past the end, so the status
-                        // code cannot signal the end. Stop once the next offset
-                        // would be at or past the total.
-                        let reached_total = total_path
-                            .as_deref()
-                            .and_then(|p| response.pointer(p))
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    Err(e) => {
+                        return Err(EngineError::Query(format!(
+                            "REST HTTP transport to {}: {}",
+                            url, e
+                        )));
+                    }
+                };
+                // Capture Link header before consuming the response body.
+                let link_header = response_raw.header("link").map(String::from);
+                // The same, for provenance: once the body is read the response is gone, so
+                // what answered and with what has to be taken here or not at all.
+                let page_status = response_raw.status();
+                let page_url = url.clone();
+                // For XML, parse as text + walk row_path; pagination is
+                // not meaningful (SOAP has no cross-envelope convention)
+                // so we treat the JSON-pointer/cursor variants as no-ops
+                // by returning a Null response from this branch.
+                let (rows, response): (Vec<JsonValue>, JsonValue) = match spec.response_format {
+                    RestResponseFormat::Json => {
+                        let response: JsonValue = response_raw.into_json().map_err(|e| {
+                            EngineError::Query(format!("REST response not JSON: {}", e))
+                        })?;
+                        // Locate the rows: the whole response when no responsePath
+                        // is set, else the JSON pointer target. A located ARRAY is
+                        // the row set; a single OBJECT is one row (issue #13: APIs
+                        // like open-meteo return one JSON object, which previously
+                        // yielded zero rows + an empty file with no error). Scalars
+                        // / null / missing pointer are genuinely empty.
+                        let rows = {
+                            let located = if spec.response_path.is_empty() {
+                                Some(&response)
+                            } else {
+                                response.pointer(&spec.response_path)
+                            };
+                            match located {
+                                Some(JsonValue::Array(a)) => a.clone(),
+                                // An empty object means "no data" (like []), not a
+                                // single empty row.
+                                Some(JsonValue::Object(o)) if o.is_empty() => Vec::new(),
+                                Some(v @ JsonValue::Object(_)) => vec![v.clone()],
+                                _ => Vec::new(),
+                            }
+                        };
+                        (rows, response)
+                    }
+                    RestResponseFormat::Xml => {
+                        let body = response_raw.into_string().map_err(|e| {
+                            EngineError::Query(format!("REST XML response read: {}", e))
+                        })?;
+                        let rows = walk_xml_to_rows(&body, &spec.response_path, &self.cancel)?;
+                        (rows, JsonValue::Null)
+                    }
+                };
+                let row_count = rows.len();
+                // Stamp each row with where it came from. Underscore-prefixed, matching the
+                // audit stamp the rest of the tool writes, and only on a row that is an
+                // object - a scalar row has nowhere to put it.
+                let rows = match spec.response_metadata {
+                    false => rows,
+                    true => {
+                        let at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        rows.into_iter()
+                            .map(|mut r| {
+                                if let Some(o) = r.as_object_mut() {
+                                    o.insert("_http_url".into(), JsonValue::from(page_url.clone()));
+                                    o.insert("_http_status".into(), JsonValue::from(page_status));
+                                    o.insert("_fetched_at".into(), JsonValue::from(at));
+                                }
+                                r
                             })
-                            .map(|total| next_offset >= total)
-                            .unwrap_or(false);
-                        if reached_total {
+                            .collect()
+                    }
+                };
+                // #257: stamp the parent's key onto every row the child returned,
+                // so child rows can be joined back to the parent that produced them.
+                // The child rarely carries it: /companies/42/officers returns
+                // officers, with nothing in them saying 42.
+                let rows = match (&spec.parent_key_column, parent) {
+                    (Some(col), JsonValue::Object(pm)) => {
+                        let v = pm.get(col).cloned().unwrap_or(JsonValue::Null);
+                        rows.into_iter()
+                            .map(|r| match r {
+                                JsonValue::Object(mut m) => {
+                                    m.insert(col.clone(), v.clone());
+                                    JsonValue::Object(m)
+                                }
+                                other => other,
+                            })
+                            .collect()
+                    }
+                    _ => rows,
+                };
+                all_rows.extend(rows);
+                pages += 1;
+                parent_pages += 1;
+                // Determine whether another page exists (and set up the next
+                // request URL as a side effect). Done BEFORE the page-cap
+                // check so we can tell "genuinely exhausted" (advanced=false)
+                // from "stopped at the cap with more to fetch" (advanced=true
+                // while pages >= max_pages).
+                let advanced = match &spec.pagination {
+                    RestPagination::None => false,
+                    RestPagination::Cursor { next_path, param } => {
+                        let next = response
+                            .pointer(next_path)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                        match next {
+                            Some(token) => {
+                                let sep = if spec.url.contains('?') { '&' } else { '?' };
+                                url = format!(
+                                    "{}{}{}={}",
+                                    spec.url,
+                                    sep,
+                                    param,
+                                    urlencode_simple(&token)
+                                );
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    RestPagination::Offset { offset_param, page_size, total_path } => {
+                        // A short page means we have reached the end.
+                        if (row_count as u64) < *page_size {
                             false
                         } else {
-                            offset = next_offset;
+                            let next_offset = offset.saturating_add(*page_size);
+                            // Body-driven stop (issue #41): an API that reports a
+                            // total row count (e.g. Redmine `total_count`) returns
+                            // HTTP 200 + an empty array past the end, so the status
+                            // code cannot signal the end. Stop once the next offset
+                            // would be at or past the total.
+                            let reached_total = total_path
+                                .as_deref()
+                                .and_then(|p| response.pointer(p))
+                                .and_then(|v| {
+                                    v.as_u64()
+                                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                                })
+                                .map(|total| next_offset >= total)
+                                .unwrap_or(false);
+                            if reached_total {
+                                false
+                            } else {
+                                offset = next_offset;
+                                let sep = if spec.url.contains('?') { '&' } else { '?' };
+                                url = format!("{}{}{}={}", spec.url, sep, offset_param, offset);
+                                true
+                            }
+                        }
+                    }
+                    RestPagination::Page { page_param, .. } => {
+                        if row_count == 0 {
+                            false
+                        } else {
+                            page_no = page_no.saturating_add(1);
                             let sep = if spec.url.contains('?') { '&' } else { '?' };
-                            url = format!("{}{}{}={}", spec.url, sep, offset_param, offset);
+                            url = format!("{}{}{}={}", spec.url, sep, page_param, page_no);
                             true
                         }
                     }
-                }
-                RestPagination::Page { page_param, .. } => {
-                    if row_count == 0 {
-                        false
-                    } else {
-                        page_no = page_no.saturating_add(1);
-                        let sep = if spec.url.contains('?') { '&' } else { '?' };
-                        url = format!("{}{}{}={}", spec.url, sep, page_param, page_no);
-                        true
-                    }
-                }
-                RestPagination::Link => {
-                    match link_header.as_deref().and_then(parse_link_next) {
-                        Some(next_url) => {
-                            url = next_url;
-                            true
+                    RestPagination::Link => {
+                        match link_header.as_deref().and_then(parse_link_next) {
+                            Some(next_url) => {
+                                url = next_url;
+                                true
+                            }
+                            None => false,
                         }
-                        None => false,
                     }
-                }
-                RestPagination::NextUrl { next_path } => {
-                    let next = response
-                        .pointer(next_path)
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(String::from);
-                    match next {
-                        Some(next_url) => {
-                            url = next_url;
-                            true
+                    RestPagination::NextUrl { next_path } => {
+                        let next = response
+                            .pointer(next_path)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                        match next {
+                            Some(next_url) => {
+                                url = next_url;
+                                true
+                            }
+                            None => false,
                         }
-                        None => false,
                     }
+                };
+                if !advanced {
+                    break;
                 }
-            };
-            if !advanced {
-                break;
+                if parent_pages >= spec.max_pages {
+                    truncated = true;
+                    break;
+                }
             }
-            if pages >= spec.max_pages {
-                truncated = true;
-                break;
+            if truncated {
+                return Err(pagination_capped_err(
+                    "rest",
+                    all_rows.len(),
+                    spec.max_pages,
+                ));
             }
-        }
-        if truncated {
-            return Err(pagination_capped_err(
-                "rest",
-                all_rows.len(),
-                spec.max_pages,
-            ));
         }
         materialize_jsonobjects_as_table_typed(
             &self.bin,
@@ -13500,6 +13548,40 @@ mod connector_helper_tests {
     use mongodb::bson::Bson;
 
     #[test]
+    fn a_url_template_names_a_column_or_fails_loudly() {
+        // #257. A template naming a column the upstream does not have must fail
+        // loudly. Blanking it the way a prompt template does would silently
+        // request /companies//officers and the run would look like it worked.
+        let row = serde_json::json!({ "id": 7, "name": "Acme" });
+        assert_eq!(
+            super::render_url_template("/c/{id}/o", &row).unwrap(),
+            "/c/7/o"
+        );
+        // Values are percent-encoded, so an id carrying a slash or a space
+        // cannot change the shape of the request.
+        let odd = serde_json::json!({ "id": "a b/c?d" });
+        assert_eq!(
+            super::render_url_template("/c/{id}", &odd).unwrap(),
+            "/c/a%20b%2Fc%3Fd"
+        );
+        let err = super::render_url_template("/c/{nope}/o", &row)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "got: {}", err);
+        assert!(
+            err.contains("id"),
+            "the error should list the columns that ARE available: {}",
+            err
+        );
+        // An unclosed brace stays literal, so the user sees it rather than
+        // losing the tail of the URL.
+        assert_eq!(
+            super::render_url_template("/c/{id", &row).unwrap(),
+            "/c/{id"
+        );
+    }
+
+    #[test]
     fn a_rate_limit_waits_as_long_as_the_provider_says() {
         // #258. Retry-After is the provider stating when it will serve again;
         // guessing shorter than that just earns another 429.
@@ -15064,4 +15146,77 @@ mod incremental_state_tests {
         std::env::remove_var("DUCKLE_WORKSPACE");
         let _ = std::fs::remove_dir_all(&ws);
     }
+}
+
+/// #257: resolve `{column}` placeholders in a child endpoint's URL from one
+/// parent row.
+///
+/// Deliberately `{column}` and not `${column}`: `${...}` is already run
+/// variables and workspace context, and is substituted before a builder ever
+/// sees the property. This is the same syntax an xf.ai.llm prompt uses.
+///
+/// A name that is not a column of the parent row is an error rather than an
+/// empty string. render_prompt_template blanks a missing column, which is right
+/// for prose and wrong for a URL: it would silently request
+/// `/companies//officers` and the run would look like it worked.
+pub(crate) fn render_url_template(
+    template: &str,
+    row: &JsonValue,
+) -> Result<String, EngineError> {
+    let obj = match row {
+        JsonValue::Object(m) => m,
+        _ => {
+            return Err(EngineError::Query(
+                "rest: a URL template needs an upstream row to resolve it".into(),
+            ))
+        }
+    };
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = match after.find('}') {
+            // An unclosed brace stays literal, so the user sees it in the URL
+            // rather than losing the tail of their template.
+            None => {
+                out.push_str(&rest[open..]);
+                return Ok(out);
+            }
+            Some(c) => c,
+        };
+        let name = &after[..close];
+        let value = obj.get(name).ok_or_else(|| {
+            EngineError::Query(format!(
+                "rest: URL template refers to {{{}}}, which is not a column of the upstream row (have: {})",
+                name,
+                obj.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+        })?;
+        let text = match value {
+            JsonValue::String(s) => s.clone(),
+            JsonValue::Null => String::new(),
+            other => other.to_string(),
+        };
+        out.push_str(&percent_encode_path(&text));
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Percent-encode a value being spliced into a URL. Unreserved characters pass
+/// through; everything else is escaped, so an id containing a space, a slash or
+/// a question mark cannot change the shape of the request.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }

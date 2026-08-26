@@ -14533,3 +14533,124 @@ fn qa_block_keeps_a_pair_once_when_several_rules_catch_it() {
         "also_postcode"
     );
 }
+
+/// #257: a parent endpoint feeding a child endpoint, which is what most real
+/// APIs look like: GET /companies, then GET /companies/{id}/officers.
+///
+/// Asserts on the CAPTURED REQUEST LINES, not just the row count, because the
+/// row count alone cannot tell you the parent's value ever reached the URL.
+#[test]
+fn src_rest_fans_a_child_endpoint_out_over_parent_rows() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sv = seen.clone();
+    listener.set_nonblocking(true).ok();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        // 1 parent request + 2 child requests.
+        let mut served = 0usize;
+        while served < 3 && std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).ok();
+            served += 1;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..32 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
+            let line = req.lines().next().unwrap_or("").to_string();
+            sv.lock().unwrap().push(line.clone());
+            let body = if line.contains("/companies/1/officers") {
+                r#"[{"officer":"ada"},{"officer":"grace"}]"#.to_string()
+            } else if line.contains("/companies/2/officers") {
+                r#"[{"officer":"linus"}]"#.to_string()
+            } else {
+                r#"[{"id":1,"name":"Acme"},{"id":2,"name":"Globex"}]"#.to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "officers.csv");
+    let base = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("companies", "src.rest", json!({ "url": format!("{}/companies", base) })),
+            node("officers", "src.rest", json!({
+                "urlTemplate": format!("{}/companies/{{id}}/officers", base),
+                "parentKeyColumn": "id",
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "companies", "officers"),
+            main_edge("e2", "officers", "k"),
+        ]),
+    ));
+    let _ = handle.join();
+    assert_eq!(r.status, "ok", "REST fan-out failed: {:?}", r.error);
+
+    // One request per parent row, with the parent's value actually in the path.
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 3, "expected 1 parent + 2 child requests, got: {:?}", reqs);
+    assert!(reqs[0].contains("GET /companies "), "got: {}", reqs[0]);
+    assert!(
+        reqs.iter().any(|l| l.contains("/companies/1/officers")),
+        "the parent's id never reached the child URL: {:?}",
+        reqs
+    );
+    assert!(
+        reqs.iter().any(|l| l.contains("/companies/2/officers")),
+        "only one parent row fanned out: {:?}",
+        reqs
+    );
+
+    // Every child row from both parents, unioned into one relation.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3);
+    // And each child row carries the parent key, so it can be joined back.
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT string_agg(officer, ',' ORDER BY officer) FROM read_csv_auto('{}') WHERE id = 1",
+            out
+        )),
+        "ada,grace"
+    );
+    assert_eq!(
+        scalar_string(&format!(
+            "SELECT officer FROM read_csv_auto('{}') WHERE id = 2",
+            out
+        )),
+        "linus"
+    );
+}

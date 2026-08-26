@@ -796,6 +796,15 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
         };
     }
 
+    // #257: src.rest can take an OPTIONAL main input. Wire a parent endpoint's
+    // rows into it and the node makes one request per row from its URL
+    // template; leave it unconnected and it is the ordinary source it has
+    // always been. Only the generic component gets the port - the vendor
+    // aliases keep their plain source shape.
+    if (id === 'src.rest') {
+        return { inputs: [MAIN_IN], outputs: [MAIN_OUT, REJECT_OUT] };
+    }
+
     // Sources: outputs only
     if (comp.kind === 'source') {
         return {
@@ -3041,6 +3050,27 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                     label: 'Max pages (safety cap)',
                     kind: 'integer',
                     defaultValue: 100,
+                },
+                {
+                    key: 'urlTemplate',
+                    label: 'URL per upstream row',
+                    kind: 'text',
+                    placeholder: 'https://api.example.com/companies/{id}/officers',
+                    description: 'Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path.',
+                },
+                {
+                    key: 'parentKeyColumn',
+                    label: 'Carry upstream column',
+                    kind: 'text',
+                    placeholder: 'id',
+                    description: 'Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42.',
+                },
+                {
+                    key: 'maxRequests',
+                    label: 'Max requests (safety cap)',
+                    kind: 'integer',
+                    defaultValue: 1000,
+                    description: 'How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm.',
                 },
                     { key: 'responseMetadata', label: 'Add response metadata', kind: 'bool', defaultValue: false, description: 'Stamp every row with where it came from: _http_url (the exact URL fetched, per page), _http_status and _fetched_at. Parsed rows alone cannot tell you whether something changed because the source changed or because the parser did.' },
             ],
