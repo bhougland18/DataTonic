@@ -8833,7 +8833,7 @@ fn src_avro_reads_container_file_records() {
     let schema = Schema::parse_str(schema_json).expect("schema parse");
     let file = std::fs::File::create(&avro_path).expect("create avro file");
     {
-        let mut writer = Writer::new(&schema, file);
+        let mut writer = Writer::new(&schema, file).expect("open avro writer");
         for (id, name, active) in [(1i64, "alice", true), (2, "bob", false), (3, "carol", true)] {
             let mut rec = Record::new(&schema).unwrap();
             rec.put("id", id);

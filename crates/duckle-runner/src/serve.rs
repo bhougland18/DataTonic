@@ -3114,7 +3114,8 @@ impl axum::response::IntoResponse for Reply {
 /// there is no longer a call site at which to forget to consult it.
 pub struct Caller(pub console_auth::Identity);
 
-#[axum::async_trait]
+// axum 0.8 dropped its async_trait re-export: the trait now uses a native
+// async fn, so the attribute is not only unnecessary but absent.
 impl axum::extract::FromRequestParts<Arc<State>> for Caller {
     type Rejection = axum::response::Response;
 

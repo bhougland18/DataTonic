@@ -6325,7 +6325,11 @@ impl DuckdbEngine {
         };
         let file = std::fs::File::create(&spec.path)
             .map_err(|e| EngineError::Query(format!("avro: create {}: {}", spec.path, e)))?;
-        let mut writer = apache_avro::Writer::new(&schema, file);
+        // apache-avro 0.22 returns a Result here: building a writer can fail on a
+        // schema it cannot encode against, which used to surface later as a
+        // confusing append error instead of at the point of the mistake.
+        let mut writer = apache_avro::Writer::new(&schema, file)
+            .map_err(|e| EngineError::Query(format!("avro: open writer: {}", e)))?;
         let mut total = 0_usize;
         for row in &rows {
             self.check_cancelled()?;
@@ -6410,8 +6414,10 @@ impl DuckdbEngine {
                     let payload = serde_json::to_vec(row).unwrap_or_default();
                     let confirm = channel
                         .basic_publish(
-                            &spec.exchange,
-                            &spec.routing_key,
+                            // lapin 4 takes the AMQP ShortString type rather
+                            // than a borrowed str for these fields.
+                            spec.exchange.as_str().into(),
+                            spec.routing_key.as_str().into(),
                             BasicPublishOptions::default(),
                             &payload,
                             props.clone(),
@@ -6472,7 +6478,7 @@ impl DuckdbEngine {
                     break;
                 }
                 let got = channel
-                    .basic_get(&spec.queue, BasicGetOptions::default())
+                    .basic_get(spec.queue.as_str().into(), BasicGetOptions::default())
                     .await
                     .map_err(|e| format!("basic_get: {}", e))?;
                 let Some(delivery) = got else {
