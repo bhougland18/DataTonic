@@ -56,6 +56,7 @@ import ImportReportModal, { type ImportReport } from './workflow-ui/ImportReport
 import HomeLauncher from './workflow-ui/HomeLauncher';
 import Rail from './rail/Rail';
 import { useAppMode } from './rail/useAppMode';
+import Playground from './playground/Playground';
 import { copyText, saveTextFile } from './tauri-io';
 import { writeClipboard, readClipboard, instantiateClipboard } from './clipboard';
 import { RunStatusContext } from './canvas/run-status-context';
@@ -2684,6 +2685,9 @@ export default function App() {
 
             <main className="workspace">
                 <Rail mode={mode} onSelect={setMode} />
+                {mode === 'playground' && <Playground workspacePath={workspacePathState} />}
+                {mode === 'canvas' && (
+                  <>
                 <LeftSidebar
                     repoItems={repo}
                     activeJobId={activeJobId}
@@ -2768,6 +2772,8 @@ export default function App() {
                     onOpenMapper={handleOpenMapper}
                     focusNameRequest={renameRequest}
                 />
+                  </>
+                )}
             </main>
 
             <BottomPanel

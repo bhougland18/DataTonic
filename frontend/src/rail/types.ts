@@ -22,7 +22,7 @@ export interface RailModeMeta {
 
 export const RAIL_MODES: RailModeMeta[] = [
     { id: 'canvas', label: 'Canvas', icon: Waypoints, enabled: true },
-    { id: 'playground', label: 'API Playground', icon: Plug, enabled: false },
+    { id: 'playground', label: 'API Playground', icon: Plug, enabled: true },
     { id: 'reports', label: 'Typst Reports', icon: FileText, enabled: false },
     { id: 'dashboards', label: 'HTML/JS Dashboards', icon: LayoutDashboard, enabled: false },
 ];
