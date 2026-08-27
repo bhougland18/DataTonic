@@ -2358,6 +2358,18 @@ export default function App() {
         (name: string, payload: ConnectionPayload) => upsertRepoItem('connection', name, payload),
         [upsertRepoItem],
     );
+    // API Playground: create a connection without the modal editor flow, reusing
+    // the same repo state + auto-encrypt/persist path (PL-9 — no parallel
+    // credential store). Returns the new id so the Playground can select it.
+    const handlePlaygroundSaveConnection = useCallback(
+        (name: string, payload: ConnectionPayload): string => {
+            const id =
+                'c_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+            setRepo(r => [...r, { id, name, type: 'connection', payload }]);
+            return id;
+        },
+        [],
+    );
     const handleSaveContext = useCallback(
         (name: string, payload: ContextPayload) => upsertRepoItem('context', name, payload),
         [upsertRepoItem],
@@ -2685,7 +2697,19 @@ export default function App() {
 
             <main className="workspace">
                 <Rail mode={mode} onSelect={setMode} />
-                {mode === 'playground' && <Playground workspacePath={workspacePathState} />}
+                {mode === 'playground' && (
+                    <Playground
+                        workspacePath={workspacePathState}
+                        connections={repo
+                            .filter(i => i.type === 'connection')
+                            .map(i => ({
+                                id: i.id,
+                                name: i.name,
+                                payload: i.payload as ConnectionPayload,
+                            }))}
+                        onSaveConnection={handlePlaygroundSaveConnection}
+                    />
+                )}
                 {mode === 'canvas' && (
                   <>
                 <LeftSidebar

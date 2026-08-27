@@ -12,7 +12,7 @@
 // a Rust command would re-parse that text. This function stays the single
 // frontend parse authority so the two never disagree silently.
 
-import { dereference, validate } from '@scalar/openapi-parser';
+import { dereference, upgrade, validate } from '@scalar/openapi-parser';
 import type { ErrorObject } from '@scalar/openapi-parser';
 import {
     HTTP_METHODS,
@@ -101,8 +101,8 @@ export async function parseSpec(text: string): Promise<ParseOutcome> {
         };
     }
 
-    const doc = asRecord(deref.schema) ?? asRecord(deref.specification);
-    if (!doc) {
+    const baseDoc = asRecord(deref.schema) ?? asRecord(deref.specification);
+    if (!baseDoc) {
         // No document came back at all — malformed JSON/YAML. Surface the
         // parser's specific reason rather than a generic "parse failed".
         const errors = (deref.errors ?? []).map(toIssue);
@@ -114,8 +114,11 @@ export async function parseSpec(text: string): Promise<ParseOutcome> {
         };
     }
 
-    const version = detectVersion(doc);
-    const hasPaths = asRecord(doc.paths) !== null;
+    // Detect the version off the ORIGINAL (dereferenced-but-not-upgraded) doc,
+    // where `swagger: '2.0'` / `securityDefinitions` still exist — this is the
+    // version we surface and record as provenance.
+    const version = detectVersion(baseDoc);
+    const hasPaths = asRecord(baseDoc.paths) !== null;
     if (version === 'unknown' && !hasPaths) {
         return {
             ok: false,
@@ -126,6 +129,22 @@ export async function parseSpec(text: string): Promise<ParseOutcome> {
                 },
             ],
         };
+    }
+
+    // Normalise to OpenAPI 3.1 so everything downstream (the request form,
+    // auth detection) handles ONE shape rather than branching on version. This
+    // is how Swagger 2.0 is made first-class per decision D3: `upgrade` rewrites
+    // 2.0's `securityDefinitions` into `securitySchemes`, `in: body` params into
+    // `requestBody`, and lifts parameter `type` into `schema` — the exact shapes
+    // tasks 1c/1d consume. 3.0 documents are lifted to 3.1 too, harmlessly. The
+    // human-facing `version` above is kept from the pre-upgrade doc.
+    let doc = baseDoc;
+    try {
+        const upgraded = asRecord(upgrade(baseDoc).specification);
+        if (upgraded) doc = upgraded;
+    } catch {
+        // If upgrade ever fails, fall back to the dereferenced original rather
+        // than sinking an otherwise-parseable spec.
     }
 
     // Advisory validation: collect issues as warnings so an over-strict schema

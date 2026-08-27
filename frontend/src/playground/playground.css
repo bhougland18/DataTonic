@@ -449,3 +449,171 @@
     margin-top: 1px;
     color: var(--accent);
 }
+
+/* ---- Request panel (1c: params, body, auth, extra headers) ---- */
+.pg-req {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    margin-top: 18px;
+}
+.pg-req-section h4 {
+    margin: 0 0 10px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-1);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.pg-req-star {
+    color: var(--danger, #d64545);
+    font-weight: 700;
+}
+.pg-hint {
+    margin: 0 0 8px;
+    font-size: 12px;
+    color: var(--text-3);
+}
+.pg-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.pg-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.pg-field-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-2);
+}
+.pg-field-label code {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    color: var(--text-1);
+}
+.pg-param-loc {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-3);
+    background: var(--bg-3);
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+.pg-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 7px 9px;
+    font-size: 12.5px;
+    color: var(--text-1);
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    outline: none;
+}
+.pg-input:focus {
+    border-color: var(--accent);
+}
+.pg-input--select {
+    cursor: pointer;
+}
+.pg-body {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 9px 10px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-1);
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    resize: vertical;
+    outline: none;
+}
+.pg-body:focus {
+    border-color: var(--accent);
+}
+
+/* Auth */
+.pg-auth-detected {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+.pg-scheme {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--text-2);
+}
+.pg-scheme code {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    color: var(--text-1);
+}
+.pg-scheme-kind {
+    color: var(--text-3);
+}
+.pg-scheme-warn {
+    color: var(--accent-warn, #c98a00);
+}
+.pg-note--conn {
+    align-items: flex-start;
+    gap: 6px;
+    color: var(--text-2);
+    background: var(--bg-2);
+    border-radius: var(--radius-sm, 6px);
+    padding: 8px 10px;
+}
+.pg-save-conn {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-top: 10px;
+}
+.pg-save-conn .pg-input {
+    flex: 1;
+}
+
+/* Key-value editor (extra headers) */
+.pg-kv {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.pg-kv-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+.pg-kv-row .pg-input {
+    flex: 1;
+}
+.pg-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    background: var(--bg-3);
+    color: var(--text-3);
+    cursor: pointer;
+}
+.pg-icon-btn:hover {
+    color: var(--danger, #d64545);
+    border-color: var(--border-strong);
+}
+.pg-btn--ghost {
+    align-self: flex-start;
+    background: transparent;
+}

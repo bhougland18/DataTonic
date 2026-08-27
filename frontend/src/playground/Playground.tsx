@@ -3,12 +3,19 @@ import { useMemo } from 'react';
 import { Plug, FileCheck2, FileWarning, HardDriveDownload, Info } from 'lucide-react';
 import ImportBar from './ImportBar';
 import EndpointTree from './EndpointTree';
+import RequestPanel from './RequestPanel';
 import { usePlayground } from './usePlayground';
+import type { PlaygroundConnection } from './connectionBridge';
+import type { credentialsToPayload } from './connectionBridge';
 
 interface PlaygroundProps {
     // The active workspace, used to persist imported specs (PL-6). Null in
     // plain browser dev with no backend - persistence reports "unavailable".
     workspacePath: string | null;
+    // Saved connections from the app's repo, for reusing REST credentials (PL-9).
+    connections?: PlaygroundConnection[];
+    // Persist inline credentials via the existing Connection mechanism (PL-9).
+    onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
 }
 
 const VERSION_LABEL: Record<string, string> = {
@@ -23,7 +30,11 @@ const VERSION_LABEL: Record<string, string> = {
 // covers import, parse, a navigable endpoint tree, and persistence. Request
 // construction / send / transfer land in tasks 1c-1e; the detail pane marks
 // that seam explicitly rather than pretending to be finished.
-export default function Playground({ workspacePath }: PlaygroundProps) {
+export default function Playground({
+    workspacePath,
+    connections = [],
+    onSaveConnection,
+}: PlaygroundProps) {
     const pg = usePlayground(workspacePath);
     const { spec, selectedId, source, persist } = pg;
 
@@ -136,11 +147,13 @@ export default function Playground({ workspacePath }: PlaygroundProps) {
                                 </>
                             )}
                         </dl>
-                        <div className="pg-seam">
-                            <Info size={14} strokeWidth={1.75} />
-                            Request construction, auth, and send arrive in the next increment. This
-                            increment covers spec import, parsing, and the endpoint tree.
-                        </div>
+                        <RequestPanel
+                            key={selected.id}
+                            document={spec.document}
+                            operation={selected}
+                            connections={connections}
+                            onSaveConnection={onSaveConnection}
+                        />
                     </div>
                 )}
             </div>
