@@ -176,6 +176,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ping,
             autodetect_schema,
+            rest_send_once,
             run_pipeline,
             run_pipeline_partial,
             run_history,
@@ -328,6 +329,32 @@ fn engine() -> Result<DuckdbEngine, String> {
 /// `read_parquet`, `read_json_auto`, `sqlite_scan`. The hand-rolled
 /// `CsvConnector` stays as a backup for environments where the DuckDB
 /// engine fails to come up.
+/// API Playground "send now" (PL-11): issue one HTTP request against a live API,
+/// bypassing the pipeline compile/run cycle. A `connectionRef` in `props` is
+/// resolved (and decrypted) against the workspace here, so the secret is applied
+/// server-side and never has to reach the frontend. The blocking ureq call runs
+/// on the blocking pool, like `run_pipeline`.
+#[tauri::command]
+async fn rest_send_once(
+    props: JsonValue,
+    workspace: Option<String>,
+) -> Result<JsonValue, String> {
+    let mut props = props;
+    if let Some(ws) = workspace.as_deref() {
+        duckle_secrets::resolve_connection_ref_props(
+            std::path::Path::new(ws),
+            "src.rest",
+            &mut props,
+        )
+        .map_err(|e| format!("resolving connection: {e}"))?;
+    }
+    let eng = engine()?;
+    tokio::task::spawn_blocking(move || eng.send_one_rest(&props))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn autodetect_schema(
     format: String,

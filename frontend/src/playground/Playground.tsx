@@ -153,6 +153,10 @@ export default function Playground({
                             operation={selected}
                             connections={connections}
                             onSaveConnection={onSaveConnection}
+                            workspacePath={workspacePath}
+                            specTitle={spec.title}
+                            specVersion={spec.version}
+                            sourceRef={source?.ref}
                         />
                     </div>
                 )}

@@ -755,6 +755,24 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
     match cmd {
         // Drives the editor's runtime indicator offline -> ready.
         "ping" => respond_json(&Value::String("pong".into())),
+        // API Playground "send now" (PL-11): one HTTP request through the engine's
+        // proxy-aware path, giving the web edition the same capability as desktop.
+        // A connectionRef resolves (and decrypts) against this workspace server-
+        // side so the browser never sees the secret.
+        "rest_send_once" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let mut props = args.get("props").cloned().unwrap_or(Value::Null);
+            if let Err(e) =
+                duckle_secrets::resolve_connection_ref_props(&state.workspace, "src.rest", &mut props)
+            {
+                return respond_err("400 Bad Request", &format!("resolving connection: {e}"));
+            }
+            let engine = DuckdbEngine::new(state.duckdb.clone());
+            match engine.send_one_rest(&props) {
+                Ok(v) => respond_json(&v),
+                Err(e) => respond_err("500 Internal Server Error", &e.to_string()),
+            }
+        }
         // Connection secrets, encrypted at rest with the same AES-256-GCM
         // primitives and the same per-workspace key the desktop app uses, so a
         // workspace stays readable whichever edition wrote it.

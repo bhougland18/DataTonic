@@ -617,3 +617,138 @@
     align-self: flex-start;
     background: transparent;
 }
+
+/* ---- Request bar + response (1d: send / test loop) ---- */
+.pg-reqbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.pg-reqbar-base {
+    flex: 1;
+    min-width: 0;
+}
+.pg-reqbar-url {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11.5px;
+    color: var(--text-3);
+    word-break: break-all;
+    margin-top: -8px;
+}
+.pg-btn--primary {
+    background: var(--btn-primary-bg, var(--accent));
+    color: var(--btn-primary-fg, #fff);
+    border-color: transparent;
+}
+.pg-btn--primary:hover:not(:disabled) {
+    background: var(--btn-primary-bg-strong, var(--accent-strong, var(--accent)));
+    border-color: transparent;
+}
+.pg-req-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.pg-req-actions .pg-hint {
+    margin: 0;
+}
+
+.pg-resp {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    background: var(--bg-1);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.pg-resp--ok {
+    border-color: color-mix(in srgb, var(--success, #3a9c5a) 45%, var(--border));
+}
+.pg-resp--warn {
+    border-color: color-mix(in srgb, var(--accent-warn, #c98a00) 50%, var(--border));
+}
+.pg-resp--err {
+    border-color: color-mix(in srgb, var(--danger, #d64545) 50%, var(--border));
+}
+.pg-resp-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-1);
+}
+.pg-resp--ok .pg-resp-status svg {
+    color: var(--success, #3a9c5a);
+}
+.pg-resp--warn .pg-resp-status svg,
+.pg-resp--err .pg-resp-status svg {
+    color: var(--danger, #d64545);
+}
+.pg-resp-sub {
+    font-size: 11.5px;
+    color: var(--text-3);
+}
+.pg-resp-time {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--text-3);
+}
+.pg-resp-headtoggle {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 11.5px;
+    color: var(--accent);
+    cursor: pointer;
+}
+.pg-resp-headers {
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 12px;
+    font-size: 11.5px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+}
+.pg-resp-headers div {
+    display: contents;
+}
+.pg-resp-headers dt {
+    color: var(--text-3);
+}
+.pg-resp-headers dd {
+    margin: 0;
+    color: var(--text-2);
+    word-break: break-all;
+}
+.pg-resp-body {
+    margin: 0;
+    max-height: 340px;
+    overflow: auto;
+    padding: 10px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-1);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.pg-resp-empty {
+    font-size: 12.5px;
+    color: var(--text-3);
+    font-style: italic;
+}
+.pg-resp--muted {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-3);
+    font-size: 12.5px;
+}

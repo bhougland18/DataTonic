@@ -10975,6 +10975,106 @@ impl DuckdbEngine {
     /// cursor pagination by extracting a cursor token + appending it
     /// as a query string parameter to the next request. Stops when
     /// no cursor token is present or max_pages is hit.
+    /// One-shot HTTP send for the API Playground "send now" (PL-11 / spike S1).
+    /// Builds the SAME proxy-aware agent and the SAME auth the pipeline run path
+    /// uses (headers_from_props + push_rest_auth + OAuth client-credentials),
+    /// issues EXACTLY ONE request, and returns the raw response as JSON — no
+    /// pagination, no DuckDB materialization. So a request that works here works
+    /// in the pipeline, and honours proxy/timeout settings.
+    ///
+    /// A received non-2xx response is a normal result (its status/headers/body
+    /// are returned), NOT an error — only a transport failure (DNS, refused,
+    /// TLS, timeout) is an `Err`, so the Playground can tell those apart (PL-13).
+    /// `props` is the `src.rest` node shape; any `connectionRef` must already be
+    /// resolved by the caller.
+    pub fn send_one_rest(&self, props: &JsonValue) -> Result<JsonValue, EngineError> {
+        use std::time::Instant;
+        let url = props
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if url.is_empty() {
+            return Err(EngineError::Config("send: the request has no URL".into()));
+        }
+        let method = props
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_uppercase();
+        let body = props
+            .get("body")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        // Headers + auth exactly as the run path assembles them.
+        let mut headers = plan::headers_from_props(props);
+        plan::push_rest_auth(&mut headers, props);
+        let oauth = plan::rest_oauth_from_props(props, false)?;
+        let transport = plan::http_transport_from_props(props);
+
+        let agent = match &transport {
+            Some(t) => crate::tls::http_agent_with(t),
+            None => crate::tls::http_agent(),
+        };
+        // OAuth client-credentials: mint a token and set Authorization, dropping
+        // any static one — same as run_rest_source.
+        if let Some(o) = &oauth {
+            let (token, _instance) = mint_oauth_token(o)?;
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+            headers.push(("Authorization".into(), format!("Bearer {}", token)));
+        }
+
+        let mut req = agent.request(&method, &url);
+        let has_ct = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        if body.is_some() && !has_ct {
+            req = req.set("content-type", "application/json");
+        }
+
+        let start = Instant::now();
+        let resp_result = match &body {
+            Some(b) => req.send_string(b),
+            None => req.call(),
+        };
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        // Non-2xx is data, not an error (PL-13). Only a transport failure is Err.
+        let response = match resp_result {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_code, r)) => r,
+            Err(e) => {
+                return Err(EngineError::Query(format!("send transport error: {}", e)));
+            }
+        };
+
+        let status = response.status();
+        let status_text = response.status_text().to_string();
+        // Capture headers before into_string consumes the response.
+        let header_pairs: Vec<(String, String)> = response
+            .headers_names()
+            .into_iter()
+            .filter_map(|name| response.header(&name).map(|v| (name.clone(), v.to_string())))
+            .collect();
+        let body_text = response
+            .into_string()
+            .map_err(|e| EngineError::Query(format!("reading response body: {}", e)))?;
+
+        Ok(serde_json::json!({
+            "status": status,
+            "statusText": status_text,
+            "headers": header_pairs,
+            "body": body_text,
+            "elapsedMs": elapsed_ms,
+        }))
+    }
+
     pub(crate) fn run_rest_source(
         &self,
         db: &Path,

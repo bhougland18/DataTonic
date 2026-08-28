@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Info, Plus, Trash2, Save, ShieldCheck, ShieldAlert } from 'lucide-react';
+import { Plus, Trash2, Save, ShieldCheck, ShieldAlert, Send, Loader2, Bookmark } from 'lucide-react';
 import type { EndpointOperation } from './types';
 import { buildRequestModel, sortParams, starterBody, type RequestParam } from './requestModel';
 import {
@@ -14,6 +14,10 @@ import {
     payloadToCredentials,
     type PlaygroundConnection,
 } from './connectionBridge';
+import { buildRestProps, buildUrl, specServers, type RequestFormState } from './requestBuilder';
+import { sendRequest, type SendOutcome } from './sendClient';
+import ResponsePanel from './ResponsePanel';
+import { persistRequest } from './specPersistence';
 
 interface RequestPanelProps {
     document: unknown;
@@ -22,6 +26,11 @@ interface RequestPanelProps {
     // Persist inline credentials through the existing Connection mechanism
     // (PL-9). Returns the new connection's id.
     onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
+    // Workspace + provenance for saving a constructed request (PL-14).
+    workspacePath?: string | null;
+    specTitle?: string;
+    specVersion?: string;
+    sourceRef?: string;
 }
 
 const AUTH_TYPE_LABEL: Record<NodeAuthType, string> = {
@@ -40,6 +49,10 @@ export default function RequestPanel({
     operation,
     connections,
     onSaveConnection,
+    workspacePath,
+    specTitle,
+    specVersion,
+    sourceRef,
 }: RequestPanelProps) {
     const model = useMemo(
         () => buildRequestModel(document, operation),
@@ -104,14 +117,122 @@ export default function RequestPanel({
         setSaveName('');
     };
 
+    // --- send / save-request state (PL-11, PL-14) ---
+    const servers = useMemo(() => specServers(document), [document]);
+    const [baseUrl, setBaseUrl] = useState(() => servers[0] ?? '');
+    const [sending, setSending] = useState(false);
+    const [response, setResponse] = useState<SendOutcome | null>(null);
+    const [reqSaved, setReqSaved] = useState<string | null>(null);
+
+    // Compose the current form into the shared request state. Basic auth folds
+    // its user:password into authToken here, the one place send and save agree.
+    const currentForm = (): RequestFormState => ({
+        baseUrl,
+        paramValues,
+        extraHeaders,
+        body: bodyText,
+        contentType,
+        connectionId,
+        creds:
+            creds.authType === 'basic'
+                ? { ...creds, authToken: `${basicUser}:${basicPass}` }
+                : creds,
+    });
+
+    const handleSend = async () => {
+        setSending(true);
+        setResponse(null);
+        try {
+            const props = buildRestProps(operation, currentForm());
+            setResponse(await sendRequest(props, workspacePath ?? null));
+        } finally {
+            setSending(false);
+        }
+    };
+
+    const handleSaveRequest = async () => {
+        if (!workspacePath) {
+            setReqSaved('No workspace backend in this session — request not saved.');
+            return;
+        }
+        try {
+            const res = await persistRequest(workspacePath, {
+                savedAt: new Date().toISOString(),
+                spec: {
+                    title: specTitle ?? 'API',
+                    version: specVersion ?? 'unknown',
+                    sourceRef,
+                    operationId: operation.operationId,
+                },
+                operation: { method: operation.method, path: operation.path },
+                request: {
+                    baseUrl,
+                    paramValues,
+                    extraHeaders,
+                    body: bodyText || undefined,
+                    contentType: contentType || undefined,
+                    // Reference only — never secret values (PL-14).
+                    auth: connectionId
+                        ? { connectionRef: connectionId }
+                        : { authType: creds.authType },
+                },
+            });
+            setReqSaved(`Saved request to ${res.path}`);
+        } catch (err) {
+            setReqSaved(`Could not save request: ${(err as Error).message}`);
+        }
+    };
+
     if (!model) {
         return <div className="pg-note">This operation could not be read from the spec.</div>;
     }
 
     const usingConnection = connectionId !== null;
+    const previewUrl = buildUrl(operation, currentForm());
 
     return (
         <div className="pg-req">
+            {/* ---- Request bar: base URL + send (PL-11) ---- */}
+            <div className="pg-reqbar">
+                <span className={`pg-method pg-method--${operation.method}`}>
+                    {operation.method.toUpperCase()}
+                </span>
+                {servers.length > 1 ? (
+                    <select
+                        className="pg-input pg-input--select pg-reqbar-base"
+                        value={baseUrl}
+                        onChange={(e) => setBaseUrl(e.target.value)}
+                    >
+                        {servers.map((s) => (
+                            <option key={s} value={s}>
+                                {s}
+                            </option>
+                        ))}
+                    </select>
+                ) : (
+                    <input
+                        className="pg-input pg-reqbar-base"
+                        placeholder="https://api.example.com"
+                        value={baseUrl}
+                        onChange={(e) => setBaseUrl(e.target.value)}
+                    />
+                )}
+                <button
+                    type="button"
+                    className="pg-btn pg-btn--primary"
+                    disabled={sending}
+                    onClick={() => void handleSend()}
+                >
+                    {sending ? <Loader2 size={14} className="pg-spin" /> : <Send size={14} strokeWidth={1.75} />}
+                    Send
+                </button>
+            </div>
+            <div className="pg-reqbar-url" title={previewUrl}>
+                {previewUrl}
+            </div>
+
+            {response && <ResponsePanel outcome={response} />}
+
             {/* ---- Parameters (PL-7) ---- */}
             <section className="pg-req-section">
                 <h4>Parameters</h4>
@@ -232,11 +353,16 @@ export default function RequestPanel({
                 <KeyValueEditor rows={extraHeaders} onChange={setExtraHeaders} />
             </section>
 
-            <div className="pg-seam">
-                <Info size={14} strokeWidth={1.75} />
-                “Send” and live response arrive in the next increment (1d). This increment builds
-                the request and captures auth.
+            {/* ---- Save request (PL-14) ---- */}
+            <div className="pg-req-actions">
+                <button type="button" className="pg-btn" onClick={() => void handleSaveRequest()}>
+                    <Bookmark size={14} strokeWidth={1.75} /> Save request
+                </button>
+                <span className="pg-hint">
+                    Saved as a workspace file with an auth reference — never credential values.
+                </span>
             </div>
+            {reqSaved && <div className="pg-persist pg-persist--ok">{reqSaved}</div>}
         </div>
     );
 }

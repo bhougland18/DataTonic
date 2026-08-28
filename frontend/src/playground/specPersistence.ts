@@ -80,3 +80,46 @@ export async function persistSpec(
     await writeTextFile(file, JSON.stringify(artifact, null, 2));
     return { path: joinPath(SPECS_DIR, `${id}.apispec.json`), id };
 }
+
+// ---- Saved requests (PL-14) ----
+//
+// A constructed request persisted as its own plain workspace file, independent
+// of any Canvas transfer. Auth is stored by REFERENCE only — a connectionRef
+// and/or the auth *type* — never secret values, so the artifact is safe to keep
+// (and commit) alongside the rest of the workspace.
+
+const REQUESTS_DIR = 'api-requests';
+
+export interface SavedRequestArtifact {
+    schemaVersion: 1;
+    id: string;
+    savedAt: string;
+    // Provenance back to the spec this came from.
+    spec: { title: string; version: string; sourceRef?: string; operationId?: string };
+    operation: { method: string; path: string };
+    request: {
+        baseUrl: string;
+        // Keyed `${location}:${name}`.
+        paramValues: Record<string, string>;
+        extraHeaders: { key: string; value: string }[];
+        body?: string;
+        contentType?: string;
+        // Reference only — no secrets.
+        auth: { connectionRef?: string; authType?: string };
+    };
+}
+
+export async function persistRequest(
+    workspacePath: string,
+    artifact: Omit<SavedRequestArtifact, 'schemaVersion' | 'id' | 'savedAt'> & { savedAt: string },
+): Promise<PersistResult> {
+    const { exists, mkdir, writeTextFile } = await fs();
+    const dir = joinPath(workspacePath, REQUESTS_DIR);
+    if (!(await exists(dir))) await mkdir(dir, { recursive: true });
+
+    const id = crypto.randomUUID();
+    const full: SavedRequestArtifact = { schemaVersion: 1, id, ...artifact };
+    const file = joinPath(dir, `${id}.apireq.json`);
+    await writeTextFile(file, JSON.stringify(full, null, 2));
+    return { path: joinPath(REQUESTS_DIR, `${id}.apireq.json`), id };
+}
