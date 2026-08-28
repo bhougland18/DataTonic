@@ -752,3 +752,127 @@
     color: var(--text-3);
     font-size: 12.5px;
 }
+
+/* ---- Provider selector + Infor scaffold (1n) ---- */
+.pg-provider {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+}
+.pg-provider-lbl {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--text-3);
+}
+.pg-provider-seg {
+    display: flex;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    padding: 2px;
+}
+.pg-provider-btn {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border: none;
+    background: transparent;
+    color: var(--text-3);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.pg-provider-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+.pg-provider-btn--on {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+.pg-provider-infor {
+    width: 13px;
+    height: 13px;
+    border-radius: 3px;
+    background: linear-gradient(135deg, #e2231a, #a11);
+}
+
+.pg-infor {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+}
+.pg-infor-brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-2);
+    margin-bottom: 2px;
+}
+.pg-infor-mark {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    background: linear-gradient(135deg, #e2231a, #a11);
+}
+.pg-infor-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    background: var(--bg-2);
+    color: var(--text-2);
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+}
+.pg-infor-step:disabled,
+.pg-infor-step--static {
+    cursor: default;
+    color: var(--text-3);
+}
+.pg-infor-step-label {
+    flex: 1;
+}
+.pg-soon {
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    background: var(--bg-3);
+    border-radius: 4px;
+    padding: 1px 6px;
+}
+.pg-infor-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 4px;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-3);
+    background: var(--bg-2);
+    border: 1px dashed var(--border-strong, var(--border));
+    border-radius: var(--radius-sm, 6px);
+}
+.pg-infor-note svg {
+    flex-shrink: 0;
+    margin-top: 1px;
+    color: var(--accent);
+}

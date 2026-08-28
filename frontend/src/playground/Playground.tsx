@@ -1,9 +1,12 @@
 import './playground.css';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { Plug, FileCheck2, FileWarning, HardDriveDownload, Info } from 'lucide-react';
 import ImportBar from './ImportBar';
 import EndpointTree from './EndpointTree';
 import RequestPanel from './RequestPanel';
+import ProviderSelector from './providers/ProviderSelector';
+import InforProvider from './providers/InforProvider';
+import type { ProviderId } from './providers/types';
 import { usePlayground } from './usePlayground';
 import type { PlaygroundConnection } from './connectionBridge';
 import type { credentialsToPayload } from './connectionBridge';
@@ -37,6 +40,7 @@ export default function Playground({
 }: PlaygroundProps) {
     const pg = usePlayground(workspacePath);
     const { spec, selectedId, source, persist } = pg;
+    const [provider, setProvider] = useState<ProviderId>('generic');
 
     const selected = useMemo(
         () => spec?.endpoints.find((e) => e.id === selectedId) ?? null,
@@ -51,6 +55,12 @@ export default function Playground({
                     <h2>API Playground</h2>
                 </header>
 
+                <ProviderSelector value={provider} onChange={setProvider} />
+
+                {provider === 'infor' && <InforProvider />}
+
+                {provider === 'generic' && (
+                  <>
                 <ImportBar
                     busy={pg.status === 'parsing'}
                     errors={pg.errors}
@@ -103,6 +113,8 @@ export default function Playground({
                             />
                         </div>
                     </>
+                )}
+                  </>
                 )}
             </aside>
 
