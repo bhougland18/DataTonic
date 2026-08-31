@@ -1200,7 +1200,23 @@ export default function App() {
                     if (q.fields !== undefined) nextProps.fields = q.fields;
                     if (q.filter !== undefined) nextProps.filter = q.filter;
                     if (q.limit !== undefined) nextProps.limit = q.limit;
-                    return { ...n, data: { ...n.data, properties: nextProps } };
+                    const patch: Partial<DuckleNodeData> = { properties: nextProps };
+                    // Declare the schema from the selected fields so the node has
+                    // one without a live probe (types default to string; editable
+                    // on the node's Schema tab).
+                    const cols = (q.fields ?? '')
+                        .split(',')
+                        .map(s => s.trim())
+                        .filter(Boolean);
+                    if (cols.length) {
+                        patch.schema = cols.map(
+                            (name): Column => ({ name, type: 'string', nullable: true }),
+                        );
+                    }
+                    // Default the SQL name to the business class when the user
+                    // hasn't set their own alias.
+                    if (!n.data.alias && q.businessClass) patch.alias = q.businessClass;
+                    return { ...n, data: { ...n.data, ...patch } };
                 }),
             );
         },

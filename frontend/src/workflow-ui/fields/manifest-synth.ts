@@ -2983,7 +2983,11 @@ function synthInforSource(comp: ComponentDef): ComponentManifest {
                 },
             ],
         },
-    ]);
+        // 'declared' (not 'autodetect'): there is no headless run path for
+        // src.infor yet, so a live schema probe fails. The schema is instead
+        // declared from the fields chosen in the Playground (written back on
+        // "Apply to node") and editable here.
+    ], 'declared');
 }
 
 function synthApiSource(comp: ComponentDef): ComponentManifest {

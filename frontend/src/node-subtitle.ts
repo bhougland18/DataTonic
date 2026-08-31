@@ -21,6 +21,10 @@ export function deriveNodeSubtitle(
     const strs = (v: unknown): string[] =>
         arr(v).filter((x): x is string => typeof x === 'string');
 
+    // Infor node: the business class is its most meaningful identifier
+    // (the equivalent of a CSV's file name).
+    if (componentId === 'src.infor') return str(p.businessClass);
+
     // Sources & sinks point at a file / table / bucket.
     if (componentId.startsWith('src.') || componentId.startsWith('snk.')) {
         return (
