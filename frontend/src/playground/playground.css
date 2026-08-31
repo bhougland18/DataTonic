@@ -991,3 +991,7 @@
 .pgi-grid td.pgi-rownum { text-align:right; color:var(--text-4, var(--text-3)); font-family:var(--font-mono, ui-monospace, monospace); font-size:11px; background:var(--bg-1); }
 .pgi-grid tbody tr:nth-child(even) td:not(.pgi-rownum) { background:rgba(255,255,255,0.015); }
 .pgi-grid tbody tr:hover td:not(.pgi-rownum) { background:var(--accent-soft); }
+
+.pgi-cacheinfo { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:10.5px; color:var(--text-4, var(--text-3)); padding-top:2px; }
+.pgi-refresh { display:inline-flex; align-items:center; gap:5px; background:transparent; border:none; color:var(--accent); font-size:11px; cursor:pointer; }
+.pgi-refresh:disabled { opacity:.5; cursor:default; }

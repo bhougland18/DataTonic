@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Search, ChevronDown, Play, Loader2, Plus, Trash2, Boxes } from 'lucide-react';
+import { Search, ChevronDown, Play, Loader2, Plus, Trash2, Boxes, RefreshCw } from 'lucide-react';
 import type { IonApiConfig } from './ionapi';
 import type { IonApiToken } from './inforAuth';
-import { listBusinessClasses, type BusinessClass } from './discovery';
+import type { BusinessClass } from './discovery';
+import {
+    cacheAvailable,
+    fetchAllBusinessClasses,
+    loadCachedClasses,
+    saveCachedClasses,
+} from './classCache';
 import { runGenericQuery, sampleFields, type FilterCondition } from './query';
 import type { GenericPage } from './inforApi';
 
@@ -18,13 +24,13 @@ const PAGE_SIZE = 25;
 // fields + a filter, run the `_generic` list, and see the rows in a grid.
 // Mirrors the approved Query-Properties mockup.
 export default function InforWorkspace({ config, token, workspacePath }: InforWorkspaceProps) {
-    // ---- business-class discovery ----
+    // ---- business-class discovery (full list cached, searched client-side) ----
     const [search, setSearch] = useState('');
-    const [classes, setClasses] = useState<BusinessClass[]>([]);
-    const [total, setTotal] = useState(0);
     const [page, setPage] = useState(1);
-    const [listLoading, setListLoading] = useState(false);
-    const [listError, setListError] = useState<string | null>(null);
+    const [allClasses, setAllClasses] = useState<BusinessClass[] | null>(null);
+    const [classesLoading, setClassesLoading] = useState(true);
+    const [classesError, setClassesError] = useState<string | null>(null);
+    const [cacheInfo, setCacheInfo] = useState<{ fetchedAt: string; fromCache: boolean } | null>(null);
     const [selected, setSelected] = useState<BusinessClass | null>(null);
     const [pickerOpen, setPickerOpen] = useState(true);
 
@@ -39,32 +45,62 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
     const [result, setResult] = useState<GenericPage | null>(null);
     const [queryError, setQueryError] = useState<string | null>(null);
 
-    // Load a page of classes (debounced on search).
+    const applyFetched = async (classes: BusinessClass[]) => {
+        setAllClasses(classes);
+        const now = new Date().toISOString();
+        setCacheInfo({ fetchedAt: now, fromCache: false });
+        if (workspacePath && cacheAvailable()) {
+            try {
+                await saveCachedClasses(workspacePath, config.tenant, classes, now);
+            } catch {
+                /* cache write is best-effort */
+            }
+        }
+    };
+
+    // Load the full class list once: from the workspace cache if present, else
+    // download it (one request) and cache it. Everything else is client-side.
     useEffect(() => {
         let cancelled = false;
-        setListLoading(true);
-        setListError(null);
-        const t = setTimeout(async () => {
-            const res = await listBusinessClasses(
-                config,
-                token.accessToken,
-                { page, pageSize: PAGE_SIZE, search },
-                workspacePath,
-            );
+        (async () => {
+            setClassesLoading(true);
+            setClassesError(null);
+            if (workspacePath && cacheAvailable()) {
+                const cached = await loadCachedClasses(workspacePath, config.tenant);
+                if (cancelled) return;
+                if (cached) {
+                    setAllClasses(cached.classes);
+                    setCacheInfo({ fetchedAt: cached.fetchedAt, fromCache: true });
+                    setClassesLoading(false);
+                    return;
+                }
+            }
+            const res = await fetchAllBusinessClasses(config, token.accessToken, workspacePath);
             if (cancelled) return;
-            setListLoading(false);
+            setClassesLoading(false);
             if (!res.ok) {
-                setListError(res.error);
+                setClassesError(res.error);
                 return;
             }
-            setClasses(res.page.items);
-            setTotal(res.page.total);
-        }, 250);
+            await applyFetched(res.classes);
+        })();
         return () => {
             cancelled = true;
-            clearTimeout(t);
         };
-    }, [config, token.accessToken, workspacePath, search, page]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [config.tenant, token.accessToken, workspacePath]);
+
+    const refreshClasses = async () => {
+        setClassesLoading(true);
+        setClassesError(null);
+        const res = await fetchAllBusinessClasses(config, token.accessToken, workspacePath);
+        setClassesLoading(false);
+        if (!res.ok) {
+            setClassesError(res.error);
+            return;
+        }
+        await applyFetched(res.classes);
+    };
 
     const selectClass = async (bc: BusinessClass) => {
         setSelected(bc);
@@ -116,21 +152,25 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
         return result?.rows.length ? Object.keys(result.rows[0]) : [];
     }, [fields, checked, result]);
 
-    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-
-    // Float an exact / prefix match to the top of the page (Infor's own search
-    // is substring-only; this just re-ranks what came back).
-    const displayClasses = useMemo(() => {
+    // Full-list client-side search + exact/prefix-first ranking + paging.
+    const filtered = useMemo(() => {
+        const all = allClasses ?? [];
         const q = search.trim().toLowerCase();
-        if (!q) return classes;
+        if (!q) return all;
         const rank = (name: string) => {
             const n = name.toLowerCase();
             if (n === q) return 0;
             if (n.startsWith(q)) return 1;
             return 2;
         };
-        return [...classes].sort((a, b) => rank(a.entity) - rank(b.entity));
-    }, [classes, search]);
+        return all
+            .filter((c) => c.entity.toLowerCase().includes(q))
+            .sort((a, b) => rank(a.entity) - rank(b.entity) || a.entity.localeCompare(b.entity));
+    }, [allClasses, search]);
+
+    const totalFiltered = filtered.length;
+    const totalPages = Math.max(1, Math.ceil(totalFiltered / PAGE_SIZE));
+    const pageItems = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
     const visibleFields = useMemo(() => {
         const q = fieldSearch.trim().toLowerCase();
@@ -162,41 +202,73 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
                                     setPage(1);
                                 }}
                             />
-                            {listLoading && <Loader2 size={13} className="pg-spin" />}
+                            {classesLoading && <Loader2 size={13} className="pg-spin" />}
                         </div>
-                        {listError && <div className="pg-note" style={{ color: 'var(--danger)' }}>{listError}</div>}
-                        <div className="pgi-classlist">
-                            {displayClasses.map((c) => (
-                                <button
-                                    key={c.entity}
-                                    type="button"
-                                    className={`pgi-class${selected?.entity === c.entity ? ' pgi-class--sel' : ''}`}
-                                    onClick={() => void selectClass(c)}
-                                    title={c.desc}
-                                >
-                                    <span className="pgi-class-nm">{c.entity}</span>
-                                    {c.category && <span className="pgi-class-cat">{c.category}</span>}
-                                </button>
-                            ))}
-                            {!listLoading && classes.length === 0 && (
-                                <div className="pg-note">No business classes match.</div>
-                            )}
-                        </div>
-                        <div className="pgi-pager">
-                            <button type="button" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
-                                ‹
-                            </button>
-                            <span>
-                                {total.toLocaleString()} classes · page {page}/{totalPages}
-                            </span>
-                            <button
-                                type="button"
-                                disabled={page >= totalPages}
-                                onClick={() => setPage((p) => p + 1)}
-                            >
-                                ›
-                            </button>
-                        </div>
+                        {classesError && (
+                            <div className="pg-note" style={{ color: 'var(--danger)' }}>{classesError}</div>
+                        )}
+                        {classesLoading && !allClasses ? (
+                            <div className="pg-note">
+                                <Loader2 size={13} className="pg-spin" /> Downloading the business-class list…
+                            </div>
+                        ) : (
+                            <>
+                                <div className="pgi-classlist">
+                                    {pageItems.map((c) => (
+                                        <button
+                                            key={c.entity}
+                                            type="button"
+                                            className={`pgi-class${selected?.entity === c.entity ? ' pgi-class--sel' : ''}`}
+                                            onClick={() => void selectClass(c)}
+                                            title={c.desc}
+                                        >
+                                            <span className="pgi-class-nm">{c.entity}</span>
+                                            {c.category && <span className="pgi-class-cat">{c.category}</span>}
+                                        </button>
+                                    ))}
+                                    {allClasses && totalFiltered === 0 && (
+                                        <div className="pg-note">No business classes match “{search}”.</div>
+                                    )}
+                                </div>
+                                <div className="pgi-pager">
+                                    <button type="button" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+                                        ‹
+                                    </button>
+                                    <span>
+                                        {totalFiltered.toLocaleString()} match{totalFiltered === 1 ? '' : 'es'} · page{' '}
+                                        {page}/{totalPages}
+                                    </span>
+                                    <button
+                                        type="button"
+                                        disabled={page >= totalPages}
+                                        onClick={() => setPage((p) => p + 1)}
+                                    >
+                                        ›
+                                    </button>
+                                </div>
+                                {cacheInfo && (
+                                    <div className="pgi-cacheinfo">
+                                        <span>
+                                            {(allClasses?.length ?? 0).toLocaleString()} classes{' '}
+                                            {cacheInfo.fromCache ? 'cached' : 'downloaded'}{' '}
+                                            {new Date(cacheInfo.fetchedAt).toLocaleString()}
+                                        </span>
+                                        <button
+                                            type="button"
+                                            className="pgi-refresh"
+                                            disabled={classesLoading}
+                                            onClick={() => void refreshClasses()}
+                                        >
+                                            <RefreshCw
+                                                size={12}
+                                                className={classesLoading ? 'pg-spin' : undefined}
+                                            />
+                                            Refresh
+                                        </button>
+                                    </div>
+                                )}
+                            </>
+                        )}
                     </>
                 )}
             </div>
