@@ -876,3 +876,64 @@
     margin-top: 1px;
     color: var(--accent);
 }
+
+/* ---- Infor .ionapi config + signed-in (1i / Phase B) ---- */
+.pg-infor-cfg {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 9px 11px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    font-size: 11.5px;
+}
+.pg-infor-cfg-row {
+    display: grid;
+    grid-template-columns: 68px 1fr;
+    gap: 8px;
+    align-items: baseline;
+}
+.pg-infor-cfg-row > span {
+    color: var(--text-3);
+}
+.pg-infor-cfg-row code {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    color: var(--text-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.pg-infor-signed {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 11px;
+    background: color-mix(in srgb, var(--ok, #3a9c5a) 12%, var(--bg-2));
+    border: 1px solid color-mix(in srgb, var(--ok, #3a9c5a) 40%, var(--border));
+    border-radius: var(--radius-sm, 6px);
+}
+.pg-infor-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--ok, #3a9c5a);
+    box-shadow: 0 0 6px var(--ok, #3a9c5a);
+    flex-shrink: 0;
+}
+.pg-infor-signed-title {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-1);
+}
+.pg-infor-signed-sub {
+    font-size: 11px;
+    color: var(--text-3);
+}
+
+.pg-infor-creds {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}

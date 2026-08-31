@@ -57,7 +57,7 @@ export default function Playground({
 
                 <ProviderSelector value={provider} onChange={setProvider} />
 
-                {provider === 'infor' && <InforProvider />}
+                {provider === 'infor' && <InforProvider workspacePath={workspacePath} />}
 
                 {provider === 'generic' && (
                   <>
