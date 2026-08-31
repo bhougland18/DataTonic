@@ -940,7 +940,8 @@
 
 /* ---- Infor workspace (1g/1o/1p): discovery + query builder + grid ---- */
 .pgi { flex:1; min-width:0; height:100%; display:flex; flex-direction:row; overflow:hidden; }
-.pgi-props { width:430px; flex-shrink:0; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:14px; border-right:1px solid var(--border); background:var(--bg-1); }
+.pgi-props { width:430px; flex-shrink:0; overflow-y:auto; display:flex; flex-direction:column; gap:0; border-right:1px solid var(--border); background:var(--bg-1); }
+.pgi-query { display:flex; flex-direction:column; gap:12px; padding:12px 14px; }
 .pgi-main { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; padding:14px 16px; }
 .pgi-mainempty { margin:auto; max-width:320px; text-align:center; color:var(--text-3); display:flex; flex-direction:column; align-items:center; gap:10px; font-size:13px; }
 .pgi-mainempty svg { color:var(--text-4, var(--text-3)); }

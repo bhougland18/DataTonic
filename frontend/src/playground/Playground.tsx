@@ -5,11 +5,8 @@ import ImportBar from './ImportBar';
 import EndpointTree from './EndpointTree';
 import RequestPanel from './RequestPanel';
 import ProviderSelector from './providers/ProviderSelector';
-import InforProvider from './providers/InforProvider';
 import InforWorkspace from './providers/infor/InforWorkspace';
 import type { ProviderId } from './providers/types';
-import type { IonApiConfig } from './providers/infor/ionapi';
-import type { IonApiToken } from './providers/infor/inforAuth';
 import { usePlayground } from './usePlayground';
 import type { PlaygroundConnection } from './connectionBridge';
 import type { credentialsToPayload } from './connectionBridge';
@@ -44,9 +41,6 @@ export default function Playground({
     const pg = usePlayground(workspacePath);
     const { spec, selectedId, source, persist } = pg;
     const [provider, setProvider] = useState<ProviderId>('generic');
-    const [inforSession, setInforSession] = useState<{ config: IonApiConfig; token: IonApiToken } | null>(
-        null,
-    );
 
     const selected = useMemo(
         () => spec?.endpoints.find((e) => e.id === selectedId) ?? null,
@@ -55,7 +49,15 @@ export default function Playground({
 
     return (
         <section className="pg" aria-label="API Playground">
-            <aside className="pg-sidebar">
+            {provider === 'infor' ? (
+                <InforWorkspace
+                    workspacePath={workspacePath}
+                    provider={provider}
+                    setProvider={setProvider}
+                />
+            ) : (
+              <>
+                <aside className="pg-sidebar">
                 <header className="pg-sidebar-head">
                     <Plug size={16} strokeWidth={1.75} />
                     <h2>API Playground</h2>
@@ -63,15 +65,6 @@ export default function Playground({
 
                 <ProviderSelector value={provider} onChange={setProvider} />
 
-                {provider === 'infor' && (
-                    <InforProvider
-                        workspacePath={workspacePath}
-                        onSignedIn={(config, token) => setInforSession({ config, token })}
-                    />
-                )}
-
-                {provider === 'generic' && (
-                  <>
                 <ImportBar
                     busy={pg.status === 'parsing'}
                     errors={pg.errors}
@@ -125,31 +118,10 @@ export default function Playground({
                         </div>
                     </>
                 )}
-                  </>
-                )}
-            </aside>
+                </aside>
 
-            <div className="pg-detail">
-                {provider === 'infor' &&
-                    (inforSession ? (
-                        <InforWorkspace
-                            config={inforSession.config}
-                            token={inforSession.token}
-                            workspacePath={workspacePath}
-                        />
-                    ) : (
-                        <div className="pg-empty">
-                            <Plug size={40} strokeWidth={1.25} />
-                            <h3>Connect to Infor</h3>
-                            <p>
-                                Import your ION API <b>.ionapi</b> credentials and sign in from the
-                                panel on the left. Business-class discovery and the query builder open
-                                here once you&rsquo;re connected.
-                            </p>
-                        </div>
-                    ))}
-
-                {provider === 'generic' && !spec && (
+                <div className="pg-detail">
+                {!spec && (
                     <div className="pg-empty">
                         <Plug size={40} strokeWidth={1.25} />
                         <h3>Import an API spec to begin</h3>
@@ -202,7 +174,9 @@ export default function Playground({
                         />
                     </div>
                 )}
-            </div>
+                </div>
+              </>
+            )}
         </section>
     );
 }
