@@ -54,6 +54,8 @@ export default function Playground({
                     workspacePath={workspacePath}
                     provider={provider}
                     setProvider={setProvider}
+                    connections={connections}
+                    onSaveConnection={onSaveConnection}
                 />
             ) : (
               <>

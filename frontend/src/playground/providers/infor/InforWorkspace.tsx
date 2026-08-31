@@ -3,6 +3,7 @@ import { Search, ChevronDown, Play, Loader2, Plus, Trash2, Boxes, RefreshCw, Plu
 import ProviderSelector from '../ProviderSelector';
 import InforProvider from '../InforProvider';
 import type { ProviderId } from '../types';
+import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
 import type { IonApiConfig } from './ionapi';
 import type { IonApiToken } from './inforAuth';
 import type { BusinessClass } from './discovery';
@@ -19,6 +20,8 @@ interface InforWorkspaceProps {
     workspacePath: string | null;
     provider: ProviderId;
     setProvider: (id: ProviderId) => void;
+    connections?: PlaygroundConnection[];
+    onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
 }
 
 const PAGE_SIZE = 25;
@@ -27,7 +30,13 @@ const PAGE_SIZE = 25;
 // credentials/connection, and the whole query builder (business class → fields
 // → filter → run); the right pane is the results grid. Matches the approved
 // Query-Properties mockup.
-export default function InforWorkspace({ workspacePath, provider, setProvider }: InforWorkspaceProps) {
+export default function InforWorkspace({
+    workspacePath,
+    provider,
+    setProvider,
+    connections = [],
+    onSaveConnection,
+}: InforWorkspaceProps) {
     const [session, setSession] = useState<{ config: IonApiConfig; token: IonApiToken } | null>(null);
 
     // ---- business-class discovery (full list cached, searched client-side) ----
@@ -214,6 +223,8 @@ export default function InforWorkspace({ workspacePath, provider, setProvider }:
                 <InforProvider
                     workspacePath={workspacePath}
                     onSignedIn={(config, token) => setSession({ config, token })}
+                    connections={connections}
+                    onSaveConnection={onSaveConnection}
                 />
 
                 {session && (
