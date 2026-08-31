@@ -158,6 +158,20 @@ export default function InforWorkspace({ workspacePath, provider, setProvider }:
         setResult(res.page);
     };
 
+    // Reset to a blank query (stays signed in and keeps the cached class list).
+    const newQuery = () => {
+        setSelected(null);
+        setPickerOpen(true);
+        setSearch('');
+        setPage(1);
+        setFields([]);
+        setChecked(new Set());
+        setFieldSearch('');
+        setConds([]);
+        setResult(null);
+        setQueryError(null);
+    };
+
     const columns = useMemo(() => {
         const active = fields.filter((f) => checked.has(f));
         if (active.length) return active;
@@ -447,6 +461,14 @@ export default function InforWorkspace({ workspacePath, provider, setProvider }:
                                             <Play size={14} strokeWidth={2} />
                                         )}
                                         Run query
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="pg-btn"
+                                        onClick={newQuery}
+                                        title="Clear this query and start over (stays signed in)"
+                                    >
+                                        <Plus size={14} strokeWidth={2} /> New query
                                     </button>
                                 </div>
                             </>

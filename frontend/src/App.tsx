@@ -2697,7 +2697,10 @@ export default function App() {
 
             <main className="workspace">
                 <Rail mode={mode} onSelect={setMode} />
-                {mode === 'playground' && (
+                {/* Kept mounted (hidden when inactive) so the Playground's
+                    in-session state - Infor sign-in, the current query - survives
+                    switching to Canvas and back. */}
+                <div style={{ display: mode === 'playground' ? 'flex' : 'none', flex: 1, minWidth: 0 }}>
                     <Playground
                         workspacePath={workspacePathState}
                         connections={repo
@@ -2709,7 +2712,7 @@ export default function App() {
                             }))}
                         onSaveConnection={handlePlaygroundSaveConnection}
                     />
-                )}
+                </div>
                 {mode === 'canvas' && (
                   <>
                 <LeftSidebar
