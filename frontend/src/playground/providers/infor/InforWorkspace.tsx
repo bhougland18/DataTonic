@@ -179,6 +179,7 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
 
     return (
         <div className="pgi">
+            <div className="pgi-props">
             {/* ---- Business class ---- */}
             <div className="pgi-section">
                 <div className="pgi-lbl">Business class</div>
@@ -402,50 +403,62 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
                         </button>
                     </div>
 
-                    {queryError && (
-                        <div className="pg-errors" role="alert">
-                            <div className="pg-errors-head">Query failed</div>
-                            <ul>
-                                <li>
-                                    <span>{queryError}</span>
-                                </li>
-                            </ul>
-                        </div>
-                    )}
-
-                    {result && (
-                        <div className="pgi-results">
-                            <div className="pgi-results-bar">
-                                <Boxes size={13} strokeWidth={2} /> {result.rows.length} row
-                                {result.rows.length === 1 ? '' : 's'}
-                                {result.next ? ' · more available' : ''}
-                            </div>
-                            <div className="pgi-grid-wrap">
-                                <table className="pgi-grid">
-                                    <thead>
-                                        <tr>
-                                            <th className="pgi-rownum">#</th>
-                                            {columns.map((col) => (
-                                                <th key={col}>{col}</th>
-                                            ))}
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {result.rows.map((row, i) => (
-                                            <tr key={i}>
-                                                <td className="pgi-rownum">{i + 1}</td>
-                                                {columns.map((col) => (
-                                                    <td key={col}>{formatCell(row[col])}</td>
-                                                ))}
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    )}
                 </>
             )}
+            </div>
+
+            <div className="pgi-main">
+                {!selected || pickerOpen ? (
+                    <div className="pgi-mainempty">
+                        <Boxes size={34} strokeWidth={1.25} />
+                        <p>Pick a business class to build a query.</p>
+                    </div>
+                ) : queryError ? (
+                    <div className="pg-errors" role="alert">
+                        <div className="pg-errors-head">Query failed</div>
+                        <ul>
+                            <li>
+                                <span>{queryError}</span>
+                            </li>
+                        </ul>
+                    </div>
+                ) : result ? (
+                    <div className="pgi-results">
+                        <div className="pgi-results-bar">
+                            <Boxes size={13} strokeWidth={2} /> {result.rows.length} row
+                            {result.rows.length === 1 ? '' : 's'}
+                            {result.next ? ' · more available' : ''}
+                        </div>
+                        <div className="pgi-grid-wrap">
+                            <table className="pgi-grid">
+                                <thead>
+                                    <tr>
+                                        <th className="pgi-rownum">#</th>
+                                        {columns.map((col) => (
+                                            <th key={col}>{col}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {result.rows.map((row, i) => (
+                                        <tr key={i}>
+                                            <td className="pgi-rownum">{i + 1}</td>
+                                            {columns.map((col) => (
+                                                <td key={col}>{formatCell(row[col])}</td>
+                                            ))}
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="pgi-mainempty">
+                        <Play size={34} strokeWidth={1.25} />
+                        <p>Choose fields and run the query to see results.</p>
+                    </div>
+                )}
+            </div>
         </div>
     );
 }
