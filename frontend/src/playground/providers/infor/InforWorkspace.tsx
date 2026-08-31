@@ -31,6 +31,7 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
     // ---- query state (per selected class) ----
     const [fields, setFields] = useState<string[]>([]);
     const [checked, setChecked] = useState<Set<string>>(new Set());
+    const [fieldSearch, setFieldSearch] = useState('');
     const [fieldsLoading, setFieldsLoading] = useState(false);
     const [conds, setConds] = useState<FilterCondition[]>([]);
     const [limit, setLimit] = useState(25);
@@ -72,14 +73,12 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
         setQueryError(null);
         setConds([]);
         setFields([]);
-        setChecked(new Set());
+        setChecked(new Set()); // default: nothing selected — the user picks
+        setFieldSearch('');
         setFieldsLoading(true);
         const res = await sampleFields(config, token.accessToken, bc.entity, workspacePath);
         setFieldsLoading(false);
-        if (res.ok) {
-            setFields(res.fields);
-            setChecked(new Set(res.fields)); // default: all sampled fields
-        }
+        if (res.ok) setFields(res.fields);
     };
 
     const toggleField = (f: string) =>
@@ -119,6 +118,25 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
 
     const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
+    // Float an exact / prefix match to the top of the page (Infor's own search
+    // is substring-only; this just re-ranks what came back).
+    const displayClasses = useMemo(() => {
+        const q = search.trim().toLowerCase();
+        if (!q) return classes;
+        const rank = (name: string) => {
+            const n = name.toLowerCase();
+            if (n === q) return 0;
+            if (n.startsWith(q)) return 1;
+            return 2;
+        };
+        return [...classes].sort((a, b) => rank(a.entity) - rank(b.entity));
+    }, [classes, search]);
+
+    const visibleFields = useMemo(() => {
+        const q = fieldSearch.trim().toLowerCase();
+        return q ? fields.filter((f) => f.toLowerCase().includes(q)) : fields;
+    }, [fields, fieldSearch]);
+
     return (
         <div className="pgi">
             {/* ---- Business class ---- */}
@@ -148,7 +166,7 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
                         </div>
                         {listError && <div className="pg-note" style={{ color: 'var(--danger)' }}>{listError}</div>}
                         <div className="pgi-classlist">
-                            {classes.map((c) => (
+                            {displayClasses.map((c) => (
                                 <button
                                     key={c.entity}
                                     type="button"
@@ -201,23 +219,43 @@ export default function InforWorkspace({ config, token, workspacePath }: InforWo
                                 <Loader2 size={13} className="pg-spin" /> Loading fields…
                             </div>
                         ) : (
-                            <div className="pgi-fieldbox">
-                                {fields.map((f) => (
-                                    <label key={f} className="pgi-fl">
+                            <>
+                                {fields.length > 0 && (
+                                    <div className="pgi-search">
+                                        <Search size={13} strokeWidth={2} />
                                         <input
-                                            type="checkbox"
-                                            checked={checked.has(f)}
-                                            onChange={() => toggleField(f)}
+                                            placeholder={`Search ${fields.length} fields…`}
+                                            value={fieldSearch}
+                                            onChange={(e) => setFieldSearch(e.target.value)}
                                         />
-                                        <span>{f}</span>
-                                    </label>
-                                ))}
-                                {fields.length === 0 && (
-                                    <div className="pg-note">No sample fields — the class may have no rows.</div>
+                                    </div>
                                 )}
-                            </div>
+                                <div className="pgi-fieldbox">
+                                    {visibleFields.map((f) => (
+                                        <label key={f} className="pgi-fl">
+                                            <input
+                                                type="checkbox"
+                                                checked={checked.has(f)}
+                                                onChange={() => toggleField(f)}
+                                            />
+                                            <span>{f}</span>
+                                        </label>
+                                    ))}
+                                    {fields.length === 0 && (
+                                        <div className="pg-note">
+                                            No sample fields — the class may have no rows.
+                                        </div>
+                                    )}
+                                    {fields.length > 0 && visibleFields.length === 0 && (
+                                        <div className="pg-note">No fields match “{fieldSearch}”.</div>
+                                    )}
+                                </div>
+                            </>
                         )}
-                        <div className="pgi-foot">{checked.size} selected</div>
+                        <div className="pgi-foot">
+                            {checked.size} selected
+                            {fieldSearch && ` · ${visibleFields.length} shown`}
+                        </div>
                     </div>
 
                     {/* ---- Filter ---- */}
