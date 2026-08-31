@@ -1,5 +1,6 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Upload, Server, Boxes, Info, ShieldCheck, ShieldAlert, Loader2, LogIn, Save } from 'lucide-react';
+import { loadPersisted, savePersisted } from '../../persistence';
 import { parseIonApi, type IonApiConfig } from './infor/ionapi';
 import type { IonApiToken } from './infor/inforAuth';
 import { getSharedToken } from './infor/inforTokenStore';
@@ -23,6 +24,9 @@ interface InforProviderProps {
     connections?: PlaygroundConnection[];
     onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
 }
+
+// Remembers the last-used saved Infor connection so sign-in survives a reload.
+const LAST_CONN_KEY = 'playground:infor:lastConnection';
 
 // Infor provider auth panel (sidebar). Ingests a `.ionapi`, mints a bearer
 // (per-user login primary; associated service account secondary for testing),
@@ -62,16 +66,35 @@ export default function InforProvider({
         setSavedNote(null);
         setConfig(cfg);
         setFromSaved(true);
+        savePersisted(LAST_CONN_KEY, id);
     };
 
     const saveConnection = () => {
         if (!config || !onSaveConnection) return;
         const name = saveName.trim() || `Infor · ${config.tenant}${config.appName ? ` (${config.appName})` : ''}`;
-        onSaveConnection(name, toInforConnectionPayload(config));
+        const id = onSaveConnection(name, toInforConnectionPayload(config));
+        savePersisted(LAST_CONN_KEY, id);
         setSavedNote(`Saved connection “${name}”.`);
         setFromSaved(true);
         setSaveName('');
     };
+
+    // Restore the last-used saved connection on mount, so sign-in survives a
+    // reload. Service-account connections re-authenticate silently; user-login
+    // connections are pre-selected so only the password is needed.
+    useEffect(() => {
+        if (status !== 'idle' || config) return;
+        const lastId = loadPersisted<string | null>(LAST_CONN_KEY, null);
+        const conn =
+            (lastId ? inforConnections.find((c) => c.id === lastId) : undefined) ??
+            (inforConnections.length === 1 ? inforConnections[0] : undefined);
+        const cfg = conn ? parseInforConfig(conn.payload) : null;
+        if (!cfg) return;
+        setConfig(cfg);
+        setFromSaved(true);
+        if (cfg.saak && cfg.sask) void signInWith(cfg, 'service');
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [inforConnections]);
 
     const handleFile = async (file: File | null) => {
         if (!file) return;
@@ -89,14 +112,15 @@ export default function InforProvider({
         setConfig(result.config);
     };
 
-    const handleSignIn = async (mode: 'user' | 'service') => {
-        if (!config) return;
+    // Mint through the shared store so all consumers of this Infor app (this
+    // panel now, Canvas nodes later) reuse one token (1r). Takes the config
+    // explicitly so auto-sign-in can pass a just-loaded config without waiting
+    // on a state update.
+    const signInWith = async (cfg: IonApiConfig, mode: 'user' | 'service') => {
         setStatus('minting');
         setAuthError(null);
-        // Mint through the shared store so all consumers of this Infor app
-        // (this panel now, Canvas nodes later) reuse one token (1r).
         const result = await getSharedToken(
-            config,
+            cfg,
             mode === 'service' ? { kind: 'service' } : { kind: 'user', username: username.trim(), password },
             workspacePath,
             Date.now(),
@@ -108,7 +132,11 @@ export default function InforProvider({
         }
         setToken(result.token);
         setStatus('signed-in');
-        onSignedIn?.(config, result.token);
+        onSignedIn?.(cfg, result.token);
+    };
+
+    const handleSignIn = (mode: 'user' | 'service') => {
+        if (config) void signInWith(config, mode);
     };
 
     const expiresLabel = token?.expiresAt
