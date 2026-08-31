@@ -10,6 +10,7 @@ import type { ProviderId } from './providers/types';
 import { usePlayground } from './usePlayground';
 import type { PlaygroundConnection } from './connectionBridge';
 import type { credentialsToPayload } from './connectionBridge';
+import type { InforNodeQuery } from './providers/infor/query';
 
 interface PlaygroundProps {
     // The active workspace, used to persist imported specs (PL-6). Null in
@@ -20,8 +21,11 @@ interface PlaygroundProps {
     // Persist inline credentials via the existing Connection mechanism (PL-9).
     onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
     // Raised when a Canvas node's "Open in Playground" is clicked: switch to the
-    // requested provider. The nonce makes repeat opens of the same node re-fire.
-    openRequest?: { nonce: number; provider: ProviderId; nodeId: string } | null;
+    // requested provider and pre-load the node's query. The nonce makes repeat
+    // opens of the same node re-fire.
+    openRequest?: { nonce: number; provider: ProviderId; nodeId: string; query?: InforNodeQuery } | null;
+    // Write a built query back to the originating Canvas node.
+    onApplyToNode?: (nodeId: string, query: InforNodeQuery) => void;
 }
 
 const VERSION_LABEL: Record<string, string> = {
@@ -41,6 +45,7 @@ export default function Playground({
     connections = [],
     onSaveConnection,
     openRequest,
+    onApplyToNode,
 }: PlaygroundProps) {
     const pg = usePlayground(workspacePath);
     const { spec, selectedId, source, persist } = pg;
@@ -67,6 +72,8 @@ export default function Playground({
                     setProvider={setProvider}
                     connections={connections}
                     onSaveConnection={onSaveConnection}
+                    openRequest={openRequest}
+                    onApplyToNode={onApplyToNode}
                 />
             ) : (
               <>

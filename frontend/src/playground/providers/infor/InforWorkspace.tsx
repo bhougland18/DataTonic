@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Search, ChevronDown, Play, Loader2, Plus, Trash2, Boxes, RefreshCw, Plug } from 'lucide-react';
+import { Search, ChevronDown, Play, Loader2, Plus, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine } from 'lucide-react';
 import ProviderSelector from '../ProviderSelector';
 import InforProvider from '../InforProvider';
 import type { ProviderId } from '../types';
@@ -13,7 +13,14 @@ import {
     loadCachedClasses,
     saveCachedClasses,
 } from './classCache';
-import { runGenericQuery, sampleFields, type FilterCondition } from './query';
+import {
+    runGenericQuery,
+    sampleFields,
+    buildSimpleFilter,
+    parseSimpleFilter,
+    type FilterCondition,
+    type InforNodeQuery,
+} from './query';
 import type { GenericPage } from './inforApi';
 
 interface InforWorkspaceProps {
@@ -22,6 +29,11 @@ interface InforWorkspaceProps {
     setProvider: (id: ProviderId) => void;
     connections?: PlaygroundConnection[];
     onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
+    // Set when the Playground was opened from a Canvas Infor node: carries the
+    // node's current query to pre-load, and the node id to write back to.
+    openRequest?: { nonce: number; nodeId: string; query?: InforNodeQuery } | null;
+    // Write the built query back to the originating node's props.
+    onApplyToNode?: (nodeId: string, query: InforNodeQuery) => void;
 }
 
 const PAGE_SIZE = 25;
@@ -36,6 +48,8 @@ export default function InforWorkspace({
     setProvider,
     connections = [],
     onSaveConnection,
+    openRequest,
+    onApplyToNode,
 }: InforWorkspaceProps) {
     const [session, setSession] = useState<{ config: IonApiConfig; token: IonApiToken } | null>(null);
 
@@ -59,6 +73,13 @@ export default function InforWorkspace({
     const [running, setRunning] = useState(false);
     const [result, setResult] = useState<GenericPage | null>(null);
     const [queryError, setQueryError] = useState<string | null>(null);
+
+    // ---- round-trip with a Canvas node (opened via "Open in Playground") ----
+    // The node we'll write back to, and its query held until sign-in + the
+    // class list are ready (the user may open before signing in).
+    const [applyNodeId, setApplyNodeId] = useState<string | null>(null);
+    const [pendingQuery, setPendingQuery] = useState<InforNodeQuery | null>(null);
+    const [applied, setApplied] = useState(false);
 
     const applyFetched = async (config: IonApiConfig, classes: BusinessClass[]) => {
         setAllClasses(classes);
@@ -105,6 +126,75 @@ export default function InforWorkspace({
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [session, workspacePath]);
+
+    // Capture an "Open in Playground" request from a Canvas node; hold the
+    // query until we can apply it (below).
+    useEffect(() => {
+        if (!openRequest) return;
+        setApplyNodeId(openRequest.nodeId);
+        setPendingQuery(openRequest.query ?? {});
+        setApplied(false);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [openRequest?.nonce]);
+
+    // Apply the held node query once signed in. Seeds limit/filter/fields
+    // immediately, then loads the business class's field list (union'd with the
+    // node's saved fields so none silently drop).
+    useEffect(() => {
+        if (!session || !pendingQuery) return;
+        const q = pendingQuery;
+        setPendingQuery(null);
+        if (typeof q.limit === 'number' && q.limit > 0) setLimit(q.limit);
+        setConds(parseSimpleFilter(q.filter));
+        const wanted = (q.fields ?? '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+        setChecked(new Set(wanted));
+        if (!q.businessClass) return;
+        const businessClass = q.businessClass;
+        const bc =
+            (allClasses ?? []).find((c) => c.entity === businessClass) ?? { entity: businessClass };
+        setSelected(bc);
+        setPickerOpen(false);
+        setResult(null);
+        setQueryError(null);
+        (async () => {
+            setFieldsLoading(true);
+            const res = await sampleFields(
+                session.config,
+                session.token.accessToken,
+                businessClass,
+                workspacePath,
+            );
+            setFieldsLoading(false);
+            if (res.ok) {
+                const union = [...res.fields];
+                for (const w of wanted) if (!union.includes(w)) union.push(w);
+                setFields(union);
+            } else {
+                setFields(wanted);
+            }
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [session, allClasses, pendingQuery]);
+
+    // Any manual edit clears the "Applied ✓" confirmation.
+    useEffect(() => {
+        setApplied(false);
+    }, [checked, conds, limit, selected]);
+
+    const applyToNode = () => {
+        if (!onApplyToNode || !applyNodeId || !selected) return;
+        const activeFields = fields.length ? fields.filter((f) => checked.has(f)) : Array.from(checked);
+        onApplyToNode(applyNodeId, {
+            businessClass: selected.entity,
+            fields: activeFields.join(','),
+            filter: buildSimpleFilter(conds),
+            limit,
+        });
+        setApplied(true);
+    };
 
     const refreshClasses = async () => {
         if (!session) return;
@@ -481,6 +571,25 @@ export default function InforWorkspace({
                                     >
                                         <Plus size={14} strokeWidth={2} /> New query
                                     </button>
+                                    {applyNodeId && onApplyToNode && (
+                                        <button
+                                            type="button"
+                                            className={`pg-btn${applied ? '' : ' pg-btn--primary'}`}
+                                            onClick={applyToNode}
+                                            disabled={!selected || checked.size === 0}
+                                            title="Write this query back to the Infor node on the canvas"
+                                        >
+                                            {applied ? (
+                                                <>
+                                                    <Check size={14} strokeWidth={2} /> Applied to node
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <ArrowUpToLine size={14} strokeWidth={2} /> Apply to node
+                                                </>
+                                            )}
+                                        </button>
+                                    )}
                                 </div>
                             </>
                         )}

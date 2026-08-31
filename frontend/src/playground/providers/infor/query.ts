@@ -32,6 +32,32 @@ export function buildSimpleFilter(conds: FilterCondition[]): string {
         .join('|');
 }
 
+// Inverse of buildSimpleFilter: turn a stored `_filter` string back into
+// editable conditions when pre-loading a Canvas node's query into the builder.
+export function parseSimpleFilter(filter: string | undefined): FilterCondition[] {
+    if (!filter) return [];
+    return filter
+        .split('|')
+        .map((part) => {
+            const i = part.indexOf('::');
+            if (i < 0) return null;
+            return { field: part.slice(0, i).trim(), value: part.slice(i + 2).trim() };
+        })
+        .filter((c): c is FilterCondition => c !== null && c.field.length > 0);
+}
+
+// The subset of an Infor source node's props that the Playground round-trips:
+// pre-loaded into the query builder on open, and written back on "Apply to
+// node". Mirrors the src.infor manifest fields (connectionRef/lplFilter stay on
+// the node and are not edited here).
+export interface InforNodeQuery {
+    businessClass?: string;
+    fields?: string;
+    filter?: string;
+    lplFilter?: string;
+    limit?: number;
+}
+
 function genericUrl(config: IonApiConfig, businessClass: string, q: GenericQuery): string {
     const params = new URLSearchParams();
     if (q.fields.length) params.set('_fields', q.fields.join(','));

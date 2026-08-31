@@ -58,6 +58,7 @@ import Rail from './rail/Rail';
 import { useAppMode } from './rail/useAppMode';
 import Playground from './playground/Playground';
 import type { ProviderId } from './playground/providers/types';
+import type { InforNodeQuery } from './playground/providers/infor/query';
 import { copyText, saveTextFile } from './tauri-io';
 import { writeClipboard, readClipboard, instantiateClipboard } from './clipboard';
 import { RunStatusContext } from './canvas/run-status-context';
@@ -1156,17 +1157,54 @@ export default function App() {
         nonce: number;
         provider: ProviderId;
         nodeId: string;
+        query?: InforNodeQuery;
     } | null>(null);
     const handleOpenPlayground = useCallback(
         (nodeId: string) => {
+            const node = nodes.find(n => n.id === nodeId);
+            const p = (node?.data.properties ?? {}) as Record<string, unknown>;
+            const asStr = (v: unknown) => (typeof v === 'string' ? v : undefined);
+            const rawLimit = p.limit;
+            const query: InforNodeQuery = {
+                businessClass: asStr(p.businessClass),
+                fields: asStr(p.fields),
+                filter: asStr(p.filter),
+                lplFilter: asStr(p.lplFilter),
+                limit:
+                    typeof rawLimit === 'number'
+                        ? rawLimit
+                        : typeof rawLimit === 'string' && rawLimit.trim()
+                          ? Number(rawLimit)
+                          : undefined,
+            };
             setPlaygroundRequest(r => ({
                 nonce: (r?.nonce ?? 0) + 1,
                 provider: 'infor',
                 nodeId,
+                query,
             }));
             setMode('playground');
         },
-        [setMode],
+        [nodes, setMode],
+    );
+
+    // Write a query built in the Playground back to the Infor node's props.
+    // Only the round-tripped keys are touched; connectionRef / lplFilter stay.
+    const handleApplyInforQuery = useCallback(
+        (nodeId: string, q: InforNodeQuery) => {
+            setNodes(ns =>
+                ns.map(n => {
+                    if (n.id !== nodeId) return n;
+                    const nextProps: Record<string, unknown> = { ...(n.data.properties ?? {}) };
+                    if (q.businessClass !== undefined) nextProps.businessClass = q.businessClass;
+                    if (q.fields !== undefined) nextProps.fields = q.fields;
+                    if (q.filter !== undefined) nextProps.filter = q.filter;
+                    if (q.limit !== undefined) nextProps.limit = q.limit;
+                    return { ...n, data: { ...n.data, properties: nextProps } };
+                }),
+            );
+        },
+        [setNodes],
     );
     const handleMapperSave = useCallback(
         (state: MapperState, derivedSchema: Column[]) => {
@@ -2734,6 +2772,7 @@ export default function App() {
                             }))}
                         onSaveConnection={handlePlaygroundSaveConnection}
                         openRequest={playgroundRequest}
+                        onApplyToNode={handleApplyInforQuery}
                     />
                 </div>
                 {mode === 'canvas' && (
