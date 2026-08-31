@@ -2915,6 +2915,77 @@ function synthWebhookSource(comp: ComponentDef): ComponentManifest {
     ]);
 }
 
+// Dedicated Infor FSM/Landmark source. Stores an Infor query (business class +
+// field list + filter + limit) and a connectionRef to a saved ION API
+// connection, rather than the raw url/auth of the generic REST form. The
+// query is authored here or interactively via "Open in Playground"; at run
+// time it compiles to a REST call against the business class's lists/_generic
+// endpoint. Distinct componentId (src.infor) so the node reads as "Infor", not
+// "REST", in the palette and on the canvas.
+function synthInforSource(comp: ComponentDef): ComponentManifest {
+    return base(comp, [
+        {
+            label: 'Connection',
+            fields: [
+                {
+                    key: 'connectionRef',
+                    label: 'Infor connection',
+                    kind: 'connection-ref',
+                    accepts: ['rest'],
+                    description:
+                        'Pick a saved Infor ION API connection (Connections folder). Resolved and decrypted at run time; all Infor nodes sharing it reuse one token.',
+                },
+            ],
+        },
+        {
+            label: 'Query',
+            fields: [
+                {
+                    key: 'businessClass',
+                    label: 'Business class',
+                    kind: 'text',
+                    required: true,
+                    placeholder: 'Item',
+                    description:
+                        'The FSM/Landmark business class to query. Its lists/_generic endpoint returns the rows.',
+                },
+                {
+                    key: 'fields',
+                    label: 'Fields',
+                    kind: 'text',
+                    placeholder: 'Item,ItemGroup,Description',
+                    description:
+                        'Comma-separated field names to return (_fields). Leave blank for the class default set.',
+                },
+                {
+                    key: 'filter',
+                    label: 'Filter',
+                    kind: 'text',
+                    placeholder: 'Item::10*',
+                    description:
+                        'Simple filter (_filter): name::value pairs joined by |. Leave blank for no filter.',
+                },
+                {
+                    key: 'lplFilter',
+                    label: 'LPL filter (advanced)',
+                    kind: 'text',
+                    placeholder: '(Item startsWith "10")',
+                    description:
+                        'Advanced LPL expression (_lplFilter). Optional; overrides the simple filter when set.',
+                },
+                {
+                    key: 'limit',
+                    label: 'Limit',
+                    kind: 'integer',
+                    placeholder: 'e.g. 100',
+                    description:
+                        'Max rows to return (_limit). Blank uses the server default. Usually set by building the query in the Playground.',
+                },
+            ],
+        },
+    ]);
+}
+
 function synthApiSource(comp: ComponentDef): ComponentManifest {
     // #166: src.salesforce offers OAuth 2.0 client-credentials as an auth mode so
     // the source stops needing a manually-refreshed ~2h Bearer token. The extra
@@ -7062,6 +7133,10 @@ function dispatchManifest(componentId: string): ComponentManifest | undefined {
     // src.webhook is a local listener, not a REST call, so it needs its own
     // form rather than the generic src.apis one (issue #162).
     if (componentId === 'src.webhook') return synthWebhookSource(comp);
+    // src.infor sits in the src.apis group but is NOT the generic REST form: it
+    // stores an Infor query (business class + fields + filter) and a
+    // connectionRef, not a raw url/auth. Route by id ahead of the group check.
+    if (componentId === 'src.infor') return synthInforSource(comp);
 
     // Sources
     // src.salesforce.bulk lives in the saas.crm group but is NOT a REST-form

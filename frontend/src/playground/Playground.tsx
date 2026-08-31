@@ -1,5 +1,5 @@
 import './playground.css';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Plug, FileCheck2, FileWarning, HardDriveDownload, Info } from 'lucide-react';
 import ImportBar from './ImportBar';
 import EndpointTree from './EndpointTree';
@@ -19,6 +19,9 @@ interface PlaygroundProps {
     connections?: PlaygroundConnection[];
     // Persist inline credentials via the existing Connection mechanism (PL-9).
     onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
+    // Raised when a Canvas node's "Open in Playground" is clicked: switch to the
+    // requested provider. The nonce makes repeat opens of the same node re-fire.
+    openRequest?: { nonce: number; provider: ProviderId; nodeId: string } | null;
 }
 
 const VERSION_LABEL: Record<string, string> = {
@@ -37,10 +40,18 @@ export default function Playground({
     workspacePath,
     connections = [],
     onSaveConnection,
+    openRequest,
 }: PlaygroundProps) {
     const pg = usePlayground(workspacePath);
     const { spec, selectedId, source, persist } = pg;
     const [provider, setProvider] = useState<ProviderId>('generic');
+
+    // Honour an "Open in Playground" request from a Canvas node: jump to that
+    // provider. Keyed on the nonce so opening the same node twice re-fires.
+    useEffect(() => {
+        if (openRequest) setProvider(openRequest.provider);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [openRequest?.nonce]);
 
     const selected = useMemo(
         () => spec?.endpoints.find((e) => e.id === selectedId) ?? null,

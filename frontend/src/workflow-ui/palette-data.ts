@@ -197,6 +197,7 @@ export const PALETTE: Category[] = [
                 label: 'APIs',
                 components: [
                     src('rest', 'REST', 'available', 'Generic HTTP GET/POST source. Parses JSON response, optionally walks a JSON pointer (responsePath) to find the row array, and follows cursor-style pagination if configured (cursorNextPath + cursorParam).'),
+                    src('infor', 'Infor', 'available', 'Query an Infor FSM/Landmark business class (the lists/_generic endpoint) via a saved ION API connection. Configure the business class, field list, and filter here, or click "Open in Playground" to build the query interactively. Compiles to a REST source at run time.'),
                     src('graphql', 'GraphQL', 'available', 'POST a GraphQL query to an endpoint and walk the response data path. Rides snk.rest/src.rest infrastructure; auth via Bearer / API-Key.'),
                     src('grpc', 'gRPC', 'planned'),
                     src('webhook', 'Webhook', 'available', 'Bind 127.0.0.1:port and collect up to `maxRequests` inbound HTTP requests with a global `timeoutMs` deadline. JSON-object bodies become the row; JSON-array bodies unfold into rows; other bodies fall back to {method, path, body, headers}. Local-only by design - point a tunnel (ngrok / cloudflared) at the port for public reach.'),

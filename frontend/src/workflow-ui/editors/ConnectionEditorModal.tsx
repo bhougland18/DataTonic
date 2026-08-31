@@ -1,8 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { KeyValueField } from '../fields/KeyValueField';
 import { createPortal } from 'react-dom';
-import { Plug, Save, X } from 'lucide-react';
+import { Plug, Save, X, Upload, ShieldAlert } from 'lucide-react';
 import type { ConnectionKind, ConnectionPayload, RepoItem } from '../../repo-types';
+import { parseIonApi, type IonApiConfig } from '../../playground/providers/infor/ionapi';
+import { toInforConnectionPayload, parseInforConfig } from '../../playground/providers/infor/inforConnection';
+
+// Infor connections are stored as kind 'rest' (with the whole .ionapi encrypted
+// under extra.secret), so 'infor' is a UI-only pseudo-type in the selector, not
+// a real ConnectionKind. Saving maps it to the rest payload via
+// toInforConnectionPayload, which is what the Infor node's connectionRef picker
+// (accepts 'rest') and the Playground both already read.
+type KindOrInfor = ConnectionKind | 'infor';
 
 type Props = {
     item: RepoItem | null;
@@ -174,12 +183,36 @@ const SECRET_FIELDS = new Set<keyof ConnectionPayload>([
 
 export default function ConnectionEditorModal({ item, onSave, onCancel }: Props) {
     const initial = (item?.payload as ConnectionPayload | undefined) ?? null;
+    const initialInfor = useMemo(() => parseInforConfig(initial ?? undefined), [initial]);
     const [name, setName] = useState(item?.name ?? '');
-    const [kind, setKind] = useState<ConnectionKind>(initial?.kind ?? 'postgres');
+    const [kind, setKind] = useState<KindOrInfor>(
+        initialInfor ? 'infor' : (initial?.kind ?? 'postgres'),
+    );
     const [values, setValues] = useState<ConnectionPayload>(initial ?? { kind: 'postgres' });
+    const [inforConfig, setInforConfig] = useState<IonApiConfig | null>(initialInfor);
+    const [inforError, setInforError] = useState<string | null>(null);
     const nameRef = useRef<HTMLInputElement>(null);
+    const fileRef = useRef<HTMLInputElement>(null);
 
     const meta = useMemo(() => CONNECTION_TYPES.find(c => c.kind === kind), [kind]);
+    const typeLabel = kind === 'infor' ? 'Infor (ION API)' : (meta?.label ?? kind);
+
+    const handleIonapi = async (file: File | null) => {
+        if (!file) return;
+        setInforError(null);
+        const res = parseIonApi(await file.text());
+        if (!res.ok) {
+            setInforConfig(null);
+            setInforError(res.error);
+            return;
+        }
+        setInforConfig(res.config);
+        if (!name.trim()) {
+            setName(
+                `Infor · ${res.config.tenant}${res.config.appName ? ` (${res.config.appName})` : ''}`,
+            );
+        }
+    };
 
     useEffect(() => {
         setTimeout(() => nameRef.current?.focus(), 30);
@@ -199,8 +232,9 @@ export default function ConnectionEditorModal({ item, onSave, onCancel }: Props)
         setValues(v => ({ ...v, [key]: value }));
     };
 
-    const handleKindChange = (newKind: ConnectionKind) => {
+    const handleKindChange = (newKind: KindOrInfor) => {
         setKind(newKind);
+        if (newKind === 'infor') return;
         const m = CONNECTION_TYPES.find(c => c.kind === newKind);
         setValues(v => ({
             ...v,
@@ -209,10 +243,18 @@ export default function ConnectionEditorModal({ item, onSave, onCancel }: Props)
         }));
     };
 
-    const canSave = name.trim().length > 0;
+    const canSave =
+        name.trim().length > 0 && (kind !== 'infor' || inforConfig !== null);
 
     const handleSave = () => {
         if (!canSave) return;
+        if (kind === 'infor') {
+            if (!inforConfig) return;
+            // Map to the encrypted rest payload; preserve any notes typed here.
+            const payload = toInforConnectionPayload(inforConfig);
+            onSave(name.trim(), values.notes ? { ...payload, notes: values.notes } : payload);
+            return;
+        }
         onSave(name.trim(), { ...values, kind });
     };
 
@@ -232,7 +274,7 @@ export default function ConnectionEditorModal({ item, onSave, onCancel }: Props)
                                 {item ? 'Edit connection' : 'New connection'}
                             </div>
                             <div className="modal-subtitle">
-                                {meta?.label ?? kind} · saved in <code>Connections</code>
+                                {typeLabel} · saved in <code>Connections</code>
                             </div>
                         </div>
                     </div>
@@ -265,16 +307,63 @@ export default function ConnectionEditorModal({ item, onSave, onCancel }: Props)
                         <select
                             className="modal-input modal-select"
                             value={kind}
-                            onChange={e => handleKindChange(e.target.value as ConnectionKind)}
+                            onChange={e => handleKindChange(e.target.value as KindOrInfor)}
                         >
                             {CONNECTION_TYPES.map(c => (
                                 <option key={c.kind} value={c.kind}>
                                     {c.label}
                                 </option>
                             ))}
+                            <option value="infor">Infor (ION API)</option>
                         </select>
                     </div>
 
+                    {kind === 'infor' && (
+                        <div className="modal-field">
+                            <label className="modal-field-label">ION API credentials</label>
+                            <button
+                                type="button"
+                                className="btn btn-secondary"
+                                onClick={() => fileRef.current?.click()}
+                            >
+                                <Upload size={13} />
+                                {inforConfig ? 'Replace .ionapi file' : 'Import .ionapi file'}
+                            </button>
+                            <input
+                                ref={fileRef}
+                                type="file"
+                                accept=".ionapi,application/json,.json"
+                                hidden
+                                onChange={e => {
+                                    void handleIonapi(e.target.files?.[0] ?? null);
+                                    e.target.value = '';
+                                }}
+                            />
+                            {inforConfig && (
+                                <div className="modal-subtitle" style={{ marginTop: 8 }}>
+                                    Tenant <code>{inforConfig.tenant}</code>
+                                    {inforConfig.appName ? (
+                                        <>
+                                            {' · App '}
+                                            <code>{inforConfig.appName}</code>
+                                        </>
+                                    ) : null}
+                                    {' · secret encrypted at rest'}
+                                </div>
+                            )}
+                            {inforError && (
+                                <div
+                                    role="alert"
+                                    style={{ marginTop: 8, color: 'var(--danger, #e5484d)', display: 'flex', gap: 6, alignItems: 'center' }}
+                                >
+                                    <ShieldAlert size={13} />
+                                    <span>{inforError}</span>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {kind !== 'infor' && (
                     <div className="connection-field-grid">
                         {meta?.fields.map(field => {
                             const isSecret = SECRET_FIELDS.has(field);
@@ -401,6 +490,7 @@ export default function ConnectionEditorModal({ item, onSave, onCancel }: Props)
                             );
                         })}
                     </div>
+                    )}
 
                     <div className="modal-field">
                         <label className="modal-field-label">Notes (optional)</label>

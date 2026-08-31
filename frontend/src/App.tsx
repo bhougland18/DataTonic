@@ -57,6 +57,7 @@ import HomeLauncher from './workflow-ui/HomeLauncher';
 import Rail from './rail/Rail';
 import { useAppMode } from './rail/useAppMode';
 import Playground from './playground/Playground';
+import type { ProviderId } from './playground/providers/types';
 import { copyText, saveTextFile } from './tauri-io';
 import { writeClipboard, readClipboard, instantiateClipboard } from './clipboard';
 import { RunStatusContext } from './canvas/run-status-context';
@@ -1146,6 +1147,27 @@ export default function App() {
     const handleOpenMapper = useCallback((nodeId: string) => {
         setMapperNodeId(nodeId);
     }, []);
+
+    // "Open in API Playground" on an Infor source node: switch to Playground
+    // in Infor mode and remember which node asked, so a query built there can
+    // be written back. The nonce forces the Playground's effect to re-run even
+    // if the same node is opened twice. (Pre-load + write-back land next.)
+    const [playgroundRequest, setPlaygroundRequest] = useState<{
+        nonce: number;
+        provider: ProviderId;
+        nodeId: string;
+    } | null>(null);
+    const handleOpenPlayground = useCallback(
+        (nodeId: string) => {
+            setPlaygroundRequest(r => ({
+                nonce: (r?.nonce ?? 0) + 1,
+                provider: 'infor',
+                nodeId,
+            }));
+            setMode('playground');
+        },
+        [setMode],
+    );
     const handleMapperSave = useCallback(
         (state: MapperState, derivedSchema: Column[]) => {
             if (!mapperNodeId) return;
@@ -2711,6 +2733,7 @@ export default function App() {
                                 payload: i.payload as ConnectionPayload,
                             }))}
                         onSaveConnection={handlePlaygroundSaveConnection}
+                        openRequest={playgroundRequest}
                     />
                 </div>
                 {mode === 'canvas' && (
@@ -2797,6 +2820,7 @@ export default function App() {
                     workspacePath={workspacePathState}
                     onUpdate={handleUpdateNode}
                     onOpenMapper={handleOpenMapper}
+                    onOpenPlayground={handleOpenPlayground}
                     focusNameRequest={renameRequest}
                 />
                   </>

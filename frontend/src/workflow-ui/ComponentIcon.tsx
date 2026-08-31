@@ -48,6 +48,7 @@ const BASE_FALLBACK: Record<string, ComponentType<IconProps>> = {
     xml: FileCode,
     fixedwidth: AlignLeft,
     rest: Globe,
+    infor: Boxes,
     http: Globe,
     odata: Globe,
     soap: FileCode,

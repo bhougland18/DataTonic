@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Edge, Node } from '@xyflow/react';
-import { CheckCircle2, ChevronLeft, ChevronRight, MousePointer2, Workflow } from 'lucide-react';
+import { CheckCircle2, ChevronLeft, ChevronRight, MousePointer2, Workflow, FlaskConical } from 'lucide-react';
 import { resolveUpstreamSchema, resolveUpstreamSampleRows, resolveOutputSchema } from '../schema-resolve';
 import { buildContextVars, builtinVars, substituteDeep } from '../run-resolve';
 import type { Column, DuckleNodeData } from '../pipeline-types';
@@ -120,6 +120,10 @@ type Props = {
     workspacePath?: string | null;
     onUpdate: (id: string, patch: Partial<DuckleNodeData>) => void;
     onOpenMapper?: (nodeId: string) => void;
+    // Opens the API Playground pre-loaded to build/modify this node's query
+    // (Infor source nodes). Carries the node id so the Playground can write
+    // the built query back to it.
+    onOpenPlayground?: (nodeId: string) => void;
     focusNameRequest?: number;
 };
 
@@ -132,6 +136,7 @@ export default function PropertiesPanel({
     workspacePath,
     onUpdate,
     onOpenMapper,
+    onOpenPlayground,
     focusNameRequest,
 }: Props) {
     const { t } = useTranslation();
@@ -491,6 +496,18 @@ export default function PropertiesPanel({
                                 >
                                     <Workflow size={14} />
                                     {t('properties.openVisualMapper')}
+                                </button>
+                            ) : null}
+                            {data.componentId === 'src.infor' && onOpenPlayground ? (
+                                <button
+                                    type="button"
+                                    className="properties-mapper-button"
+                                    onClick={() => onOpenPlayground(selected.id)}
+                                >
+                                    <FlaskConical size={14} />
+                                    {t('properties.openInPlayground', {
+                                        defaultValue: 'Open in API Playground',
+                                    })}
                                 </button>
                             ) : null}
                             {manifest ? (
