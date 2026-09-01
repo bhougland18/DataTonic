@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Search, ChevronDown, Play, Loader2, Plus, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine } from 'lucide-react';
-import ProviderSelector from '../ProviderSelector';
 import InforProvider from '../InforProvider';
-import type { ProviderId } from '../types';
 import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
 import type { IonApiConfig } from './ionapi';
 import type { IonApiToken } from './inforAuth';
@@ -25,8 +23,6 @@ import type { GenericPage } from './inforApi';
 
 interface InforWorkspaceProps {
     workspacePath: string | null;
-    provider: ProviderId;
-    setProvider: (id: ProviderId) => void;
     connections?: PlaygroundConnection[];
     onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
     // Set when the Playground was opened from a Canvas Infor node: carries the
@@ -37,15 +33,14 @@ interface InforWorkspaceProps {
 }
 
 const PAGE_SIZE = 25;
+const DEFAULT_LIMIT = 25;
 
-// The full Infor experience in one place: the left panel holds provider,
-// credentials/connection, and the whole query builder (business class → fields
+// The full Infor experience in one place: the left panel holds the
+// credentials/connection and the whole query builder (business class → fields
 // → filter → run); the right pane is the results grid. Matches the approved
 // Query-Properties mockup.
 export default function InforWorkspace({
     workspacePath,
-    provider,
-    setProvider,
     connections = [],
     onSaveConnection,
     openRequest,
@@ -69,7 +64,7 @@ export default function InforWorkspace({
     const [fieldSearch, setFieldSearch] = useState('');
     const [fieldsLoading, setFieldsLoading] = useState(false);
     const [conds, setConds] = useState<FilterCondition[]>([]);
-    const [limit, setLimit] = useState(25);
+    const [limit, setLimit] = useState(DEFAULT_LIMIT);
     const [running, setRunning] = useState(false);
     const [result, setResult] = useState<GenericPage | null>(null);
     const [queryError, setQueryError] = useState<string | null>(null);
@@ -137,28 +132,44 @@ export default function InforWorkspace({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [openRequest?.nonce]);
 
-    // Apply the held node query once signed in. Seeds limit/filter/fields
-    // immediately, then loads the business class's field list (union'd with the
-    // node's saved fields so none silently drop).
+    // Apply the held node query once signed in. A blank query (a freshly
+    // created node) resets the builder to empty so it never inherits the
+    // previously opened node's class/fields/filter; a saved query auto-populates
+    // it — loading the class's field list (union'd with the node's saved fields
+    // so none silently drop).
     useEffect(() => {
         if (!session || !pendingQuery) return;
         const q = pendingQuery;
         setPendingQuery(null);
-        if (typeof q.limit === 'number' && q.limit > 0) setLimit(q.limit);
-        setConds(parseSimpleFilter(q.filter));
+        setResult(null);
+        setQueryError(null);
         const wanted = (q.fields ?? '')
             .split(',')
             .map((s) => s.trim())
             .filter(Boolean);
+        // New / unconfigured node → start blank (do NOT carry over prior state).
+        if (!q.businessClass) {
+            setSelected(null);
+            setPickerOpen(true);
+            setSearch('');
+            setPage(1);
+            setFields([]);
+            setChecked(new Set());
+            setFieldSearch('');
+            setConds([]);
+            setLimit(DEFAULT_LIMIT);
+            return;
+        }
+        // Saved query → populate the builder from it.
+        setLimit(typeof q.limit === 'number' && q.limit > 0 ? q.limit : DEFAULT_LIMIT);
+        setConds(parseSimpleFilter(q.filter));
         setChecked(new Set(wanted));
-        if (!q.businessClass) return;
+        setFieldSearch('');
         const businessClass = q.businessClass;
         const bc =
             (allClasses ?? []).find((c) => c.entity === businessClass) ?? { entity: businessClass };
         setSelected(bc);
         setPickerOpen(false);
-        setResult(null);
-        setQueryError(null);
         (async () => {
             setFieldsLoading(true);
             const res = await sampleFields(
@@ -257,20 +268,6 @@ export default function InforWorkspace({
         setResult(res.page);
     };
 
-    // Reset to a blank query (stays signed in and keeps the cached class list).
-    const newQuery = () => {
-        setSelected(null);
-        setPickerOpen(true);
-        setSearch('');
-        setPage(1);
-        setFields([]);
-        setChecked(new Set());
-        setFieldSearch('');
-        setConds([]);
-        setResult(null);
-        setQueryError(null);
-    };
-
     const columns = useMemo(() => {
         const active = fields.filter((f) => checked.has(f));
         if (active.length) return active;
@@ -309,7 +306,6 @@ export default function InforWorkspace({
                     <Plug size={16} strokeWidth={1.75} />
                     <h2>API Playground</h2>
                 </header>
-                <ProviderSelector value={provider} onChange={setProvider} />
                 <InforProvider
                     workspacePath={workspacePath}
                     onSignedIn={(config, token) => setSession({ config, token })}
@@ -562,14 +558,6 @@ export default function InforWorkspace({
                                             <Play size={14} strokeWidth={2} />
                                         )}
                                         Run query
-                                    </button>
-                                    <button
-                                        type="button"
-                                        className="pg-btn"
-                                        onClick={newQuery}
-                                        title="Clear this query and start over (stays signed in)"
-                                    >
-                                        <Plus size={14} strokeWidth={2} /> New query
                                     </button>
                                     {applyNodeId && onApplyToNode && (
                                         <button

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Upload, Server, Boxes, Info, ShieldCheck, ShieldAlert, Loader2, LogIn, Save } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Server, Boxes, Info, ShieldCheck, ShieldAlert, Loader2, LogIn, Save } from 'lucide-react';
 import { loadPersisted, savePersisted } from '../../persistence';
-import { parseIonApi, type IonApiConfig } from './infor/ionapi';
+import type { IonApiConfig } from './infor/ionapi';
 import type { IonApiToken } from './infor/inforAuth';
 import { getSharedToken } from './infor/inforTokenStore';
 import { restBase } from './infor/inforApi';
@@ -38,10 +38,8 @@ export default function InforProvider({
     connections = [],
     onSaveConnection,
 }: InforProviderProps) {
-    const fileRef = useRef<HTMLInputElement>(null);
     const [config, setConfig] = useState<IonApiConfig | null>(null);
     const [fromSaved, setFromSaved] = useState(false);
-    const [parseError, setParseError] = useState<string | null>(null);
     const [status, setStatus] = useState<'idle' | 'minting' | 'signed-in' | 'error'>('idle');
     const [token, setToken] = useState<IonApiToken | null>(null);
     const [authError, setAuthError] = useState<string | null>(null);
@@ -60,7 +58,6 @@ export default function InforProvider({
         const conn = inforConnections.find((c) => c.id === id);
         const cfg = conn && parseInforConfig(conn.payload);
         if (!cfg) return;
-        setParseError(null);
         setToken(null);
         setStatus('idle');
         setSavedNote(null);
@@ -96,21 +93,6 @@ export default function InforProvider({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [inforConnections]);
 
-    const handleFile = async (file: File | null) => {
-        if (!file) return;
-        setParseError(null);
-        setToken(null);
-        setStatus('idle');
-        setSavedNote(null);
-        setFromSaved(false);
-        const result = parseIonApi(await file.text());
-        if (!result.ok) {
-            setConfig(null);
-            setParseError(result.error);
-            return;
-        }
-        setConfig(result.config);
-    };
 
     // Mint through the shared store so all consumers of this Infor app (this
     // panel now, Canvas nodes later) reuse one token (1r). Takes the config
@@ -166,33 +148,6 @@ export default function InforProvider({
                         ))}
                     </select>
                 </label>
-            )}
-
-            <button type="button" className="pg-btn" onClick={() => fileRef.current?.click()}>
-                <Upload size={14} strokeWidth={1.75} /> Import .ionapi credentials
-            </button>
-            <input
-                ref={fileRef}
-                type="file"
-                accept=".ionapi,application/json,.json"
-                hidden
-                onChange={(e) => {
-                    void handleFile(e.target.files?.[0] ?? null);
-                    e.target.value = '';
-                }}
-            />
-
-            {parseError && (
-                <div className="pg-errors" role="alert">
-                    <div className="pg-errors-head">
-                        <ShieldAlert size={14} strokeWidth={2} /> Could not read the .ionapi file
-                    </div>
-                    <ul>
-                        <li>
-                            <span>{parseError}</span>
-                        </li>
-                    </ul>
-                </div>
             )}
 
             {config && (
@@ -312,7 +267,7 @@ export default function InforProvider({
             )}
             {savedNote && <div className="pg-persist pg-persist--ok">{savedNote}</div>}
 
-            {!config && !parseError && (
+            {!config && (
                 <>
                     <div className="pg-infor-step pg-infor-step--static">
                         <Server size={15} strokeWidth={1.75} />
@@ -327,8 +282,9 @@ export default function InforProvider({
                     <div className="pg-infor-note">
                         <Info size={14} strokeWidth={1.75} />
                         <span>
-                            Import your ION API <b>.ionapi</b> credentials to connect. Business-class
-                            discovery and the query builder open once you sign in.
+                            Choose a saved Infor <b>connection</b> above to sign in. Add one from the
+                            Connections folder (New connection → Infor). Business-class discovery and
+                            the query builder open once you sign in.
                         </span>
                     </div>
                 </>

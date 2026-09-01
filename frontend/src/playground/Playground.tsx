@@ -68,8 +68,6 @@ export default function Playground({
             {provider === 'infor' ? (
                 <InforWorkspace
                     workspacePath={workspacePath}
-                    provider={provider}
-                    setProvider={setProvider}
                     connections={connections}
                     onSaveConnection={onSaveConnection}
                     openRequest={openRequest}
