@@ -1,12 +1,35 @@
-// Infor FSM REST calls through the backend send path (proxy-aware, no CORS).
-// Confirmed live (2026-08-31): discovery and data both hang off the FSM REST
-// base `{iu}/{tenant}/FSM/fsm/soap`.
+// Infor REST calls through the backend send path (proxy-aware, no CORS).
+// Confirmed live (2026-08-31): discovery and data both hang off the REST base
+// `{iu}/{tenant}/{app}/{module}/soap`, which varies by data area (FSM vs HCM).
 
 import { sendRequest } from '../../sendClient';
 import type { IonApiConfig } from './ionapi';
 
-export function restBase(config: IonApiConfig): string {
-    return `${config.ionApiBase.replace(/\/+$/, '')}/${config.tenant}/FSM/fsm/soap`;
+// An Infor data area — the variable middle of the REST base. FSM is the finance
+// suite; HCM is Global HR, served under the LAWSONGHR/hcm path.
+export type DataAreaId = 'FSM' | 'HCM';
+
+export interface DataArea {
+    id: DataAreaId;
+    label: string;
+    app: string; // path segment after the tenant (e.g. FSM, LAWSONGHR)
+    module: string; // path segment after the app (e.g. fsm, hcm)
+}
+
+export const DATA_AREAS: DataArea[] = [
+    { id: 'FSM', label: 'FSM', app: 'FSM', module: 'fsm' },
+    { id: 'HCM', label: 'HCM (GHR)', app: 'LAWSONGHR', module: 'hcm' },
+];
+
+export function dataAreaOf(id: DataAreaId | undefined): DataArea {
+    return DATA_AREAS.find((a) => a.id === id) ?? DATA_AREAS[0];
+}
+
+// REST base for a data area: {ionApiBase}/{tenant}/{app}/{module}/soap.
+// Defaults to FSM so existing callers are unchanged.
+export function restBase(config: IonApiConfig, dataArea: DataAreaId = 'FSM'): string {
+    const area = dataAreaOf(dataArea);
+    return `${config.ionApiBase.replace(/\/+$/, '')}/${config.tenant}/${area.app}/${area.module}/soap`;
 }
 
 export interface ProbeResult {

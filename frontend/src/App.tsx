@@ -1166,6 +1166,8 @@ export default function App() {
             const asStr = (v: unknown) => (typeof v === 'string' ? v : undefined);
             const rawLimit = p.limit;
             const query: InforNodeQuery = {
+                dataArea: (p.dataArea === 'HCM' || p.dataArea === 'FSM' ? p.dataArea : undefined) as
+                    | InforNodeQuery['dataArea'],
                 businessClass: asStr(p.businessClass),
                 fields: asStr(p.fields),
                 filter: asStr(p.filter),
@@ -1196,6 +1198,7 @@ export default function App() {
                 ns.map(n => {
                     if (n.id !== nodeId) return n;
                     const nextProps: Record<string, unknown> = { ...(n.data.properties ?? {}) };
+                    if (q.dataArea !== undefined) nextProps.dataArea = q.dataArea;
                     if (q.businessClass !== undefined) nextProps.businessClass = q.businessClass;
                     if (q.fields !== undefined) nextProps.fields = q.fields;
                     if (q.filter !== undefined) nextProps.filter = q.filter;

@@ -4,7 +4,7 @@
 // (`pageNumber`/`pageSize`). Goes through the backend send path.
 
 import { sendRequest } from '../../sendClient';
-import { restBase } from './inforApi';
+import { restBase, type DataAreaId } from './inforApi';
 import type { IonApiConfig } from './ionapi';
 
 export interface BusinessClass {
@@ -30,6 +30,7 @@ export async function listBusinessClasses(
     accessToken: string,
     opts: { page: number; pageSize: number; search?: string },
     workspacePath: string | null,
+    dataArea?: DataAreaId,
 ): Promise<DiscoveryResult> {
     const params = new URLSearchParams({
         pageNumber: String(opts.page),
@@ -39,7 +40,7 @@ export async function listBusinessClasses(
 
     const outcome = await sendRequest(
         {
-            url: `${restBase(config)}/ionapi-doc?${params.toString()}`,
+            url: `${restBase(config, dataArea)}/ionapi-doc?${params.toString()}`,
             method: 'GET',
             authType: 'bearer',
             authToken: accessToken,

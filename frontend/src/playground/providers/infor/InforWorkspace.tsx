@@ -19,7 +19,7 @@ import {
     type FilterCondition,
     type InforNodeQuery,
 } from './query';
-import type { GenericPage } from './inforApi';
+import { DATA_AREAS, type DataAreaId, type GenericPage } from './inforApi';
 
 interface InforWorkspaceProps {
     workspacePath: string | null;
@@ -47,6 +47,10 @@ export default function InforWorkspace({
     onApplyToNode,
 }: InforWorkspaceProps) {
     const [session, setSession] = useState<{ config: IonApiConfig; token: IonApiToken } | null>(null);
+
+    // Data area (FSM / HCM) — the variable middle of the REST base. Discovery
+    // and queries both hang off it, so switching it re-fetches the class list.
+    const [dataArea, setDataArea] = useState<DataAreaId>('FSM');
 
     // ---- business-class discovery (full list cached, searched client-side) ----
     const [search, setSearch] = useState('');
@@ -82,14 +86,15 @@ export default function InforWorkspace({
         setCacheInfo({ fetchedAt: now, fromCache: false });
         if (workspacePath && cacheAvailable()) {
             try {
-                await saveCachedClasses(workspacePath, config.tenant, classes, now);
+                await saveCachedClasses(workspacePath, config.tenant, classes, now, dataArea);
             } catch {
                 /* cache write is best-effort */
             }
         }
     };
 
-    // On sign-in, load the full class list once (cache first, else download).
+    // On sign-in (or a data-area switch), load that area's class list once
+    // (cache first, else download).
     useEffect(() => {
         if (!session) return;
         const { config, token } = session;
@@ -98,7 +103,7 @@ export default function InforWorkspace({
             setClassesLoading(true);
             setClassesError(null);
             if (workspacePath && cacheAvailable()) {
-                const cached = await loadCachedClasses(workspacePath, config.tenant);
+                const cached = await loadCachedClasses(workspacePath, config.tenant, dataArea);
                 if (cancelled) return;
                 if (cached) {
                     setAllClasses(cached.classes);
@@ -107,7 +112,7 @@ export default function InforWorkspace({
                     return;
                 }
             }
-            const res = await fetchAllBusinessClasses(config, token.accessToken, workspacePath);
+            const res = await fetchAllBusinessClasses(config, token.accessToken, workspacePath, dataArea);
             if (cancelled) return;
             setClassesLoading(false);
             if (!res.ok) {
@@ -120,7 +125,25 @@ export default function InforWorkspace({
             cancelled = true;
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [session, workspacePath]);
+    }, [session, workspacePath, dataArea]);
+
+    // Switch data area: reset the query builder and let the effect above
+    // re-fetch the new area's classes (clearing allClasses shows the loader).
+    const changeDataArea = (next: DataAreaId) => {
+        if (next === dataArea) return;
+        setDataArea(next);
+        setAllClasses(null);
+        setSelected(null);
+        setPickerOpen(true);
+        setSearch('');
+        setPage(1);
+        setFields([]);
+        setChecked(new Set());
+        setFieldSearch('');
+        setConds([]);
+        setResult(null);
+        setQueryError(null);
+    };
 
     // Capture an "Open in Playground" request from a Canvas node; hold the
     // query until we can apply it (below).
@@ -149,6 +172,7 @@ export default function InforWorkspace({
             .filter(Boolean);
         // New / unconfigured node → start blank (do NOT carry over prior state).
         if (!q.businessClass) {
+            setDataArea('FSM');
             setSelected(null);
             setPickerOpen(true);
             setSearch('');
@@ -161,6 +185,8 @@ export default function InforWorkspace({
             return;
         }
         // Saved query → populate the builder from it.
+        const area: DataAreaId = q.dataArea ?? 'FSM';
+        setDataArea(area);
         setLimit(typeof q.limit === 'number' && q.limit > 0 ? q.limit : DEFAULT_LIMIT);
         setConds(parseSimpleFilter(q.filter));
         setChecked(new Set(wanted));
@@ -177,6 +203,7 @@ export default function InforWorkspace({
                 session.token.accessToken,
                 businessClass,
                 workspacePath,
+                area,
             );
             setFieldsLoading(false);
             if (res.ok) {
@@ -199,6 +226,7 @@ export default function InforWorkspace({
         if (!onApplyToNode || !applyNodeId || !selected) return;
         const activeFields = fields.length ? fields.filter((f) => checked.has(f)) : Array.from(checked);
         onApplyToNode(applyNodeId, {
+            dataArea,
             businessClass: selected.entity,
             fields: activeFields.join(','),
             filter: buildSimpleFilter(conds),
@@ -215,6 +243,7 @@ export default function InforWorkspace({
             session.config,
             session.token.accessToken,
             workspacePath,
+            dataArea,
         );
         setClassesLoading(false);
         if (!res.ok) {
@@ -235,7 +264,13 @@ export default function InforWorkspace({
         setChecked(new Set());
         setFieldSearch('');
         setFieldsLoading(true);
-        const res = await sampleFields(session.config, session.token.accessToken, bc.entity, workspacePath);
+        const res = await sampleFields(
+            session.config,
+            session.token.accessToken,
+            bc.entity,
+            workspacePath,
+            dataArea,
+        );
         setFieldsLoading(false);
         if (res.ok) setFields(res.fields);
     };
@@ -259,6 +294,7 @@ export default function InforWorkspace({
             selected.entity,
             { fields: fields.filter((f) => checked.has(f)), filter: conds, limit },
             workspacePath,
+            dataArea,
         );
         setRunning(false);
         if (!res.ok) {
@@ -315,6 +351,22 @@ export default function InforWorkspace({
 
                 {session && (
                     <div className="pgi-query">
+                        {/* ---- Data area ---- */}
+                        <div className="pgi-section">
+                            <div className="pgi-lbl">Data area</div>
+                            <select
+                                className="pg-input pg-input--select"
+                                value={dataArea}
+                                onChange={(e) => changeDataArea(e.target.value as DataAreaId)}
+                            >
+                                {DATA_AREAS.map((a) => (
+                                    <option key={a.id} value={a.id}>
+                                        {a.label}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+
                         {/* ---- Business class ---- */}
                         <div className="pgi-section">
                             <div className="pgi-lbl">Business class</div>

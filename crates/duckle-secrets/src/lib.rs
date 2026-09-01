@@ -534,9 +534,14 @@ fn merge_infor_connection(conn: &JsonValue, map: &mut serde_json::Map<String, Js
         map.insert(k.to_string(), JsonValue::String(v.to_string()));
     };
 
-    // Base for the _generic REST call: {ionApiBase}/{tenant}/FSM/fsm/soap.
-    if let (Some(iu), Some(ti)) = (get("ionApiBase"), get("tenant")) {
-        put("inforBase", &format!("{}/{}/FSM/fsm/soap", iu.trim_end_matches('/'), ti));
+    // Connection root for the _generic REST base. The node's `dataArea` picks
+    // the {app}/{module} path (FSM/fsm vs LAWSONGHR/hcm) at plan time, so the
+    // area is a per-node choice, not baked into the connection here.
+    if let Some(iu) = get("ionApiBase") {
+        put("inforApiBase", iu.trim_end_matches('/'));
+    }
+    if let Some(ti) = get("tenant") {
+        put("inforTenant", ti);
     }
     if let Some(v) = get("tokenUrl") {
         put("tokenUrl", v);
@@ -961,10 +966,8 @@ mod tests {
         resolve_connection_refs(&ws, std::slice::from_mut(&mut node)).unwrap();
         let props = node.data.properties.unwrap();
 
-        assert_eq!(
-            props["inforBase"],
-            "https://mingle-ionapi.example.com/ROIHS_PP1/FSM/fsm/soap"
-        );
+        assert_eq!(props["inforApiBase"], "https://mingle-ionapi.example.com");
+        assert_eq!(props["inforTenant"], "ROIHS_PP1");
         assert_eq!(
             props["tokenUrl"],
             "https://mingle-sso.example.com/ROIHS_PP1/as/token.oauth2"

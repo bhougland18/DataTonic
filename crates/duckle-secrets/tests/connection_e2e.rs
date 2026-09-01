@@ -384,3 +384,72 @@ fn infor_source_resolves_mints_password_and_flattens() {
         csv
     );
 }
+
+/// The node's dataArea=HCM builds the GHR base (LAWSONGHR/hcm/soap) rather than
+/// the FSM default — the same connection, a different area.
+#[test]
+fn infor_hcm_data_area_hits_the_ghr_path() {
+    use std::time::Duration;
+    let Some(engine) = engine() else {
+        eprintln!("skipping: set DUCKLE_DUCKDB_BIN to a duckdb CLI to run");
+        return;
+    };
+    let (port, rx, handle) = infor_mock_server(
+        r#"[{"_count":1,"_links":[]},{"_fields":{"Employee":"1001"}}]"#,
+    );
+    let ws = tempfile::tempdir().unwrap();
+    let host = format!("http://127.0.0.1:{}", port);
+    let ionapi = json!({
+        "tenant": "TENANT",
+        "clientId": "e2e-cid",
+        "clientSecret": "e2e-csecret",
+        "ionApiBase": host,
+        "tokenUrl": format!("{}/TENANT/as/token.oauth2", host),
+        "saak": "svc-saak",
+        "sask": "svc-sask",
+    })
+    .to_string();
+    let enc = duckle_secrets::encrypt_payload_json(
+        ws.path(),
+        "infor-hcm",
+        &json!({
+            "kind": "rest",
+            "url": host,
+            "extra": { "provider": "infor", "tenant": "TENANT", "app": "e2e", "secret": ionapi }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(ws.path().join("connections")).unwrap();
+    std::fs::write(ws.path().join("connections").join("infor-hcm.json"), &enc).unwrap();
+
+    let out = ws
+        .path()
+        .join("hcm.csv")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut pipeline = doc(
+        json!([
+            node(
+                "s",
+                "src.infor",
+                json!({ "connectionRef": "infor-hcm", "dataArea": "HCM", "businessClass": "Employee", "fields": "Employee" }),
+            ),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e", "s", "k")]),
+    );
+    duckle_secrets::resolve_connection_refs(ws.path(), &mut pipeline.nodes).unwrap();
+    let r = engine.execute_pipeline_named(&pipeline, "infor-hcm");
+    assert_eq!(r.status, "ok", "hcm pipeline failed: {:?}", r.error);
+
+    let _tok = rx.recv_timeout(Duration::from_secs(5)).expect("token request");
+    let data_req = rx.recv_timeout(Duration::from_secs(5)).expect("data request");
+    let _ = handle.join();
+    let data_raw = String::from_utf8_lossy(&data_req);
+    assert!(
+        data_raw.contains("/TENANT/LAWSONGHR/hcm/soap/classes/Employee/lists/_generic"),
+        "HCM should hit the GHR path, got: {}",
+        data_raw
+    );
+}

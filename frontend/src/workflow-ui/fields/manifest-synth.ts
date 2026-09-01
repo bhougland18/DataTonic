@@ -2941,6 +2941,18 @@ function synthInforSource(comp: ComponentDef): ComponentManifest {
             label: 'Query',
             fields: [
                 {
+                    key: 'dataArea',
+                    label: 'Data area',
+                    kind: 'select',
+                    defaultValue: 'FSM',
+                    options: [
+                        { value: 'FSM', label: 'FSM' },
+                        { value: 'HCM', label: 'HCM (GHR)' },
+                    ],
+                    description:
+                        'Which Infor suite to query. Sets the REST base: FSM → FSM/fsm/soap, HCM → LAWSONGHR/hcm/soap.',
+                },
+                {
                     key: 'businessClass',
                     label: 'Business class',
                     kind: 'text',

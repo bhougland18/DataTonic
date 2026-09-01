@@ -10,6 +10,7 @@
 import { isTauri } from '../../../tauri-dialog';
 import { isWebBackend, webFs } from '../../../web-fs';
 import { listBusinessClasses, type BusinessClass } from './discovery';
+import type { DataAreaId } from './inforApi';
 import type { IonApiConfig } from './ionapi';
 
 export interface ClassCache {
@@ -34,8 +35,9 @@ function joinPath(dir: string, ...parts: string[]): string {
     return [dir.replace(/[/\\]+$/, ''), ...parts].join(sep);
 }
 const CACHE_DIR = ['api-cache', 'infor'];
-function cacheFile(workspacePath: string, tenant: string): string {
-    return joinPath(workspacePath, ...CACHE_DIR, `${tenant || 'default'}-classes.json`);
+// Cache per tenant AND data area — FSM and HCM expose different class sets.
+function cacheFile(workspacePath: string, tenant: string, dataArea: DataAreaId = 'FSM'): string {
+    return joinPath(workspacePath, ...CACHE_DIR, `${tenant || 'default'}-${dataArea}-classes.json`);
 }
 
 // Fetch every business class in one shot (pageSize covers the whole set).
@@ -43,12 +45,14 @@ export async function fetchAllBusinessClasses(
     config: IonApiConfig,
     accessToken: string,
     workspacePath: string | null,
+    dataArea?: DataAreaId,
 ): Promise<{ ok: true; classes: BusinessClass[] } | { ok: false; error: string }> {
     const res = await listBusinessClasses(
         config,
         accessToken,
         { page: 1, pageSize: 10000 },
         workspacePath,
+        dataArea,
     );
     if (!res.ok) return { ok: false, error: res.error };
     return { ok: true, classes: res.page.items };
@@ -57,10 +61,11 @@ export async function fetchAllBusinessClasses(
 export async function loadCachedClasses(
     workspacePath: string,
     tenant: string,
+    dataArea?: DataAreaId,
 ): Promise<ClassCache | null> {
     try {
         const { exists, readTextFile } = await fs();
-        const file = cacheFile(workspacePath, tenant);
+        const file = cacheFile(workspacePath, tenant, dataArea);
         if (!(await exists(file))) return null;
         const parsed = JSON.parse(await readTextFile(file)) as ClassCache;
         return Array.isArray(parsed.classes) ? parsed : null;
@@ -74,6 +79,7 @@ export async function saveCachedClasses(
     tenant: string,
     classes: BusinessClass[],
     fetchedAt: string,
+    dataArea?: DataAreaId,
 ): Promise<void> {
     const { exists, mkdir, writeTextFile } = await fs();
     const dir = joinPath(workspacePath, ...CACHE_DIR);
@@ -85,5 +91,5 @@ export async function saveCachedClasses(
         count: classes.length,
         classes,
     };
-    await writeTextFile(cacheFile(workspacePath, tenant), JSON.stringify(payload));
+    await writeTextFile(cacheFile(workspacePath, tenant, dataArea), JSON.stringify(payload));
 }

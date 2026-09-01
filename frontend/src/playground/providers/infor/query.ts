@@ -3,7 +3,7 @@
 // parses the `{_fields}` / `_links` response via inforApi.parseGenericResponse.
 
 import { sendRequest } from '../../sendClient';
-import { parseGenericResponse, restBase, type GenericPage } from './inforApi';
+import { parseGenericResponse, restBase, type GenericPage, type DataAreaId } from './inforApi';
 import type { IonApiConfig } from './ionapi';
 
 export interface FilterCondition {
@@ -51,6 +51,7 @@ export function parseSimpleFilter(filter: string | undefined): FilterCondition[]
 // node". Mirrors the src.infor manifest fields (connectionRef/lplFilter stay on
 // the node and are not edited here).
 export interface InforNodeQuery {
+    dataArea?: DataAreaId;
     businessClass?: string;
     fields?: string;
     filter?: string;
@@ -58,14 +59,19 @@ export interface InforNodeQuery {
     limit?: number;
 }
 
-function genericUrl(config: IonApiConfig, businessClass: string, q: GenericQuery): string {
+function genericUrl(
+    config: IonApiConfig,
+    businessClass: string,
+    q: GenericQuery,
+    dataArea?: DataAreaId,
+): string {
     const params = new URLSearchParams();
     if (q.fields.length) params.set('_fields', q.fields.join(','));
     const simple = buildSimpleFilter(q.filter);
     if (simple) params.set('_filter', simple);
     if (q.lpl && q.lpl.trim()) params.set('_lplFilter', q.lpl.trim());
     params.set('_limit', String(q.limit));
-    return `${restBase(config)}/classes/${encodeURIComponent(businessClass)}/lists/_generic?${params.toString()}`;
+    return `${restBase(config, dataArea)}/classes/${encodeURIComponent(businessClass)}/lists/_generic?${params.toString()}`;
 }
 
 async function getGeneric(
@@ -101,8 +107,9 @@ export function runGenericQuery(
     businessClass: string,
     q: GenericQuery,
     workspacePath: string | null,
+    dataArea?: DataAreaId,
 ): Promise<QueryResult> {
-    return getGeneric(accessToken, genericUrl(config, businessClass, q), workspacePath);
+    return getGeneric(accessToken, genericUrl(config, businessClass, q, dataArea), workspacePath);
 }
 
 // Discover a business class's (persistent) fields by sampling one row — the
@@ -114,8 +121,9 @@ export async function sampleFields(
     accessToken: string,
     businessClass: string,
     workspacePath: string | null,
+    dataArea?: DataAreaId,
 ): Promise<{ ok: true; fields: string[] } | { ok: false; error: string }> {
-    const url = `${restBase(config)}/classes/${encodeURIComponent(businessClass)}/lists/_generic?_limit=1`;
+    const url = `${restBase(config, dataArea)}/classes/${encodeURIComponent(businessClass)}/lists/_generic?_limit=1`;
     const res = await getGeneric(accessToken, url, workspacePath);
     if (!res.ok) return { ok: false, error: res.error };
     const first = res.page.rows[0];

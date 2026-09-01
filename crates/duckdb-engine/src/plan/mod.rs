@@ -4476,10 +4476,10 @@ fn build_stage(
         // Dedicated Infor FSM/Landmark source. The node carries an Infor query
         // (businessClass + fields + filter + lplFilter + limit) and a
         // connectionRef, NOT a url — so it can't ride the generic REST arm.
-        // Build the lists/_generic URL from the query + the connection-injected
-        // base (inforBase, from duckle-secrets), mint via the password grant
-        // (authMode=inforPassword), and let the runner unwrap the response
-        // (infor_generic).
+        // Build the lists/_generic URL from the query + the connection root
+        // (inforApiBase/inforTenant, from duckle-secrets) + the node's data
+        // area, mint via the password grant (authMode=inforPassword), and let
+        // the runner unwrap the response (infor_generic).
         fn infor_qenc(s: &str) -> String {
             let mut out = String::with_capacity(s.len());
             for b in s.bytes() {
@@ -4492,15 +4492,35 @@ fn build_stage(
             }
             out
         }
-        let base = string_prop(&props, "inforBase")
+        let api_base = string_prop(&props, "inforApiBase")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 EngineError::Config(format!(
-                    "{}: no Infor connection resolved (inforBase missing) - \
+                    "{}: no Infor connection resolved (inforApiBase missing) - \
                      pick a saved Infor connection on the node",
                     component_id
                 ))
             })?;
+        let tenant = string_prop(&props, "inforTenant")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "{}: no Infor connection resolved (inforTenant missing)",
+                    component_id
+                ))
+            })?;
+        // Data area picks the {app}/{module} path; default FSM.
+        let (app, module) = match string_prop(&props, "dataArea").as_deref() {
+            Some("HCM") => ("LAWSONGHR", "hcm"),
+            _ => ("FSM", "fsm"),
+        };
+        let base = format!(
+            "{}/{}/{}/{}/soap",
+            api_base.trim_end_matches('/'),
+            tenant,
+            app,
+            module
+        );
         let business_class = string_prop(&props, "businessClass")
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
