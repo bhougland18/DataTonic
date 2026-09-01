@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Search, ChevronDown, Play, Loader2, Plus, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Search, ChevronDown, ChevronLeft, ChevronRight, Play, Loader2, Plus, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine, Save, Download, Upload, Bookmark } from 'lucide-react';
 import InforProvider from '../InforProvider';
 import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
 import type { IonApiConfig } from './ionapi';
@@ -20,6 +20,14 @@ import {
     type InforNodeQuery,
 } from './query';
 import { DATA_AREAS, type DataAreaId, type GenericPage } from './inforApi';
+import {
+    savedQueriesAvailable,
+    loadSavedQueries,
+    saveSavedQueries,
+    exportQueryFile,
+    parseImportedQuery,
+    type SavedQuery,
+} from './savedQueries';
 
 interface InforWorkspaceProps {
     workspacePath: string | null;
@@ -69,6 +77,8 @@ export default function InforWorkspace({
     const [fieldsLoading, setFieldsLoading] = useState(false);
     const [conds, setConds] = useState<FilterCondition[]>([]);
     const [limit, setLimit] = useState(DEFAULT_LIMIT);
+    // The limit checkbox (on by default). Off omits _limit — server default/all.
+    const [limitEnabled, setLimitEnabled] = useState(true);
     const [running, setRunning] = useState(false);
     const [result, setResult] = useState<GenericPage | null>(null);
     const [queryError, setQueryError] = useState<string | null>(null);
@@ -79,6 +89,13 @@ export default function InforWorkspace({
     const [applyNodeId, setApplyNodeId] = useState<string | null>(null);
     const [pendingQuery, setPendingQuery] = useState<InforNodeQuery | null>(null);
     const [applied, setApplied] = useState(false);
+
+    // ---- saved queries (task 1q): per-tenant list, filtered by data area ----
+    const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
+    const [savedOpen, setSavedOpen] = useState(true);
+    const [savedSearch, setSavedSearch] = useState('');
+    const [saveDesc, setSaveDesc] = useState('');
+    const importRef = useRef<HTMLInputElement>(null);
 
     const applyFetched = async (config: IonApiConfig, classes: BusinessClass[]) => {
         setAllClasses(classes);
@@ -170,9 +187,11 @@ export default function InforWorkspace({
             .split(',')
             .map((s) => s.trim())
             .filter(Boolean);
-        // New / unconfigured node → start blank (do NOT carry over prior state).
+        // New / unconfigured node → start blank (do NOT carry over prior state)
+        // and open the saved-queries panel so the user can pick one.
         if (!q.businessClass) {
             setDataArea('FSM');
+            setSavedOpen(true);
             setSelected(null);
             setPickerOpen(true);
             setSearch('');
@@ -184,9 +203,11 @@ export default function InforWorkspace({
             setLimit(DEFAULT_LIMIT);
             return;
         }
-        // Saved query → populate the builder from it.
+        // Configured node → populate the builder; the panel stays collapsed
+        // since the user is editing an existing query, not browsing.
         const area: DataAreaId = q.dataArea ?? 'FSM';
         setDataArea(area);
+        setSavedOpen(false);
         setLimit(typeof q.limit === 'number' && q.limit > 0 ? q.limit : DEFAULT_LIMIT);
         setConds(parseSimpleFilter(q.filter));
         setChecked(new Set(wanted));
@@ -230,10 +251,106 @@ export default function InforWorkspace({
             businessClass: selected.entity,
             fields: activeFields.join(','),
             filter: buildSimpleFilter(conds),
-            limit,
+            limit: limitEnabled ? limit : undefined,
         });
         setApplied(true);
     };
+
+    // Load this tenant's saved queries once signed in.
+    useEffect(() => {
+        if (!session || !workspacePath || !savedQueriesAvailable()) return;
+        let cancelled = false;
+        (async () => {
+            const list = await loadSavedQueries(workspacePath, session.config.tenant);
+            if (!cancelled) setSavedQueries(list);
+        })();
+        return () => {
+            cancelled = true;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [session, workspacePath]);
+
+    const persistQueries = (next: SavedQuery[]) => {
+        setSavedQueries(next);
+        if (session && workspacePath && savedQueriesAvailable()) {
+            void saveSavedQueries(workspacePath, session.config.tenant, next).catch(() => {});
+        }
+    };
+
+    const saveCurrentQuery = () => {
+        if (!selected || !saveDesc.trim()) return;
+        const q: SavedQuery = {
+            id: crypto.randomUUID(),
+            description: saveDesc.trim(),
+            dataArea,
+            businessClass: selected.entity,
+            fields: fields.filter((f) => checked.has(f)),
+            filter: conds.filter((c) => c.field.trim() && c.value.trim()),
+            limit: limitEnabled ? limit : undefined,
+            savedAt: new Date().toISOString(),
+        };
+        persistQueries([q, ...savedQueries]);
+        setSaveDesc('');
+    };
+
+    // Load a saved query into the builder, then collapse the panel.
+    const loadSavedQuery = async (q: SavedQuery) => {
+        if (!session) return;
+        setSavedOpen(false);
+        setResult(null);
+        setQueryError(null);
+        setConds(q.filter.map((c) => ({ ...c })));
+        setChecked(new Set(q.fields));
+        if (typeof q.limit === 'number' && q.limit > 0) {
+            setLimit(q.limit);
+            setLimitEnabled(true);
+        } else {
+            setLimitEnabled(false);
+        }
+        const bc =
+            (allClasses ?? []).find((c) => c.entity === q.businessClass) ?? { entity: q.businessClass };
+        setSelected(bc);
+        setPickerOpen(false);
+        setFieldSearch('');
+        setFieldsLoading(true);
+        const res = await sampleFields(
+            session.config,
+            session.token.accessToken,
+            q.businessClass,
+            workspacePath,
+            q.dataArea,
+        );
+        setFieldsLoading(false);
+        if (res.ok) {
+            const union = [...res.fields];
+            for (const w of q.fields) if (!union.includes(w)) union.push(w);
+            setFields(union);
+        } else {
+            setFields(q.fields);
+        }
+    };
+
+    const deleteSavedQuery = (id: string) => {
+        persistQueries(savedQueries.filter((q) => q.id !== id));
+    };
+
+    const handleImportQuery = async (file: File | null) => {
+        if (!file) return;
+        const q = parseImportedQuery(await file.text());
+        if (q) persistQueries([q, ...savedQueries]);
+    };
+
+    const filteredSaved = useMemo(() => {
+        const s = savedSearch.trim().toLowerCase();
+        return savedQueries
+            .filter((q) => q.dataArea === dataArea)
+            .filter(
+                (q) =>
+                    !s ||
+                    q.businessClass.toLowerCase().includes(s) ||
+                    q.description.toLowerCase().includes(s),
+            );
+    }, [savedQueries, dataArea, savedSearch]);
 
     const refreshClasses = async () => {
         if (!session) return;
@@ -257,6 +374,7 @@ export default function InforWorkspace({
         if (!session) return;
         setSelected(bc);
         setPickerOpen(false);
+        setSavedOpen(false);
         setResult(null);
         setQueryError(null);
         setConds([]);
@@ -292,7 +410,11 @@ export default function InforWorkspace({
             session.config,
             session.token.accessToken,
             selected.entity,
-            { fields: fields.filter((f) => checked.has(f)), filter: conds, limit },
+            {
+                fields: fields.filter((f) => checked.has(f)),
+                filter: conds,
+                limit: limitEnabled ? limit : undefined,
+            },
             workspacePath,
             dataArea,
         );
@@ -597,12 +719,21 @@ export default function InforWorkspace({
 
                                 {/* ---- Run ---- */}
                                 <div className="pgi-run">
+                                    <input
+                                        type="checkbox"
+                                        className="pgi-limitchk"
+                                        checked={limitEnabled}
+                                        onChange={(e) => setLimitEnabled(e.target.checked)}
+                                        title="Apply a row limit (off = server default / all rows)"
+                                        aria-label="Apply limit"
+                                    />
                                     <label className="pgi-limit">
                                         <span>Limit</span>
                                         <input
                                             type="number"
                                             min={1}
                                             value={limit}
+                                            disabled={!limitEnabled}
                                             onChange={(e) => setLimit(Math.max(1, Number(e.target.value) || 1))}
                                         />
                                     </label>
@@ -639,11 +770,131 @@ export default function InforWorkspace({
                                         </button>
                                     )}
                                 </div>
+
+                                {/* ---- Save query (requires a description) ---- */}
+                                <div className="pgi-saverow">
+                                    <input
+                                        className="pg-input"
+                                        placeholder="Describe this query to save it…"
+                                        value={saveDesc}
+                                        onChange={(e) => setSaveDesc(e.target.value)}
+                                    />
+                                    <button
+                                        type="button"
+                                        className="pg-btn"
+                                        disabled={!selected || checked.size === 0 || !saveDesc.trim()}
+                                        onClick={saveCurrentQuery}
+                                        title="Save this query (data area, business class, fields, filter) for reuse"
+                                    >
+                                        <Save size={14} strokeWidth={1.75} /> Save query
+                                    </button>
+                                </div>
                             </>
                         )}
                     </div>
                 )}
             </div>
+
+            {/* ---- Middle: saved queries (collapsible) ---- */}
+            {session &&
+                (savedOpen ? (
+                    <div className="pgi-saved">
+                        <div className="pgi-saved-head">
+                            <span className="pgi-saved-title">
+                                <Bookmark size={13} strokeWidth={2} /> Saved queries
+                            </span>
+                            <button
+                                type="button"
+                                className="pg-icon-btn"
+                                onClick={() => setSavedOpen(false)}
+                                title="Collapse"
+                            >
+                                <ChevronLeft size={14} />
+                            </button>
+                        </div>
+                        <div className="pgi-search">
+                            <Search size={13} strokeWidth={2} />
+                            <input
+                                placeholder="Search saved queries…"
+                                value={savedSearch}
+                                onChange={(e) => setSavedSearch(e.target.value)}
+                            />
+                        </div>
+                        <div className="pgi-saved-list">
+                            {filteredSaved.length === 0 ? (
+                                <div className="pg-note">
+                                    No saved queries for {dataArea}. Build one on the left and use
+                                    “Save query”.
+                                </div>
+                            ) : (
+                                filteredSaved.map((q) => (
+                                    <div key={q.id} className="pgi-saved-item">
+                                        <button
+                                            type="button"
+                                            className="pgi-saved-open"
+                                            onClick={() => void loadSavedQuery(q)}
+                                            title="Load this query"
+                                        >
+                                            <span className="pgi-saved-bc">{q.businessClass}</span>
+                                            {q.description && (
+                                                <span className="pgi-saved-desc">{q.description}</span>
+                                            )}
+                                            <span className="pgi-saved-cols">
+                                                {q.fields.length} column{q.fields.length === 1 ? '' : 's'}
+                                            </span>
+                                        </button>
+                                        <div className="pgi-saved-actions">
+                                            <button
+                                                type="button"
+                                                className="pg-icon-btn"
+                                                onClick={() => exportQueryFile(q)}
+                                                title="Export as JSON"
+                                            >
+                                                <Download size={12} />
+                                            </button>
+                                            <button
+                                                type="button"
+                                                className="pg-icon-btn"
+                                                onClick={() => deleteSavedQuery(q.id)}
+                                                title="Delete"
+                                            >
+                                                <Trash2 size={12} />
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                        <button
+                            type="button"
+                            className="pg-btn pgi-saved-import"
+                            onClick={() => importRef.current?.click()}
+                            title="Import a query JSON file"
+                        >
+                            <Upload size={13} strokeWidth={1.75} /> Import query…
+                        </button>
+                        <input
+                            ref={importRef}
+                            type="file"
+                            accept="application/json,.json"
+                            hidden
+                            onChange={(e) => {
+                                void handleImportQuery(e.target.files?.[0] ?? null);
+                                e.target.value = '';
+                            }}
+                        />
+                    </div>
+                ) : (
+                    <button
+                        type="button"
+                        className="pgi-saved-rail"
+                        onClick={() => setSavedOpen(true)}
+                        title="Saved queries"
+                    >
+                        <ChevronRight size={14} />
+                        <Bookmark size={13} strokeWidth={2} />
+                    </button>
+                ))}
 
             {/* ---- Right: results grid ---- */}
             <div className="pgi-main">

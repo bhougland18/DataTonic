@@ -17,7 +17,8 @@ export interface GenericQuery {
     filter: FilterCondition[];
     // Optional raw LPL expression -> `_lplFilter` (advanced, e.g. (Item like "10*")).
     lpl?: string;
-    limit: number;
+    // Undefined omits `_limit` entirely (server default / all rows).
+    limit?: number;
 }
 
 export type QueryResult =
@@ -70,7 +71,7 @@ function genericUrl(
     const simple = buildSimpleFilter(q.filter);
     if (simple) params.set('_filter', simple);
     if (q.lpl && q.lpl.trim()) params.set('_lplFilter', q.lpl.trim());
-    params.set('_limit', String(q.limit));
+    if (typeof q.limit === 'number' && q.limit > 0) params.set('_limit', String(q.limit));
     return `${restBase(config, dataArea)}/classes/${encodeURIComponent(businessClass)}/lists/_generic?${params.toString()}`;
 }
 

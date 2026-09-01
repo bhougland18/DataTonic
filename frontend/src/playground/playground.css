@@ -986,6 +986,28 @@
 .pgi-limit { display:flex; flex-direction:column; gap:3px; }
 .pgi-limit span { font-size:9.5px; text-transform:uppercase; letter-spacing:.03em; color:var(--text-3); }
 .pgi-limit input { width:90px; background:var(--bg-0); border:1px solid var(--border); border-radius:var(--radius-sm, 6px); color:var(--text-1); font-size:12.5px; padding:7px 9px; }
+.pgi-limit input:disabled { opacity:.45; }
+.pgi-limitchk { width:15px; height:15px; margin:0 0 9px 0; accent-color:var(--accent, #4f8cff); cursor:pointer; }
+
+/* Save-query row below the run bar. */
+.pgi-saverow { display:flex; gap:8px; margin-top:10px; }
+.pgi-saverow .pg-input { flex:1; min-width:0; }
+
+/* Saved-queries panel (collapsible middle column). */
+.pgi-saved { width:280px; flex-shrink:0; overflow:hidden; display:flex; flex-direction:column; gap:10px; padding:14px 12px; border-right:1px solid var(--border); background:var(--bg-1); }
+.pgi-saved-head { display:flex; align-items:center; justify-content:space-between; }
+.pgi-saved-title { display:flex; align-items:center; gap:6px; font-size:11px; font-weight:650; text-transform:uppercase; letter-spacing:.04em; color:var(--text-2); }
+.pgi-saved-list { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:6px; }
+.pgi-saved-item { display:flex; align-items:stretch; gap:2px; border:1px solid var(--border); border-radius:var(--radius-sm, 6px); background:var(--bg-0); }
+.pgi-saved-item:hover { border-color:var(--accent, #4f8cff); }
+.pgi-saved-open { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; text-align:left; background:none; border:none; color:inherit; cursor:pointer; padding:8px 10px; }
+.pgi-saved-bc { font-size:12.5px; font-weight:600; color:var(--text-1); }
+.pgi-saved-desc { font-size:11.5px; color:var(--text-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pgi-saved-cols { font-size:10px; text-transform:uppercase; letter-spacing:.03em; color:var(--text-3); }
+.pgi-saved-actions { display:flex; flex-direction:column; justify-content:center; gap:2px; padding-right:4px; }
+.pgi-saved-import { justify-content:center; }
+.pgi-saved-rail { flex-shrink:0; width:30px; display:flex; flex-direction:column; align-items:center; gap:8px; padding-top:14px; border-right:1px solid var(--border); background:var(--bg-1); color:var(--text-3); cursor:pointer; }
+.pgi-saved-rail:hover { color:var(--text-1); background:var(--bg-2); }
 
 .pgi-results { display:flex; flex-direction:column; gap:8px; flex:1; min-height:0; }
 .pgi-results-bar { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--text-2); font-weight:600; }
