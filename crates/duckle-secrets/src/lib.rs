@@ -504,7 +504,76 @@ fn resolve_transport_ref(workspace: &Path, props: &mut JsonValue) -> Result<(), 
     Ok(())
 }
 
+/// An Infor ION API connection rides the `rest` kind but carries its whole
+/// normalized `.ionapi` (an IonApiConfig, camelCase keys) as a JSON string under
+/// `extra.secret` (encrypted at rest; decrypted by `load_connection` before we
+/// get here). Parse it and inject the props the `src.infor` engine branch and
+/// its password-grant OAuth read. Returns true when this was an Infor
+/// connection (so the generic REST merge is skipped).
+///
+/// Run credential is PLUGGABLE via `extra.runCredential`; it defaults to the
+/// service account (saak/sask) — the approach an Infor IT consultant confirmed
+/// as preferred. A future `"user"` mode would inject a stored user token here
+/// instead, with no engine change.
+fn merge_infor_connection(conn: &JsonValue, map: &mut serde_json::Map<String, JsonValue>) -> bool {
+    let extra = conn.get("extra");
+    if extra.and_then(|e| e.get("provider")).and_then(|v| v.as_str()) != Some("infor") {
+        return false;
+    }
+    let cfg = extra
+        .and_then(|e| e.get("secret"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<JsonValue>(s).ok());
+    let Some(cfg) = cfg else {
+        // It IS Infor but the blob is missing/unreadable; leave the node as-is
+        // so the run fails later with a clear auth error rather than silently.
+        return true;
+    };
+    let get = |k: &str| cfg.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let mut put = |k: &str, v: &str| {
+        map.insert(k.to_string(), JsonValue::String(v.to_string()));
+    };
+
+    // Base for the _generic REST call: {ionApiBase}/{tenant}/FSM/fsm/soap.
+    if let (Some(iu), Some(ti)) = (get("ionApiBase"), get("tenant")) {
+        put("inforBase", &format!("{}/{}/FSM/fsm/soap", iu.trim_end_matches('/'), ti));
+    }
+    if let Some(v) = get("tokenUrl") {
+        put("tokenUrl", v);
+    }
+    if let Some(v) = get("clientId") {
+        put("clientId", v);
+    }
+    if let Some(v) = get("clientSecret") {
+        put("clientSecret", v);
+    }
+    if let Some(v) = get("scope") {
+        put("scope", v);
+    }
+
+    let run_credential = extra
+        .and_then(|e| e.get("runCredential"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("service");
+    if run_credential != "user" {
+        if let Some(v) = get("saak") {
+            put("username", v);
+        }
+        if let Some(v) = get("sask") {
+            put("password", v);
+        }
+    }
+    // Marker consumed by the src.infor engine branch to build a password grant.
+    put("authMode", "inforPassword");
+    true
+}
+
 fn merge_rest_connection(conn: &JsonValue, map: &mut serde_json::Map<String, JsonValue>) {
+    // Infor connections ride the `rest` kind but store credentials in
+    // extra.secret and need Infor-specific props; handle and return.
+    if merge_infor_connection(conn, map) {
+        return;
+    }
     let filled = |v: Option<&JsonValue>| -> bool {
         !matches!(v, None | Some(JsonValue::Null)) && v.and_then(|x| x.as_str()) != Some("")
     };
@@ -859,6 +928,56 @@ mod tests {
         assert_eq!(props["clientSecret"], "csecret");
         // The user-authored query URL is untouched.
         assert_eq!(props["url"], "https://x/services/data/v60.0/query");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn resolve_infor_connection_injects_service_account_props() {
+        let ws = temp_ws("infor");
+        // The stored blob is the normalized IonApiConfig that
+        // toInforConnectionPayload writes under extra.secret; the whole
+        // connection is encrypted at rest.
+        let ionapi = r#"{"tenant":"ROIHS_PP1","clientId":"cid","clientSecret":"csecret","ionApiBase":"https://mingle-ionapi.example.com/","tokenUrl":"https://mingle-sso.example.com/ROIHS_PP1/as/token.oauth2","saak":"svc-saak","sask":"svc-sask"}"#;
+        let payload = serde_json::json!({
+            "kind": "rest",
+            "url": "https://mingle-ionapi.example.com/",
+            "extra": { "provider": "infor", "tenant": "ROIHS_PP1", "app": "DuckleTest", "secret": ionapi }
+        })
+        .to_string();
+        let enc = encrypt_payload_json(&ws, "infor-conn", &payload).unwrap();
+        // The nested .ionapi blob (with the service-account secret) is encrypted.
+        assert!(!enc.contains("svc-sask"), "service-account secret leaked: {}", enc);
+        write_connection(&ws, "infor-conn", &enc);
+
+        let mut node = sf_node(
+            "src.infor",
+            serde_json::json!({
+                "connectionRef": "infor-conn",
+                "businessClass": "Item",
+                "fields": "Item,ItemGroup",
+                "limit": 5
+            }),
+        );
+        resolve_connection_refs(&ws, std::slice::from_mut(&mut node)).unwrap();
+        let props = node.data.properties.unwrap();
+
+        assert_eq!(
+            props["inforBase"],
+            "https://mingle-ionapi.example.com/ROIHS_PP1/FSM/fsm/soap"
+        );
+        assert_eq!(
+            props["tokenUrl"],
+            "https://mingle-sso.example.com/ROIHS_PP1/as/token.oauth2"
+        );
+        assert_eq!(props["clientId"], "cid");
+        assert_eq!(props["clientSecret"], "csecret");
+        // Headless run defaults to the service account (saak/sask).
+        assert_eq!(props["username"], "svc-saak");
+        assert_eq!(props["password"], "svc-sask");
+        assert_eq!(props["authMode"], "inforPassword");
+        // Query props are left untouched.
+        assert_eq!(props["businessClass"], "Item");
+        assert_eq!(props["fields"], "Item,ItemGroup");
         let _ = std::fs::remove_dir_all(&ws);
     }
 
