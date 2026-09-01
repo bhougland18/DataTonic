@@ -1607,6 +1607,13 @@ pub struct RestSourceSpec {
     /// records) so downstream SQL sees the real columns instead of a single
     /// `json` column. None -> an empty result is a clear source-level error.
     pub declared_schema: Option<Vec<duckle_metadata::Column>>,
+    /// src.infor: the Landmark `_generic` list response is a JSON array whose
+    /// first element is metadata (`{_count, _links}`) and whose remaining
+    /// elements wrap the row under `_fields`. When true, the runner skips the
+    /// metadata element and lifts each row's `_fields` to the top level, so
+    /// downstream SQL sees real columns instead of a single `_fields` struct.
+    /// False for every other REST source (unchanged behaviour).
+    pub infor_generic: bool,
 }
 
 /// src.databricks: SQL Statement Execution API read. Same shape as

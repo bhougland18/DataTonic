@@ -4469,6 +4469,97 @@ fn build_stage(
             parent_key_column: None,
             max_requests: 0,
             declared_schema: node.data.schema.clone(),
+            infor_generic: false,
+        });
+        (String::new(), StageKind::View, None)
+    } else if component_id == "src.infor" {
+        // Dedicated Infor FSM/Landmark source. The node carries an Infor query
+        // (businessClass + fields + filter + lplFilter + limit) and a
+        // connectionRef, NOT a url — so it can't ride the generic REST arm.
+        // Build the lists/_generic URL from the query + the connection-injected
+        // base (inforBase, from duckle-secrets), mint via the password grant
+        // (authMode=inforPassword), and let the runner unwrap the response
+        // (infor_generic).
+        fn infor_qenc(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for b in s.bytes() {
+                match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        out.push(b as char)
+                    }
+                    _ => out.push_str(&format!("%{:02X}", b)),
+                }
+            }
+            out
+        }
+        let base = string_prop(&props, "inforBase")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "{}: no Infor connection resolved (inforBase missing) - \
+                     pick a saved Infor connection on the node",
+                    component_id
+                ))
+            })?;
+        let business_class = string_prop(&props, "businessClass")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!("{}: businessClass required", component_id))
+            })?;
+        let mut query: Vec<String> = Vec::new();
+        if let Some(f) = string_prop(&props, "fields").filter(|s| !s.trim().is_empty()) {
+            query.push(format!("_fields={}", infor_qenc(f.trim())));
+        }
+        if let Some(f) = string_prop(&props, "filter").filter(|s| !s.trim().is_empty()) {
+            query.push(format!("_filter={}", infor_qenc(f.trim())));
+        }
+        if let Some(f) = string_prop(&props, "lplFilter").filter(|s| !s.trim().is_empty()) {
+            query.push(format!("_lplFilter={}", infor_qenc(f.trim())));
+        }
+        // `limit` may arrive as a number or a string; omit when blank/zero so
+        // the server default applies.
+        let limit = props
+            .get("limit")
+            .and_then(|v| {
+                v.as_u64()
+                    .map(|n| n.to_string())
+                    .or_else(|| v.as_str().map(|s| s.trim().to_string()))
+            })
+            .filter(|s| !s.is_empty() && s != "0");
+        if let Some(l) = limit {
+            query.push(format!("_limit={}", infor_qenc(&l)));
+        }
+        let qs = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        let url = format!(
+            "{}/classes/{}/lists/_generic{}",
+            base.trim_end_matches('/'),
+            infor_qenc(business_class.trim()),
+            qs
+        );
+        let oauth = rest_oauth_from_props(&props, false)?;
+        rest_source = Some(RestSourceSpec {
+            transport: http_transport_from_props(&props),
+            node_id: node.id.clone(),
+            response_metadata: false,
+            url,
+            method: "GET".into(),
+            headers: Vec::new(),
+            body: None,
+            response_path: String::new(),
+            response_format: RestResponseFormat::Json,
+            pagination: RestPagination::None,
+            max_pages: 1,
+            oauth,
+            declared_schema: node.data.schema.clone(),
+            from_view: None,
+            url_template: None,
+            parent_key_column: None,
+            max_requests: 1000,
+            infor_generic: true,
         });
         (String::new(), StageKind::View, None)
     } else if matches!(
@@ -4733,6 +4824,7 @@ fn build_stage(
                 .and_then(|v| v.as_u64())
                 .filter(|n| *n > 0)
                 .unwrap_or(1000),
+            infor_generic: false,
         });
         (String::new(), StageKind::View, None)
     } else if component_id == "src.snowflake" {
