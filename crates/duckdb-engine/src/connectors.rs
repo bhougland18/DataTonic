@@ -121,6 +121,27 @@ pub(crate) fn mint_oauth_token(o: &plan::RestOAuth) -> Result<(String, String), 
     Ok((access, instance))
 }
 
+/// Flatten a Landmark `_generic` list body into plain rows.
+///
+/// The response is a JSON array: element [0] is metadata (`{_count, _links}`)
+/// and every other element wraps its row under `_fields`. Drop the metadata and
+/// lift each `_fields` object to the top level, so downstream SQL sees real
+/// columns instead of a single `_fields` struct. A port of the Playground's
+/// parseGenericResponse; applied only when `RestSourceSpec.infor_generic` is set.
+fn infor_unwrap_generic(rows: Vec<JsonValue>) -> Vec<JsonValue> {
+    rows.into_iter()
+        .filter_map(|r| match r {
+            JsonValue::Object(mut m) => match m.remove("_fields") {
+                Some(JsonValue::Object(f)) => Some(JsonValue::Object(f)),
+                // The metadata element ({_count,_links}) and any unexpected
+                // shape carry no _fields -> dropped.
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// Counts accumulated across DHIS2 import chunks. DHIS2 reports these under
 /// two different key sets depending on the endpoint (`importCount` vs
 /// `stats`), so both parsers normalise into this one shape.
@@ -11236,6 +11257,17 @@ impl DuckdbEngine {
                         (rows, JsonValue::Null)
                     }
                 };
+                // src.infor: the Landmark _generic body is
+                // [ {_count,_links}, {_fields:{…}}, … ]. Drop the metadata
+                // element and lift each row's `_fields` to the top level so
+                // downstream SQL sees real columns instead of one `_fields`
+                // struct (a port of the Playground's parseGenericResponse).
+                // Gated on the spec flag so no other REST source is touched.
+                let rows = if spec.infor_generic {
+                    infor_unwrap_generic(rows)
+                } else {
+                    rows
+                };
                 let row_count = rows.len();
                 // Stamp each row with where it came from. Underscore-prefixed, matching the
                 // audit stamp the rest of the tool writes, and only on a row that is an
@@ -13802,6 +13834,36 @@ mod ftp_tests {
         assert!(!is_sftp_target("files.example.com", 21));
         assert!(!is_sftp_target("ftp://files.example.com", 21));
         assert!(!is_sftp_target("ftps://files.example.com", 990));
+    }
+}
+
+#[cfg(test)]
+mod infor_generic_tests {
+    use super::infor_unwrap_generic;
+    use serde_json::json;
+
+    #[test]
+    fn unwraps_fields_and_drops_metadata() {
+        let body = json!([
+            { "_count": 2, "_links": [{ "rel": "next", "href": "?_paging=NEXT" }] },
+            { "_fields": { "Item": "10", "ItemGroup": "FG" } },
+            { "_fields": { "Item": "20", "ItemGroup": "RM" } }
+        ]);
+        let out = infor_unwrap_generic(body.as_array().unwrap().clone());
+        assert_eq!(out.len(), 2, "the metadata element should be dropped");
+        assert_eq!(out[0]["Item"], "10");
+        assert_eq!(out[0]["ItemGroup"], "FG");
+        assert_eq!(out[1]["Item"], "20");
+        // The _fields wrapper is gone; columns are top-level.
+        assert!(out[0].get("_fields").is_none());
+    }
+
+    #[test]
+    fn empty_and_metadata_only_yield_no_rows() {
+        assert!(infor_unwrap_generic(vec![]).is_empty());
+        let meta_only = json!([{ "_count": 0, "_links": [] }]);
+        let out = infor_unwrap_generic(meta_only.as_array().unwrap().clone());
+        assert!(out.is_empty(), "a metadata-only body yields no rows");
     }
 }
 
