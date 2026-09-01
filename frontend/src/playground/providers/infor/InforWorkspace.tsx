@@ -489,11 +489,19 @@ export default function InforWorkspace({
                                         </div>
                                     </div>
                                     <div className="pgi-filters">
+                                        {/* The class's fields as a searchable dropdown for the
+                                            filter's field name: type to filter or pick from the list. */}
+                                        <datalist id="pgi-fieldnames">
+                                            {fields.map((f) => (
+                                                <option key={f} value={f} />
+                                            ))}
+                                        </datalist>
                                         {conds.map((c, i) => (
                                             <div className="pgi-frow" key={i}>
                                                 <input
                                                     className="pg-input"
                                                     placeholder="Field"
+                                                    list="pgi-fieldnames"
                                                     value={c.field}
                                                     onChange={(e) =>
                                                         setConds((cs) =>
