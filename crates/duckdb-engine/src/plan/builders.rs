@@ -9423,7 +9423,10 @@ pub(crate) fn rest_oauth_from_props(
         mode.as_str(),
         "clientCredentials" | "client_credentials" | "oauth" | "oauth_client_credentials"
     );
-    if !is_client_credentials {
+    // Infor ION API: resource-owner password grant with HTTP Basic client auth
+    // (marker set by the Infor connection resolver, duckle-secrets).
+    let is_infor_password = mode == "inforPassword";
+    if !is_client_credentials && !is_infor_password {
         return Ok(None);
     }
     let who = if salesforce { "salesforce" } else { "rest" };
@@ -9461,11 +9464,32 @@ pub(crate) fn rest_oauth_from_props(
                  (e.g. https://identity.xero.com/connect/token)"
                     .into(),
             ))?;
-        let client_auth = match string_prop(props, "clientAuth").as_deref() {
-            Some("basic") => OAuthClientAuth::Basic,
-            _ => OAuthClientAuth::Body,
+        // Infor authenticates the client via HTTP Basic; other REST providers
+        // default to body credentials unless clientAuth=basic is set.
+        let client_auth = if is_infor_password {
+            OAuthClientAuth::Basic
+        } else {
+            match string_prop(props, "clientAuth").as_deref() {
+                Some("basic") => OAuthClientAuth::Basic,
+                _ => OAuthClientAuth::Body,
+            }
         };
         (token_url, client_auth)
+    };
+    let grant = if is_infor_password {
+        let username = string_prop(props, "username")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(
+                "infor: username (service-account saak) required for the password grant".into(),
+            ))?;
+        let password = string_prop(props, "password")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(
+                "infor: password (service-account sask) required for the password grant".into(),
+            ))?;
+        OAuthGrant::Password { username, password }
+    } else {
+        OAuthGrant::ClientCredentials
     };
     Ok(Some(RestOAuth {
         token_url,
@@ -9473,6 +9497,7 @@ pub(crate) fn rest_oauth_from_props(
         client_secret,
         scope: string_prop(props, "scope").filter(|s| !s.is_empty()),
         client_auth,
+        grant,
     }))
 }
 
@@ -10170,6 +10195,42 @@ mod rest_oauth_tests {
         assert_eq!(o.scope, None);
         assert_eq!(o.client_id, "cid");
         assert_eq!(o.client_secret, "secret");
+    }
+
+    #[test]
+    fn infor_password_mode_builds_password_grant_with_basic_auth() {
+        use crate::plan::OAuthGrant;
+        let p = json!({
+            "authMode": "inforPassword",
+            "clientId": "cid",
+            "clientSecret": "csecret",
+            "tokenUrl": "https://mingle-sso.example.com/T/as/token.oauth2",
+            "username": "svc-saak",
+            "password": "svc-sask",
+        });
+        let o = rest_oauth_from_props(&p, false).unwrap().expect("oauth built");
+        assert_eq!(o.token_url, "https://mingle-sso.example.com/T/as/token.oauth2");
+        // Infor authenticates the client via HTTP Basic.
+        assert_eq!(o.client_auth, OAuthClientAuth::Basic);
+        assert_eq!(o.client_id, "cid");
+        assert_eq!(o.client_secret, "csecret");
+        match o.grant {
+            OAuthGrant::Password { username, password } => {
+                assert_eq!(username, "svc-saak");
+                assert_eq!(password, "svc-sask");
+            }
+            _ => panic!("expected a password grant"),
+        }
+    }
+
+    #[test]
+    fn infor_password_mode_requires_username_and_password() {
+        let p = json!({
+            "authMode": "inforPassword",
+            "clientId": "cid", "clientSecret": "s",
+            "tokenUrl": "https://t/token",
+        });
+        assert!(rest_oauth_from_props(&p, false).is_err());
     }
 
     #[test]

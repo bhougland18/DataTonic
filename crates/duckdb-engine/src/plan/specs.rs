@@ -1715,13 +1715,27 @@ pub enum OAuthClientAuth {
     Basic,
 }
 
-/// OAuth 2.0 client-credentials config for REST-shaped connectors.
+/// Which OAuth 2.0 grant the token endpoint is asked for.
+#[derive(Debug, Clone)]
+pub enum OAuthGrant {
+    /// `grant_type=client_credentials` — the client authenticates as itself.
+    /// The default (Salesforce, Xero, most machine-to-machine REST auth).
+    ClientCredentials,
+    /// `grant_type=password` (Resource Owner Password Credentials). Used by
+    /// Infor ION API, where the client is authenticated via HTTP Basic and the
+    /// `username`/`password` are the service account (saak/sask) — or, later, a
+    /// user's credentials — carried in the POST body.
+    Password { username: String, password: String },
+}
+
+/// OAuth 2.0 token-minting config for REST-shaped connectors.
 ///
 /// Added for Salesforce (#166) and generalized in #195 to any REST source that
 /// supplies its own token endpoint (e.g. a Xero Custom Connection). When
 /// present on a source/sink spec the engine mints a fresh short-lived access
-/// token per run by POSTing `grant_type=client_credentials` to `token_url`,
-/// replacing a pre-minted Bearer token the user would otherwise re-paste.
+/// token per run by POSTing to `token_url`, replacing a pre-minted Bearer token
+/// the user would otherwise re-paste. `grant` selects client-credentials (the
+/// default) or the password grant (Infor).
 ///
 /// `token_url` is the fully resolved endpoint: for Salesforce the builder
 /// derives it as `{loginUrl}/services/oauth2/token`, and that response also
@@ -1734,6 +1748,8 @@ pub struct RestOAuth {
     /// Optional `scope` form field, required by some providers.
     pub scope: Option<String>,
     pub client_auth: OAuthClientAuth,
+    /// Which grant to request. Defaults to client-credentials.
+    pub grant: OAuthGrant,
 }
 
 /// snk.salesforce: write upstream rows into a Salesforce object via the REST

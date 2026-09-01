@@ -49,7 +49,11 @@ pub(crate) fn mint_oauth_token(o: &plan::RestOAuth) -> Result<(String, String), 
     let mut req = crate::tls::http_agent()
         .post(&url)
         .set("Accept", "application/json");
-    let mut form: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
+    let grant_type = match &o.grant {
+        plan::OAuthGrant::ClientCredentials => "client_credentials",
+        plan::OAuthGrant::Password { .. } => "password",
+    };
+    let mut form: Vec<(&str, &str)> = vec![("grant_type", grant_type)];
     match o.client_auth {
         plan::OAuthClientAuth::Body => {
             form.push(("client_id", &o.client_id));
@@ -61,6 +65,12 @@ pub(crate) fn mint_oauth_token(o: &plan::RestOAuth) -> Result<(String, String), 
             let creds = B64.encode(format!("{}:{}", o.client_id, o.client_secret));
             req = req.set("Authorization", &format!("Basic {}", creds));
         }
+    }
+    // Resource-owner password grant: the user/service-account credentials ride
+    // in the body; the client is still authenticated per `client_auth` above.
+    if let plan::OAuthGrant::Password { username, password } = &o.grant {
+        form.push(("username", username));
+        form.push(("password", password));
     }
     if let Some(s) = &o.scope {
         form.push(("scope", s));
