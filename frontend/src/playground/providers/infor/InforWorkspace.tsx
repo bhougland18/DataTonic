@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Search, ChevronDown, ChevronLeft, ChevronRight, Play, Loader2, Plus, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine, Save, Download, Upload, Bookmark } from 'lucide-react';
 import InforProvider from '../InforProvider';
 import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
@@ -91,6 +92,8 @@ export default function InforWorkspace({
     const [applyNodeId, setApplyNodeId] = useState<string | null>(null);
     const [pendingQuery, setPendingQuery] = useState<InforNodeQuery | null>(null);
     const [applied, setApplied] = useState(false);
+    // Confirm dialog shown when applying to a node while a limit is active.
+    const [limitConfirm, setLimitConfirm] = useState(false);
 
     // ---- saved queries (task 1q): per-tenant list, filtered by data area ----
     const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
@@ -245,7 +248,7 @@ export default function InforWorkspace({
         setApplied(false);
     }, [checked, filterTree, limit, selected]);
 
-    const applyToNode = () => {
+    const performApply = (useLimit: boolean) => {
         if (!onApplyToNode || !applyNodeId || !selected) return;
         const activeFields = fields.length ? fields.filter((f) => checked.has(f)) : Array.from(checked);
         onApplyToNode(applyNodeId, {
@@ -256,9 +259,18 @@ export default function InforWorkspace({
             // builder can be re-edited.
             lplFilter: filterToLpl(filterTree),
             filterTree: isEmptyFilter(filterTree) ? undefined : filterTree,
-            limit: limitEnabled ? limit : undefined,
+            limit: useLimit ? limit : undefined,
         });
         setApplied(true);
+        setLimitConfirm(false);
+    };
+
+    // A limit is handy for previewing here, but a pipeline node usually wants
+    // ALL matching rows — confirm intent before baking a limit into the node.
+    const requestApply = () => {
+        if (!onApplyToNode || !applyNodeId || !selected) return;
+        if (limitEnabled) setLimitConfirm(true);
+        else performApply(false);
     };
 
     // Load this tenant's saved queries once signed in.
@@ -719,7 +731,7 @@ export default function InforWorkspace({
                                         <button
                                             type="button"
                                             className={`pg-btn${applied ? '' : ' pg-btn--primary'}`}
-                                            onClick={applyToNode}
+                                            onClick={requestApply}
                                             disabled={!selected || checked.size === 0}
                                             title="Write this query back to the Infor node on the canvas"
                                         >
@@ -919,6 +931,49 @@ export default function InforWorkspace({
                     </div>
                 )}
             </div>
+
+            {limitConfirm &&
+                createPortal(
+                    <div
+                        className="pgi-modal-backdrop"
+                        onClick={(e) => {
+                            if (e.target === e.currentTarget) setLimitConfirm(false);
+                        }}
+                    >
+                        <div className="pgi-modal" role="dialog" aria-modal="true">
+                            <div className="pgi-modal-title">Apply the row limit to the node?</div>
+                            <div className="pgi-modal-body">
+                                This query has a limit of <b>{limit}</b> row{limit === 1 ? '' : 's'}. A
+                                pipeline node usually reads <b>all</b> matching rows — the limit is
+                                typically just for previewing here.
+                            </div>
+                            <div className="pgi-modal-actions">
+                                <button
+                                    type="button"
+                                    className="pg-btn"
+                                    onClick={() => setLimitConfirm(false)}
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="button"
+                                    className="pg-btn"
+                                    onClick={() => performApply(false)}
+                                >
+                                    Apply without limit
+                                </button>
+                                <button
+                                    type="button"
+                                    className="pg-btn pg-btn--primary"
+                                    onClick={() => performApply(true)}
+                                >
+                                    Keep limit ({limit})
+                                </button>
+                            </div>
+                        </div>
+                    </div>,
+                    document.body,
+                )}
         </div>
     );
 }
