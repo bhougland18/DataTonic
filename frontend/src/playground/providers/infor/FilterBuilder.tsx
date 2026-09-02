@@ -128,8 +128,13 @@ function RuleEditor({
     onChange: (r: FilterRule) => void;
     onRemove: () => void;
 }) {
+    // A rule that's been started (field or value typed) but not finished is
+    // dropped from the generated filter — flag it so it isn't a silent no-op.
+    const hasField = rule.field.trim().length > 0;
+    const hasValue = rule.value.trim().length > 0;
+    const incomplete = (hasField || hasValue) && !(hasField && hasValue);
     return (
-        <div className="pgi-fb-rule">
+        <div className={`pgi-fb-rule${incomplete ? ' pgi-fb-rule--incomplete' : ''}`}>
             <input
                 className="pg-input pgi-fb-field"
                 list={DATALIST_ID}
@@ -159,6 +164,12 @@ function RuleEditor({
                     <Trash2 size={12} />
                 </button>
             </div>
+            {incomplete && (
+                <div className="pgi-fb-rulehint">
+                    {hasValue ? 'Pick a field' : 'Enter a value'} — this rule is skipped until
+                    it's complete
+                </div>
+            )}
         </div>
     );
 }
