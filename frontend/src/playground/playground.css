@@ -982,16 +982,23 @@
 .pgi-op { font-family:var(--font-mono, ui-monospace, monospace); color:var(--accent); font-size:12px; }
 .pgi-add { align-self:flex-start; background:transparent; border:none; color:var(--accent); font-size:12px; cursor:pointer; display:inline-flex; align-items:center; gap:5px; padding:2px 0; }
 
-.pgi-run { display:flex; align-items:flex-end; gap:12px; }
+.pgi-run { display:flex; align-items:flex-end; gap:12px; margin:0 14px; }
 .pgi-limit { display:flex; flex-direction:column; gap:3px; }
 .pgi-limit span { font-size:9.5px; text-transform:uppercase; letter-spacing:.03em; color:var(--text-3); }
 .pgi-limit input { width:90px; background:var(--bg-0); border:1px solid var(--border); border-radius:var(--radius-sm, 6px); color:var(--text-1); font-size:12.5px; padding:7px 9px; }
 .pgi-limit input:disabled { opacity:.45; }
 .pgi-limitchk { width:15px; height:15px; margin:0 0 9px 0; accent-color:var(--accent, #4f8cff); cursor:pointer; }
 
-/* Save-query row below the run bar. */
-.pgi-saverow { display:flex; gap:8px; margin-top:10px; }
-.pgi-saverow .pg-input { flex:1; min-width:0; }
+/* Run + Apply stretch to fill the row so its right edge lines up with the
+   rest of the panel (they were content-sized, leaving a ragged edge). */
+.pgi-run .pg-btn { flex:1; justify-content:center; }
+
+/* Save-query is a quieter utility set off by a divider, so it reads as
+   secondary to the primary Run / Apply actions above it. */
+.pgi-saverow { display:flex; gap:8px; margin:0 14px; padding-top:12px; border-top:1px solid var(--border); }
+.pgi-saverow .pg-input { flex:1; min-width:0; font-size:12px; }
+.pgi-saverow .pg-btn { color:var(--text-2); }
+.pgi-saverow .pg-btn:hover:not(:disabled) { color:var(--text-1); }
 
 /* Saved-queries panel (collapsible middle column). */
 .pgi-saved { width:280px; flex-shrink:0; overflow:hidden; display:flex; flex-direction:column; gap:10px; padding:14px 12px; border-right:1px solid var(--border); background:var(--bg-1); }
