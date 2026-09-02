@@ -5,6 +5,7 @@
 import { sendRequest } from '../../sendClient';
 import { parseGenericResponse, restBase, type GenericPage, type DataAreaId } from './inforApi';
 import type { IonApiConfig } from './ionapi';
+import type { FilterGroup } from './filterModel';
 
 export interface FilterCondition {
     field: string;
@@ -55,8 +56,13 @@ export interface InforNodeQuery {
     dataArea?: DataAreaId;
     businessClass?: string;
     fields?: string;
+    // Legacy simple filter (field::value); superseded by filterTree but still
+    // read to upgrade pre-existing nodes.
     filter?: string;
     lplFilter?: string;
+    // The structured filter tree (round-trips for editing); lplFilter is its
+    // compiled form that actually runs.
+    filterTree?: FilterGroup;
     limit?: number;
 }
 

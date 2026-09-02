@@ -9,11 +9,7 @@
 import { isTauri } from '../../../tauri-dialog';
 import { isWebBackend, webFs } from '../../../web-fs';
 import type { DataAreaId } from './inforApi';
-
-export interface SavedQueryFilter {
-    field: string;
-    value: string;
-}
+import { hydrateFilter, emptyFilter, type FilterGroup } from './filterModel';
 
 export interface SavedQuery {
     id: string;
@@ -23,7 +19,8 @@ export interface SavedQuery {
     dataArea: DataAreaId;
     businessClass: string;
     fields: string[];
-    filter: SavedQueryFilter[];
+    // Structured filter tree (compiles to LPL when the query runs).
+    filter: FilterGroup;
     lplFilter?: string;
     // Omitted when the user turned the limit off (server default / all rows).
     limit?: number;
@@ -105,12 +102,7 @@ export function parseImportedQuery(text: string): SavedQuery | null {
                 dataArea: o.dataArea === 'HCM' ? 'HCM' : 'FSM',
                 businessClass: o.businessClass,
                 fields: o.fields.filter((f): f is string => typeof f === 'string'),
-                filter: Array.isArray(o.filter)
-                    ? o.filter.filter(
-                          (c): c is SavedQueryFilter =>
-                              !!c && typeof c.field === 'string' && typeof c.value === 'string',
-                      )
-                    : [],
+                filter: o.filter ? hydrateFilter(o.filter) : emptyFilter(),
                 lplFilter: typeof o.lplFilter === 'string' ? o.lplFilter : undefined,
                 limit: typeof o.limit === 'number' ? o.limit : undefined,
                 savedAt: new Date().toISOString(),

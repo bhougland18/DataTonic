@@ -1172,6 +1172,10 @@ export default function App() {
                 fields: asStr(p.fields),
                 filter: asStr(p.filter),
                 lplFilter: asStr(p.lplFilter),
+                filterTree:
+                    p.inforFilter && typeof p.inforFilter === 'object'
+                        ? (p.inforFilter as InforNodeQuery['filterTree'])
+                        : undefined,
                 limit:
                     typeof rawLimit === 'number'
                         ? rawLimit
@@ -1201,8 +1205,14 @@ export default function App() {
                     if (q.dataArea !== undefined) nextProps.dataArea = q.dataArea;
                     if (q.businessClass !== undefined) nextProps.businessClass = q.businessClass;
                     if (q.fields !== undefined) nextProps.fields = q.fields;
-                    if (q.filter !== undefined) nextProps.filter = q.filter;
                     if (q.limit !== undefined) nextProps.limit = q.limit;
+                    // Filter: store the structured tree (for editing) + its
+                    // compiled LPL (for running), and clear the legacy simple
+                    // filter so the engine never sends a stale _filter.
+                    nextProps.lplFilter = q.lplFilter ?? '';
+                    nextProps.filter = '';
+                    if (q.filterTree) nextProps.inforFilter = q.filterTree;
+                    else delete nextProps.inforFilter;
                     const patch: Partial<DuckleNodeData> = { properties: nextProps };
                     // Declare the schema from the selected fields so the node has
                     // one without a live probe (types default to string; editable

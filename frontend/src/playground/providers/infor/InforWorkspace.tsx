@@ -11,14 +11,16 @@ import {
     loadCachedClasses,
     saveCachedClasses,
 } from './classCache';
+import { runGenericQuery, sampleFields, type InforNodeQuery } from './query';
+import FilterBuilder from './FilterBuilder';
 import {
-    runGenericQuery,
-    sampleFields,
-    buildSimpleFilter,
-    parseSimpleFilter,
-    type FilterCondition,
-    type InforNodeQuery,
-} from './query';
+    emptyFilter,
+    filterToLpl,
+    isEmptyFilter,
+    hydrateFilter,
+    filterFromSimple,
+    type FilterGroup,
+} from './filterModel';
 import { DATA_AREAS, type DataAreaId, type GenericPage } from './inforApi';
 import {
     savedQueriesAvailable,
@@ -75,7 +77,7 @@ export default function InforWorkspace({
     const [checked, setChecked] = useState<Set<string>>(new Set());
     const [fieldSearch, setFieldSearch] = useState('');
     const [fieldsLoading, setFieldsLoading] = useState(false);
-    const [conds, setConds] = useState<FilterCondition[]>([]);
+    const [filterTree, setFilterTree] = useState<FilterGroup>(() => emptyFilter());
     const [limit, setLimit] = useState(DEFAULT_LIMIT);
     // The limit checkbox (on by default). Off omits _limit — server default/all.
     const [limitEnabled, setLimitEnabled] = useState(true);
@@ -157,7 +159,7 @@ export default function InforWorkspace({
         setFields([]);
         setChecked(new Set());
         setFieldSearch('');
-        setConds([]);
+        setFilterTree(emptyFilter());
         setResult(null);
         setQueryError(null);
     };
@@ -199,7 +201,7 @@ export default function InforWorkspace({
             setFields([]);
             setChecked(new Set());
             setFieldSearch('');
-            setConds([]);
+            setFilterTree(emptyFilter());
             setLimit(DEFAULT_LIMIT);
             return;
         }
@@ -209,7 +211,7 @@ export default function InforWorkspace({
         setDataArea(area);
         setSavedOpen(false);
         setLimit(typeof q.limit === 'number' && q.limit > 0 ? q.limit : DEFAULT_LIMIT);
-        setConds(parseSimpleFilter(q.filter));
+        setFilterTree(q.filterTree ? hydrateFilter(q.filterTree) : filterFromSimple(q.filter));
         setChecked(new Set(wanted));
         setFieldSearch('');
         const businessClass = q.businessClass;
@@ -241,7 +243,7 @@ export default function InforWorkspace({
     // Any manual edit clears the "Applied ✓" confirmation.
     useEffect(() => {
         setApplied(false);
-    }, [checked, conds, limit, selected]);
+    }, [checked, filterTree, limit, selected]);
 
     const applyToNode = () => {
         if (!onApplyToNode || !applyNodeId || !selected) return;
@@ -250,7 +252,9 @@ export default function InforWorkspace({
             dataArea,
             businessClass: selected.entity,
             fields: activeFields.join(','),
-            filter: buildSimpleFilter(conds),
+            // The structured tree round-trips for editing; the derived LPL runs.
+            filterTree: isEmptyFilter(filterTree) ? undefined : filterTree,
+            lplFilter: filterToLpl(filterTree),
             limit: limitEnabled ? limit : undefined,
         });
         setApplied(true);
@@ -285,7 +289,7 @@ export default function InforWorkspace({
             dataArea,
             businessClass: selected.entity,
             fields: fields.filter((f) => checked.has(f)),
-            filter: conds.filter((c) => c.field.trim() && c.value.trim()),
+            filter: filterTree,
             limit: limitEnabled ? limit : undefined,
             savedAt: new Date().toISOString(),
         };
@@ -299,7 +303,7 @@ export default function InforWorkspace({
         setSavedOpen(false);
         setResult(null);
         setQueryError(null);
-        setConds(q.filter.map((c) => ({ ...c })));
+        setFilterTree(hydrateFilter(q.filter));
         setChecked(new Set(q.fields));
         if (typeof q.limit === 'number' && q.limit > 0) {
             setLimit(q.limit);
@@ -377,7 +381,7 @@ export default function InforWorkspace({
         setSavedOpen(false);
         setResult(null);
         setQueryError(null);
-        setConds([]);
+        setFilterTree(emptyFilter());
         setFields([]);
         setChecked(new Set());
         setFieldSearch('');
@@ -412,7 +416,8 @@ export default function InforWorkspace({
             selected.entity,
             {
                 fields: fields.filter((f) => checked.has(f)),
-                filter: conds,
+                filter: [],
+                lpl: filterToLpl(filterTree),
                 limit: limitEnabled ? limit : undefined,
             },
             workspacePath,
@@ -659,62 +664,22 @@ export default function InforWorkspace({
                                 <div className="pgi-section">
                                     <div className="pgi-section-head">
                                         <div className="pgi-lbl">
-                                            Filter <span className="pgi-maps">→ _filter</span>
+                                            Filter <span className="pgi-maps">→ _lplFilter</span>
                                         </div>
                                     </div>
-                                    <div className="pgi-filters">
-                                        {/* The class's fields as a searchable dropdown for the
-                                            filter's field name: type to filter or pick from the list. */}
-                                        <datalist id="pgi-fieldnames">
-                                            {fields.map((f) => (
-                                                <option key={f} value={f} />
-                                            ))}
-                                        </datalist>
-                                        {conds.map((c, i) => (
-                                            <div className="pgi-frow" key={i}>
-                                                <input
-                                                    className="pg-input"
-                                                    placeholder="Field"
-                                                    list="pgi-fieldnames"
-                                                    value={c.field}
-                                                    onChange={(e) =>
-                                                        setConds((cs) =>
-                                                            cs.map((x, j) =>
-                                                                j === i ? { ...x, field: e.target.value } : x,
-                                                            ),
-                                                        )
-                                                    }
-                                                />
-                                                <span className="pgi-op">::</span>
-                                                <input
-                                                    className="pg-input"
-                                                    placeholder="Value"
-                                                    value={c.value}
-                                                    onChange={(e) =>
-                                                        setConds((cs) =>
-                                                            cs.map((x, j) =>
-                                                                j === i ? { ...x, value: e.target.value } : x,
-                                                            ),
-                                                        )
-                                                    }
-                                                />
-                                                <button
-                                                    type="button"
-                                                    className="pg-icon-btn"
-                                                    onClick={() => setConds((cs) => cs.filter((_, j) => j !== i))}
-                                                >
-                                                    <Trash2 size={13} />
-                                                </button>
-                                            </div>
-                                        ))}
-                                        <button
-                                            type="button"
-                                            className="pgi-add"
-                                            onClick={() => setConds((cs) => [...cs, { field: '', value: '' }])}
+                                    <FilterBuilder
+                                        root={filterTree}
+                                        fields={fields}
+                                        onChange={setFilterTree}
+                                    />
+                                    {!isEmptyFilter(filterTree) && (
+                                        <div
+                                            className="pgi-fb-preview"
+                                            title="Generated LPL, sent as _lplFilter"
                                         >
-                                            <Plus size={13} /> Add condition
-                                        </button>
-                                    </div>
+                                            {filterToLpl(filterTree)}
+                                        </div>
+                                    )}
                                 </div>
 
                                 {/* ---- Run ---- */}
