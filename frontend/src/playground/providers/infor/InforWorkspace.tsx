@@ -252,9 +252,10 @@ export default function InforWorkspace({
             dataArea,
             businessClass: selected.entity,
             fields: activeFields.join(','),
-            // The structured tree round-trips for editing; the derived LPL runs.
+            // The compiled expression runs (_filter); the tree round-trips so
+            // the builder can be re-edited.
+            filter: filterToLpl(filterTree),
             filterTree: isEmptyFilter(filterTree) ? undefined : filterTree,
-            lplFilter: filterToLpl(filterTree),
             limit: limitEnabled ? limit : undefined,
         });
         setApplied(true);
@@ -416,8 +417,7 @@ export default function InforWorkspace({
             selected.entity,
             {
                 fields: fields.filter((f) => checked.has(f)),
-                filter: [],
-                lpl: filterToLpl(filterTree),
+                filter: filterToLpl(filterTree),
                 limit: limitEnabled ? limit : undefined,
             },
             workspacePath,
@@ -664,7 +664,7 @@ export default function InforWorkspace({
                                 <div className="pgi-section">
                                     <div className="pgi-section-head">
                                         <div className="pgi-lbl">
-                                            Filter <span className="pgi-maps">→ _lplFilter</span>
+                                            Filter <span className="pgi-maps">→ _filter</span>
                                         </div>
                                     </div>
                                     <FilterBuilder
@@ -675,7 +675,7 @@ export default function InforWorkspace({
                                     {!isEmptyFilter(filterTree) && (
                                         <div
                                             className="pgi-fb-preview"
-                                            title="Generated LPL, sent as _lplFilter"
+                                            title="Generated filter expression, sent as _filter"
                                         >
                                             {filterToLpl(filterTree)}
                                         </div>

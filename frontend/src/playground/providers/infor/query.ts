@@ -7,17 +7,12 @@ import { parseGenericResponse, restBase, type GenericPage, type DataAreaId } fro
 import type { IonApiConfig } from './ionapi';
 import type { FilterGroup } from './filterModel';
 
-export interface FilterCondition {
-    field: string;
-    value: string;
-}
-
 export interface GenericQuery {
     fields: string[];
-    // Simple filter conditions -> `_filter=field::value|field2::value2`.
-    filter: FilterCondition[];
-    // Optional raw LPL expression -> `_lplFilter` (advanced, e.g. (Item like "10*")).
-    lpl?: string;
+    // The `_filter` condition expression built by the visual filter builder,
+    // e.g. `Item like "100*"` or `(Item like "100*" or ItemGroup = 200)`.
+    // Empty/undefined omits `_filter`.
+    filter?: string;
     // Undefined omits `_limit` entirely (server default / all rows).
     limit?: number;
 }
@@ -25,28 +20,6 @@ export interface GenericQuery {
 export type QueryResult =
     | { ok: true; page: GenericPage; status: number; url: string }
     | { ok: false; status: number; error: string };
-
-// Landmark simple-filter syntax: name::value pairs joined by '|'.
-export function buildSimpleFilter(conds: FilterCondition[]): string {
-    return conds
-        .filter((c) => c.field.trim() && c.value.trim())
-        .map((c) => `${c.field.trim()}::${c.value.trim()}`)
-        .join('|');
-}
-
-// Inverse of buildSimpleFilter: turn a stored `_filter` string back into
-// editable conditions when pre-loading a Canvas node's query into the builder.
-export function parseSimpleFilter(filter: string | undefined): FilterCondition[] {
-    if (!filter) return [];
-    return filter
-        .split('|')
-        .map((part) => {
-            const i = part.indexOf('::');
-            if (i < 0) return null;
-            return { field: part.slice(0, i).trim(), value: part.slice(i + 2).trim() };
-        })
-        .filter((c): c is FilterCondition => c !== null && c.field.length > 0);
-}
 
 // The subset of an Infor source node's props that the Playground round-trips:
 // pre-loaded into the query builder on open, and written back on "Apply to
@@ -56,12 +29,10 @@ export interface InforNodeQuery {
     dataArea?: DataAreaId;
     businessClass?: string;
     fields?: string;
-    // Legacy simple filter (field::value); superseded by filterTree but still
-    // read to upgrade pre-existing nodes.
+    // The compiled `_filter` expression (what actually runs).
     filter?: string;
-    lplFilter?: string;
-    // The structured filter tree (round-trips for editing); lplFilter is its
-    // compiled form that actually runs.
+    // The structured filter tree that produced `filter` (round-trips so the
+    // builder can be re-edited). Absent on legacy nodes.
     filterTree?: FilterGroup;
     limit?: number;
 }
@@ -74,9 +45,7 @@ function genericUrl(
 ): string {
     const params = new URLSearchParams();
     if (q.fields.length) params.set('_fields', q.fields.join(','));
-    const simple = buildSimpleFilter(q.filter);
-    if (simple) params.set('_filter', simple);
-    if (q.lpl && q.lpl.trim()) params.set('_lplFilter', q.lpl.trim());
+    if (q.filter && q.filter.trim()) params.set('_filter', q.filter.trim());
     if (typeof q.limit === 'number' && q.limit > 0) params.set('_limit', String(q.limit));
     return `${restBase(config, dataArea)}/classes/${encodeURIComponent(businessClass)}/lists/_generic?${params.toString()}`;
 }
