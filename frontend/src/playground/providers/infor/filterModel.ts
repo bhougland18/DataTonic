@@ -70,14 +70,10 @@ export function isEmptyFilter(g: FilterGroup): boolean {
 function esc(s: string): string {
     return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
-function isNumeric(s: string): boolean {
-    return /^-?\d+(\.\d+)?$/.test(s.trim());
-}
-// `=,!=,>,<` take a bare number for numeric fields, a quoted string otherwise;
-// `like` always wants a quoted string.
+// Infor treats these fields as strings, so every value is quoted — matching
+// what Infor's own filter builder emits (e.g. Item = "111", Item like "100*").
 function operand(value: string): string {
-    const v = value.trim();
-    return isNumeric(v) ? v : `"${esc(v)}"`;
+    return `"${esc(value.trim())}"`;
 }
 
 function ruleToLpl(r: FilterRule): string | null {

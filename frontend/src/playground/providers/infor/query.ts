@@ -9,10 +9,12 @@ import type { FilterGroup } from './filterModel';
 
 export interface GenericQuery {
     fields: string[];
-    // The `_filter` condition expression built by the visual filter builder,
-    // e.g. `Item like "100*"` or `(Item like "100*" or ItemGroup = 200)`.
-    // Empty/undefined omits `_filter`.
-    filter?: string;
+    // The LPL condition expression built by the visual filter builder, e.g.
+    // `Item like "100*"` or `((Description like "STENT*") and (Item = "108"))`.
+    // Sent as `_lplFilter` — the only param that honors AND/OR/grouping and the
+    // full operator set (the simpler `_filter` only does field::value + AND).
+    // Empty/undefined omits it.
+    lplFilter?: string;
     // Undefined omits `_limit` entirely (server default / all rows).
     limit?: number;
 }
@@ -29,9 +31,9 @@ export interface InforNodeQuery {
     dataArea?: DataAreaId;
     businessClass?: string;
     fields?: string;
-    // The compiled `_filter` expression (what actually runs).
-    filter?: string;
-    // The structured filter tree that produced `filter` (round-trips so the
+    // The compiled LPL expression (what actually runs, sent as _lplFilter).
+    lplFilter?: string;
+    // The structured filter tree that produced lplFilter (round-trips so the
     // builder can be re-edited). Absent on legacy nodes.
     filterTree?: FilterGroup;
     limit?: number;
@@ -43,11 +45,16 @@ function genericUrl(
     q: GenericQuery,
     dataArea?: DataAreaId,
 ): string {
-    const params = new URLSearchParams();
-    if (q.fields.length) params.set('_fields', q.fields.join(','));
-    if (q.filter && q.filter.trim()) params.set('_filter', q.filter.trim());
-    if (typeof q.limit === 'number' && q.limit > 0) params.set('_limit', String(q.limit));
-    return `${restBase(config, dataArea)}/classes/${encodeURIComponent(businessClass)}/lists/_generic?${params.toString()}`;
+    // Build the query string with encodeURIComponent (space -> %20), NOT
+    // URLSearchParams (space -> '+'): Landmark's filter parser doesn't treat
+    // '+' as a space, so the expression must go over the wire %20-separated.
+    const parts: string[] = [];
+    if (q.fields.length) parts.push(`_fields=${encodeURIComponent(q.fields.join(','))}`);
+    if (q.lplFilter && q.lplFilter.trim())
+        parts.push(`_lplFilter=${encodeURIComponent(q.lplFilter.trim())}`);
+    if (typeof q.limit === 'number' && q.limit > 0) parts.push(`_limit=${q.limit}`);
+    const qs = parts.length ? `?${parts.join('&')}` : '';
+    return `${restBase(config, dataArea)}/classes/${encodeURIComponent(businessClass)}/lists/_generic${qs}`;
 }
 
 async function getGeneric(

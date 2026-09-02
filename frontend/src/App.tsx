@@ -1170,7 +1170,7 @@ export default function App() {
                     | InforNodeQuery['dataArea'],
                 businessClass: asStr(p.businessClass),
                 fields: asStr(p.fields),
-                filter: asStr(p.filter),
+                lplFilter: asStr(p.lplFilter),
                 filterTree:
                     p.inforFilter && typeof p.inforFilter === 'object'
                         ? (p.inforFilter as InforNodeQuery['filterTree'])
@@ -1205,11 +1205,11 @@ export default function App() {
                     if (q.businessClass !== undefined) nextProps.businessClass = q.businessClass;
                     if (q.fields !== undefined) nextProps.fields = q.fields;
                     if (q.limit !== undefined) nextProps.limit = q.limit;
-                    // Filter: the compiled expression runs as _filter; store the
-                    // structured tree for re-editing, and clear any legacy
-                    // _lplFilter so the engine never sends a stale one.
-                    nextProps.filter = q.filter ?? '';
-                    nextProps.lplFilter = '';
+                    // Filter: the compiled LPL runs as _lplFilter; store the
+                    // structured tree for re-editing, and clear the legacy
+                    // simple _filter so nothing stale is sent alongside it.
+                    nextProps.lplFilter = q.lplFilter ?? '';
+                    nextProps.filter = '';
                     if (q.filterTree) nextProps.inforFilter = q.filterTree;
                     else delete nextProps.inforFilter;
                     const patch: Partial<DuckleNodeData> = { properties: nextProps };
