@@ -2784,7 +2784,16 @@ export default function App() {
             />
 
             <main className="workspace">
-                <Rail mode={mode} onSelect={setMode} />
+                <Rail
+                    mode={mode}
+                    onSelect={setMode}
+                    isVisible={m =>
+                        // The API Playground is opened from a Canvas node, so it
+                        // only appears on the rail once it's in use (active, or a
+                        // session has been opened this run).
+                        m.id !== 'playground' || mode === 'playground' || playgroundRequest !== null
+                    }
+                />
                 {/* Kept mounted (hidden when inactive) so the Playground's
                     in-session state - Infor sign-in, the current query - survives
                     switching to Canvas and back. */}
