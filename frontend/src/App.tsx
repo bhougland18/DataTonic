@@ -56,6 +56,7 @@ import ImportReportModal, { type ImportReport } from './workflow-ui/ImportReport
 import HomeLauncher from './workflow-ui/HomeLauncher';
 import Rail from './rail/Rail';
 import { useAppMode } from './rail/useAppMode';
+import type { AppMode } from './rail/types';
 import Playground from './playground/Playground';
 import type { ProviderId } from './playground/providers/types';
 import type { InforNodeQuery } from './playground/providers/infor/query';
@@ -1350,6 +1351,28 @@ export default function App() {
     const selectedNode = useMemo(
         () => nodes.find(n => n.id === selectedId) ?? null,
         [nodes, selectedId],
+    );
+
+    // The API Playground is Infor-node-driven: keep it on the rail as long as a
+    // src.infor node exists on the canvas (or it's the active view).
+    const hasInforNode = useMemo(
+        () => nodes.some(n => (n.data.componentId ?? '') === 'src.infor'),
+        [nodes],
+    );
+
+    // Entering the Playground from the rail binds it to the currently-selected
+    // Infor node, so it always reflects whatever node you have selected. Picking
+    // a different node on the canvas and returning re-loads that node's query.
+    // Other modes just switch.
+    const handleRailSelect = useCallback(
+        (next: AppMode) => {
+            if (next === 'playground' && (selectedNode?.data.componentId ?? '') === 'src.infor') {
+                handleOpenPlayground(selectedNode!.id);
+                return;
+            }
+            setMode(next);
+        },
+        [selectedNode, handleOpenPlayground, setMode],
     );
 
     const openNewPipelineModal = useCallback((parentId: string = 'pipelines') => {
@@ -2786,12 +2809,11 @@ export default function App() {
             <main className="workspace">
                 <Rail
                     mode={mode}
-                    onSelect={setMode}
+                    onSelect={handleRailSelect}
                     isVisible={m =>
-                        // The API Playground is opened from a Canvas node, so it
-                        // only appears on the rail once it's in use (active, or a
-                        // session has been opened this run).
-                        m.id !== 'playground' || mode === 'playground' || playgroundRequest !== null
+                        // The API Playground is Infor-node-driven: shown while any
+                        // src.infor node exists on the canvas (or it's active).
+                        m.id !== 'playground' || mode === 'playground' || hasInforNode
                     }
                 />
                 {/* Kept mounted (hidden when inactive) so the Playground's
