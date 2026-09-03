@@ -69,7 +69,7 @@ use plan::{
     PubSubSourceSpec, QdrantSourceSpec, QvdSinkSpec, QvdSourceSpec, RabbitSinkSpec,
     RabbitSourceSpec, RedisSinkSpec,
     RedisSourceSpec, RestPagination, RestResponseFormat, RestSourceSpec, RuntimeSpec, ShellSpec,
-    Dhis2SinkSpec, SalesforceBulkSinkSpec, SalesforceBulkSourceSpec, SalesforceSinkSpec, SftpSinkSpec, SftpSourceSpec, SnowflakeAuth,
+    Dhis2SinkSpec, InforSinkSpec, SalesforceBulkSinkSpec, SalesforceBulkSourceSpec, SalesforceSinkSpec, SftpSinkSpec, SftpSourceSpec, SnowflakeAuth,
     FileOpSpec,
     SnowflakeSinkSpec,
     SnowflakeSourceSpec,
@@ -1693,6 +1693,11 @@ impl DuckdbEngine {
                     }
                     Some(RuntimeSpec::SalesforceBulkSink(spec)) => {
                         self.run_salesforce_bulk_sink(&db_path, &secret_prefix, spec)
+                    }
+                    // snk.infor: bulk-upload rows to an Infor business-class
+                    // action, emitting a per-record results relation.
+                    Some(RuntimeSpec::InforSink(spec)) => {
+                        self.run_infor_sink(&db_path, &secret_prefix, spec)
                     }
                     Some(RuntimeSpec::SalesforceBulkSource(spec)) => {
                         self.run_salesforce_bulk_source(&db_path, spec)

@@ -254,6 +254,9 @@ pub enum RuntimeSpec {
     /// snk.salesforce.bulk: write rows into a Salesforce object via Bulk API
     /// 2.0's async job lifecycle. See SalesforceBulkSinkSpec.
     SalesforceBulkSink(SalesforceBulkSinkSpec),
+    /// snk.infor: bulk-upload rows to an Infor FSM/Landmark business-class
+    /// action via the Action Batch Service. See InforSinkSpec.
+    InforSink(InforSinkSpec),
     /// src.salesforce.bulk: read a SOQL result set via a Bulk API 2.0
     /// query job. See SalesforceBulkSourceSpec.
     SalesforceBulkSource(SalesforceBulkSourceSpec),
@@ -1370,6 +1373,7 @@ fn build_stage(
     let mut salesforce_sink: Option<SalesforceSinkSpec> = None;
     let mut dhis2_sink: Option<Dhis2SinkSpec> = None;
     let mut salesforce_bulk_sink: Option<SalesforceBulkSinkSpec> = None;
+    let mut infor_sink: Option<InforSinkSpec> = None;
     let mut salesforce_bulk_source: Option<SalesforceBulkSourceSpec> = None;
     let mut snowflake_source: Option<SnowflakeSourceSpec> = None;
     let mut databricks_source: Option<DatabricksSourceSpec> = None;
@@ -2374,6 +2378,114 @@ fn build_stage(
             timeout_secs,
             fail_on_error: props.get("failOnError").and_then(|v| v.as_bool()).unwrap_or(true),
             oauth,
+            results_path: string_prop(&props, "resultsPath").filter(|s| !s.is_empty()),
+        });
+        (String::new(), StageKind::Sink, Some(from_view.to_string()))
+    } else if component_id == "snk.infor" {
+        // Infor FSM/Landmark upload sink via the Action Batch Service. Reuses
+        // src.infor's connection plumbing (inforApiBase/inforTenant from
+        // duckle-secrets, dataArea -> {app}/{module}, password-grant OAuth) and
+        // mirrors the live-tested Playground uploader's request:
+        // POST /classes/{class}/actions/{action}/batch?_maxFailures={n} with a
+        // {_records:[{_fields:{apiField:value}}]} body.
+        fn infor_qenc(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for b in s.bytes() {
+                match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        out.push(b as char)
+                    }
+                    _ => out.push_str(&format!("%{:02X}", b)),
+                }
+            }
+            out
+        }
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let api_base = string_prop(&props, "inforApiBase")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "{}: no Infor connection resolved (inforApiBase missing) -                      pick a saved Infor connection on the node",
+                    component_id
+                ))
+            })?;
+        let tenant = string_prop(&props, "inforTenant")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "{}: no Infor connection resolved (inforTenant missing)",
+                    component_id
+                ))
+            })?;
+        // Data area picks the {app}/{module} path; default FSM (mirrors src.infor).
+        let (app, module) = match string_prop(&props, "dataArea").as_deref() {
+            Some("HCM") => ("LAWSONGHR", "hcm"),
+            _ => ("FSM", "fsm"),
+        };
+        let base = format!(
+            "{}/{}/{}/{}/soap",
+            api_base.trim_end_matches('/'),
+            tenant,
+            app,
+            module
+        );
+        let business_class = string_prop(&props, "businessClass")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!("{}: businessClass required", component_id))
+            })?;
+        let action = string_prop(&props, "action")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "{}: action required - open the Infor uploader and pick an action",
+                    component_id
+                ))
+            })?;
+        let mapping: Vec<(String, String)> = props
+            .get("mapping")
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if mapping.is_empty() {
+            return Err(EngineError::Config(format!(
+                "{}: mapping required - open the Infor uploader and map columns to action fields",
+                component_id
+            )));
+        }
+        // _maxFailures=-1 (the uploader's tested default) tolerates every
+        // per-record failure so the whole batch is processed and each record's
+        // result comes back, instead of the batch aborting on the first error.
+        let max_failures = props.get("maxFailures").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let batch_size = props
+            .get("batchSize")
+            .and_then(|v| v.as_u64())
+            .filter(|n| *n > 0)
+            .unwrap_or(500) as usize;
+        let url = format!(
+            "{}/classes/{}/actions/{}/batch?_maxFailures={}",
+            base.trim_end_matches('/'),
+            infor_qenc(business_class.trim()),
+            infor_qenc(action.trim()),
+            max_failures
+        );
+        // confirmWarnings is written by the uploader but its Batch-Service
+        // mapping is unverified (P3 open question), so it is not sent yet.
+        infor_sink = Some(InforSinkSpec {
+            node_id: node.id.clone(),
+            from_view: from_view.to_string(),
+            url,
+            business_class,
+            action,
+            mapping,
+            batch_size,
+            trim_alpha: props.get("trimAlpha").and_then(|v| v.as_bool()).unwrap_or(false),
+            fail_on_error: props.get("failOnError").and_then(|v| v.as_bool()).unwrap_or(false),
+            oauth: rest_oauth_from_props(&props, false)?,
             results_path: string_prop(&props, "resultsPath").filter(|s| !s.is_empty()),
         });
         (String::new(), StageKind::Sink, Some(from_view.to_string()))
@@ -5649,6 +5761,7 @@ fn build_stage(
         .or_else(|| salesforce_sink.map(RuntimeSpec::SalesforceSink))
         .or_else(|| dhis2_sink.map(RuntimeSpec::Dhis2Sink))
         .or_else(|| salesforce_bulk_sink.map(RuntimeSpec::SalesforceBulkSink))
+        .or_else(|| infor_sink.map(RuntimeSpec::InforSink))
         .or_else(|| salesforce_bulk_source.map(RuntimeSpec::SalesforceBulkSource))
         .or_else(|| snowflake_source.map(RuntimeSpec::SnowflakeSource))
         .or_else(|| databricks_source.map(RuntimeSpec::DatabricksSource))

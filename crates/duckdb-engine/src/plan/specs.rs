@@ -1918,6 +1918,43 @@ pub struct SalesforceBulkSinkSpec {
     pub results_path: Option<String>,
 }
 
+/// snk.infor: bulk-upload upstream rows to an Infor FSM/Landmark business-class
+/// action via the Action Batch Service. Mirrors the live-tested Playground
+/// uploader (InforUploadWorkspace): POST
+/// `{restBase}/classes/{class}/actions/{action}/batch?_maxFailures={n}` with a
+/// `{_records:[{_fields:{apiField:value}}]}` body, then classify each returned
+/// record message ok/error. Auth is the same Infor password-grant OAuth as
+/// src.infor (`oauth`). The per-record results (input columns + `_status` +
+/// `_message`) are materialized as the node's output relation so downstream
+/// nodes / the uploader Results tab can read them.
+#[derive(Debug, Clone)]
+pub struct InforSinkSpec {
+    /// Output relation name = the sink node id; carries the per-record results.
+    pub node_id: String,
+    /// Upstream view feeding the sink (the dataset being uploaded).
+    pub from_view: String,
+    /// Fully built batch endpoint, incl. `?_maxFailures=<n>`.
+    pub url: String,
+    /// FSM/Landmark business class, e.g. "Item" (used in summary messages).
+    pub business_class: String,
+    /// Batch action invoked per request, e.g. "Create" (used in summaries).
+    pub action: String,
+    /// (apiField, datasetColumn) pairs mapping each input column onto the
+    /// action field sent under `_fields`. Values are stringified like the
+    /// uploader's fmtCell (null -> "", object -> JSON, else the scalar text).
+    pub mapping: Vec<(String, String)>,
+    /// Records per `/batch` POST.
+    pub batch_size: usize,
+    /// Trim string field values before sending (the uploader's trimAlpha).
+    pub trim_alpha: bool,
+    /// When true, the stage errors if any record came back classified as error.
+    pub fail_on_error: bool,
+    /// Infor OAuth (password grant + HTTP Basic client auth), minted per run.
+    pub oauth: Option<RestOAuth>,
+    /// Optional directory for success/error CSVs (P4; parity with snk.salesforce).
+    pub results_path: Option<String>,
+}
+
 /// src.salesforce.bulk: read a SOQL result set via a Bulk API 2.0 query job -
 /// the migration-scale read, where src.salesforce (the REST query endpoint,
 /// ~2000 records per page) would mean thousands of paginated round-trips.

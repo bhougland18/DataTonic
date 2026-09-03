@@ -142,6 +142,71 @@ fn infor_unwrap_generic(rows: Vec<JsonValue>) -> Vec<JsonValue> {
         .collect()
 }
 
+/// Stringify a mapped cell value exactly like the uploader's fmtCell, so the
+/// engine sink and the live Test upload send byte-identical _fields: null ->
+/// "", object/array -> compact JSON, scalar -> its text (no surrounding quotes).
+fn infor_cell(v: &JsonValue) -> String {
+    match v {
+        JsonValue::Null => String::new(),
+        JsonValue::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse an Action Batch Service response into expected (status, message) pairs,
+/// one per input record. The body is a JSON array of {_fields, message} per
+/// record plus a trailing {batchStatus} element (dropped). Classification
+/// mirrors the uploader's summarizeBatch: a record is "error" when its message
+/// matches the error regex, else "ok". If the body can't be parsed as an array,
+/// every record in the chunk gets one shared error so nothing is silently
+/// counted as success. (Duplicate / "already exists" -> "skipped" is a P3 open
+/// question, pending a captured real error body.)
+fn parse_infor_batch_results(body: &str, expected: usize) -> Vec<(String, String)> {
+    fn is_error(msg: &str) -> bool {
+        let m = msg.to_lowercase();
+        ["error", "fail", "invalid", "denied", "cannot", "unable", "reject"]
+            .iter()
+            .any(|kw| m.contains(kw))
+    }
+    if let Ok(JsonValue::Array(arr)) = serde_json::from_str::<JsonValue>(body) {
+        let mut out: Vec<(String, String)> = Vec::with_capacity(expected);
+        for el in &arr {
+            let o = match el.as_object() {
+                Some(o) => o,
+                None => continue,
+            };
+            if o.contains_key("batchStatus") {
+                continue; // trailing batch summary, not a per-record result
+            }
+            let message = o
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let status = if is_error(&message) { "error" } else { "ok" };
+            out.push((status.into(), message));
+        }
+        // The server returns one entry per input record; if it returned fewer,
+        // pad so the results relation stays positionally aligned with the rows.
+        while out.len() < expected {
+            out.push((
+                "error".into(),
+                "no per-record result returned for this row".into(),
+            ));
+        }
+        out.truncate(expected);
+        out
+    } else {
+        let msg = format!(
+            "Infor batch response was not a JSON array: {}",
+            body.chars().take(200).collect::<String>()
+        );
+        (0..expected)
+            .map(|_| ("error".to_string(), msg.clone()))
+            .collect()
+    }
+}
+
 /// Counts accumulated across DHIS2 import chunks. DHIS2 reports these under
 /// two different key sets depending on the endpoint (`importCount` vs
 /// `stats`), so both parsers normalise into this one shape.
@@ -961,6 +1026,166 @@ impl DuckdbEngine {
         Ok(format!(
             "salesforce {} {}: {} succeeded, {} failed",
             spec.operation, spec.object, ok_count, fail_count
+        ))
+    }
+
+    /// snk.infor: bulk-upload the upstream view to an Infor FSM/Landmark
+    /// business-class action via the Action Batch Service. Mirrors the
+    /// live-tested Playground uploader: build the {_records:[{_fields:{..}}]}
+    /// body from the column mapping (values stringified like fmtCell, optionally
+    /// trimmed), POST one batch per batch_size rows to /batch?_maxFailures=.. with
+    /// a per-run OAuth Bearer token, and classify each returned record message
+    /// ok/error (same regex as InforUploadWorkspace's summarizeBatch). The
+    /// per-record results (input columns + _status + _message) are materialized
+    /// as the node's own output relation so downstream nodes and the uploader
+    /// Results tab can read them.
+    pub(crate) fn run_infor_sink(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        spec: &InforSinkSpec,
+    ) -> Result<String, EngineError> {
+        let select = format!(
+            "{}SELECT * FROM {}",
+            secret_prefix,
+            plan::quote_ident(&spec.from_view)
+        );
+        let rows = self.run_rows(Some(db), &select)?;
+        if rows.is_empty() {
+            return Ok(format!(
+                "infor {} {}: 0 rows to upload",
+                spec.action, spec.business_class
+            ));
+        }
+
+        // Same Infor password-grant token flow as src.infor; minted once per run.
+        let auth_header = match &spec.oauth {
+            Some(o) => {
+                let (token, _instance) = mint_oauth_token(o)?;
+                format!("Bearer {}", token)
+            }
+            None => {
+                return Err(EngineError::Config(
+                    "snk.infor: no Infor connection resolved (OAuth not configured) - \
+                     pick a saved Infor connection on the node"
+                        .into(),
+                ))
+            }
+        };
+
+        // One (status, message) per attempted input row, positionally aligned
+        // with rows, so the results relation lines up column-for-column.
+        let mut results: Vec<(String, String)> = Vec::with_capacity(rows.len());
+        let run_chunks = |results: &mut Vec<(String, String)>| -> Result<(), EngineError> {
+            for chunk in rows.chunks(spec.batch_size.max(1)) {
+                self.check_cancelled()?;
+                let records: Vec<JsonValue> = chunk
+                    .iter()
+                    .map(|row| {
+                        let mut fields = serde_json::Map::new();
+                        for (api_field, column) in &spec.mapping {
+                            let raw = row.get(column).unwrap_or(&JsonValue::Null);
+                            let mut val = infor_cell(raw);
+                            if spec.trim_alpha {
+                                val = val.trim().to_string();
+                            }
+                            fields.insert(api_field.clone(), JsonValue::String(val));
+                        }
+                        let mut rec = serde_json::Map::new();
+                        rec.insert("_fields".into(), JsonValue::Object(fields));
+                        JsonValue::Object(rec)
+                    })
+                    .collect();
+                let mut body = serde_json::Map::new();
+                body.insert("_records".into(), JsonValue::Array(records));
+                let body_str = serde_json::to_string(&JsonValue::Object(body))
+                    .unwrap_or_else(|_| "{}".into());
+
+                let send = crate::tls::http_agent()
+                    .post(&spec.url)
+                    .set("Authorization", &auth_header)
+                    .set("Content-Type", "application/json")
+                    .set("Accept", "application/json")
+                    .send_string(&body_str);
+                match send {
+                    Ok(resp) => {
+                        let txt = resp.into_string().unwrap_or_default();
+                        results.extend(parse_infor_batch_results(&txt, chunk.len()));
+                    }
+                    Err(ureq::Error::Status(code, response)) => {
+                        let b = response.into_string().unwrap_or_default();
+                        let msg = format!(
+                            "Infor HTTP {} from {}: {}",
+                            code,
+                            spec.url,
+                            b.chars().take(300).collect::<String>()
+                        );
+                        for _ in 0..chunk.len() {
+                            results.push(("error".into(), msg.clone()));
+                        }
+                        return Err(EngineError::Query(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Infor HTTP transport to {}: {}", spec.url, e);
+                        for _ in 0..chunk.len() {
+                            results.push(("error".into(), msg.clone()));
+                        }
+                        return Err(EngineError::Query(msg));
+                    }
+                }
+            }
+            Ok(())
+        };
+        let loop_result = run_chunks(&mut results);
+
+        // Emit the results relation (input columns + _status + _message),
+        // aligned by position. Rows past an aborted chunk have no result yet.
+        let result_rows: Vec<JsonValue> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut m = match row {
+                    JsonValue::Object(o) => o.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                let (status, message) = results.get(i).cloned().unwrap_or_else(|| {
+                    (
+                        "skipped".into(),
+                        "not attempted (run aborted earlier)".into(),
+                    )
+                });
+                m.insert("_status".into(), JsonValue::String(status));
+                m.insert("_message".into(), JsonValue::String(message));
+                JsonValue::Object(m)
+            })
+            .collect();
+        materialize_jsonobjects_as_table_typed(&self.bin, db, &spec.node_id, &result_rows, None)?;
+
+        // A transport/HTTP abort is the more useful diagnosis; surface it after
+        // the results relation is written so the partial results survive.
+        loop_result?;
+
+        let ok = results.iter().filter(|(s, _)| s == "ok").count();
+        let errored = results.iter().filter(|(s, _)| s == "error").count();
+        if errored > 0 && spec.fail_on_error {
+            let first: Vec<String> = results
+                .iter()
+                .filter(|(s, _)| s == "error")
+                .take(5)
+                .map(|(_, m)| m.clone())
+                .collect();
+            return Err(EngineError::Query(format!(
+                "infor {} {}: {} ok, {} error. First errors: {}",
+                spec.action,
+                spec.business_class,
+                ok,
+                errored,
+                first.join("; ")
+            )));
+        }
+        Ok(format!(
+            "infor {} {}: {} ok, {} error",
+            spec.action, spec.business_class, ok, errored
         ))
     }
 
@@ -15880,4 +16105,57 @@ fn page_media_box(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> (Option<f6
         }
     }
     (None, None)
+}
+
+#[cfg(test)]
+mod infor_sink_tests {
+    use super::{infor_cell, parse_infor_batch_results};
+    use serde_json::json;
+
+    #[test]
+    fn infor_cell_stringifies_like_fmtcell() {
+        // null -> "", string kept verbatim (no quotes), scalars -> their text,
+        // object/array -> compact JSON. Matches the uploader's fmtCell so the
+        // engine sink and the live Test upload send byte-identical _fields.
+        assert_eq!(infor_cell(&json!(null)), "");
+        assert_eq!(infor_cell(&json!("ABC")), "ABC");
+        assert_eq!(infor_cell(&json!(42)), "42");
+        assert_eq!(infor_cell(&json!(true)), "true");
+        assert_eq!(infor_cell(&json!({"a":1})), "{\"a\":1}");
+    }
+
+    #[test]
+    fn parse_batch_classifies_and_drops_batchstatus() {
+        // The Action Batch Service body: {_fields, message} per record plus a
+        // trailing {batchStatus}. The summary element must not become a record.
+        let body = r#"[
+            {"_fields":{"Item":"ABC"},"message":"Item updated"},
+            {"_fields":{"Item":"BAD"},"message":"The value is invalid for field X"},
+            {"batchStatus":"0"}
+        ]"#;
+        let out = parse_infor_batch_results(body, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "ok");
+        assert_eq!(out[0].1, "Item updated");
+        assert_eq!(out[1].0, "error");
+        assert!(out[1].1.contains("invalid"));
+    }
+
+    #[test]
+    fn parse_batch_pads_missing_and_handles_non_array() {
+        // Fewer records than rows -> pad with an error so the results relation
+        // stays positionally aligned.
+        let body = r#"[{"_fields":{"Item":"ABC"},"message":"Item updated"}]"#;
+        let out = parse_infor_batch_results(body, 3);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, "ok");
+        assert_eq!(out[1].0, "error");
+        assert_eq!(out[2].0, "error");
+
+        // A non-array body (e.g. an HTML error page) marks every row error
+        // rather than silently counting success.
+        let out = parse_infor_batch_results("<html>gateway timeout</html>", 2);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(s, _)| s == "error"));
+    }
 }
