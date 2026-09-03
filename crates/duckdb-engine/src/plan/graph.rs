@@ -619,7 +619,7 @@ pub(crate) fn canonical_port(p: &str) -> &str {
 pub(crate) fn is_multi_main_component(component_id: &str) -> bool {
     matches!(
         component_id,
-        "xf.union" | "xf.unionall" | "xf.intersect" | "xf.except" | "xf.dbt"
+        "xf.union" | "xf.unionall" | "xf.intersect" | "xf.except" | "xf.dbt" | "code.workingdb"
     )
 }
 

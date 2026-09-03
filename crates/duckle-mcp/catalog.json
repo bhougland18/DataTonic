@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 397,
+  "componentCount": 399,
   "components": [
     {
       "id": "src.csv",
@@ -8613,6 +8613,126 @@
               "type": "main"
             }
           ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.infor",
+      "label": "Infor",
+      "kind": "source",
+      "availability": "available",
+      "summary": "Query an Infor FSM/Landmark business class (the lists/_generic endpoint) via a saved ION API connection. Configure the business class, field list, and filter here, or click \"Open in Playground\" to build the query interactively. Compiles to a REST source at run time.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.infor",
+        "kind": "source",
+        "label": "Infor",
+        "description": "Query an Infor FSM/Landmark business class (the lists/_generic endpoint) via a saved ION API connection. Configure the business class, field list, and filter here, or click \"Open in Playground\" to build the query interactively. Compiles to a REST source at run time.",
+        "schemaSource": "declared",
+        "sections": [
+          {
+            "label": "Connection",
+            "fields": [
+              {
+                "key": "connectionRef",
+                "label": "Infor connection",
+                "kind": "connection-ref",
+                "accepts": [
+                  "rest"
+                ],
+                "description": "Pick a saved Infor ION API connection (Connections folder). Resolved and decrypted at run time; all Infor nodes sharing it reuse one token."
+              }
+            ]
+          },
+          {
+            "label": "Query",
+            "fields": [
+              {
+                "key": "dataArea",
+                "label": "Data area",
+                "kind": "select",
+                "defaultValue": "FSM",
+                "options": [
+                  {
+                    "value": "FSM",
+                    "label": "FSM"
+                  },
+                  {
+                    "value": "HCM",
+                    "label": "HCM (GHR)"
+                  }
+                ],
+                "description": "Which Infor suite to query. Sets the REST base: FSM → FSM/fsm/soap, HCM → LAWSONGHR/hcm/soap."
+              },
+              {
+                "key": "businessClass",
+                "label": "Business class",
+                "kind": "text",
+                "required": true,
+                "placeholder": "Item",
+                "description": "The FSM/Landmark business class to query. Its lists/_generic endpoint returns the rows."
+              },
+              {
+                "key": "fields",
+                "label": "Fields",
+                "kind": "text",
+                "placeholder": "Item,ItemGroup,Description",
+                "description": "Comma-separated field names to return (_fields). Leave blank for the class default set."
+              },
+              {
+                "key": "filter",
+                "label": "Filter",
+                "kind": "text",
+                "placeholder": "Item::10*",
+                "description": "Simple filter (_filter): name::value pairs joined by |. Leave blank for no filter."
+              },
+              {
+                "key": "lplFilter",
+                "label": "LPL filter (advanced)",
+                "kind": "text",
+                "placeholder": "(Item startsWith \"10\")",
+                "description": "Advanced LPL expression (_lplFilter). Optional; overrides the simple filter when set."
+              },
+              {
+                "key": "limit",
+                "label": "Limit",
+                "kind": "integer",
+                "placeholder": "e.g. 100",
+                "description": "Max rows to return (_limit). Blank uses the server default. Usually set by building the query in the Playground."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
           "outputs": [
             {
               "id": "main",
@@ -42326,6 +42446,66 @@
               "label": "reject",
               "type": "reject",
               "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "code.workingdb",
+      "label": "Working DB",
+      "kind": "custom",
+      "availability": "available",
+      "summary": "Collect many sources into the shared DuckDB, then fan out to SQL nodes that query them by name. A multi-input barrier that moves no data (it uses the flow in-memory database). Wire your sources in, then hang Inline SQL nodes off its output and reference each source table by its alias. Set feeding sources to Materialize = Memory so each is read once.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "code.workingdb",
+        "kind": "transform",
+        "label": "Working DB",
+        "description": "Collect many sources into the shared DuckDB, then fan out to SQL nodes that query them by name. A multi-input barrier that moves no data (it uses the flow in-memory database). Wire your sources in, then hang Inline SQL nodes off its output and reference each source table by its alias. Set feeding sources to Materialize = Memory so each is read once.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Settings",
+            "fields": [
+              {
+                "key": "notes",
+                "label": "Notes",
+                "kind": "textarea",
+                "rows": 3,
+                "description": "Component-specific configuration not yet modeled - describe the intent here."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
             }
           ]
         }

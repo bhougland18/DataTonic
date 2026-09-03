@@ -775,6 +775,13 @@ export const PALETTE: Category[] = [
                 ],
             },
             {
+                id: 'code.store',
+                label: 'Datastore',
+                components: [
+                    code('workingdb', 'Working DB', 'available', 'Collect many sources into the shared DuckDB, then fan out to SQL nodes that query them by name. A multi-input barrier that moves no data (it uses the flow in-memory database). Wire your sources in, then hang Inline SQL nodes off its output and reference each source table by its alias. Set feeding sources to Materialize = Memory so each is read once.'),
+                ],
+            },
+            {
                 id: 'code.scripts',
                 label: 'Scripting',
                 components: [

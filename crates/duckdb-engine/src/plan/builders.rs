@@ -385,6 +385,10 @@ pub(crate) fn build_view_sql(
         // Custom SQL - runs the user's SELECT as a real stage, with the
         // upstream exposed as `input`. Makes SQL routines executable too.
         "code.sql" | "code.sqltemplate" => build_custom_sql(inputs, props),
+        // Working DB: a multi-input barrier + fan-out hub. Moves no data (every
+        // upstream already lives in the run's shared DuckDB); the stage just
+        // emits a catalog of the tables currently in the database.
+        "code.workingdb" => build_workingdb(inputs, props),
         // Routing: replicate is a passthrough (the graph already lets
         // multiple downstream edges read the same materialized table);
         // merge concatenates multiple input streams with UNION ALL.
@@ -690,6 +694,20 @@ pub(crate) fn build_custom_sql(inputs: &NodeInputs, props: &JsonValue) -> Result
         }
         None => sql,
     })
+}
+
+/// code.workingdb ("Working DB"): a multi-input barrier + fan-out hub. It moves
+/// no data - every upstream node's output already lives in the run's shared
+/// DuckDB - so this stage only needs to run after all its inputs (ordering is
+/// enforced by the graph edges via the topological sort, and the node is exempt
+/// from the fan-in guard via is_multi_main_component). Its output is a catalog of
+/// the tables currently in the database, so clicking the node previews "what's in
+/// the store". Downstream SQL nodes hang off this node's single output and
+/// reference the upstream tables by name (their alias). Sources feeding a Working
+/// DB should set Materialize = Memory so an expensive source (e.g. an API) is read
+/// once into a table rather than re-scanned by each downstream query.
+pub(crate) fn build_workingdb(_inputs: &NodeInputs, _props: &JsonValue) -> Result<String, String> {
+    Ok("SELECT table_name FROM duckdb_tables() ORDER BY table_name".to_string())
 }
 
 /// Sanitize an inline dbt model name to a safe SQL identifier. The same rule

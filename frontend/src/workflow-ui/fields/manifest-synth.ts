@@ -682,6 +682,13 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
         };
     }
 
+    // Working DB - a multi-input hub: many sources feed one main port, one
+    // fan-out output. The single main port accepts multiple incoming edges;
+    // downstream SQL nodes hang off the output and query the sources by alias.
+    if (id === 'code.workingdb') {
+        return { inputs: [MAIN_IN], outputs: [MAIN_OUT] };
+    }
+
     // Set operations - multiple inputs, one output
     if (id === 'xf.union' || id === 'xf.unionall' || id === 'xf.intersect' || id === 'xf.except') {
         return {
