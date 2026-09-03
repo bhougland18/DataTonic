@@ -88,3 +88,95 @@ export async function listBusinessClasses(
         },
     };
 }
+
+export type ClassSwaggerResult =
+    | { ok: true; swagger: unknown; url: string; status: number }
+    | { ok: false; error: string; url: string; status: number };
+
+// Fetch a business class's OpenAPI/swagger document from the `swaggerEndpoint`
+// captured during class discovery, through the same backend send path + bearer
+// token the reads use. The write side (snk.infor) feeds the result to
+// `parsePostActions()` to list POST actions + their fields. The endpoint's form
+// varies by tenant: an absolute URL is used as-is; a leading-slash path hangs off
+// the ION API host; anything else is treated as relative to the REST base.
+export async function fetchClassSwagger(
+    config: IonApiConfig,
+    accessToken: string,
+    swaggerEndpoint: string,
+    workspacePath: string | null,
+    dataArea?: DataAreaId,
+): Promise<ClassSwaggerResult> {
+    const ep = (swaggerEndpoint ?? '').trim();
+    if (!ep) return { ok: false, error: 'Class has no swaggerEndpoint to fetch.', url: '', status: 0 };
+
+    // The ionapi-doc swaggerEndpoint is a relative ref (e.g.
+    // "../../consolidated/ic/Item") whose intended base is undocumented, so resolve
+    // it against the plausible bases (class resource, the soap resource, the soap
+    // directory, a deeper list resource) and use the first that returns a real
+    // swagger - a JSON doc with `paths`. Absolute endpoints are used as-is. Every
+    // attempt is recorded so a total miss reports what was tried.
+    const rb = restBase(config, dataArea);
+    const candidates: string[] = [];
+    const push = (u: string) => {
+        if (u && !candidates.includes(u)) candidates.push(u);
+    };
+    if (/^https?:\/\//i.test(ep)) {
+        push(ep);
+    } else {
+        // Primary (confirmed live via the Infor API Gateway): the `ionapi-doc`
+        // endpoint returns a class's swagger when its relative swaggerEndpoint ref
+        // is passed as a query param, e.g.
+        //   {restBase}/ionapi-doc/?swaggerEndpoint=../../consolidated/ic/Item
+        push(`${rb}/ionapi-doc/?swaggerEndpoint=${encodeURIComponent(ep)}`);
+        // Fallbacks: direct relative resolutions, in case a tenant serves the
+        // swagger straight from the resolved path.
+        for (const base of [`${rb}/classes/_`, rb, `${rb}/`]) {
+            try {
+                push(new URL(ep, base).toString());
+            } catch {
+                /* skip a malformed base */
+            }
+        }
+        push(ep);
+    }
+
+    let lastUrl = ep;
+    let lastStatus = 0;
+    let lastErr = 'no candidate URL could be built';
+    for (const url of candidates) {
+        const outcome = await sendRequest(
+            { url, method: 'GET', authType: 'bearer', authToken: accessToken },
+            workspacePath,
+        );
+        if (outcome.kind === 'unavailable') {
+            return { ok: false, error: 'Swagger fetch needs the desktop app or web backend.', url, status: 0 };
+        }
+        if (outcome.kind === 'network-error') {
+            lastUrl = url;
+            lastErr = outcome.message;
+            continue;
+        }
+        const status = outcome.response.status;
+        lastUrl = url;
+        lastStatus = status;
+        if (status >= 200 && status < 300) {
+            try {
+                const swagger = JSON.parse(outcome.response.body) as { paths?: unknown };
+                if (swagger && typeof swagger === 'object' && swagger.paths) {
+                    return { ok: true, swagger, url, status };
+                }
+                lastErr = 'response had no `paths` (not a swagger)';
+            } catch {
+                lastErr = 'non-JSON response';
+            }
+        } else {
+            lastErr = `HTTP ${status}`;
+        }
+    }
+    return {
+        ok: false,
+        error: `Could not fetch a swagger (last: ${lastErr}).\nTried:\n${candidates.join('\n')}`,
+        url: lastUrl,
+        status: lastStatus,
+    };
+}

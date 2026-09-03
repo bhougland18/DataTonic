@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 399,
+  "componentCount": 400,
   "components": [
     {
       "id": "src.csv",
@@ -35861,6 +35861,139 @@
             }
           ],
           "outputs": []
+        }
+      }
+    },
+    {
+      "id": "snk.infor",
+      "label": "Infor",
+      "kind": "sink",
+      "availability": "available",
+      "summary": "Bulk-upload rows to an Infor FSM/Landmark business-class action (Create / Update / ...) via the batch service. Connect a dataset, pick the action, and map columns to the action fields in the rail; per-record results (status + message) flow out the output for logging or retry.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "snk.infor",
+        "kind": "sink",
+        "label": "Infor",
+        "description": "Bulk-upload rows to an Infor FSM/Landmark business-class action (Create / Update / ...) via the batch service. Connect a dataset, pick the action, and map columns to the action fields in the rail; per-record results (status + message) flow out the output for logging or retry.",
+        "schemaSource": "declared",
+        "sections": [
+          {
+            "label": "Connection",
+            "fields": [
+              {
+                "key": "connectionRef",
+                "label": "Infor connection",
+                "kind": "connection-ref",
+                "accepts": [
+                  "rest"
+                ],
+                "description": "Pick a saved Infor ION API connection (Connections folder). Resolved and decrypted at run time."
+              }
+            ]
+          },
+          {
+            "label": "Target",
+            "fields": [
+              {
+                "key": "dataArea",
+                "label": "Data area",
+                "kind": "select",
+                "defaultValue": "FSM",
+                "options": [
+                  {
+                    "value": "FSM",
+                    "label": "FSM"
+                  },
+                  {
+                    "value": "HCM",
+                    "label": "HCM (GHR)"
+                  }
+                ],
+                "description": "Which Infor suite to upload to. Sets the REST base."
+              },
+              {
+                "key": "businessClass",
+                "label": "Business class",
+                "kind": "text",
+                "required": true,
+                "placeholder": "Item",
+                "description": "The FSM/Landmark business class to upload to. Usually set via \"Open Infor uploader\"."
+              },
+              {
+                "key": "action",
+                "label": "Action",
+                "kind": "text",
+                "required": true,
+                "placeholder": "Create",
+                "description": "The POST action invoked per batch (Create / RequestUpdateItem / ...). Set via the uploader."
+              }
+            ]
+          },
+          {
+            "label": "Upload",
+            "fields": [
+              {
+                "key": "batchSize",
+                "label": "Batch size",
+                "kind": "integer",
+                "placeholder": "e.g. 500",
+                "description": "Records per /batch request."
+              },
+              {
+                "key": "maxFailures",
+                "label": "Max failures (_maxFailures)",
+                "kind": "integer",
+                "placeholder": "blank = server default",
+                "description": "How many per-record failures a batch tolerates before it stops."
+              },
+              {
+                "key": "failOnError",
+                "label": "Fail run on any error",
+                "kind": "bool",
+                "defaultValue": false,
+                "description": "On: the pipeline fails if any record failed. Off: partial success - failures appear on the output."
+              },
+              {
+                "key": "resultsPath",
+                "label": "Results path (optional)",
+                "kind": "text",
+                "placeholder": "${workspace}/out/upload-results",
+                "description": "Optional directory for success/error CSVs that survive an aborted run."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ]
         }
       }
     },

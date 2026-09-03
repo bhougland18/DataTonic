@@ -124,6 +124,7 @@ type Props = {
     // (Infor source nodes). Carries the node id so the Playground can write
     // the built query back to it.
     onOpenPlayground?: (nodeId: string) => void;
+    onOpenUploader?: (nodeId: string) => void;
     focusNameRequest?: number;
 };
 
@@ -137,6 +138,7 @@ export default function PropertiesPanel({
     onUpdate,
     onOpenMapper,
     onOpenPlayground,
+    onOpenUploader,
     focusNameRequest,
 }: Props) {
     const { t } = useTranslation();
@@ -507,6 +509,18 @@ export default function PropertiesPanel({
                                     <FlaskConical size={14} />
                                     {t('properties.openInPlayground', {
                                         defaultValue: 'Open in API Playground',
+                                    })}
+                                </button>
+                            ) : null}
+                            {data.componentId === 'snk.infor' && onOpenUploader ? (
+                                <button
+                                    type="button"
+                                    className="properties-mapper-button"
+                                    onClick={() => onOpenUploader(selected.id)}
+                                >
+                                    <FlaskConical size={14} />
+                                    {t('properties.openUploader', {
+                                        defaultValue: 'Open Infor uploader',
                                     })}
                                 </button>
                             ) : null}

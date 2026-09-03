@@ -6,6 +6,7 @@ import EndpointTree from './EndpointTree';
 import RequestPanel from './RequestPanel';
 import ProviderSelector from './providers/ProviderSelector';
 import InforWorkspace from './providers/infor/InforWorkspace';
+import InforUploadWorkspace from './providers/infor/InforUploadWorkspace';
 import type { ProviderId } from './providers/types';
 import { usePlayground } from './usePlayground';
 import type { PlaygroundConnection } from './connectionBridge';
@@ -23,7 +24,18 @@ interface PlaygroundProps {
     // Raised when a Canvas node's "Open in Playground" is clicked: switch to the
     // requested provider and pre-load the node's query. The nonce makes repeat
     // opens of the same node re-fire.
-    openRequest?: { nonce: number; provider: ProviderId; nodeId: string; query?: InforNodeQuery } | null;
+    openRequest?: {
+        nonce: number;
+        provider: ProviderId;
+        nodeId: string;
+        // 'upload' opens the Infor write uploader instead of the query builder.
+        kind?: 'query' | 'upload';
+        query?: InforNodeQuery;
+        businessClass?: string;
+        dataArea?: 'FSM' | 'HCM';
+        action?: string;
+        datasetColumns?: string[];
+    } | null;
     // Write a built query back to the originating Canvas node.
     onApplyToNode?: (nodeId: string, query: InforNodeQuery) => void;
 }
@@ -66,13 +78,29 @@ export default function Playground({
     return (
         <section className="pg" aria-label="API Playground">
             {provider === 'infor' ? (
-                <InforWorkspace
-                    workspacePath={workspacePath}
-                    connections={connections}
-                    onSaveConnection={onSaveConnection}
-                    openRequest={openRequest}
-                    onApplyToNode={onApplyToNode}
-                />
+                openRequest?.kind === 'upload' ? (
+                    <InforUploadWorkspace
+                        workspacePath={workspacePath}
+                        connections={connections}
+                        onSaveConnection={onSaveConnection}
+                        openRequest={{
+                            nonce: openRequest.nonce,
+                            nodeId: openRequest.nodeId,
+                            businessClass: openRequest.businessClass,
+                            dataArea: openRequest.dataArea,
+                            action: openRequest.action,
+                            datasetColumns: openRequest.datasetColumns,
+                        }}
+                    />
+                ) : (
+                    <InforWorkspace
+                        workspacePath={workspacePath}
+                        connections={connections}
+                        onSaveConnection={onSaveConnection}
+                        openRequest={openRequest}
+                        onApplyToNode={onApplyToNode}
+                    />
+                )
             ) : (
               <>
                 <aside className="pg-sidebar">

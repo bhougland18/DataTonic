@@ -1158,7 +1158,12 @@ export default function App() {
         nonce: number;
         provider: ProviderId;
         nodeId: string;
+        kind?: 'query' | 'upload';
         query?: InforNodeQuery;
+        businessClass?: string;
+        dataArea?: 'FSM' | 'HCM';
+        action?: string;
+        datasetColumns?: string[];
     } | null>(null);
     const handleOpenPlayground = useCallback(
         (nodeId: string) => {
@@ -1192,6 +1197,41 @@ export default function App() {
             setMode('playground');
         },
         [nodes, setMode],
+    );
+
+    // "Open uploader" on an Infor SINK node (snk.infor): open the Playground rail
+    // in Infor UPLOAD mode, carrying the node's class/action so the uploader
+    // pre-selects them. Mirrors handleOpenPlayground.
+    const handleOpenUploader = useCallback(
+        (nodeId: string) => {
+            const node = nodes.find(n => n.id === nodeId);
+            const p = (node?.data.properties ?? {}) as Record<string, unknown>;
+            const asStr = (v: unknown) => (typeof v === 'string' ? v : undefined);
+            // Columns of the dataset feeding this sink (its main-input upstream),
+            // shown in the uploader's right pane for column -> field mapping.
+            const up = edges.find(e => e.target === nodeId && (e.targetHandle ?? 'main') === 'main');
+            const upNode = up ? nodes.find(n => n.id === up.source) : undefined;
+            const datasetColumns = Array.isArray(upNode?.data.schema)
+                ? (upNode!.data.schema as Array<{ name?: string }>)
+                      .map(c => c.name)
+                      .filter((n): n is string => !!n)
+                : [];
+            setPlaygroundRequest(r => ({
+                nonce: (r?.nonce ?? 0) + 1,
+                provider: 'infor',
+                nodeId,
+                kind: 'upload',
+                businessClass: asStr(p.businessClass),
+                dataArea: (p.dataArea === 'HCM' || p.dataArea === 'FSM' ? p.dataArea : undefined) as
+                    | 'FSM'
+                    | 'HCM'
+                    | undefined,
+                action: asStr(p.action),
+                datasetColumns,
+            }));
+            setMode('playground');
+        },
+        [nodes, edges, setMode],
     );
 
     // Write a query built in the Playground back to the Infor node's props.
@@ -2919,6 +2959,7 @@ export default function App() {
                     onUpdate={handleUpdateNode}
                     onOpenMapper={handleOpenMapper}
                     onOpenPlayground={handleOpenPlayground}
+                    onOpenUploader={handleOpenUploader}
                     focusNameRequest={renameRequest}
                 />
                   </>

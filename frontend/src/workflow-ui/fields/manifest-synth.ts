@@ -689,6 +689,12 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
         return { inputs: [MAIN_IN], outputs: [MAIN_OUT] };
     }
 
+    // Infor upload sink - unlike other sinks it emits per-record results, so it
+    // has a main OUTPUT as well as its input (docs/plans/infor-upload-sink.md).
+    if (id === 'snk.infor') {
+        return { inputs: [MAIN_IN], outputs: [MAIN_OUT] };
+    }
+
     // Set operations - multiple inputs, one output
     if (id === 'xf.union' || id === 'xf.unionall' || id === 'xf.intersect' || id === 'xf.except') {
         return {
@@ -3007,6 +3013,102 @@ function synthInforSource(comp: ComponentDef): ComponentManifest {
         // declared from the fields chosen in the Playground (written back on
         // "Apply to node") and editable here.
     ], 'declared');
+}
+
+// snk.infor: bulk upload to an Infor business-class POST action via the batch
+// service. Config here is a fallback / record of what the rail uploader set;
+// connection + data area + class + action + the column->field mapping are
+// normally chosen via "Open Infor uploader". Emits per-record results on its
+// output (see docs/plans/infor-upload-sink.md).
+function synthInforSink(comp: ComponentDef): ComponentManifest {
+    return base(
+        comp,
+        [
+            {
+                label: 'Connection',
+                fields: [
+                    {
+                        key: 'connectionRef',
+                        label: 'Infor connection',
+                        kind: 'connection-ref',
+                        accepts: ['rest'],
+                        description:
+                            'Pick a saved Infor ION API connection (Connections folder). Resolved and decrypted at run time.',
+                    },
+                ],
+            },
+            {
+                label: 'Target',
+                fields: [
+                    {
+                        key: 'dataArea',
+                        label: 'Data area',
+                        kind: 'select',
+                        defaultValue: 'FSM',
+                        options: [
+                            { value: 'FSM', label: 'FSM' },
+                            { value: 'HCM', label: 'HCM (GHR)' },
+                        ],
+                        description: 'Which Infor suite to upload to. Sets the REST base.',
+                    },
+                    {
+                        key: 'businessClass',
+                        label: 'Business class',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'Item',
+                        description:
+                            'The FSM/Landmark business class to upload to. Usually set via "Open Infor uploader".',
+                    },
+                    {
+                        key: 'action',
+                        label: 'Action',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'Create',
+                        description:
+                            'The POST action invoked per batch (Create / RequestUpdateItem / ...). Set via the uploader.',
+                    },
+                ],
+            },
+            {
+                label: 'Upload',
+                fields: [
+                    {
+                        key: 'batchSize',
+                        label: 'Batch size',
+                        kind: 'integer',
+                        placeholder: 'e.g. 500',
+                        description: 'Records per /batch request.',
+                    },
+                    {
+                        key: 'maxFailures',
+                        label: 'Max failures (_maxFailures)',
+                        kind: 'integer',
+                        placeholder: 'blank = server default',
+                        description: 'How many per-record failures a batch tolerates before it stops.',
+                    },
+                    {
+                        key: 'failOnError',
+                        label: 'Fail run on any error',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'On: the pipeline fails if any record failed. Off: partial success - failures appear on the output.',
+                    },
+                    {
+                        key: 'resultsPath',
+                        label: 'Results path (optional)',
+                        kind: 'text',
+                        placeholder: '${workspace}/out/upload-results',
+                        description:
+                            'Optional directory for success/error CSVs that survive an aborted run.',
+                    },
+                ],
+            },
+        ],
+        'declared',
+    );
 }
 
 function synthApiSource(comp: ComponentDef): ComponentManifest {
@@ -7160,6 +7262,7 @@ function dispatchManifest(componentId: string): ComponentManifest | undefined {
     // stores an Infor query (business class + fields + filter) and a
     // connectionRef, not a raw url/auth. Route by id ahead of the group check.
     if (componentId === 'src.infor') return synthInforSource(comp);
+    if (componentId === 'snk.infor') return synthInforSink(comp);
 
     // Sources
     // src.salesforce.bulk lives in the saas.crm group but is NOT a REST-form
