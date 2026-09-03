@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Plug, Search, ChevronDown, Loader2 } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { Plug, Search, ChevronDown, Loader2, ArrowUpToLine } from 'lucide-react';
 import InforProvider from '../InforProvider';
 import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
 import type { IonApiConfig } from './ionapi';
@@ -12,7 +13,66 @@ import {
     saveCachedClasses,
 } from './classCache';
 import { parsePostActions, type InforAction } from './inforActions';
-import { DATA_AREAS, type DataAreaId } from './inforApi';
+import { DATA_AREAS, restBase, type DataAreaId } from './inforApi';
+import { sendRequest } from '../../sendClient';
+
+function fmtCell(v: unknown): string {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+}
+
+interface TestRecordResult {
+    id: string;
+    message: string;
+    ok: boolean;
+}
+interface TestSummary {
+    httpStatus: number;
+    batchStatus?: string;
+    records: TestRecordResult[];
+    overallOk: boolean;
+    raw?: string;
+}
+
+// Parse the Action Batch Service response - an array of { _fields, message } per
+// record plus a trailing { batchStatus } (0 = success). The FULL message is kept:
+// error messages are long and descriptive and the user needs every word. Falls
+// back to the raw body when the shape differs.
+function summarizeBatch(status: number, body: string): TestSummary {
+    try {
+        const parsed: unknown = JSON.parse(body);
+        if (Array.isArray(parsed)) {
+            let batchStatus: string | undefined;
+            const records: TestRecordResult[] = [];
+            for (const el of parsed) {
+                if (!el || typeof el !== 'object') continue;
+                const o = el as Record<string, unknown>;
+                if ('batchStatus' in o) {
+                    batchStatus = String(o.batchStatus);
+                    continue;
+                }
+                const fields =
+                    o._fields && typeof o._fields === 'object'
+                        ? (o._fields as Record<string, unknown>)
+                        : {};
+                const message = String(o.message ?? '');
+                const id = String(fields.Item ?? Object.values(fields)[0] ?? '');
+                const ok = !/error|fail|invalid|denied|cannot|unable|reject/i.test(message);
+                records.push({ id, message, ok });
+            }
+            const overallOk =
+                status >= 200 &&
+                status < 300 &&
+                (batchStatus === undefined || batchStatus === '0') &&
+                records.every((r) => r.ok);
+            return { httpStatus: status, batchStatus, records, overallOk, raw: body };
+        }
+    } catch {
+        /* not JSON - fall through to raw */
+    }
+    return { httpStatus: status, records: [], overallOk: status >= 200 && status < 300, raw: body };
+}
 
 export interface UploadOpenRequest {
     nonce: number;
@@ -22,6 +82,23 @@ export interface UploadOpenRequest {
     action?: string;
     /** Columns of the dataset feeding this sink node (its main-input upstream). */
     datasetColumns?: string[];
+    /** Cached preview rows from the upstream node (populated after a run). */
+    datasetRows?: Record<string, unknown>[];
+    /** The node's saved mapping/options, to restore on re-open. */
+    mapping?: Record<string, string>;
+    confirmWarnings?: boolean;
+    trimAlpha?: boolean;
+}
+
+// What "Apply to node" writes back to the snk.infor node's props.
+export interface UploadApplyConfig {
+    dataArea: DataAreaId;
+    businessClass: string;
+    action: string;
+    /** API field -> dataset column. A field is uploaded iff it is mapped. */
+    mapping: Record<string, string>;
+    confirmWarnings: boolean;
+    trimAlpha: boolean;
 }
 
 interface InforUploadWorkspaceProps {
@@ -29,6 +106,7 @@ interface InforUploadWorkspaceProps {
     connections?: PlaygroundConnection[];
     onSaveConnection?: (name: string, payload: ReturnType<typeof credentialsToPayload>) => string;
     openRequest?: UploadOpenRequest | null;
+    onApply?: (nodeId: string, cfg: UploadApplyConfig) => void;
 }
 
 const PAGE_SIZE = 25;
@@ -44,6 +122,7 @@ export default function InforUploadWorkspace({
     connections = [],
     onSaveConnection,
     openRequest,
+    onApply,
 }: InforUploadWorkspaceProps) {
     const [session, setSession] = useState<{ config: IonApiConfig; token: IonApiToken } | null>(null);
     const [dataArea, setDataArea] = useState<DataAreaId>(openRequest?.dataArea ?? 'FSM');
@@ -165,6 +244,158 @@ export default function InforUploadWorkspace({
     );
 
     const datasetColumns = openRequest?.datasetColumns ?? [];
+    const datasetRows = openRequest?.datasetRows ?? [];
+
+    // --- P2: field -> column mapping + upload options ---
+    const [mapping, setMapping] = useState<Record<string, string>>({});
+    const [fieldSearch, setFieldSearch] = useState('');
+    const [showMappedOnly, setShowMappedOnly] = useState(false);
+    const [actionPickerOpen, setActionPickerOpen] = useState(false);
+    const [actionSearch, setActionSearch] = useState('');
+    const [confirmWarnings, setConfirmWarnings] = useState(openRequest?.confirmWarnings ?? false);
+    const [trimAlpha, setTrimAlpha] = useState(openRequest?.trimAlpha ?? true);
+    const [appliedNonce, setAppliedNonce] = useState(0);
+    const [testRows, setTestRows] = useState(2);
+    const [testing, setTesting] = useState(false);
+    const [testResult, setTestResult] = useState<TestSummary | null>(null);
+
+    // Auto-map fields -> columns by name (case-insensitive). A field is uploaded
+    // iff it is mapped, so this is also the include/exclude.
+    const autoMap = () => {
+        const byLower = new Map(datasetColumns.map((c) => [c.toLowerCase(), c] as const));
+        const next: Record<string, string> = {};
+        for (const f of selectedAction?.fields ?? []) {
+            const hit = byLower.get(f.name.toLowerCase());
+            if (hit) next[f.name] = hit;
+        }
+        setMapping(next);
+    };
+
+    // On (re)open or action switch: restore the node's saved mapping if it is for
+    // this action, otherwise auto-map by name.
+    useEffect(() => {
+        if (!selectedAction) return;
+        const saved = openRequest?.mapping;
+        if (saved && openRequest?.action === selectedAction.name && Object.keys(saved).length) {
+            setMapping(saved);
+        } else {
+            autoMap();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedAction?.name, datasetColumns.length, openRequest?.nonce]);
+
+    const setField = (field: string, column: string) =>
+        setMapping((m) => {
+            const next = { ...m };
+            if (column) next[field] = column;
+            else delete next[field];
+            return next;
+        });
+
+    const filteredActions = useMemo(() => {
+        const q = actionSearch.trim().toLowerCase();
+        if (!q) return actions;
+        const rank = (n: string) => {
+            const s = n.toLowerCase();
+            if (s === q) return 0;
+            if (s.startsWith(q)) return 1;
+            return 2;
+        };
+        return actions
+            .filter((a) => a.name.toLowerCase().includes(q))
+            .sort((a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name));
+    }, [actions, actionSearch]);
+
+    const visibleFields = useMemo(() => {
+        const q = fieldSearch.trim().toLowerCase();
+        let list = selectedAction?.fields ?? [];
+        if (showMappedOnly) list = list.filter((f) => mapping[f.name]);
+        if (q) list = list.filter((f) => f.name.toLowerCase().includes(q));
+        return list;
+    }, [selectedAction, fieldSearch, showMappedOnly, mapping]);
+
+    const mappedCount = useMemo(
+        () => (selectedAction?.fields ?? []).filter((f) => mapping[f.name]).length,
+        [selectedAction, mapping],
+    );
+    const unmappedRequired = useMemo(
+        () => (selectedAction?.fields ?? []).filter((f) => f.required && !mapping[f.name]),
+        [selectedAction, mapping],
+    );
+
+    const apply = () => {
+        if (!onApply || !openRequest || !selectedClass || !selectedAction) return;
+        onApply(openRequest.nodeId, {
+            dataArea,
+            businessClass: selectedClass.entity,
+            action: selectedAction.name,
+            mapping,
+            confirmWarnings,
+            trimAlpha,
+        });
+        setAppliedNonce((n) => n + 1);
+    };
+
+    // Fire a REAL batch upload of the first N preview rows to validate the mapping
+    // live (Infor has no dry-run; these records are actually created/updated).
+    const testUpload = async () => {
+        if (!session || !selectedClass || !selectedAction) return;
+        const rows = datasetRows.slice(0, Math.max(1, testRows));
+        if (!rows.length) {
+            setTestResult({
+                httpStatus: 0,
+                records: [],
+                overallOk: false,
+                raw: 'No preview rows to test — run the pipeline once so the upstream data is available.',
+            });
+            return;
+        }
+        const records = rows.map((row) => {
+            const fields: Record<string, string> = {};
+            for (const [apiField, col] of Object.entries(mapping)) {
+                let v = fmtCell(row[col]);
+                if (trimAlpha) v = v.trim();
+                fields[apiField] = v;
+            }
+            return { _fields: fields };
+        });
+        const url =
+            `${restBase(session.config, dataArea)}/classes/${encodeURIComponent(selectedClass.entity)}` +
+            `/actions/${encodeURIComponent(selectedAction.name)}/batch?_maxFailures=-1`;
+        setTesting(true);
+        setTestResult(null);
+        const outcome = await sendRequest(
+            {
+                url,
+                method: 'POST',
+                headers: [{ key: 'Content-Type', value: 'application/json' }],
+                body: JSON.stringify({ _records: records }),
+                authType: 'bearer',
+                authToken: session.token.accessToken,
+            },
+            workspacePath,
+        );
+        setTesting(false);
+        if (outcome.kind === 'unavailable') {
+            setTestResult({
+                httpStatus: 0,
+                records: [],
+                overallOk: false,
+                raw: 'Send backend unavailable in this session.',
+            });
+            return;
+        }
+        if (outcome.kind === 'network-error') {
+            setTestResult({
+                httpStatus: 0,
+                records: [],
+                overallOk: false,
+                raw: `Network error: ${outcome.message}`,
+            });
+            return;
+        }
+        setTestResult(summarizeBatch(outcome.response.status, outcome.response.body));
+    };
 
     return (
         <div className="pgi">
@@ -299,19 +530,55 @@ export default function InforUploadWorkspace({
                                     <div className="pg-note">
                                         <Loader2 size={13} className="pg-spin" /> Loading actions…
                                     </div>
-                                ) : (
-                                    <select
-                                        className="pg-input pg-input--select"
-                                        value={action}
-                                        onChange={(e) => setAction(e.target.value)}
+                                ) : action && !actionPickerOpen ? (
+                                    <button
+                                        type="button"
+                                        className="pgi-selected"
+                                        onClick={() => {
+                                            setActionSearch('');
+                                            setActionPickerOpen(true);
+                                        }}
                                     >
-                                        <option value="">— choose an action —</option>
-                                        {actions.map((a) => (
-                                            <option key={a.name} value={a.name}>
-                                                {a.name}
-                                            </option>
-                                        ))}
-                                    </select>
+                                        <span className="pgi-selected-nm">{action}</span>
+                                        <span className="pgi-selected-change">
+                                            change <ChevronDown size={13} />
+                                        </span>
+                                    </button>
+                                ) : (
+                                    <>
+                                        <div className="pgi-search">
+                                            <Search size={13} strokeWidth={2} />
+                                            <input
+                                                autoFocus
+                                                placeholder="Search actions…"
+                                                value={actionSearch}
+                                                onChange={(e) => setActionSearch(e.target.value)}
+                                            />
+                                        </div>
+                                        <div className="pgi-classlist" style={{ maxHeight: 240 }}>
+                                            {filteredActions.map((a) => (
+                                                <button
+                                                    key={a.name}
+                                                    type="button"
+                                                    className={`pgi-class${
+                                                        a.name === action ? ' pgi-class--sel' : ''
+                                                    }`}
+                                                    onClick={() => {
+                                                        setAction(a.name);
+                                                        setActionPickerOpen(false);
+                                                        setActionSearch('');
+                                                    }}
+                                                >
+                                                    <span className="pgi-class-nm">{a.name}</span>
+                                                </button>
+                                            ))}
+                                            {!filteredActions.length && (
+                                                <div className="pg-note">
+                                                    No actions match “{actionSearch}”.
+                                                </div>
+                                            )}
+                                        </div>
+                                    </>
                                 )}
                                 {error && (
                                     <div
@@ -329,40 +596,181 @@ export default function InforUploadWorkspace({
                             </div>
                         )}
 
-                        {/* ---- Fields of the selected action ---- */}
+                        {/* ---- Field map: field -> dataset column ---- */}
                         {selectedAction && (
                             <div className="pgi-section">
-                                <div className="pgi-lbl">
-                                    Fields
-                                    <span
+                                <div
+                                    className="pgi-lbl"
+                                    style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+                                >
+                                    <span style={{ flex: 1 }}>Field map</span>
+                                    <label
                                         style={{
-                                            color: 'var(--accent, #e8590c)',
-                                            fontWeight: 600,
-                                            marginLeft: 8,
-                                            fontSize: 11,
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: 4,
+                                            fontWeight: 400,
+                                            textTransform: 'none',
+                                            letterSpacing: 0,
                                         }}
                                     >
-                                        ● required key
-                                    </span>
+                                        <input
+                                            type="checkbox"
+                                            checked={showMappedOnly}
+                                            onChange={(e) => setShowMappedOnly(e.target.checked)}
+                                        />
+                                        mapped only
+                                    </label>
+                                    <button
+                                        type="button"
+                                        className="pg-btn"
+                                        onClick={autoMap}
+                                        disabled={!datasetColumns.length}
+                                    >
+                                        Auto-map
+                                    </button>
                                 </div>
-                                <div className="pgi-classlist" style={{ maxHeight: 360 }}>
-                                    {selectedAction.fields.map((f) => (
+                                {!datasetColumns.length && (
+                                    <div className="pg-note">
+                                        Connect a dataset to this node to map fields to its columns.
+                                    </div>
+                                )}
+                                <div className="pgi-search">
+                                    <Search size={13} strokeWidth={2} />
+                                    <input
+                                        placeholder="Search fields…"
+                                        value={fieldSearch}
+                                        onChange={(e) => setFieldSearch(e.target.value)}
+                                    />
+                                </div>
+                                <div className="pgi-classlist" style={{ maxHeight: 300 }}>
+                                    {visibleFields.map((f) => (
                                         <div
                                             key={f.name}
-                                            className="pgi-class"
                                             style={{
-                                                cursor: 'default',
-                                                color: f.required ? 'var(--accent, #e8590c)' : undefined,
-                                                fontWeight: f.required ? 600 : 400,
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: 8,
+                                                padding: '4px 8px',
                                             }}
                                         >
-                                            <span className="pgi-class-nm">{f.name}</span>
+                                            <span
+                                                title={f.name}
+                                                style={{
+                                                    flex: 1,
+                                                    minWidth: 0,
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap',
+                                                    color: f.required ? 'var(--accent, #e8590c)' : undefined,
+                                                    fontWeight: f.required ? 600 : 400,
+                                                }}
+                                            >
+                                                {f.name}
+                                                {f.required && !mapping[f.name] ? ' ⚠' : ''}
+                                            </span>
+                                            <select
+                                                className="pg-input pg-input--select"
+                                                style={{ width: 200, flexShrink: 0 }}
+                                                value={mapping[f.name] ?? ''}
+                                                onChange={(e) => setField(f.name, e.target.value)}
+                                            >
+                                                <option value=""></option>
+                                                {datasetColumns.map((c) => (
+                                                    <option key={c} value={c}>
+                                                        {c}
+                                                    </option>
+                                                ))}
+                                            </select>
                                         </div>
                                     ))}
-                                    {!selectedAction.fields.length && (
-                                        <div className="pg-note">This action takes no fields.</div>
-                                    )}
                                 </div>
+                                <div className="pg-note">
+                                    {mappedCount} of {selectedAction.fields.length} fields mapped
+                                    {unmappedRequired.length
+                                        ? ` · ${unmappedRequired.length} required key${
+                                              unmappedRequired.length === 1 ? '' : 's'
+                                          } unmapped`
+                                        : ''}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* ---- Upload options + apply to node ---- */}
+                        {selectedAction && (
+                            <div className="pgi-section">
+                                <div className="pgi-lbl">Upload options</div>
+                                <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={confirmWarnings}
+                                        onChange={(e) => setConfirmWarnings(e.target.checked)}
+                                    />
+                                    Confirm all warnings
+                                </label>
+                                <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={trimAlpha}
+                                        onChange={(e) => setTrimAlpha(e.target.checked)}
+                                    />
+                                    Trim alpha fields
+                                </label>
+
+                                {/* ---- Test: send a couple real records to validate ---- */}
+                                <div
+                                    style={{
+                                        marginTop: 10,
+                                        paddingTop: 8,
+                                        borderTop: '1px solid var(--border)',
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: 6,
+                                    }}
+                                >
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                        Test
+                                        <input
+                                            type="number"
+                                            min={1}
+                                            value={testRows}
+                                            onChange={(e) =>
+                                                setTestRows(Math.max(1, Number(e.target.value) || 1))
+                                            }
+                                            style={{ width: 60 }}
+                                        />
+                                        rows
+                                        <button
+                                            type="button"
+                                            className="pg-btn"
+                                            onClick={testUpload}
+                                            disabled={testing || !mappedCount || !datasetRows.length}
+                                        >
+                                            {testing ? 'Testing…' : 'Test upload'}
+                                        </button>
+                                    </div>
+                                    <div className="pg-note" style={{ color: 'var(--danger)' }}>
+                                        ⚠ Sends the first {testRows} row{testRows === 1 ? '' : 's'} to Infor for
+                                        real ({selectedAction.name} creates/updates records) — Infor has no
+                                        dry-run. Use it to validate the mapping before Apply.
+                                    </div>
+                                </div>
+
+                                <button
+                                    type="button"
+                                    className="pg-btn pg-btn--primary"
+                                    style={{ marginTop: 8 }}
+                                    onClick={apply}
+                                    disabled={!onApply || !mappedCount}
+                                >
+                                    <ArrowUpToLine size={14} /> Apply to node
+                                </button>
+                                {appliedNonce > 0 && (
+                                    <div className="pg-note" style={{ color: 'var(--ok, #2b8a3e)' }}>
+                                        Applied {mappedCount} mapped field{mappedCount === 1 ? '' : 's'} to the
+                                        node.
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>
@@ -379,39 +787,170 @@ export default function InforUploadWorkspace({
                     </div>
                 ) : datasetColumns.length === 0 ? (
                     <div className="pgi-mainempty">
-                        <p>
-                            Connect a dataset to this node — its columns appear here to map to the action
-                            fields.
-                        </p>
+                        <p>Connect a dataset to this node — its data appears here to map from.</p>
                     </div>
                 ) : (
                     <div className="pgi-results">
                         <div className="pgi-results-bar">
                             Connected dataset — {datasetColumns.length} column
                             {datasetColumns.length === 1 ? '' : 's'}
+                            {datasetRows.length
+                                ? ` · ${datasetRows.length} preview row${datasetRows.length === 1 ? '' : 's'}`
+                                : ''}
                         </div>
                         <div className="pgi-grid-wrap">
                             <table className="pgi-grid">
                                 <thead>
                                     <tr>
-                                        <th>Column</th>
+                                        {datasetColumns.map((c) => (
+                                            <th key={c}>{c}</th>
+                                        ))}
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {datasetColumns.map((c) => (
-                                        <tr key={c}>
-                                            <td>{c}</td>
+                                    {datasetRows.length ? (
+                                        datasetRows.slice(0, 100).map((row, i) => (
+                                            <tr key={i}>
+                                                {datasetColumns.map((c) => (
+                                                    <td key={c}>{fmtCell(row[c])}</td>
+                                                ))}
+                                            </tr>
+                                        ))
+                                    ) : (
+                                        <tr>
+                                            <td
+                                                colSpan={datasetColumns.length}
+                                                style={{ color: 'var(--text-3)' }}
+                                            >
+                                                Run the pipeline once to preview the upstream data here.
+                                            </td>
                                         </tr>
-                                    ))}
+                                    )}
                                 </tbody>
                             </table>
-                        </div>
-                        <div className="pg-note" style={{ padding: '8px 12px' }}>
-                            P2: map each field on the left to a column here (Auto-map by name).
                         </div>
                     </div>
                 )}
             </div>
+
+            {testResult &&
+                createPortal(
+                    <div
+                        onClick={() => setTestResult(null)}
+                        style={{
+                            position: 'fixed',
+                            inset: 0,
+                            background: 'rgba(0,0,0,0.4)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            zIndex: 1000,
+                        }}
+                    >
+                        <div
+                            onClick={(e) => e.stopPropagation()}
+                            style={{
+                                background: 'var(--bg-1, #fff)',
+                                color: 'var(--text-1)',
+                                width: 'min(760px, 92vw)',
+                                maxHeight: '80vh',
+                                overflow: 'auto',
+                                borderRadius: 10,
+                                padding: 18,
+                                boxShadow: '0 12px 40px rgba(0,0,0,0.3)',
+                            }}
+                        >
+                            <div
+                                style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}
+                            >
+                                <h3 style={{ margin: 0, flex: 1 }}>Test upload result</h3>
+                                <button
+                                    type="button"
+                                    className="pg-btn"
+                                    onClick={() => setTestResult(null)}
+                                >
+                                    Close
+                                </button>
+                            </div>
+                            <div
+                                style={{
+                                    fontWeight: 600,
+                                    marginBottom: 10,
+                                    color: testResult.overallOk ? 'var(--ok, #2b8a3e)' : 'var(--danger)',
+                                }}
+                            >
+                                {testResult.overallOk ? '✓ Success' : '✗ Issues'} · HTTP{' '}
+                                {testResult.httpStatus}
+                                {testResult.batchStatus !== undefined
+                                    ? ` · batchStatus ${testResult.batchStatus}`
+                                    : ''}
+                                {testResult.records.length
+                                    ? ` · ${testResult.records.filter((r) => r.ok).length}/${
+                                          testResult.records.length
+                                      } ok`
+                                    : ''}
+                            </div>
+                            {testResult.records.length > 0 && (
+                                <table className="pgi-grid" style={{ width: '100%' }}>
+                                    <thead>
+                                        <tr>
+                                            <th style={{ width: 120 }}>Record</th>
+                                            <th>Result</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {testResult.records.map((r, i) => (
+                                            <tr key={i}>
+                                                <td style={{ whiteSpace: 'nowrap', verticalAlign: 'top' }}>
+                                                    {r.id || `#${i + 1}`}
+                                                </td>
+                                                <td
+                                                    style={{
+                                                        color: r.ok ? undefined : 'var(--danger)',
+                                                        whiteSpace: 'pre-wrap',
+                                                        wordBreak: 'break-word',
+                                                    }}
+                                                >
+                                                    {r.message}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            )}
+                            {testResult.raw && testResult.records.length === 0 && (
+                                <pre
+                                    style={{
+                                        whiteSpace: 'pre-wrap',
+                                        wordBreak: 'break-word',
+                                        fontSize: 12,
+                                        margin: 0,
+                                    }}
+                                >
+                                    {testResult.raw}
+                                </pre>
+                            )}
+                            {testResult.raw && testResult.records.length > 0 && (
+                                <details style={{ marginTop: 10 }}>
+                                    <summary style={{ cursor: 'pointer', fontSize: 12 }}>
+                                        Raw response
+                                    </summary>
+                                    <pre
+                                        style={{
+                                            whiteSpace: 'pre-wrap',
+                                            wordBreak: 'break-word',
+                                            fontSize: 11,
+                                            margin: '6px 0 0',
+                                        }}
+                                    >
+                                        {testResult.raw}
+                                    </pre>
+                                </details>
+                            )}
+                        </div>
+                    </div>,
+                    document.body,
+                )}
         </div>
     );
 }

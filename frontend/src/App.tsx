@@ -60,6 +60,7 @@ import type { AppMode } from './rail/types';
 import Playground from './playground/Playground';
 import type { ProviderId } from './playground/providers/types';
 import type { InforNodeQuery } from './playground/providers/infor/query';
+import type { UploadApplyConfig } from './playground/providers/infor/InforUploadWorkspace';
 import { copyText, saveTextFile } from './tauri-io';
 import { writeClipboard, readClipboard, instantiateClipboard } from './clipboard';
 import { RunStatusContext } from './canvas/run-status-context';
@@ -1164,6 +1165,10 @@ export default function App() {
         dataArea?: 'FSM' | 'HCM';
         action?: string;
         datasetColumns?: string[];
+        datasetRows?: Record<string, unknown>[];
+        mapping?: Record<string, string>;
+        confirmWarnings?: boolean;
+        trimAlpha?: boolean;
     } | null>(null);
     const handleOpenPlayground = useCallback(
         (nodeId: string) => {
@@ -1211,11 +1216,22 @@ export default function App() {
             // shown in the uploader's right pane for column -> field mapping.
             const up = edges.find(e => e.target === nodeId && (e.targetHandle ?? 'main') === 'main');
             const upNode = up ? nodes.find(n => n.id === up.source) : undefined;
-            const datasetColumns = Array.isArray(upNode?.data.schema)
+            const schemaCols = Array.isArray(upNode?.data.schema)
                 ? (upNode!.data.schema as Array<{ name?: string }>)
                       .map(c => c.name)
                       .filter((n): n is string => !!n)
                 : [];
+            const datasetRows = Array.isArray(upNode?.data.sampleRows)
+                ? (upNode!.data.sampleRows as Record<string, unknown>[])
+                : [];
+            // Columns: prefer the declared schema; otherwise derive from the
+            // upstream's cached preview rows (populated after a run).
+            const datasetColumns =
+                schemaCols.length > 0
+                    ? schemaCols
+                    : datasetRows.length > 0
+                      ? Object.keys(datasetRows[0])
+                      : [];
             setPlaygroundRequest(r => ({
                 nonce: (r?.nonce ?? 0) + 1,
                 provider: 'infor',
@@ -1228,10 +1244,42 @@ export default function App() {
                     | undefined,
                 action: asStr(p.action),
                 datasetColumns,
+                datasetRows,
+                mapping:
+                    p.mapping && typeof p.mapping === 'object'
+                        ? (p.mapping as Record<string, string>)
+                        : undefined,
+                confirmWarnings: typeof p.confirmWarnings === 'boolean' ? p.confirmWarnings : undefined,
+                trimAlpha: typeof p.trimAlpha === 'boolean' ? p.trimAlpha : undefined,
             }));
             setMode('playground');
         },
         [nodes, edges, setMode],
+    );
+
+    // "Apply to node" from the uploader: persist the mapping + upload options to
+    // the snk.infor node's props so the engine (P3) reads them at run time.
+    const handleApplyInforUpload = useCallback(
+        (nodeId: string, cfg: UploadApplyConfig) => {
+            setNodes(ns =>
+                ns.map(n => {
+                    if (n.id !== nodeId) return n;
+                    const nextProps: Record<string, unknown> = { ...(n.data.properties ?? {}) };
+                    nextProps.dataArea = cfg.dataArea;
+                    nextProps.businessClass = cfg.businessClass;
+                    nextProps.action = cfg.action;
+                    nextProps.mapping = cfg.mapping;
+                    nextProps.confirmWarnings = cfg.confirmWarnings;
+                    nextProps.trimAlpha = cfg.trimAlpha;
+                    const patch: Partial<DuckleNodeData> = { properties: nextProps };
+                    // Name the sink "<BusinessClass>-Sink" so its SQL name never
+                    // collides with the source node (named for the class itself).
+                    if (cfg.businessClass) patch.alias = `${cfg.businessClass}-Sink`;
+                    return { ...n, data: { ...n.data, ...patch } };
+                }),
+            );
+        },
+        [setNodes],
     );
 
     // Write a query built in the Playground back to the Infor node's props.
@@ -2872,6 +2920,7 @@ export default function App() {
                         onSaveConnection={handlePlaygroundSaveConnection}
                         openRequest={playgroundRequest}
                         onApplyToNode={handleApplyInforQuery}
+                        onApplyUpload={handleApplyInforUpload}
                     />
                 </div>
                 {mode === 'canvas' && (

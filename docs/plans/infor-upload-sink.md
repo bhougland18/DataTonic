@@ -123,6 +123,24 @@ Dispatch: it's a `snk.*`, so it plugs into the `starts_with("snk.")` sink path i
   body `{ "_records": [ { "_fields": { "<ApiField>": "<value>", … } } ] }`.
 - **Single action (reference):** `POST {restBase}/classes/{Class}/actions/{Action}?_out=JSON`.
 
+### Test-vs-run collision on Create — result classification (P3 decision)
+The rail **Test** is a REAL batch POST (Infor has no dry-run), so testing N rows
+with **Create** actually creates them; the full run then re-attempts those N and
+Infor returns an "already exists"-type error per row — noise. Update / idempotent
+actions are unaffected.
+
+**Handling (P3):** the engine sink runs `_maxFailures=-1` (never abort) and
+**classifies each per-record result** from the response `message` into
+`ok` / `skipped` (benign: already-exists / duplicate key) / `error`. `failOnError`
+trips only on `error`; the results OUTPUT carries a `_status` column so noise
+(`skipped`) is filtered from real `error`s downstream. This also covers Create
+re-runs over records that already exist for any reason.
+
+TODO for P3: capture the EXACT duplicate-Create message (test a Create on an
+existing Item) to tune the classifier. Alternative considered and rejected for v1:
+track successfully-tested row keys on the node and skip them on the run — more
+precise but fragile when the upstream data changes between test and run.
+
 ### P2 mapper UX target — mirror the Infor Spreadsheet Designer "Upload"
 Its Field Map is the model: a list of the class fields, each row =
 `[✓ include] <Field, orange if a required key>  →  <Mapped From: dataset column>`.

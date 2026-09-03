@@ -7,6 +7,7 @@ import RequestPanel from './RequestPanel';
 import ProviderSelector from './providers/ProviderSelector';
 import InforWorkspace from './providers/infor/InforWorkspace';
 import InforUploadWorkspace from './providers/infor/InforUploadWorkspace';
+import type { UploadApplyConfig } from './providers/infor/InforUploadWorkspace';
 import type { ProviderId } from './providers/types';
 import { usePlayground } from './usePlayground';
 import type { PlaygroundConnection } from './connectionBridge';
@@ -35,9 +36,15 @@ interface PlaygroundProps {
         dataArea?: 'FSM' | 'HCM';
         action?: string;
         datasetColumns?: string[];
+        datasetRows?: Record<string, unknown>[];
+        mapping?: Record<string, string>;
+        confirmWarnings?: boolean;
+        trimAlpha?: boolean;
     } | null;
     // Write a built query back to the originating Canvas node.
     onApplyToNode?: (nodeId: string, query: InforNodeQuery) => void;
+    // Write the uploader's field mapping + options back to the sink node.
+    onApplyUpload?: (nodeId: string, cfg: UploadApplyConfig) => void;
 }
 
 const VERSION_LABEL: Record<string, string> = {
@@ -58,6 +65,7 @@ export default function Playground({
     onSaveConnection,
     openRequest,
     onApplyToNode,
+    onApplyUpload,
 }: PlaygroundProps) {
     const pg = usePlayground(workspacePath);
     const { spec, selectedId, source, persist } = pg;
@@ -83,6 +91,7 @@ export default function Playground({
                         workspacePath={workspacePath}
                         connections={connections}
                         onSaveConnection={onSaveConnection}
+                        onApply={onApplyUpload}
                         openRequest={{
                             nonce: openRequest.nonce,
                             nodeId: openRequest.nodeId,
@@ -90,6 +99,10 @@ export default function Playground({
                             dataArea: openRequest.dataArea,
                             action: openRequest.action,
                             datasetColumns: openRequest.datasetColumns,
+                            datasetRows: openRequest.datasetRows,
+                            mapping: openRequest.mapping,
+                            confirmWarnings: openRequest.confirmWarnings,
+                            trimAlpha: openRequest.trimAlpha,
                         }}
                     />
                 ) : (
