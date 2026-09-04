@@ -48,6 +48,8 @@ import { DuckleLogo } from './workflow-ui/DuckleLogo';
 import EngineSetupModal from './workflow-ui/EngineSetupModal';
 import SetupWizard from './workflow-ui/SetupWizard';
 import ChatPanel from './workflow-ui/ChatPanel';
+import SqlEditor from './sqleditor/SqlEditor';
+import type { SqlEditorRequest, SqlEditorResult } from './sqleditor/types';
 import GitPanel from './workflow-ui/GitPanel';
 import WindowControls from './workflow-ui/WindowControls';
 import WindowResizeHandles from './workflow-ui/WindowResizeHandles';
@@ -1345,6 +1347,46 @@ export default function App() {
         },
         [setNodes],
     );
+
+    // SQL Studio (code.sqlstudio): open the studio rail pre-loaded with the
+    // node's SQL, remembering which node asked so the authored SQL can be
+    // written back. The nonce re-fires the studio's load effect on reopen —
+    // mirrors handleOpenPlayground.
+    const [sqlEditorRequest, setSqlEditorRequest] = useState<SqlEditorRequest | null>(null);
+    const handleOpenSqlEditor = useCallback(
+        (nodeId: string) => {
+            const node = nodes.find(n => n.id === nodeId);
+            const p = (node?.data.properties ?? {}) as Record<string, unknown>;
+            const sql = typeof p.sql === 'string' ? p.sql : '';
+            const nodeName = node?.data.alias || node?.data.label || undefined;
+            setSqlEditorRequest(r => ({
+                nonce: (r?.nonce ?? 0) + 1,
+                nodeId,
+                sql,
+                nodeName,
+            }));
+            setMode('sql');
+        },
+        [nodes, setMode],
+    );
+    // Write SQL authored in the studio back to the node's `sql` prop. Only that
+    // key is touched — the node's runtime contract is identical to code.sql.
+    const handleApplySqlEditor = useCallback(
+        (nodeId: string, result: SqlEditorResult) => {
+            setNodes(ns =>
+                ns.map(n => {
+                    if (n.id !== nodeId) return n;
+                    const nextProps: Record<string, unknown> = {
+                        ...(n.data.properties ?? {}),
+                        sql: result.sql,
+                    };
+                    return { ...n, data: { ...n.data, properties: nextProps } };
+                }),
+            );
+        },
+        [setNodes],
+    );
+
     const handleMapperSave = useCallback(
         (state: MapperState, derivedSchema: Column[]) => {
             if (!mapperNodeId) return;
@@ -1465,6 +1507,12 @@ export default function App() {
 
     // The API Playground is Infor-node-driven: keep it on the rail as long as a
     // src.infor node exists on the canvas (or it's the active view).
+    // SQL Studio is node-driven too: keep it on the rail while a code.sqlstudio
+    // node exists on the canvas (or it's the active view).
+    const hasSqlStudioNode = useMemo(
+        () => nodes.some(n => (n.data.componentId ?? '') === 'code.sqlstudio'),
+        [nodes],
+    );
     const hasInforNode = useMemo(
         () => nodes.some(n => (n.data.componentId ?? '') === 'src.infor'),
         [nodes],
@@ -1480,9 +1528,13 @@ export default function App() {
                 handleOpenPlayground(selectedNode!.id);
                 return;
             }
+            if (next === 'sql' && (selectedNode?.data.componentId ?? '') === 'code.sqlstudio') {
+                handleOpenSqlEditor(selectedNode!.id);
+                return;
+            }
             setMode(next);
         },
-        [selectedNode, handleOpenPlayground, setMode],
+        [selectedNode, handleOpenPlayground, handleOpenSqlEditor, setMode],
     );
 
     const openNewPipelineModal = useCallback((parentId: string = 'pipelines') => {
@@ -2920,11 +2972,15 @@ export default function App() {
                 <Rail
                     mode={mode}
                     onSelect={handleRailSelect}
-                    isVisible={m =>
+                    isVisible={m => {
                         // The API Playground is Infor-node-driven: shown while any
                         // src.infor node exists on the canvas (or it's active).
-                        m.id !== 'playground' || mode === 'playground' || hasInforNode
-                    }
+                        if (m.id === 'playground')
+                            return mode === 'playground' || hasInforNode;
+                        // SQL Studio is code.sqlstudio-node-driven, same pattern.
+                        if (m.id === 'sql') return mode === 'sql' || hasSqlStudioNode;
+                        return true;
+                    }}
                 />
                 {/* Kept mounted (hidden when inactive) so the Playground's
                     in-session state - Infor sign-in, the current query - survives
@@ -2943,6 +2999,15 @@ export default function App() {
                         openRequest={playgroundRequest}
                         onApplyToNode={handleApplyInforQuery}
                         onApplyUpload={handleApplyInforUpload}
+                    />
+                </div>
+                {/* SQL Studio — kept mounted (hidden when inactive) so an
+                    in-progress query survives switching to Canvas and back. */}
+                <div style={{ display: mode === 'sql' ? 'flex' : 'none', flex: 1, minWidth: 0 }}>
+                    <SqlEditor
+                        workspacePath={workspacePathState}
+                        openRequest={sqlEditorRequest}
+                        onApplyToNode={handleApplySqlEditor}
                     />
                 </div>
                 {mode === 'canvas' && (
@@ -3031,6 +3096,7 @@ export default function App() {
                     onOpenMapper={handleOpenMapper}
                     onOpenPlayground={handleOpenPlayground}
                     onOpenUploader={handleOpenUploader}
+                    onOpenSqlEditor={handleOpenSqlEditor}
                     focusNameRequest={renameRequest}
                 />
                   </>

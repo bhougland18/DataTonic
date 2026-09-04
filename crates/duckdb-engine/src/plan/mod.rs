@@ -5422,7 +5422,7 @@ fn build_stage(
 
         });
         (String::new(), StageKind::View, None)
-    } else if matches!(component_id, "code.sql" | "code.sqltemplate")
+    } else if matches!(component_id, "code.sql" | "code.sqltemplate" | "code.sqlstudio")
         && props.get("pureSql").and_then(JsonValue::as_bool).unwrap_or(false)
     {
         // Pure SQL (#102 follow-up): run the user's statements verbatim - no

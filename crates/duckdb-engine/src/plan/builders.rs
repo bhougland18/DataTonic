@@ -384,7 +384,10 @@ pub(crate) fn build_view_sql(
         "xf.sample" => build_take(inputs, props, TakeKind::Sample),
         // Custom SQL - runs the user's SELECT as a real stage, with the
         // upstream exposed as `input`. Makes SQL routines executable too.
-        "code.sql" | "code.sqltemplate" => build_custom_sql(inputs, props),
+        // code.sqlstudio (DataTonic) shares the code.sql runtime contract
+        // exactly - it only differs in its editing surface (a launched SQL
+        // studio instead of the inline textarea), so it dispatches identically.
+        "code.sql" | "code.sqltemplate" | "code.sqlstudio" => build_custom_sql(inputs, props),
         // Working DB: a multi-input barrier + fan-out hub. Moves no data (every
         // upstream already lives in the run's shared DuckDB); the stage just
         // emits a catalog of the tables currently in the database.
@@ -5433,7 +5436,7 @@ pub(crate) fn attach_prelude(component_id: &str, props: &JsonValue) -> String {
     // #113: also INSTALL + LOAD any extensions the user listed in
     // `loadExtensions` (e.g. h3, a5), so SQL Template can reach the wider DuckDB
     // ecosystem. Both feed one prelude, returned even when empty.
-    if matches!(component_id, "code.sql" | "code.sqltemplate") {
+    if matches!(component_id, "code.sql" | "code.sqltemplate" | "code.sqlstudio") {
         let mut prelude = String::new();
         let opt_in = props.get("loadSpatial").and_then(JsonValue::as_bool).unwrap_or(false);
         let auto = string_prop(props, "sql").map(|s| references_spatial(&s)).unwrap_or(false);

@@ -6031,7 +6031,7 @@ function synthQualityCleanse(comp: ComponentDef): ComponentManifest {
 
 function synthCustomCode(comp: ComponentDef): ComponentManifest {
     const id = comp.id;
-    if (id === 'code.sql' || id === 'code.sqltemplate') {
+    if (id === 'code.sql' || id === 'code.sqltemplate' || id === 'code.sqlstudio') {
         return base(comp, [
             {
                 label: 'SQL',

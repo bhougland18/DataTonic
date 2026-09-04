@@ -392,7 +392,7 @@ pub(crate) fn output_table_ref(source_id: &str, source_handle: Option<&str>) -> 
 /// is a distinct, non-empty name; None means "reference by node id as usual".
 pub(crate) fn pure_sql_alias_ref(node: &PipelineNode) -> Option<String> {
     let cid = node.data.component_id.as_deref()?;
-    if !matches!(cid, "code.sql" | "code.sqltemplate") {
+    if !matches!(cid, "code.sql" | "code.sqltemplate" | "code.sqlstudio") {
         return None;
     }
     let is_pure = node

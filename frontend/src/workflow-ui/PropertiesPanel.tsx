@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Edge, Node } from '@xyflow/react';
-import { CheckCircle2, ChevronLeft, ChevronRight, MousePointer2, Workflow, FlaskConical } from 'lucide-react';
+import { CheckCircle2, ChevronLeft, ChevronRight, MousePointer2, Workflow, FlaskConical, Database } from 'lucide-react';
 import { resolveUpstreamSchema, resolveUpstreamSampleRows, resolveOutputSchema } from '../schema-resolve';
 import { buildContextVars, builtinVars, substituteDeep } from '../run-resolve';
 import type { Column, DuckleNodeData } from '../pipeline-types';
@@ -125,6 +125,9 @@ type Props = {
     // the built query back to it.
     onOpenPlayground?: (nodeId: string) => void;
     onOpenUploader?: (nodeId: string) => void;
+    // Opens the SQL Studio pre-loaded with this node's SQL (code.sqlstudio
+    // nodes). Carries the node id so the studio can write the SQL back.
+    onOpenSqlEditor?: (nodeId: string) => void;
     focusNameRequest?: number;
 };
 
@@ -139,6 +142,7 @@ export default function PropertiesPanel({
     onOpenMapper,
     onOpenPlayground,
     onOpenUploader,
+    onOpenSqlEditor,
     focusNameRequest,
 }: Props) {
     const { t } = useTranslation();
@@ -441,7 +445,11 @@ export default function PropertiesPanel({
                         next.routineRef = routineId;
                         const cid = selected.data.componentId;
                         const codeKey =
-                            cid === 'code.sql' || cid === 'code.sqltemplate' ? 'sql' : 'code';
+                            cid === 'code.sql' ||
+                            cid === 'code.sqltemplate' ||
+                            cid === 'code.sqlstudio'
+                                ? 'sql'
+                                : 'code';
                         if (payload.code) next[codeKey] = payload.code;
                         if (payload.language) next.language = payload.language;
                         onUpdate(selected.id, { properties: next });
@@ -521,6 +529,18 @@ export default function PropertiesPanel({
                                     <FlaskConical size={14} />
                                     {t('properties.openUploader', {
                                         defaultValue: 'Open Infor uploader',
+                                    })}
+                                </button>
+                            ) : null}
+                            {data.componentId === 'code.sqlstudio' && onOpenSqlEditor ? (
+                                <button
+                                    type="button"
+                                    className="properties-mapper-button"
+                                    onClick={() => onOpenSqlEditor(selected.id)}
+                                >
+                                    <Database size={14} />
+                                    {t('properties.openSqlStudio', {
+                                        defaultValue: 'Open in SQL Studio',
                                     })}
                                 </button>
                             ) : null}

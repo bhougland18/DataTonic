@@ -842,7 +842,10 @@ fn resolve_workspace_impl(
 
     for node in &mut doc.nodes {
         let cid = node.data.component_id.as_deref();
-        let is_sql = matches!(cid, Some("code.sql") | Some("code.sqltemplate"));
+        let is_sql = matches!(
+            cid,
+            Some("code.sql") | Some("code.sqltemplate") | Some("code.sqlstudio")
+        );
 
         // Determine whether routine inlining will apply, so we know if we
         // need to materialize an object when properties was None.

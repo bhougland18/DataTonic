@@ -773,6 +773,7 @@ export const PALETTE: Category[] = [
                 components: [
                     code('sql', 'Inline SQL', 'available', 'Run a SELECT; upstream is `input`'),
                     code('sqltemplate', 'SQL Template', 'available', 'Parameterized SQL with ${context.var}'),
+                    code('sqlstudio', 'SQL Studio', 'available', 'Same as Inline SQL, but authored in a full read-only DuckDB studio launched from the node - schema browser of the working DB, syntax highlighting, live preview, visual query builder and AI text-to-SQL. Writes a SELECT back to the node.'),
                 ],
             },
             {

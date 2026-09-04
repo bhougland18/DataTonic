@@ -1,0 +1,152 @@
+/* SQL Studio — own stylesheet (imported by SqlEditor.tsx) rather than appended
+   to the shared styles.css, to keep upstream rebases clean (same discipline as
+   rail.css / the playground module). Uses the app's theme tokens so light/dark
+   work automatically. */
+
+.sqlstudio {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    background: var(--bg-0);
+    color: var(--text-1);
+    overflow: hidden;
+}
+
+.sqlstudio-top {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 9px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-1);
+}
+
+.sqlstudio-ctx {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.sqlstudio-glyph {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+.sqlstudio-titles {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.sqlstudio-titles b {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.sqlstudio-titles small {
+    font-size: 10.5px;
+    color: var(--text-3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sqlstudio-ro {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent-cyan, #2eafff);
+    background: color-mix(in srgb, var(--accent-cyan, #2eafff) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-cyan, #2eafff) 30%, transparent);
+    border-radius: 5px;
+    padding: 3px 8px;
+}
+
+.sqlstudio-spacer {
+    flex: 1;
+}
+
+.sqlstudio-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    border-radius: 6px;
+    padding: 7px 13px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--bg-3);
+    color: var(--text-1);
+}
+
+.sqlstudio-btn:hover {
+    background: var(--bg-4);
+}
+
+.sqlstudio-btn--primary {
+    background: var(--accent);
+    color: #0a0a0a;
+    border-color: transparent;
+}
+
+.sqlstudio-btn--primary:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.sqlstudio-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    padding: 14px 16px;
+    gap: 10px;
+}
+
+.sqlstudio-note {
+    font-size: 12px;
+    color: var(--text-3);
+    line-height: 1.5;
+}
+
+.sqlstudio-editor {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    resize: none;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-1);
+    font-family: var(--mono, "SFMono-Regular", ui-monospace, Menlo, monospace);
+    font-size: 13px;
+    line-height: 1.6;
+    padding: 12px 14px;
+    outline: none;
+}
+
+.sqlstudio-editor:focus {
+    border-color: var(--accent);
+}
+
+.sqlstudio-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-3);
+    font-size: 13px;
+}
