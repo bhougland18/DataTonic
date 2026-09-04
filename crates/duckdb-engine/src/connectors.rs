@@ -207,6 +207,73 @@ fn parse_infor_batch_results(body: &str, expected: usize) -> Vec<(String, String
     }
 }
 
+/// Write the Infor sink's per-record results (the same rows emitted as the
+/// output relation: input columns + `_status` + `_message`) to `target` as a
+/// single CSV, so results survive an aborted run and can be diffed / retried
+/// externally. If `target` ends in `.csv` it is written as exactly that file;
+/// otherwise `target` is treated as a directory and a stamped
+/// `infor_<class>_<action>_<utc>.csv` is written inside it (parity with
+/// snk.salesforce's stamped result files). Parent directories are created.
+fn write_infor_results_csv(
+    target: &str,
+    rows: &[JsonValue],
+    business_class: &str,
+    action: &str,
+) -> Result<(), EngineError> {
+    let path = if target.to_lowercase().ends_with(".csv") {
+        std::path::PathBuf::from(target)
+    } else {
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect()
+        };
+        let name = format!(
+            "infor_{}_{}_{}.csv",
+            sanitize(business_class),
+            sanitize(action),
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        );
+        std::path::Path::new(target).join(name)
+    };
+    // Column order: union of keys across rows in first-seen order, so the
+    // input columns come first and _status / _message land last (as inserted).
+    let mut cols: Vec<String> = Vec::new();
+    for row in rows {
+        if let Some(obj) = row.as_object() {
+            for k in obj.keys() {
+                if !cols.iter().any(|c| c == k) {
+                    cols.push(k.clone());
+                }
+            }
+        }
+    }
+    let mut buf = cols.iter().map(|c| csv_escape(c)).collect::<Vec<_>>().join(",");
+    buf.push('\n');
+    for row in rows {
+        let obj = row.as_object();
+        let line = cols
+            .iter()
+            .map(|c| {
+                let cell = obj.and_then(|o| o.get(c)).unwrap_or(&JsonValue::Null);
+                csv_escape(&infor_cell(cell))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                EngineError::Query(format!("infor results: create {}: {}", parent.display(), e))
+            })?;
+        }
+    }
+    std::fs::write(&path, buf)
+        .map_err(|e| EngineError::Query(format!("infor results: write {}: {}", path.display(), e)))
+}
+
 /// Counts accumulated across DHIS2 import chunks. DHIS2 reports these under
 /// two different key sets depending on the endpoint (`importCount` vs
 /// `stats`), so both parsers normalise into this one shape.
@@ -1160,6 +1227,20 @@ impl DuckdbEngine {
             })
             .collect();
         materialize_jsonobjects_as_table_typed(&self.bin, db, &spec.node_id, &result_rows, None)?;
+
+        // Optional: dump the same per-record results to a CSV that survives an
+        // aborted run (${workspace} is already resolved by the context layer).
+        if let Some(target) = spec.results_path.as_deref() {
+            let write_result =
+                write_infor_results_csv(target, &result_rows, &spec.business_class, &spec.action);
+            // A loop (HTTP) error is the more useful diagnosis, so it wins over a
+            // write error; if the loop was fine, a write failure is surfaced here.
+            if let Err(e) = write_result {
+                if loop_result.is_ok() {
+                    return Err(e);
+                }
+            }
+        }
 
         // A transport/HTTP abort is the more useful diagnosis; surface it after
         // the results relation is written so the partial results survive.
@@ -16109,7 +16190,7 @@ fn page_media_box(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> (Option<f6
 
 #[cfg(test)]
 mod infor_sink_tests {
-    use super::{infor_cell, parse_infor_batch_results};
+    use super::{infor_cell, parse_infor_batch_results, write_infor_results_csv};
     use serde_json::json;
 
     #[test]
@@ -16157,5 +16238,37 @@ mod infor_sink_tests {
         let out = parse_infor_batch_results("<html>gateway timeout</html>", 2);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|(s, _)| s == "error"));
+    }
+
+    #[test]
+    fn results_csv_writes_exact_file_and_dir() {
+        // Same shape run_infor_sink emits: input columns + _status + _message.
+        let rows = vec![
+            json!({"Item": "ABC", "_status": "ok", "_message": "Item updated"}),
+            json!({"Item": "B,Z", "_status": "error", "_message": "bad \"value\""}),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+
+        // .csv target -> written as exactly that file, parent dirs created.
+        let file = tmp.path().join("out").join("bill_test.csv");
+        write_infor_results_csv(file.to_str().unwrap(), &rows, "Item", "Create").unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Item,_status,_message"); // input col first, then status/message
+        assert_eq!(lines[1], "ABC,ok,Item updated");
+        // CSV escaping: comma-bearing and quote-bearing cells are quoted.
+        assert_eq!(lines[2], "\"B,Z\",error,\"bad \"\"value\"\"\"");
+
+        // Non-.csv target -> treated as a directory with a stamped file inside.
+        let dir = tmp.path().join("results_dir");
+        write_infor_results_csv(dir.to_str().unwrap(), &rows, "Item", "Create").unwrap();
+        let produced: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(produced.len(), 1);
+        assert!(produced[0].starts_with("infor_Item_Create_"));
+        assert!(produced[0].ends_with(".csv"));
     }
 }

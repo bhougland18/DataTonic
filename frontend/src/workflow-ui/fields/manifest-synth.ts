@@ -3100,9 +3100,9 @@ function synthInforSink(comp: ComponentDef): ComponentManifest {
                         key: 'resultsPath',
                         label: 'Results path (optional)',
                         kind: 'text',
-                        placeholder: '${workspace}/out/upload-results',
+                        placeholder: '${workspace}/out/upload-results.csv',
                         description:
-                            'Optional directory for success/error CSVs that survive an aborted run.',
+                            'Optional CSV of the per-record results (input columns + _status + _message) that survives an aborted run. A path ending in .csv is written as that exact file; otherwise it is treated as a directory and a stamped infor_<class>_<action>_<utc>.csv is written inside it.',
                     },
                 ],
             },
