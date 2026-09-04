@@ -265,11 +265,14 @@ export default function InforUploadWorkspace({
     // Right-pane tabs: the connected dataset (map-from source) vs the per-record
     // results of the last pipeline run (the sink node's own output relation).
     const [mainTab, setMainTab] = useState<'dataset' | 'results'>('dataset');
-    const [resultFilter, setResultFilter] = useState<'all' | 'ok' | 'error' | 'skipped'>('all');
+    // The results grid can be filtered to a single message ("error type") by
+    // clicking a segment of the roll-up bar; null = show all.
+    const [msgFilter, setMsgFilter] = useState<string | null>(null);
     const resultRows = openRequest?.resultRows ?? [];
     const hasResults = resultRows.length > 0;
     const statusOf = (r: Record<string, unknown>) =>
         String(r['_status'] ?? '').toLowerCase();
+    const messageOf = (r: Record<string, unknown>) => String(r['_message'] ?? '');
     // Result columns in first-seen order: input columns, then _status / _message
     // as the engine appends them.
     const resultColumns: string[] = [];
@@ -283,13 +286,31 @@ export default function InforUploadWorkspace({
         else if (s === 'skipped') resultCounts.skipped++;
         else resultCounts.other++;
     }
+    // Roll up by message ("error type"). Status is a deterministic function of
+    // the message, so each group carries one status -> one colour. Sorted by
+    // count so the biggest buckets read left-to-right.
+    const msgGroups: { message: string; status: string; count: number }[] = [];
+    {
+        const idx = new Map<string, number>();
+        for (const r of resultRows) {
+            const message = messageOf(r);
+            let i = idx.get(message);
+            if (i === undefined) {
+                i = msgGroups.length;
+                idx.set(message, i);
+                msgGroups.push({ message, status: statusOf(r), count: 0 });
+            }
+            msgGroups[i].count++;
+        }
+        msgGroups.sort((a, b) => b.count - a.count);
+    }
     const filteredResults =
-        resultFilter === 'all' ? resultRows : resultRows.filter(r => statusOf(r) === resultFilter);
+        msgFilter == null ? resultRows : resultRows.filter(r => messageOf(r) === msgFilter);
 
     // On (re)open, surface the Results tab when the last run produced results.
     useEffect(() => {
         setMainTab(openRequest?.resultRows?.length ? 'results' : 'dataset');
-        setResultFilter('all');
+        setMsgFilter(null);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [openRequest?.nonce]);
 
@@ -853,44 +874,67 @@ export default function InforUploadWorkspace({
                         </div>
                         {mainTab === 'results' && hasResults ? (
                             <div className="pgi-results">
+                                {/* Single stacked bar: one segment per message
+                                    ("error type"), width ∝ count, colour by
+                                    status. Hover = message + count; click =
+                                    filter the grid to that message. */}
+                                <div
+                                    className="pgi-msgbar"
+                                    role="group"
+                                    aria-label="Results by message — click a segment to filter"
+                                >
+                                    {msgGroups.map((g) => {
+                                        const selected = msgFilter === g.message;
+                                        return (
+                                            <button
+                                                key={g.message || '(none)'}
+                                                type="button"
+                                                className={
+                                                    `pgi-msgseg pgi-msgseg-${g.status || 'other'}` +
+                                                    (selected ? ' is-selected' : '') +
+                                                    (msgFilter && !selected ? ' is-dim' : '')
+                                                }
+                                                style={{ flexGrow: g.count }}
+                                                title={`${g.message || '(no message)'} — ${g.count} of ${resultRows.length}`}
+                                                aria-pressed={selected}
+                                                onClick={() =>
+                                                    setMsgFilter(selected ? null : g.message)
+                                                }
+                                            >
+                                                <span className="pgi-msgseg-label">{g.count}</span>
+                                            </button>
+                                        );
+                                    })}
+                                </div>
                                 <div className="pgi-results-bar">
                                     {resultRows.length} record{resultRows.length === 1 ? '' : 's'}
                                     {resultCounts.ok ? ` · ${resultCounts.ok} ok` : ''}
                                     {resultCounts.error ? ` · ${resultCounts.error} error` : ''}
                                     {resultCounts.skipped ? ` · ${resultCounts.skipped} skipped` : ''}
-                                    <span style={{ flex: 1 }} />
-                                    <label
-                                        style={{
-                                            display: 'inline-flex',
-                                            alignItems: 'center',
-                                            gap: 4,
-                                            fontWeight: 500,
-                                        }}
-                                    >
-                                        Status
-                                        <select
-                                            value={resultFilter}
-                                            onChange={(e) =>
-                                                setResultFilter(
-                                                    e.target.value as typeof resultFilter,
-                                                )
-                                            }
-                                        >
-                                            <option value="all">All</option>
-                                            <option value="ok">
-                                                ok{resultCounts.ok ? ` (${resultCounts.ok})` : ''}
-                                            </option>
-                                            <option value="error">
-                                                error
-                                                {resultCounts.error ? ` (${resultCounts.error})` : ''}
-                                            </option>
-                                            {resultCounts.skipped ? (
-                                                <option value="skipped">
-                                                    skipped ({resultCounts.skipped})
-                                                </option>
-                                            ) : null}
-                                        </select>
-                                    </label>
+                                    {msgFilter != null && (
+                                        <>
+                                            <span style={{ flex: 1 }} />
+                                            <span
+                                                style={{
+                                                    fontWeight: 500,
+                                                    maxWidth: 360,
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap',
+                                                }}
+                                                title={msgFilter || '(no message)'}
+                                            >
+                                                Showing {filteredResults.length}: {msgFilter || '(no message)'}
+                                            </span>
+                                            <button
+                                                type="button"
+                                                className="pgi-clearfilter"
+                                                onClick={() => setMsgFilter(null)}
+                                            >
+                                                Clear
+                                            </button>
+                                        </>
+                                    )}
                                 </div>
                                 <div className="pgi-grid-wrap">
                                     <table className="pgi-grid">

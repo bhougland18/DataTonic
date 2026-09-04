@@ -1072,3 +1072,19 @@
 .pgi-grid td.pgi-status-error { color:var(--danger, #e03131); font-weight:600; }
 .pgi-grid td.pgi-status-ok { color:var(--ok, #2b8a3e); }
 .pgi-grid td.pgi-status-skipped { color:var(--text-3); }
+
+/* Results roll-up: one stacked horizontal bar, a segment per message
+   ("error type"), width proportional to count, colour by status. Click to
+   filter the grid to that message; click again (or Clear) to reset. — DAA.46 */
+.pgi-msgbar { display:flex; width:100%; height:20px; gap:1px; margin-bottom:8px; border-radius:6px; overflow:hidden; background:var(--border); flex:0 0 auto; }
+.pgi-msgseg { appearance:none; border:0; min-width:6px; padding:0; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1; color:rgba(255,255,255,0.92); overflow:hidden; transition:opacity .12s ease, filter .12s ease; }
+.pgi-msgseg-ok { background:var(--ok, #2b8a3e); }
+.pgi-msgseg-error { background:var(--danger, #e03131); }
+.pgi-msgseg-skipped { background:var(--text-3); }
+.pgi-msgseg-other { background:var(--text-2); }
+.pgi-msgseg:hover { filter:brightness(1.12); }
+.pgi-msgseg.is-dim { opacity:0.32; }
+.pgi-msgseg.is-selected { outline:2px solid var(--text-1); outline-offset:-2px; }
+.pgi-msgseg-label { pointer-events:none; }
+.pgi-clearfilter { appearance:none; border:1px solid var(--border); background:var(--bg-2); color:var(--text-2); font-size:11px; font-weight:600; padding:2px 8px; border-radius:var(--radius-xs, 4px); cursor:pointer; }
+.pgi-clearfilter:hover { color:var(--text-1); border-color:var(--border-strong, var(--border)); }
