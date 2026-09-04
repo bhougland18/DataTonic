@@ -52,6 +52,24 @@ function summarizeBatch(status: number, body: string): TestSummary {
                     batchStatus = String(o.batchStatus);
                     continue;
                 }
+                // A failed record comes back as {"exception": {...}} (Landmark
+                // ViewException) — no _fields, no top-level message, and
+                // batchStatus stays "0". This is the only per-record failure
+                // signal, so detect it before the success shape.
+                const exc =
+                    o.exception && typeof o.exception === 'object'
+                        ? (o.exception as Record<string, unknown>)
+                        : null;
+                if (exc) {
+                    const base = String(exc.viewMessage ?? exc.message ?? 'upload failed');
+                    const field = String(exc.fieldName ?? '');
+                    records.push({
+                        id: '',
+                        message: field ? `${base} (field ${field})` : base,
+                        ok: false,
+                    });
+                    continue;
+                }
                 const fields =
                     o._fields && typeof o._fields === 'object'
                         ? (o._fields as Record<string, unknown>)

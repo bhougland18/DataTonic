@@ -154,14 +154,23 @@ fn infor_cell(v: &JsonValue) -> String {
 }
 
 /// Parse an Action Batch Service response into expected (status, message) pairs,
-/// one per input record. The body is a JSON array of {_fields, message} per
-/// record plus a trailing {batchStatus} element (dropped). Classification
-/// mirrors the uploader's summarizeBatch: a record is "error" when its message
-/// matches the error regex, else "ok". If the body can't be parsed as an array,
-/// every record in the chunk gets one shared error so nothing is silently
-/// counted as success. (Duplicate / "already exists" -> "skipped" is a P3 open
-/// question, pending a captured real error body.)
+/// one per input record. The body is a JSON array with one element per record
+/// plus a trailing {batchStatus} element (dropped). Two record shapes, verified
+/// against a live Landmark response:
+///   - success: {"_fields": {...}, "message": "Item updated"}
+///   - failure: {"exception": {"fieldName", "viewMessage", "message", "class":
+///     "...ViewException"}} — NO _fields, NO top-level message.
+/// The exception element is the ONLY per-record failure signal: with
+/// _maxFailures=-1 the trailing batchStatus stays "0" even when a record fails.
+/// A benign "already exists" / duplicate outcome is surfaced as "skipped" so it
+/// does not trip failOnError. If the body is not a JSON array, every record in
+/// the chunk is marked error so nothing is silently counted as success.
 fn parse_infor_batch_results(body: &str, expected: usize) -> Vec<(String, String)> {
+    fn is_benign_dupe(msg: &str) -> bool {
+        let m = msg.to_lowercase();
+        m.contains("already exist") || m.contains("duplicate")
+    }
+    // Fallback sniff for a message that carries no structured exception.
     fn is_error(msg: &str) -> bool {
         let m = msg.to_lowercase();
         ["error", "fail", "invalid", "denied", "cannot", "unable", "reject"]
@@ -178,12 +187,38 @@ fn parse_infor_batch_results(body: &str, expected: usize) -> Vec<(String, String
             if o.contains_key("batchStatus") {
                 continue; // trailing batch summary, not a per-record result
             }
+            // A failed record is an {"exception": {...}} element (ViewException):
+            // prefer viewMessage, name the offending field when present.
+            if let Some(exc) = o.get("exception").and_then(|v| v.as_object()) {
+                let base = exc
+                    .get("viewMessage")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| exc.get("message").and_then(|v| v.as_str()))
+                    .unwrap_or("upload failed");
+                let message = match exc
+                    .get("fieldName")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(f) => format!("{} (field {})", base, f),
+                    None => base.to_string(),
+                };
+                let status = if is_benign_dupe(base) { "skipped" } else { "error" };
+                out.push((status.into(), message));
+                continue;
+            }
             let message = o
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let status = if is_error(&message) { "error" } else { "ok" };
+            let status = if is_benign_dupe(&message) {
+                "skipped"
+            } else if is_error(&message) {
+                "error"
+            } else {
+                "ok"
+            };
             out.push((status.into(), message));
         }
         // The server returns one entry per input record; if it returned fewer,
@@ -16238,6 +16273,32 @@ mod infor_sink_tests {
         let out = parse_infor_batch_results("<html>gateway timeout</html>", 2);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|(s, _)| s == "error"));
+    }
+
+    #[test]
+    fn parse_batch_detects_exception_and_dupe() {
+        // Real Landmark response: a failed record is an {"exception": {...}}
+        // element (no _fields, no message), and batchStatus stays "0" even so.
+        // Positional alignment must hold: slot 1 (10031) is the failure.
+        let body = r#"[
+            {"_fields":{"Item":"10002"},"message":"Item updated"},
+            {"exception":{"fieldName":"StockUOM","viewMessage":"Cannot change UOM; UOM is used by item location","message":"Cannot change UOM; UOM is used by item location","class":"com.lawson.rdtech.type.ViewException"}},
+            {"_fields":{"Item":"10071"},"message":"Item updated"},
+            {"batchStatus":"0"}
+        ]"#;
+        let out = parse_infor_batch_results(body, 3);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, "ok");
+        assert_eq!(out[1].0, "error");
+        assert!(out[1].1.contains("Cannot change UOM"));
+        assert!(out[1].1.contains("StockUOM")); // offending field named
+        assert_eq!(out[2].0, "ok");
+
+        // A benign duplicate exception is downgraded to skipped so it does not
+        // trip failOnError.
+        let dupe = r#"[{"exception":{"message":"Item already exists"}},{"batchStatus":"0"}]"#;
+        let out = parse_infor_batch_results(dupe, 1);
+        assert_eq!(out[0].0, "skipped");
     }
 
     #[test]
