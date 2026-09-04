@@ -1271,6 +1271,20 @@ export default function App() {
                     nextProps.mapping = cfg.mapping;
                     nextProps.confirmWarnings = cfg.confirmWarnings;
                     nextProps.trimAlpha = cfg.trimAlpha;
+                    // Default the results CSV path so every upload logs a per-run
+                    // report without the user typing one. ${workspace} and
+                    // ${datetime} are resolved by the engine at run time
+                    // (${datetime} is filename-safe, no colons), so repeat runs
+                    // never clobber. Only fill when empty, so a hand-edited path
+                    // is preserved; clear the field to regenerate.
+                    const existingResultsPath =
+                        typeof nextProps.resultsPath === 'string'
+                            ? nextProps.resultsPath.trim()
+                            : '';
+                    if (!existingResultsPath && cfg.businessClass) {
+                        nextProps.resultsPath =
+                            '${workspace}/infor-sink/' + cfg.businessClass + '_${datetime}.csv';
+                    }
                     const patch: Partial<DuckleNodeData> = { properties: nextProps };
                     // Name the sink "<BusinessClass>-Sink" so its SQL name never
                     // collides with the source node (named for the class itself).
