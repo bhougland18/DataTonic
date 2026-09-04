@@ -84,6 +84,9 @@ export interface UploadOpenRequest {
     datasetColumns?: string[];
     /** Cached preview rows from the upstream node (populated after a run). */
     datasetRows?: Record<string, unknown>[];
+    /** The sink node's OWN cached output after a run: the results relation
+     *  (input columns + _status + _message), shown in the Results tab. */
+    resultRows?: Record<string, unknown>[];
     /** The node's saved mapping/options, to restore on re-open. */
     mapping?: Record<string, string>;
     confirmWarnings?: boolean;
@@ -258,6 +261,37 @@ export default function InforUploadWorkspace({
     const [testRows, setTestRows] = useState(2);
     const [testing, setTesting] = useState(false);
     const [testResult, setTestResult] = useState<TestSummary | null>(null);
+
+    // Right-pane tabs: the connected dataset (map-from source) vs the per-record
+    // results of the last pipeline run (the sink node's own output relation).
+    const [mainTab, setMainTab] = useState<'dataset' | 'results'>('dataset');
+    const [resultFilter, setResultFilter] = useState<'all' | 'ok' | 'error' | 'skipped'>('all');
+    const resultRows = openRequest?.resultRows ?? [];
+    const hasResults = resultRows.length > 0;
+    const statusOf = (r: Record<string, unknown>) =>
+        String(r['_status'] ?? '').toLowerCase();
+    // Result columns in first-seen order: input columns, then _status / _message
+    // as the engine appends them.
+    const resultColumns: string[] = [];
+    for (const r of resultRows)
+        for (const k of Object.keys(r)) if (!resultColumns.includes(k)) resultColumns.push(k);
+    const resultCounts = { ok: 0, error: 0, skipped: 0, other: 0 };
+    for (const r of resultRows) {
+        const s = statusOf(r);
+        if (s === 'ok') resultCounts.ok++;
+        else if (s === 'error') resultCounts.error++;
+        else if (s === 'skipped') resultCounts.skipped++;
+        else resultCounts.other++;
+    }
+    const filteredResults =
+        resultFilter === 'all' ? resultRows : resultRows.filter(r => statusOf(r) === resultFilter);
+
+    // On (re)open, surface the Results tab when the last run produced results.
+    useEffect(() => {
+        setMainTab(openRequest?.resultRows?.length ? 'results' : 'dataset');
+        setResultFilter('all');
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [openRequest?.nonce]);
 
     // Auto-map fields -> columns by name (case-insensitive). A field is uploaded
     // iff it is mapped, so this is also the include/exclude.
@@ -785,51 +819,183 @@ export default function InforUploadWorkspace({
                         <h3>Sign in to upload</h3>
                         <p>Authenticate on the left, then pick a business class and an action.</p>
                     </div>
-                ) : datasetColumns.length === 0 ? (
+                ) : datasetColumns.length === 0 && !hasResults ? (
                     <div className="pgi-mainempty">
                         <p>Connect a dataset to this node — its data appears here to map from.</p>
                     </div>
                 ) : (
-                    <div className="pgi-results">
-                        <div className="pgi-results-bar">
-                            Connected dataset — {datasetColumns.length} column
-                            {datasetColumns.length === 1 ? '' : 's'}
-                            {datasetRows.length
-                                ? ` · ${datasetRows.length} preview row${datasetRows.length === 1 ? '' : 's'}`
-                                : ''}
+                    <>
+                        <div className="pgi-tabs" role="tablist" aria-label="Upload panes">
+                            <button
+                                type="button"
+                                role="tab"
+                                aria-selected={mainTab === 'dataset'}
+                                className="pgi-tab"
+                                onClick={() => setMainTab('dataset')}
+                            >
+                                Dataset{datasetRows.length ? ` · ${datasetRows.length}` : ''}
+                            </button>
+                            <button
+                                type="button"
+                                role="tab"
+                                aria-selected={mainTab === 'results'}
+                                className="pgi-tab"
+                                disabled={!hasResults}
+                                title={
+                                    hasResults
+                                        ? undefined
+                                        : 'Run the pipeline to see per-record upload results'
+                                }
+                                onClick={() => setMainTab('results')}
+                            >
+                                Results{hasResults ? ` · ${resultRows.length}` : ''}
+                            </button>
                         </div>
-                        <div className="pgi-grid-wrap">
-                            <table className="pgi-grid">
-                                <thead>
-                                    <tr>
-                                        {datasetColumns.map((c) => (
-                                            <th key={c}>{c}</th>
-                                        ))}
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {datasetRows.length ? (
-                                        datasetRows.slice(0, 100).map((row, i) => (
-                                            <tr key={i}>
-                                                {datasetColumns.map((c) => (
-                                                    <td key={c}>{fmtCell(row[c])}</td>
+                        {mainTab === 'results' && hasResults ? (
+                            <div className="pgi-results">
+                                <div className="pgi-results-bar">
+                                    {resultRows.length} record{resultRows.length === 1 ? '' : 's'}
+                                    {resultCounts.ok ? ` · ${resultCounts.ok} ok` : ''}
+                                    {resultCounts.error ? ` · ${resultCounts.error} error` : ''}
+                                    {resultCounts.skipped ? ` · ${resultCounts.skipped} skipped` : ''}
+                                    <span style={{ flex: 1 }} />
+                                    <label
+                                        style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: 4,
+                                            fontWeight: 500,
+                                        }}
+                                    >
+                                        Status
+                                        <select
+                                            value={resultFilter}
+                                            onChange={(e) =>
+                                                setResultFilter(
+                                                    e.target.value as typeof resultFilter,
+                                                )
+                                            }
+                                        >
+                                            <option value="all">All</option>
+                                            <option value="ok">
+                                                ok{resultCounts.ok ? ` (${resultCounts.ok})` : ''}
+                                            </option>
+                                            <option value="error">
+                                                error
+                                                {resultCounts.error ? ` (${resultCounts.error})` : ''}
+                                            </option>
+                                            {resultCounts.skipped ? (
+                                                <option value="skipped">
+                                                    skipped ({resultCounts.skipped})
+                                                </option>
+                                            ) : null}
+                                        </select>
+                                    </label>
+                                </div>
+                                <div className="pgi-grid-wrap">
+                                    <table className="pgi-grid">
+                                        <thead>
+                                            <tr>
+                                                {resultColumns.map((c) => (
+                                                    <th key={c}>{c}</th>
                                                 ))}
                                             </tr>
-                                        ))
-                                    ) : (
-                                        <tr>
-                                            <td
-                                                colSpan={datasetColumns.length}
-                                                style={{ color: 'var(--text-3)' }}
-                                            >
-                                                Run the pipeline once to preview the upstream data here.
-                                            </td>
-                                        </tr>
-                                    )}
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
+                                        </thead>
+                                        <tbody>
+                                            {filteredResults.length ? (
+                                                filteredResults.slice(0, 500).map((row, i) => {
+                                                    const s = statusOf(row);
+                                                    return (
+                                                        <tr
+                                                            key={i}
+                                                            className={
+                                                                s === 'error'
+                                                                    ? 'pgi-row-error'
+                                                                    : s === 'skipped'
+                                                                      ? 'pgi-row-skipped'
+                                                                      : ''
+                                                            }
+                                                        >
+                                                            {resultColumns.map((c) => (
+                                                                <td
+                                                                    key={c}
+                                                                    className={
+                                                                        c === '_status'
+                                                                            ? `pgi-status pgi-status-${s || 'other'}`
+                                                                            : undefined
+                                                                    }
+                                                                >
+                                                                    {fmtCell(row[c])}
+                                                                </td>
+                                                            ))}
+                                                        </tr>
+                                                    );
+                                                })
+                                            ) : (
+                                                <tr>
+                                                    <td
+                                                        colSpan={resultColumns.length || 1}
+                                                        style={{ color: 'var(--text-3)' }}
+                                                    >
+                                                        No records match this status.
+                                                    </td>
+                                                </tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        ) : datasetColumns.length === 0 ? (
+                            <div className="pgi-mainempty">
+                                <p>
+                                    Connect a dataset to this node — its data appears here to
+                                    map from.
+                                </p>
+                            </div>
+                        ) : (
+                            <div className="pgi-results">
+                                <div className="pgi-results-bar">
+                                    Connected dataset — {datasetColumns.length} column
+                                    {datasetColumns.length === 1 ? '' : 's'}
+                                    {datasetRows.length
+                                        ? ` · ${datasetRows.length} preview row${datasetRows.length === 1 ? '' : 's'}`
+                                        : ''}
+                                </div>
+                                <div className="pgi-grid-wrap">
+                                    <table className="pgi-grid">
+                                        <thead>
+                                            <tr>
+                                                {datasetColumns.map((c) => (
+                                                    <th key={c}>{c}</th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {datasetRows.length ? (
+                                                datasetRows.slice(0, 100).map((row, i) => (
+                                                    <tr key={i}>
+                                                        {datasetColumns.map((c) => (
+                                                            <td key={c}>{fmtCell(row[c])}</td>
+                                                        ))}
+                                                    </tr>
+                                                ))
+                                            ) : (
+                                                <tr>
+                                                    <td
+                                                        colSpan={datasetColumns.length}
+                                                        style={{ color: 'var(--text-3)' }}
+                                                    >
+                                                        Run the pipeline once to preview the
+                                                        upstream data here.
+                                                    </td>
+                                                </tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+                    </>
                 )}
             </div>
 

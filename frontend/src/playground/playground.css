@@ -1059,3 +1059,16 @@
 .pgi-cacheinfo { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:10.5px; color:var(--text-4, var(--text-3)); padding-top:2px; }
 .pgi-refresh { display:inline-flex; align-items:center; gap:5px; background:transparent; border:none; color:var(--accent); font-size:11px; cursor:pointer; }
 .pgi-refresh:disabled { opacity:.5; cursor:default; }
+
+/* Infor uploader right-pane tabs (Dataset | Results) — DAA.46 */
+.pgi-tabs { display:inline-flex; gap:2px; align-self:flex-start; margin-bottom:10px; padding:2px; background:var(--bg-2); border:1px solid var(--border); border-radius:var(--radius-sm, 6px); }
+.pgi-tab { appearance:none; border:0; background:transparent; color:var(--text-2); font-size:12px; font-weight:600; padding:5px 12px; border-radius:var(--radius-xs, 4px); cursor:pointer; }
+.pgi-tab:hover:not(:disabled) { color:var(--text-1); }
+.pgi-tab[aria-selected="true"] { background:var(--bg-1); color:var(--text-1); box-shadow:0 1px 2px rgba(0,0,0,0.15); }
+.pgi-tab:disabled { opacity:0.45; cursor:default; }
+/* Per-record result rows: failures stand out, skipped is muted. */
+.pgi-grid tbody tr.pgi-row-error td:not(.pgi-rownum) { background:rgba(224,49,49,0.10); }
+.pgi-grid tbody tr.pgi-row-skipped td:not(.pgi-rownum) { color:var(--text-3); }
+.pgi-grid td.pgi-status-error { color:var(--danger, #e03131); font-weight:600; }
+.pgi-grid td.pgi-status-ok { color:var(--ok, #2b8a3e); }
+.pgi-grid td.pgi-status-skipped { color:var(--text-3); }

@@ -1166,6 +1166,7 @@ export default function App() {
         action?: string;
         datasetColumns?: string[];
         datasetRows?: Record<string, unknown>[];
+        resultRows?: Record<string, unknown>[];
         mapping?: Record<string, string>;
         confirmWarnings?: boolean;
         trimAlpha?: boolean;
@@ -1232,6 +1233,12 @@ export default function App() {
                     : datasetRows.length > 0
                       ? Object.keys(datasetRows[0])
                       : [];
+            // The sink node's OWN cached output after a run = the results
+            // relation (input columns + _status + _message), shown in the
+            // uploader's Results tab.
+            const resultRows = Array.isArray(node?.data.sampleRows)
+                ? (node!.data.sampleRows as Record<string, unknown>[])
+                : [];
             setPlaygroundRequest(r => ({
                 nonce: (r?.nonce ?? 0) + 1,
                 provider: 'infor',
@@ -1245,6 +1252,7 @@ export default function App() {
                 action: asStr(p.action),
                 datasetColumns,
                 datasetRows,
+                resultRows,
                 mapping:
                     p.mapping && typeof p.mapping === 'object'
                         ? (p.mapping as Record<string, string>)

@@ -1997,15 +1997,27 @@ impl DuckdbEngine {
                     // upstream and have no preview. A Pure SQL node creates no
                     // `<node>` relation, so there is nothing to count/preview.
                     let (rows_opt, view_preview) = match stage.kind {
-                        StageKind::Sink => (
-                            self.sink_rows(
+                        StageKind::Sink => {
+                            let rows = self.sink_rows(
                                 &db_path,
                                 stage.from.as_deref(),
                                 sink_self_count(stage),
                                 &nodes,
-                            ),
-                            None,
-                        ),
+                            );
+                            // Most sinks are terminal (no relation to preview),
+                            // but snk.infor materializes a `<node_id>` results
+                            // relation (input columns + _status + _message).
+                            // Preview it so the canvas Preview tab and the Infor
+                            // uploader's Results tab can show the per-record
+                            // outcome. count_and_preview no-ops when the relation
+                            // is absent or previews are off.
+                            let preview = if stage.component_id == "snk.infor" {
+                                self.count_and_preview(&db_path, &stage.node_id, false).1
+                            } else {
+                                None
+                            };
+                            (rows, preview)
+                        }
                         StageKind::View if stage.no_output_relation => (None, None),
                         // A view whose rows a self-counting sink is about to
                         // write skips its own COUNT(*) and keeps its preview;

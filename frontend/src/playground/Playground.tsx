@@ -37,6 +37,7 @@ interface PlaygroundProps {
         action?: string;
         datasetColumns?: string[];
         datasetRows?: Record<string, unknown>[];
+        resultRows?: Record<string, unknown>[];
         mapping?: Record<string, string>;
         confirmWarnings?: boolean;
         trimAlpha?: boolean;
@@ -100,6 +101,7 @@ export default function Playground({
                             action: openRequest.action,
                             datasetColumns: openRequest.datasetColumns,
                             datasetRows: openRequest.datasetRows,
+                            resultRows: openRequest.resultRows,
                             mapping: openRequest.mapping,
                             confirmWarnings: openRequest.confirmWarnings,
                             trimAlpha: openRequest.trimAlpha,
