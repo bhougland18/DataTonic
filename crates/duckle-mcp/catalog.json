@@ -42724,14 +42724,14 @@
         "schemaSource": "upstream",
         "sections": [
           {
-            "label": "Settings",
+            "label": "Working DB",
             "fields": [
               {
-                "key": "notes",
-                "label": "Notes",
-                "kind": "textarea",
-                "rows": 3,
-                "description": "Component-specific configuration not yet modeled - describe the intent here."
+                "key": "fullMaterialize",
+                "label": "Full materialization",
+                "kind": "bool",
+                "defaultValue": false,
+                "description": "Force the sources feeding this Working DB to materialize as real tables in the run database (instead of lazy views). Turn this on when a SQL Studio (or several SQL nodes) query the collected tables repeatedly, so each source is read once into a stable snapshot rather than re-scanned per query. An upstream node that already sets its own Materialize mode is left as-is."
               }
             ]
           }

@@ -6029,6 +6029,36 @@ function synthQualityCleanse(comp: ComponentDef): ComponentManifest {
     ], 'upstream');
 }
 
+function synthDatastore(comp: ComponentDef): ComponentManifest {
+    // code.workingdb — a multi-input barrier / fan-out hub. Its one knob is
+    // full materialization (SE-10): force its upstream inputs to real run-db
+    // tables so a downstream SQL Studio reads a stable snapshot rather than
+    // re-scanning sources per query. Other code.store components (none today)
+    // fall through to the generic renderer.
+    if (comp.id === 'code.workingdb') {
+        return base(
+            comp,
+            [
+                {
+                    label: 'Working DB',
+                    fields: [
+                        {
+                            key: 'fullMaterialize',
+                            label: 'Full materialization',
+                            kind: 'bool',
+                            defaultValue: false,
+                            description:
+                                'Force the sources feeding this Working DB to materialize as real tables in the run database (instead of lazy views). Turn this on when a SQL Studio (or several SQL nodes) query the collected tables repeatedly, so each source is read once into a stable snapshot rather than re-scanned per query. An upstream node that already sets its own Materialize mode is left as-is.',
+                        },
+                    ],
+                },
+            ],
+            'upstream',
+        );
+    }
+    return synthGeneric(comp, 'upstream');
+}
+
 function synthCustomCode(comp: ComponentDef): ComponentManifest {
     const id = comp.id;
     if (id === 'code.sql' || id === 'code.sqltemplate' || id === 'code.sqlstudio') {
@@ -7333,6 +7363,7 @@ function dispatchManifest(componentId: string): ComponentManifest | undefined {
     // Custom code
     if (groupId === 'code.sql') return synthCustomCode(comp);
     if (groupId === 'code.scripts') return synthCustomCode(comp);
+    if (groupId === 'code.store') return synthDatastore(comp);
 
     // SaaS - treat as API sources for now
     if (groupId.startsWith('saas.')) return synthApiSource(comp);

@@ -6,6 +6,22 @@
 //
 // This file is intentionally free of upstream imports.
 
+export interface SqlStudioColumn {
+    name: string;
+    type?: string;
+    nullable?: boolean;
+    primaryKey?: boolean;
+}
+
+// A table the studio's SQL can reference — derived from the node's upstream
+// subgraph (each upstream relation the run DB will hold). `input` is the
+// immediate main upstream, always available inside a code.sqlstudio node.
+export interface SqlStudioTable {
+    name: string;
+    kind: 'input' | 'upstream';
+    columns: SqlStudioColumn[];
+}
+
 // The request bag App.tsx hands the studio when a node opens it. `nonce` forces
 // the open effect to re-run even when the same node is reopened (mirrors the
 // Playground's `playgroundRequest.nonce`).
@@ -16,11 +32,20 @@ export interface SqlEditorRequest {
     sql: string;
     // The node's SQL name / alias, shown for context (optional).
     nodeName?: string;
+    // The working-DB catalog the SQL can query — the node's upstream tables.
+    tables?: SqlStudioTable[];
 }
 
-// What the studio writes back to the node via `onApplyToNode`. Kept to just the
-// SQL for now — the node's runtime contract is identical to code.sql, so only
-// the `sql` prop changes. Richer options (rawSql/pureSql) can join later.
+// What the studio writes back to the node via `onApplyToNode`.
 export interface SqlEditorResult {
     sql: string;
+}
+
+// The shape a studio "Run" returns (mirrors the engine's NodePreview minus the
+// node id). On failure, `error` carries the message and rows/columns are empty.
+export interface SqlRunResult {
+    columns: SqlStudioColumn[];
+    rows: Record<string, unknown>[];
+    error?: string;
+    durationMs?: number;
 }

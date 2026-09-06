@@ -49,7 +49,12 @@ import EngineSetupModal from './workflow-ui/EngineSetupModal';
 import SetupWizard from './workflow-ui/SetupWizard';
 import ChatPanel from './workflow-ui/ChatPanel';
 import SqlEditor from './sqleditor/SqlEditor';
-import type { SqlEditorRequest, SqlEditorResult } from './sqleditor/types';
+import type {
+    SqlEditorRequest,
+    SqlEditorResult,
+    SqlRunResult,
+    SqlStudioTable,
+} from './sqleditor/types';
 import GitPanel from './workflow-ui/GitPanel';
 import WindowControls from './workflow-ui/WindowControls';
 import WindowResizeHandles from './workflow-ui/WindowResizeHandles';
@@ -1359,15 +1364,53 @@ export default function App() {
             const p = (node?.data.properties ?? {}) as Record<string, unknown>;
             const sql = typeof p.sql === 'string' ? p.sql : '';
             const nodeName = node?.data.alias || node?.data.label || undefined;
+
+            // Derive the working-DB catalog from the node's upstream subgraph so
+            // the studio can browse the tables its SQL may reference. The
+            // immediate main upstream is exposed as `input`; every other
+            // backward-reachable node is listed by its SQL name/alias (the name
+            // a Working DB fan-out query would use). Columns come from each
+            // node's declared/last-run schema.
+            const byId = new Map(nodes.map(n => [n.id, n]));
+            const toCols = (n: (typeof nodes)[number] | undefined) =>
+                Array.isArray(n?.data.schema)
+                    ? n!.data.schema.map(c => ({
+                          name: c.name,
+                          type: c.type,
+                          nullable: c.nullable,
+                          primaryKey: (c as { primaryKey?: boolean }).primaryKey,
+                      }))
+                    : [];
+            const tables: SqlStudioTable[] = [];
+            const inputEdge = edges.find(e => e.target === nodeId);
+            const inputSourceId = inputEdge?.source;
+            if (inputSourceId) {
+                tables.push({ name: 'input', kind: 'input', columns: toCols(byId.get(inputSourceId)) });
+            }
+            const seen = new Set<string>([nodeId]);
+            const queue = edges.filter(e => e.target === nodeId).map(e => e.source);
+            while (queue.length) {
+                const id = queue.shift()!;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                const up = byId.get(id);
+                if (up && id !== inputSourceId) {
+                    const nm = (up.data.alias || up.data.label || id).toString();
+                    tables.push({ name: nm, kind: 'upstream', columns: toCols(up) });
+                }
+                for (const e of edges) if (e.target === id) queue.push(e.source);
+            }
+
             setSqlEditorRequest(r => ({
                 nonce: (r?.nonce ?? 0) + 1,
                 nodeId,
                 sql,
                 nodeName,
+                tables,
             }));
             setMode('sql');
         },
-        [nodes, setMode],
+        [nodes, edges, setMode],
     );
     // Write SQL authored in the studio back to the node's `sql` prop. Only that
     // key is touched — the node's runtime contract is identical to code.sql.
@@ -1385,6 +1428,69 @@ export default function App() {
             );
         },
         [setNodes],
+    );
+
+    // Run the studio's in-editor SQL as this node against its upstream and return
+    // the result grid. Reuses the pipeline partial-run path: we override the
+    // node's `sql` with the editor text, run the subgraph up to it, and read the
+    // node's own preview (columns + rows). No new engine command — the query is
+    // exactly what the node would produce at run time, so it stays read-only.
+    const handleRunSqlEditor = useCallback(
+        async (nodeId: string, sqlText: string): Promise<SqlRunResult> => {
+            const start = performance.now();
+            try {
+                const extra = await settingsLoadContextVars(workspacePathState ?? '');
+                // Override the node's SQL with the editor text BEFORE resolving,
+                // so ${context.var} substitution still applies to studio SQL.
+                const overridden = nodes.map(n =>
+                    n.id === nodeId
+                        ? {
+                              ...n,
+                              data: {
+                                  ...n.data,
+                                  properties: { ...(n.data.properties ?? {}), sql: sqlText },
+                              },
+                          }
+                        : n,
+                );
+                const runNodes = resolveForRun(overridden, repo, workspacePathState, extra);
+                const pipelineName = repo.find(r => r.id === activeJobId)?.name ?? activeJobId;
+                const result = await runPipelinePartial(
+                    runNodes,
+                    edges,
+                    nodeId,
+                    undefined,
+                    activeJobId,
+                    workspacePathState,
+                    pipelineName,
+                );
+                const durationMs = performance.now() - start;
+                if (!result) {
+                    return { columns: [], rows: [], error: 'Run is unavailable in this edition.' };
+                }
+                if (result.status === 'error') {
+                    return { columns: [], rows: [], error: result.error ?? 'Query failed.', durationMs };
+                }
+                const preview = result.preview.find(p => p.node_id === nodeId);
+                return {
+                    columns: (preview?.columns ?? []).map(c => ({
+                        name: c.name,
+                        type: c.type,
+                        nullable: c.nullable,
+                        primaryKey: (c as { primaryKey?: boolean }).primaryKey,
+                    })),
+                    rows: preview?.rows ?? [],
+                    durationMs,
+                };
+            } catch (e) {
+                return {
+                    columns: [],
+                    rows: [],
+                    error: e instanceof Error ? e.message : String(e),
+                };
+            }
+        },
+        [nodes, edges, repo, activeJobId, workspacePathState],
     );
 
     const handleMapperSave = useCallback(
@@ -3008,6 +3114,7 @@ export default function App() {
                         workspacePath={workspacePathState}
                         openRequest={sqlEditorRequest}
                         onApplyToNode={handleApplySqlEditor}
+                        onRun={handleRunSqlEditor}
                     />
                 </div>
                 {mode === 'canvas' && (

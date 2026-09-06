@@ -502,6 +502,71 @@ COPY (SELECT * FROM {}) TO '{}' (FORMAT PARQUET);
     }
 }
 
+/// SQL Studio (SE-10): a `code.workingdb` node with `fullMaterialize: true`
+/// forces its DIRECT upstream inputs to materialize as run-db TABLEs
+/// (`materialize = "memory"`) instead of lazy views, so a downstream SQL Studio
+/// (or any fan-out consumer) reads a stable, fully-materialized snapshot rather
+/// than re-scanning each source per query. An upstream node that has already
+/// chosen its own materialize mode is left untouched — an explicit user choice
+/// always wins. Returns a modified clone only when the toggle actually applies,
+/// so pipelines that don't use it stay byte-identical (and allocation-free).
+fn apply_full_materialize(doc: &PipelineDoc) -> Option<PipelineDoc> {
+    let full_wdb: std::collections::HashSet<&str> = doc
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.data.component_id.as_deref() == Some("code.workingdb")
+                && n.data
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.get("fullMaterialize"))
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false)
+        })
+        .map(|n| n.id.as_str())
+        .collect();
+    if full_wdb.is_empty() {
+        return None;
+    }
+    let feeders: std::collections::HashSet<String> = doc
+        .edges
+        .iter()
+        .filter(|e| is_data_edge(e) && full_wdb.contains(e.target.as_str()))
+        .map(|e| e.source.clone())
+        .collect();
+    if feeders.is_empty() {
+        return None;
+    }
+    // PipelineDoc doesn't derive Clone, so rebuild it from cloned nodes/edges
+    // (the same shape compile_partial constructs), mutating only the feeders.
+    let nodes = doc
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut n = n.clone();
+            if feeders.contains(&n.id) {
+                let props = n
+                    .data
+                    .properties
+                    .get_or_insert_with(|| JsonValue::Object(Default::default()));
+                if let Some(obj) = props.as_object_mut() {
+                    let already_set = obj
+                        .get("materialize")
+                        .and_then(JsonValue::as_str)
+                        .map(|s| !s.is_empty() && s != "auto")
+                        .unwrap_or(false);
+                    if !already_set {
+                        obj.insert("materialize".into(), JsonValue::String("memory".into()));
+                    }
+                }
+            }
+            n
+        })
+        .collect();
+    let edges = doc.edges.iter().cloned().collect();
+    Some(PipelineDoc { nodes, edges })
+}
+
 pub fn compile_partial(
     pipeline: &PipelineDoc,
     target_id: &str,
@@ -538,6 +603,8 @@ pub fn compile_partial(
             .cloned()
             .collect(),
     };
+    // SE-10: force upstream tables for a full-materialize Working DB (see helper).
+    let filtered = apply_full_materialize(&filtered).unwrap_or(filtered);
     // Partial runs never batch (the executor only batches when target.is_none()),
     // so suppress the live-VIEW upgrade - keep ATTACH-backed sources as
     // materialized TABLEs that survive across the per-stage processes (#87).
@@ -566,7 +633,11 @@ const ATTACH_PARQUET_SOURCES: &[&str] = &[
 ];
 
 pub fn compile(pipeline: &PipelineDoc) -> Result<CompiledPipeline, EngineError> {
-    compile_impl(pipeline, true)
+    // SE-10: force upstream tables for a full-materialize Working DB (see helper).
+    match apply_full_materialize(pipeline) {
+        Some(doc) => compile_impl(&doc, true),
+        None => compile_impl(pipeline, true),
+    }
 }
 
 /// `allow_view_upgrade=false` is used by partial ("Run from here") runs: those
