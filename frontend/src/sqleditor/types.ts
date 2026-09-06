@@ -6,6 +6,8 @@
 //
 // This file is intentionally free of upstream imports.
 
+import type { ErdRelationship } from '../erd/model';
+
 export interface SqlStudioColumn {
     name: string;
     type?: string;
@@ -34,6 +36,12 @@ export interface SqlEditorRequest {
     nodeName?: string;
     // The working-DB catalog the SQL can query — the node's upstream tables.
     tables?: SqlStudioTable[];
+    // Inherited ERD relationships (SE-11) — present only when the direct upstream
+    // is a Working DB. Read-only in the Studio; feeds the ER tab + AI context.
+    relationships?: ErdRelationship[];
+    // Whether the catalog/ERD came from an upstream Working DB (vs. a single
+    // `input` source). Drives the ER-tab messaging.
+    fromWorkingDb?: boolean;
 }
 
 // What the studio writes back to the node via `onApplyToNode`.

@@ -19,6 +19,8 @@ import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { tags as t } from '@lezer/highlight';
 import './sqleditor.css';
 import type { SqlEditorRequest, SqlEditorResult, SqlRunResult, SqlStudioTable } from './types';
+import type { ErdRelationship } from '../erd/model';
+import ErDiagram from '../erd/ErDiagram';
 
 // Theme the editor with the app's own tokens so it tracks Duckle's light/dark
 // mode automatically (var(--bg-1) etc. resolve per theme), instead of a fixed
@@ -81,6 +83,8 @@ export default function SqlEditor({ openRequest, onApplyToNode, onRun }: SqlEdit
     const [nodeId, setNodeId] = useState<string | null>(null);
     const [nodeName, setNodeName] = useState<string | undefined>(undefined);
     const [tables, setTables] = useState<SqlStudioTable[]>([]);
+    const [relationships, setRelationships] = useState<ErdRelationship[]>([]);
+    const [fromWorkingDb, setFromWorkingDb] = useState(false);
     const [tab, setTab] = useState<StudioTab>('sql');
     const [running, setRunning] = useState(false);
     const [result, setResult] = useState<SqlRunResult | null>(null);
@@ -97,6 +101,8 @@ export default function SqlEditor({ openRequest, onApplyToNode, onRun }: SqlEdit
         setNodeId(openRequest.nodeId);
         setNodeName(openRequest.nodeName);
         setTables(openRequest.tables ?? []);
+        setRelationships(openRequest.relationships ?? []);
+        setFromWorkingDb(!!openRequest.fromWorkingDb);
         setResult(null);
         setSort(null);
         setTab('sql');
@@ -345,16 +351,54 @@ export default function SqlEditor({ openRequest, onApplyToNode, onRun }: SqlEdit
                         </div>
                     </>
                 ) : (
-                    <div className="sqlstudio-soon">
-                        <span className="sqlstudio-glyph">
-                            <Network size={16} />
-                        </span>
-                        <b>ER Diagram</b>
-                        <p>Coming next — a read-only view of the entity-relationship model defined
-                            on the upstream Working DB node, shared by every SQL Studio wired to it.</p>
-                    </div>
+                    <ErView
+                        tables={tables}
+                        relationships={relationships}
+                        fromWorkingDb={fromWorkingDb}
+                    />
                 )}
             </div>
+        </div>
+    );
+}
+
+// Read-only view of the ERD inherited from the upstream Working DB (SE-11).
+// A textual/card view for now; the ReactFlow diagram lands in 4b. Editing the
+// model happens only on the Working DB node — never here.
+function ErView({
+    tables,
+    relationships,
+    fromWorkingDb,
+}: {
+    tables: SqlStudioTable[];
+    relationships: ErdRelationship[];
+    fromWorkingDb: boolean;
+}) {
+    if (!fromWorkingDb) {
+        return (
+            <div className="sqlstudio-soon">
+                <span className="sqlstudio-glyph">
+                    <Network size={16} />
+                </span>
+                <b>No ER model</b>
+                <p>
+                    Wire this SQL Studio to a <b>Working DB</b> node to inherit its
+                    entity-relationship model. A studio on a single source has just one{' '}
+                    <code>input</code> table, so there are no relationships to show.
+                </p>
+            </div>
+        );
+    }
+    return (
+        <div className="sqlstudio-er-wrap">
+            <div className="sqlstudio-er-note">
+                Inherited from the upstream <b>Working DB</b> · read-only.{' '}
+                {relationships.length > 0
+                    ? `${relationships.length} relationship${relationships.length === 1 ? '' : 's'}`
+                    : 'No relationships yet'}{' '}
+                · edit the model on the Working DB node.
+            </div>
+            <ErDiagram tables={tables} relationships={relationships} readOnly />
         </div>
     );
 }

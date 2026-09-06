@@ -55,6 +55,8 @@ import type {
     SqlRunResult,
     SqlStudioTable,
 } from './sqleditor/types';
+import { buildErdModel, type ErdModel, type ErdTable } from './erd/model';
+import ErdEditor from './erd/ErdEditor';
 import GitPanel from './workflow-ui/GitPanel';
 import WindowControls from './workflow-ui/WindowControls';
 import WindowResizeHandles from './workflow-ui/WindowResizeHandles';
@@ -1365,14 +1367,14 @@ export default function App() {
             const sql = typeof p.sql === 'string' ? p.sql : '';
             const nodeName = node?.data.alias || node?.data.label || undefined;
 
-            // Derive the working-DB catalog from the node's upstream subgraph so
-            // the studio can browse the tables its SQL may reference. The
-            // immediate main upstream is exposed as `input`; every other
-            // backward-reachable node is listed by its SQL name/alias (the name
-            // a Working DB fan-out query would use). Columns come from each
-            // node's declared/last-run schema.
+            // Build the studio's catalog + ERD (SE-11). A Studio inherits the
+            // Working DB's ERD only when its DIRECT upstream is a code.workingdb
+            // node: the tables are that Working DB's own source inputs, and the
+            // relationships come from the Working DB's persisted erdModel (or are
+            // auto-inferred). Wired to a plain source instead, the Studio just
+            // sees a single `input` table with no relationships.
             const byId = new Map(nodes.map(n => [n.id, n]));
-            const toCols = (n: (typeof nodes)[number] | undefined) =>
+            const toCols = (n: (typeof nodes)[number] | undefined): SqlStudioTable['columns'] =>
                 Array.isArray(n?.data.schema)
                     ? n!.data.schema.map(c => ({
                           name: c.name,
@@ -1381,24 +1383,32 @@ export default function App() {
                           primaryKey: (c as { primaryKey?: boolean }).primaryKey,
                       }))
                     : [];
-            const tables: SqlStudioTable[] = [];
+
             const inputEdge = edges.find(e => e.target === nodeId);
-            const inputSourceId = inputEdge?.source;
-            if (inputSourceId) {
-                tables.push({ name: 'input', kind: 'input', columns: toCols(byId.get(inputSourceId)) });
-            }
-            const seen = new Set<string>([nodeId]);
-            const queue = edges.filter(e => e.target === nodeId).map(e => e.source);
-            while (queue.length) {
-                const id = queue.shift()!;
-                if (seen.has(id)) continue;
-                seen.add(id);
-                const up = byId.get(id);
-                if (up && id !== inputSourceId) {
-                    const nm = (up.data.alias || up.data.label || id).toString();
-                    tables.push({ name: nm, kind: 'upstream', columns: toCols(up) });
-                }
-                for (const e of edges) if (e.target === id) queue.push(e.source);
+            const upstream = inputEdge ? byId.get(inputEdge.source) : undefined;
+            const upstreamIsWorkingDb =
+                (upstream?.data.componentId ?? '') === 'code.workingdb';
+
+            let tables: SqlStudioTable[] = [];
+            let relationships: SqlEditorRequest['relationships'] = [];
+            if (upstream && upstreamIsWorkingDb) {
+                const wdbId = upstream.id;
+                const sourceIds = Array.from(
+                    new Set(edges.filter(e => e.target === wdbId).map(e => e.source)),
+                );
+                tables = sourceIds.map(id => {
+                    const s = byId.get(id);
+                    return {
+                        name: (s?.data.alias || s?.data.label || id).toString(),
+                        kind: 'upstream' as const,
+                        columns: toCols(s),
+                    };
+                });
+                const persisted = (upstream.data.properties as { erdModel?: ErdModel } | undefined)
+                    ?.erdModel;
+                relationships = buildErdModel(tables, persisted).relationships;
+            } else if (upstream) {
+                tables = [{ name: 'input', kind: 'input', columns: toCols(upstream) }];
             }
 
             setSqlEditorRequest(r => ({
@@ -1407,6 +1417,8 @@ export default function App() {
                 sql,
                 nodeName,
                 tables,
+                relationships,
+                fromWorkingDb: upstreamIsWorkingDb,
             }));
             setMode('sql');
         },
@@ -1491,6 +1503,61 @@ export default function App() {
             }
         },
         [nodes, edges, repo, activeJobId, workspacePathState],
+    );
+
+    // Working DB ER-model authoring (SE-11 / 4c). Opened from the Working DB
+    // node; edits/persists the `erdModel` prop that downstream Studios inherit.
+    const [erdEditorNodeId, setErdEditorNodeId] = useState<string | null>(null);
+    const erdEditorData = useMemo(() => {
+        if (!erdEditorNodeId) return null;
+        const wdb = nodes.find(n => n.id === erdEditorNodeId);
+        if (!wdb) return null;
+        const byId = new Map(nodes.map(n => [n.id, n]));
+        const sourceIds = Array.from(
+            new Set(edges.filter(e => e.target === erdEditorNodeId).map(e => e.source)),
+        );
+        const tables: ErdTable[] = sourceIds.map(id => {
+            const s = byId.get(id);
+            return {
+                name: (s?.data.alias || s?.data.label || id).toString(),
+                columns: Array.isArray(s?.data.schema)
+                    ? s!.data.schema.map(c => ({
+                          name: c.name,
+                          type: c.type,
+                          nullable: c.nullable,
+                          primaryKey: (c as { primaryKey?: boolean }).primaryKey,
+                      }))
+                    : [],
+            };
+        });
+        const persisted = (wdb.data.properties as { erdModel?: ErdModel } | undefined)?.erdModel;
+        const model = buildErdModel(tables, persisted);
+        return {
+            nodeName: (wdb.data.alias || wdb.data.label || wdb.id).toString(),
+            tables,
+            relationships: model.relationships,
+        };
+    }, [erdEditorNodeId, nodes, edges]);
+    const handleOpenErdEditor = useCallback((nodeId: string) => setErdEditorNodeId(nodeId), []);
+    const handleSaveErd = useCallback(
+        (model: ErdModel) => {
+            if (!erdEditorNodeId) return;
+            setNodes(ns =>
+                ns.map(n =>
+                    n.id === erdEditorNodeId
+                        ? {
+                              ...n,
+                              data: {
+                                  ...n.data,
+                                  properties: { ...(n.data.properties ?? {}), erdModel: model },
+                              },
+                          }
+                        : n,
+                ),
+            );
+            setErdEditorNodeId(null);
+        },
+        [erdEditorNodeId, setNodes],
     );
 
     const handleMapperSave = useCallback(
@@ -3117,6 +3184,16 @@ export default function App() {
                         onRun={handleRunSqlEditor}
                     />
                 </div>
+                {erdEditorData && (
+                    <ErdEditor
+                        open
+                        nodeName={erdEditorData.nodeName}
+                        tables={erdEditorData.tables}
+                        initialRelationships={erdEditorData.relationships}
+                        onSave={handleSaveErd}
+                        onClose={() => setErdEditorNodeId(null)}
+                    />
+                )}
                 {mode === 'canvas' && (
                   <>
                 <LeftSidebar
@@ -3204,6 +3281,7 @@ export default function App() {
                     onOpenPlayground={handleOpenPlayground}
                     onOpenUploader={handleOpenUploader}
                     onOpenSqlEditor={handleOpenSqlEditor}
+                    onOpenErdEditor={handleOpenErdEditor}
                     focusNameRequest={renameRequest}
                 />
                   </>

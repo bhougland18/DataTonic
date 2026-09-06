@@ -128,6 +128,8 @@ type Props = {
     // Opens the SQL Studio pre-loaded with this node's SQL (code.sqlstudio
     // nodes). Carries the node id so the studio can write the SQL back.
     onOpenSqlEditor?: (nodeId: string) => void;
+    // Opens the ER-model authoring editor for a Working DB node (code.workingdb).
+    onOpenErdEditor?: (nodeId: string) => void;
     focusNameRequest?: number;
 };
 
@@ -143,6 +145,7 @@ export default function PropertiesPanel({
     onOpenPlayground,
     onOpenUploader,
     onOpenSqlEditor,
+    onOpenErdEditor,
     focusNameRequest,
 }: Props) {
     const { t } = useTranslation();
@@ -541,6 +544,18 @@ export default function PropertiesPanel({
                                     <Database size={14} />
                                     {t('properties.openSqlStudio', {
                                         defaultValue: 'Open in SQL Studio',
+                                    })}
+                                </button>
+                            ) : null}
+                            {data.componentId === 'code.workingdb' && onOpenErdEditor ? (
+                                <button
+                                    type="button"
+                                    className="properties-mapper-button"
+                                    onClick={() => onOpenErdEditor(selected.id)}
+                                >
+                                    <Workflow size={14} />
+                                    {t('properties.editErModel', {
+                                        defaultValue: 'Edit ER model',
                                     })}
                                 </button>
                             ) : null}
