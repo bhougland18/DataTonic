@@ -14,6 +14,8 @@ import type { ErdRelationship } from '../erd/model';
 interface AiPaneProps {
     tables: SqlStudioTable[];
     relationships: ErdRelationship[];
+    // The active editor's SQL, sent as context so "fix/tweak this" works.
+    currentSql?: string;
     workspacePath?: string | null;
     // Kept mounted always; `visible` toggles display so collapsing never loses
     // the conversation. `onCollapse` hides it from within the pane.
@@ -43,13 +45,22 @@ function schemaText(tables: SqlStudioTable[], relationships: ErdRelationship[]):
     return lines.join('\n');
 }
 
-function systemPrompt(tables: SqlStudioTable[], relationships: ErdRelationship[]): string {
+function systemPrompt(
+    tables: SqlStudioTable[],
+    relationships: ErdRelationship[],
+    currentSql?: string,
+): string {
+    const current = currentSql?.trim()
+        ? `\n\nThe user's current query in the editor is:\n\`\`\`sql\n${currentSql.trim()}\n\`\`\`\n` +
+          'When they ask to fix, change, or extend it, modify THIS query and return the full updated SQL.'
+        : '';
     return (
         'You are a SQL assistant embedded in a read-only DuckDB SQL editor. ' +
         "Write ONE DuckDB SQL SELECT that answers the user's request. " +
         'Use ONLY the tables, columns, and join keys listed below — do not invent names. ' +
         'Never write INSERT/UPDATE/DELETE/DDL. Return ONLY the SQL inside a ```sql fenced block.\n\n' +
-        schemaText(tables, relationships)
+        schemaText(tables, relationships) +
+        current
     );
 }
 
@@ -69,6 +80,7 @@ function extractSql(text: string): string | null {
 export default function AiPane({
     tables,
     relationships,
+    currentSql,
     workspacePath,
     visible,
     onCollapse,
@@ -104,7 +116,7 @@ export default function AiPane({
                 }
             },
             workspacePath,
-            systemPrompt(tables, relationships),
+            systemPrompt(tables, relationships, currentSql),
         );
         setStreaming(false);
     };

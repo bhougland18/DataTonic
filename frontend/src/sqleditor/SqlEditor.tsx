@@ -9,11 +9,15 @@ import {
     ChevronDown,
     Table2,
     Sparkles,
+    Plus,
+    X,
     AlertTriangle,
 } from 'lucide-react';
 import CodeMirror from '@uiw/react-codemirror';
 import { sql, type SQLNamespace } from '@codemirror/lang-sql';
 import { keymap, EditorView } from '@codemirror/view';
+import { Prec } from '@codemirror/state';
+import { acceptCompletion } from '@codemirror/autocomplete';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { tags as t } from '@lezer/highlight';
 import './sqleditor.css';
@@ -66,73 +70,136 @@ interface SqlEditorProps {
     workspacePath?: string | null;
     openRequest: SqlEditorRequest | null;
     onApplyToNode?: (nodeId: string, result: SqlEditorResult) => void;
-    // Run the given SQL as this node against its upstream, returning the result
-    // grid. Backed by the pipeline partial-run path (see App.handleRunSqlEditor).
     onRun?: (nodeId: string, sqlText: string) => Promise<SqlRunResult>;
 }
 
+interface QueryTab {
+    id: string;
+    name: string;
+    sql: string;
+}
+
+const MAIN = 'main';
+const AI_TAB = 'ai';
+
 // SQL Studio surface. Authors a code.sqlstudio node's SQL in a read-only DuckDB
-// studio: a working-DB catalog (left), a CodeMirror editor + live preview grid
-// (center). Runtime is identical to Inline SQL — "Apply to node" writes the SQL
-// back. See docs/plans/sql-editor-node.md.
+// studio: working-DB catalog (left), CodeMirror editor + live preview grid, a
+// collapsible AI pane. Multiple query tabs let the AI draft into its own tab
+// without overwriting your query, so you can run and compare both.
 export default function SqlEditor({
     workspacePath,
     openRequest,
     onApplyToNode,
     onRun,
 }: SqlEditorProps) {
-    const [sqlText, setSqlText] = useState('');
     const [nodeId, setNodeId] = useState<string | null>(null);
     const [nodeName, setNodeName] = useState<string | undefined>(undefined);
     const [tables, setTables] = useState<SqlStudioTable[]>([]);
     const [relationships, setRelationships] = useState<ErdRelationship[]>([]);
     const [showAi, setShowAi] = useState(false);
-    const [running, setRunning] = useState(false);
-    const [result, setResult] = useState<SqlRunResult | null>(null);
-    const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' } | null>(null);
+
+    // Query tabs. The primary tab holds the node's SQL; the AI drafts into its
+    // own tab. Results + sort are kept per tab so switching preserves them.
+    const [tabs, setTabs] = useState<QueryTab[]>([{ id: MAIN, name: 'Query', sql: '' }]);
+    const [activeId, setActiveId] = useState(MAIN);
+    const [results, setResults] = useState<Record<string, SqlRunResult | null>>({});
+    const [sorts, setSorts] = useState<Record<string, { col: string; dir: 'asc' | 'desc' } | null>>(
+        {},
+    );
+    const [runningId, setRunningId] = useState<string | null>(null);
+    const idSeq = useRef(1);
     const lastNonce = useRef<number>(-1);
 
-    // Load the request whenever a (re)open fires. Keyed on nonce so the same
-    // node reopening still reloads.
     useEffect(() => {
         if (!openRequest) return;
         if (openRequest.nonce === lastNonce.current) return;
         lastNonce.current = openRequest.nonce;
-        setSqlText(openRequest.sql ?? '');
         setNodeId(openRequest.nodeId);
         setNodeName(openRequest.nodeName);
         setTables(openRequest.tables ?? []);
         setRelationships(openRequest.relationships ?? []);
-        setResult(null);
-        setSort(null);
+        setTabs([{ id: MAIN, name: 'Query', sql: openRequest.sql ?? '' }]);
+        setActiveId(MAIN);
+        setResults({});
+        setSorts({});
     }, [openRequest]);
+
+    const activeTab = tabs.find(t => t.id === activeId) ?? tabs[0];
+    const activeSql = activeTab?.sql ?? '';
+    const activeResult = results[activeId] ?? null;
+    const activeSort = sorts[activeId] ?? null;
+
+    const setActiveSql = useCallback(
+        (v: string) => {
+            setTabs(ts => ts.map(t => (t.id === activeId ? { ...t, sql: v } : t)));
+            // Drop a stale error banner for this tab once the user edits.
+            setResults(m => (m[activeId]?.error ? { ...m, [activeId]: null } : m));
+        },
+        [activeId],
+    );
 
     const canApply = nodeId != null && onApplyToNode != null;
     const apply = useCallback(() => {
-        if (nodeId != null && onApplyToNode) onApplyToNode(nodeId, { sql: sqlText });
-    }, [nodeId, onApplyToNode, sqlText]);
+        if (nodeId != null && onApplyToNode && activeTab) {
+            onApplyToNode(nodeId, { sql: activeTab.sql });
+        }
+    }, [nodeId, onApplyToNode, activeTab]);
 
-    // Run in a ref so the CodeMirror keymap (memoized once) always calls the
-    // latest closure with fresh sql/nodeId.
     const runRef = useRef<() => void>(() => {});
     const run = useCallback(async () => {
-        if (nodeId == null || !onRun || running) return;
-        setRunning(true);
+        const tab = tabs.find(t => t.id === activeId);
+        if (!tab || nodeId == null || !onRun || runningId) return;
+        setRunningId(tab.id);
         try {
-            const r = await onRun(nodeId, sqlText);
-            setResult(r);
-            setSort(null);
+            const r = await onRun(nodeId, tab.sql);
+            setResults(m => ({ ...m, [tab.id]: r }));
+            setSorts(m => ({ ...m, [tab.id]: null }));
         } catch (e) {
-            setResult({ columns: [], rows: [], error: e instanceof Error ? e.message : String(e) });
+            setResults(m => ({
+                ...m,
+                [tab.id]: { columns: [], rows: [], error: e instanceof Error ? e.message : String(e) },
+            }));
         } finally {
-            setRunning(false);
+            setRunningId(null);
         }
-    }, [nodeId, onRun, running, sqlText]);
+    }, [tabs, activeId, nodeId, onRun, runningId]);
     runRef.current = run;
 
-    // CodeMirror extensions — SQL language (with catalog-aware autocomplete),
-    // app-themed styling + highlight, and Mod-Enter to run. The `schema` feeds
-    // the completion engine the upstream tables and their columns.
+    // AI drafts into its own tab (non-destructive) and we switch to it.
+    const aiInsert = useCallback((generated: string) => {
+        setTabs(ts => {
+            const has = ts.some(t => t.id === AI_TAB);
+            return has
+                ? ts.map(t => (t.id === AI_TAB ? { ...t, sql: generated } : t))
+                : [...ts, { id: AI_TAB, name: 'AI draft', sql: generated }];
+        });
+        setResults(m => ({ ...m, [AI_TAB]: null }));
+        setActiveId(AI_TAB);
+    }, []);
+
+    const addTab = useCallback(() => {
+        const id = `q${idSeq.current++}`;
+        setTabs(ts => [...ts, { id, name: `Query ${ts.length + 1}`, sql: '' }]);
+        setActiveId(id);
+    }, []);
+
+    const closeTab = useCallback(
+        (id: string) => {
+            if (id === MAIN) return;
+            setTabs(ts => ts.filter(t => t.id !== id));
+            setResults(m => {
+                const n = { ...m };
+                delete n[id];
+                return n;
+            });
+            setActiveId(a => (a === id ? MAIN : a));
+        },
+        [],
+    );
+
+    // CodeMirror extensions — SQL language (catalog-aware autocomplete),
+    // app-themed styling + highlight. Tab accepts the highlighted completion
+    // (falls through to indent when the popup is closed); Mod-Enter runs.
     const extensions = useMemo(() => {
         const schema: SQLNamespace = {};
         for (const tbl of tables) {
@@ -143,23 +210,26 @@ export default function SqlEditor({
             sql({ schema, defaultTable, upperCaseKeywords: false }),
             duckleEditorTheme,
             syntaxHighlighting(duckleHighlight),
-            keymap.of([
-                {
-                    key: 'Mod-Enter',
-                    run: () => {
-                        runRef.current();
-                        return true;
+            Prec.highest(
+                keymap.of([
+                    { key: 'Tab', run: acceptCompletion },
+                    {
+                        key: 'Mod-Enter',
+                        run: () => {
+                            runRef.current();
+                            return true;
+                        },
                     },
-                },
-            ]),
+                ]),
+            ),
         ];
     }, [tables]);
 
     const sortedRows = useMemo(() => {
-        if (!result || !sort) return result?.rows ?? [];
-        const { col, dir } = sort;
+        if (!activeResult || !activeSort) return activeResult?.rows ?? [];
+        const { col, dir } = activeSort;
         const factor = dir === 'asc' ? 1 : -1;
-        return [...result.rows].sort((a, b) => {
+        return [...activeResult.rows].sort((a, b) => {
             const av = a[col];
             const bv = b[col];
             if (av == null && bv == null) return 0;
@@ -168,16 +238,19 @@ export default function SqlEditor({
             if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * factor;
             return String(av).localeCompare(String(bv)) * factor;
         });
-    }, [result, sort]);
+    }, [activeResult, activeSort]);
 
     const toggleSort = (col: string) =>
-        setSort(s =>
-            s?.col === col
-                ? s.dir === 'asc'
-                    ? { col, dir: 'desc' }
-                    : null
-                : { col, dir: 'asc' },
-        );
+        setSorts(m => {
+            const s = m[activeId] ?? null;
+            const next =
+                s?.col === col
+                    ? s.dir === 'asc'
+                        ? { col, dir: 'desc' as const }
+                        : null
+                    : { col, dir: 'asc' as const };
+            return { ...m, [activeId]: next };
+        });
 
     if (nodeId == null) {
         return (
@@ -188,6 +261,8 @@ export default function SqlEditor({
             </div>
         );
     }
+
+    const running = runningId != null;
 
     return (
         <div className="sqlstudio">
@@ -238,7 +313,7 @@ export default function SqlEditor({
                         className="sqlstudio-btn"
                         onClick={run}
                         disabled={running || !onRun}
-                        title="Run this SQL against upstream (⌘/Ctrl+Enter)"
+                        title="Run this query against upstream (⌘/Ctrl+Enter)"
                     >
                         {running ? (
                             <Loader2 size={14} className="sqlstudio-spin" strokeWidth={2} />
@@ -252,111 +327,133 @@ export default function SqlEditor({
                         className="sqlstudio-btn sqlstudio-btn--primary"
                         onClick={apply}
                         disabled={!canApply}
-                        title="Write this SQL back to the node"
+                        title="Write the active query back to the node"
                     >
                         <ArrowUpToLine size={14} strokeWidth={2} /> Apply to node
                     </button>
                 </div>
 
-                        <div className="sqlstudio-editor">
-                            <CodeMirror
-                                value={sqlText}
-                                height="100%"
-                                theme="none"
-                                extensions={extensions}
-                                onChange={v => {
-                                    setSqlText(v);
-                                    // Drop a stale error banner once the user edits.
-                                    if (result?.error) setResult(null);
-                                }}
-                                basicSetup={{ lineNumbers: true, foldGutter: false }}
-                                placeholder="SELECT *, upper(status) AS status FROM input"
-                            />
+                {/* Query tabs */}
+                <div className="sqlstudio-qtabs">
+                    {tabs.map(tb => (
+                        <div
+                            key={tb.id}
+                            className={`sqlstudio-qtab${tb.id === activeId ? ' on' : ''}`}
+                            onClick={() => setActiveId(tb.id)}
+                        >
+                            <span>{tb.name}</span>
+                            {tb.id !== MAIN && (
+                                <button
+                                    className="sqlstudio-qtab-x"
+                                    onClick={e => {
+                                        e.stopPropagation();
+                                        closeTab(tb.id);
+                                    }}
+                                    aria-label="Close tab"
+                                >
+                                    <X size={11} />
+                                </button>
+                            )}
                         </div>
+                    ))}
+                    <button className="sqlstudio-qtab-add" onClick={addTab} title="New query tab">
+                        <Plus size={13} />
+                    </button>
+                </div>
 
-                        <div className="sqlstudio-res-head">
-                            <span className="sqlstudio-res-lbl">Results</span>
-                            {result?.error ? (
-                                <span className="sqlstudio-res-err">
-                                    <AlertTriangle size={13} /> {result.error}
-                                </span>
-                            ) : result ? (
-                                <>
-                                    <span className="sqlstudio-res-ok">
-                                        {result.rows.length} row{result.rows.length === 1 ? '' : 's'}
-                                    </span>
-                                    {result.durationMs != null && (
-                                        <span className="sqlstudio-res-m">
-                                            · {Math.round(result.durationMs)} ms · read-only preview
-                                        </span>
-                                    )}
-                                </>
-                            ) : (
+                <div className="sqlstudio-editor">
+                    <CodeMirror
+                        value={activeSql}
+                        height="100%"
+                        theme="none"
+                        extensions={extensions}
+                        onChange={setActiveSql}
+                        basicSetup={{ lineNumbers: true, foldGutter: false }}
+                        placeholder="SELECT *, upper(status) AS status FROM input"
+                    />
+                </div>
+
+                <div className="sqlstudio-res-head">
+                    <span className="sqlstudio-res-lbl">Results</span>
+                    {activeResult?.error ? (
+                        <span className="sqlstudio-res-err">
+                            <AlertTriangle size={13} /> {activeResult.error}
+                        </span>
+                    ) : activeResult ? (
+                        <>
+                            <span className="sqlstudio-res-ok">
+                                {activeResult.rows.length} row
+                                {activeResult.rows.length === 1 ? '' : 's'}
+                            </span>
+                            {activeResult.durationMs != null && (
                                 <span className="sqlstudio-res-m">
-                                    Run the query to preview results.
+                                    · {Math.round(activeResult.durationMs)} ms · read-only preview
                                 </span>
                             )}
-                        </div>
+                        </>
+                    ) : (
+                        <span className="sqlstudio-res-m">Run the query to preview results.</span>
+                    )}
+                </div>
 
-                        <div className="sqlstudio-grid-wrap">
-                            {result && !result.error && result.columns.length > 0 ? (
-                                <table className="sqlstudio-grid">
-                                    <thead>
-                                        <tr>
-                                            <th className="rownum">#</th>
-                                            {result.columns.map(c => (
-                                                <th key={c.name} onClick={() => toggleSort(c.name)}>
-                                                    {c.name}
-                                                    {sort?.col === c.name && (
-                                                        <span className="srt">
-                                                            {sort.dir === 'asc' ? ' ▲' : ' ▼'}
-                                                        </span>
+                <div className="sqlstudio-grid-wrap">
+                    {activeResult && !activeResult.error && activeResult.columns.length > 0 ? (
+                        <table className="sqlstudio-grid">
+                            <thead>
+                                <tr>
+                                    <th className="rownum">#</th>
+                                    {activeResult.columns.map(c => (
+                                        <th key={c.name} onClick={() => toggleSort(c.name)}>
+                                            {c.name}
+                                            {activeSort?.col === c.name && (
+                                                <span className="srt">
+                                                    {activeSort.dir === 'asc' ? ' ▲' : ' ▼'}
+                                                </span>
+                                            )}
+                                            {c.type && <span className="ty">{c.type}</span>}
+                                        </th>
+                                    ))}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {sortedRows.map((row, i) => (
+                                    <tr key={i}>
+                                        <td className="rownum">{i + 1}</td>
+                                        {activeResult.columns.map(c => {
+                                            const v = row[c.name];
+                                            return (
+                                                <td key={c.name}>
+                                                    {v == null ? (
+                                                        <span className="null">null</span>
+                                                    ) : (
+                                                        String(v)
                                                     )}
-                                                    {c.type && <span className="ty">{c.type}</span>}
-                                                </th>
-                                            ))}
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {sortedRows.map((row, i) => (
-                                            <tr key={i}>
-                                                <td className="rownum">{i + 1}</td>
-                                                {result.columns.map(c => {
-                                                    const v = row[c.name];
-                                                    return (
-                                                        <td key={c.name}>
-                                                            {v == null ? (
-                                                                <span className="null">null</span>
-                                                            ) : (
-                                                                String(v)
-                                                            )}
-                                                        </td>
-                                                    );
-                                                })}
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            ) : (
-                                <div className="sqlstudio-grid-empty">
-                                    {result?.error
-                                        ? 'Fix the query and run again.'
-                                        : 'No results yet.'}
-                                </div>
-                            )}
+                                                </td>
+                                            );
+                                        })}
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    ) : (
+                        <div className="sqlstudio-grid-empty">
+                            {activeResult?.error
+                                ? 'Fix the query and run again.'
+                                : 'No results yet.'}
                         </div>
+                    )}
+                </div>
             </div>
+
             {/* Always mounted so collapsing the pane keeps its conversation. */}
             <AiPane
                 visible={showAi}
                 onCollapse={() => setShowAi(false)}
                 tables={tables}
                 relationships={relationships}
+                currentSql={activeSql}
                 workspacePath={workspacePath}
-                onInsert={sql => {
-                    setSqlText(sql);
-                    setResult(null);
-                }}
+                onInsert={aiInsert}
             />
         </div>
     );

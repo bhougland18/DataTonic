@@ -703,3 +703,70 @@
     opacity: 0.5;
     cursor: default;
 }
+
+/* ---- Query tabs ---- */
+.sqlstudio-qtabs {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 5px 10px 0;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--border);
+}
+.sqlstudio-qtab {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 11px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-3);
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    margin-bottom: -1px;
+}
+.sqlstudio-qtab:hover {
+    color: var(--text-1);
+}
+.sqlstudio-qtab.on {
+    color: var(--text-1);
+    background: var(--bg-0);
+    border-color: var(--border);
+}
+.sqlstudio-qtab-x {
+    display: inline-flex;
+    align-items: center;
+    border: none;
+    background: transparent;
+    color: var(--text-4);
+    cursor: pointer;
+    padding: 1px;
+    border-radius: 3px;
+}
+.sqlstudio-qtab-x:hover {
+    color: var(--danger, #ff4d6d);
+    background: var(--bg-2);
+}
+.sqlstudio-qtab-add {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border: none;
+    background: transparent;
+    color: var(--text-3);
+    cursor: pointer;
+    border-radius: 5px;
+}
+.sqlstudio-qtab-add:hover {
+    background: var(--bg-3);
+    color: var(--text-1);
+}
+
+/* Ensure the editor scrolls when a query gets long. */
+.sqlstudio-editor .cm-scroller {
+    overflow: auto;
+}
