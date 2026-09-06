@@ -18,25 +18,29 @@ import { inferBetween, type ErdRelationship, type ErdTable } from './model';
 interface ErDiagramProps {
     tables: ErdTable[];
     relationships: ErdRelationship[];
-    // Read-only mode (the Studio's ER tab). When false, columns expose connect
-    // handles and edges are editable; changes flow through onRelationshipsChange.
+    // Read-only mode (no drawing). When false, dragging a table onto another
+    // adds inferred join(s) via onRelationshipsChange.
     readOnly?: boolean;
     onRelationshipsChange?: (rels: ErdRelationship[]) => void;
+    // Clicking an edge (a table pair) reports the two tables so the caller can
+    // filter its relationship list to that pair.
+    onPairSelect?: (a: string, b: string) => void;
 }
 
-type TableNodeData = { table: ErdTable; editable: boolean };
+type TableNodeData = { table: ErdTable };
 
-const relId = (r: Omit<ErdRelationship, 'id'>) =>
-    `${r.fromTable}.${r.fromColumn}->${r.toTable}.${r.toColumn}`;
+// Unordered pair key so both directions collapse to one edge.
+const pairKey = (a: string, b: string) =>
+    [a.toLowerCase(), b.toLowerCase()].sort().join('||');
 
-// A table rendered as a ReactFlow node — header + column rows. In editable mode
-// each column exposes a left (target) and right (source) handle so the user can
-// draw relationships column-to-column; read-only mode uses single table handles.
+// A table rendered as a ReactFlow node — header + column rows, with a single
+// left (target) / right (source) handle. Relationships are drawn table-to-table
+// (the join columns are inferred), so per-column handles aren't needed.
 function TableNode({ data }: NodeProps) {
-    const { table, editable } = data as TableNodeData;
+    const { table } = data as TableNodeData;
     return (
         <div className="erd-node">
-            {!editable && <Handle type="target" position={Position.Left} className="erd-handle" />}
+            <Handle type="target" position={Position.Left} className="erd-handle" />
             <div className="erd-node-head">{table.name}</div>
             <div className="erd-node-cols">
                 {table.columns.length === 0 ? (
@@ -44,117 +48,94 @@ function TableNode({ data }: NodeProps) {
                 ) : (
                     table.columns.map(c => (
                         <div className="erd-node-col" key={c.name}>
-                            {editable && (
-                                <Handle
-                                    type="target"
-                                    id={c.name}
-                                    position={Position.Left}
-                                    className="erd-handle erd-handle--col"
-                                />
-                            )}
                             <span className="cn">{c.name}</span>
                             {c.primaryKey && <span className="pk">PK</span>}
                             {c.type && <span className="ty">{c.type}</span>}
-                            {editable && (
-                                <Handle
-                                    type="source"
-                                    id={c.name}
-                                    position={Position.Right}
-                                    className="erd-handle erd-handle--col"
-                                />
-                            )}
                         </div>
                     ))
                 )}
             </div>
-            {!editable && <Handle type="source" position={Position.Right} className="erd-handle" />}
+            <Handle type="source" position={Position.Right} className="erd-handle" />
         </div>
     );
 }
 
 const nodeTypes = { erdTable: TableNode };
 
-// Shared ER diagram (SE-11). Read-only in the SQL Studio; the same component
-// backs the editable authoring surface on the Working DB node.
+// Shared ER diagram (SE-11). Edges are aggregated per table pair: one line, and
+// a "N" count label when a pair holds several joins (click it to filter the
+// panel). Read-only in the Studio's autocomplete/AI path (currently unused
+// visually); editable on the Working DB rail surface.
 export default function ErDiagram({
     tables,
     relationships,
     readOnly = true,
     onRelationshipsChange,
+    onPairSelect,
 }: ErDiagramProps) {
     const initialNodes = useMemo<Node<TableNodeData>[]>(
         () =>
             tables.map((t, i) => ({
                 id: t.name,
                 type: 'erdTable',
-                position: { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
-                data: { table: t, editable: !readOnly },
+                position: { x: (i % 3) * 320, y: Math.floor(i / 3) * 320 },
+                data: { table: t },
                 draggable: !readOnly,
             })),
         [tables, readOnly],
     );
-    // Local node state so positions survive drags in editable mode; re-seeded
-    // when the table set changes.
     const [nodes, , onNodesChange] = useNodesState(initialNodes);
 
-    const edges = useMemo<Edge[]>(
-        () =>
-            relationships.map(r => ({
-                id: r.id,
-                source: r.fromTable,
-                target: r.toTable,
-                sourceHandle: readOnly ? undefined : r.fromColumn,
-                targetHandle: readOnly ? undefined : r.toColumn,
-                label: `${r.fromColumn} → ${r.toColumn}`,
-                animated: false,
+    // One edge per table pair. Label shows the join when there's exactly one,
+    // else the count (click to filter).
+    const edges = useMemo<Edge[]>(() => {
+        const groups = new Map<string, ErdRelationship[]>();
+        for (const r of relationships) {
+            const key = pairKey(r.fromTable, r.toTable);
+            const arr = groups.get(key);
+            if (arr) arr.push(r);
+            else groups.set(key, [r]);
+        }
+        return Array.from(groups.values()).map(rels => {
+            const first = rels[0];
+            const many = rels.length > 1;
+            return {
+                id: `pair:${pairKey(first.fromTable, first.toTable)}`,
+                source: first.fromTable,
+                target: first.toTable,
+                label: many ? `${rels.length} joins` : `${first.fromColumn} → ${first.toColumn}`,
                 selectable: !readOnly,
-                deletable: !readOnly,
-                style: { stroke: 'var(--accent)', strokeWidth: 1.5 },
-                labelStyle: { fill: 'var(--text-2)', fontSize: 10 },
+                style: { stroke: 'var(--accent)', strokeWidth: many ? 2 : 1.5 },
+                labelStyle: {
+                    fill: many ? 'var(--accent)' : 'var(--text-2)',
+                    fontSize: many ? 11 : 10,
+                    fontWeight: many ? 700 : 400,
+                    cursor: 'pointer',
+                },
                 labelBgStyle: { fill: 'var(--bg-2)' },
-            })),
-        [relationships, readOnly],
-    );
+                labelBgPadding: [6, 3] as [number, number],
+                labelBgBorderRadius: 4,
+            };
+        });
+    }, [relationships, readOnly]);
 
     const onConnect = useCallback(
         (conn: Connection) => {
             if (readOnly || !onRelationshipsChange) return;
             if (!conn.source || !conn.target || conn.source === conn.target) return;
-            // Auto-infer the join for the connected table PAIR rather than using
-            // whichever columns the drag landed on — the common case (a key
-            // column named like the other table) is chosen correctly. Fall back
-            // to the exact dragged columns only when nothing can be inferred
-            // (a genuine custom join with no name match).
             const existing = new Set(relationships.map(r => r.id));
             const inferred = inferBetween(tables, conn.source, conn.target).filter(
                 r => !existing.has(r.id),
             );
-            if (inferred.length) {
-                onRelationshipsChange([...relationships, ...inferred]);
-                return;
-            }
-            if (!conn.sourceHandle || !conn.targetHandle) return;
-            const base = {
-                fromTable: conn.source,
-                fromColumn: conn.sourceHandle,
-                toTable: conn.target,
-                toColumn: conn.targetHandle,
-                inferred: false,
-            };
-            const id = relId(base);
-            if (existing.has(id)) return;
-            onRelationshipsChange([...relationships, { id, ...base }]);
+            if (inferred.length) onRelationshipsChange([...relationships, ...inferred]);
+            else onPairSelect?.(conn.source, conn.target);
         },
-        [readOnly, onRelationshipsChange, relationships, tables],
+        [readOnly, onRelationshipsChange, relationships, tables, onPairSelect],
     );
 
-    const onEdgesDelete = useCallback(
-        (deleted: Edge[]) => {
-            if (readOnly || !onRelationshipsChange) return;
-            const gone = new Set(deleted.map(e => e.id));
-            onRelationshipsChange(relationships.filter(r => !gone.has(r.id)));
-        },
-        [readOnly, onRelationshipsChange, relationships],
+    const onEdgeClick = useCallback(
+        (_: unknown, edge: Edge) => onPairSelect?.(edge.source, edge.target),
+        [onPairSelect],
     );
 
     return (
@@ -165,13 +146,13 @@ export default function ErDiagram({
                 nodeTypes={nodeTypes}
                 onNodesChange={onNodesChange}
                 onConnect={onConnect}
-                onEdgesDelete={onEdgesDelete}
+                onEdgeClick={onEdgeClick}
                 fitView
                 minZoom={0.2}
                 proOptions={{ hideAttribution: true }}
                 nodesConnectable={!readOnly}
                 nodesDraggable={!readOnly}
-                elementsSelectable={!readOnly}
+                elementsSelectable
             >
                 <Background gap={16} color="var(--border)" />
                 <Controls showInteractive={false} />
