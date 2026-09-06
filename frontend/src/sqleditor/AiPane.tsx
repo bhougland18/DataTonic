@@ -1,5 +1,12 @@
 import { useRef, useState } from 'react';
-import { Sparkles, Send, Loader2, ArrowDownToLine, AlertTriangle } from 'lucide-react';
+import {
+    Sparkles,
+    Send,
+    Loader2,
+    ArrowDownToLine,
+    AlertTriangle,
+    PanelRightClose,
+} from 'lucide-react';
 import { chatSend } from '../tauri-bridge';
 import type { SqlStudioTable } from './types';
 import type { ErdRelationship } from '../erd/model';
@@ -8,6 +15,10 @@ interface AiPaneProps {
     tables: SqlStudioTable[];
     relationships: ErdRelationship[];
     workspacePath?: string | null;
+    // Kept mounted always; `visible` toggles display so collapsing never loses
+    // the conversation. `onCollapse` hides it from within the pane.
+    visible: boolean;
+    onCollapse: () => void;
     // Put generated SQL into the editor.
     onInsert: (sql: string) => void;
 }
@@ -55,7 +66,14 @@ function extractSql(text: string): string | null {
 // `chat_send` bridge — local Qwen, or a configured OpenAI-compatible endpoint),
 // with the inherited ERD (tables + columns + join keys) as context. Desktop-only
 // (the local model), so a friendly message shows in the web edition.
-export default function AiPane({ tables, relationships, workspacePath, onInsert }: AiPaneProps) {
+export default function AiPane({
+    tables,
+    relationships,
+    workspacePath,
+    visible,
+    onCollapse,
+    onInsert,
+}: AiPaneProps) {
     const [input, setInput] = useState('');
     const [messages, setMessages] = useState<Msg[]>([]);
     const [streaming, setStreaming] = useState(false);
@@ -92,11 +110,19 @@ export default function AiPane({ tables, relationships, workspacePath, onInsert 
     };
 
     return (
-        <aside className="sqlstudio-ai">
+        <aside className={`sqlstudio-ai${visible ? '' : ' sqlstudio-ai--hidden'}`}>
             <div className="sqlstudio-ai-head">
                 <Sparkles size={14} />
                 <b>Ask AI</b>
                 <span className="sqlstudio-ai-prov">text-to-SQL</span>
+                <button
+                    className="sqlstudio-ai-collapse"
+                    onClick={onCollapse}
+                    title="Collapse (keeps the conversation)"
+                    aria-label="Collapse AI panel"
+                >
+                    <PanelRightClose size={15} />
+                </button>
             </div>
             <div className="sqlstudio-ai-body" ref={bodyRef}>
                 {messages.length === 0 ? (

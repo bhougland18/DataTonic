@@ -8,8 +8,6 @@ import {
     ChevronRight,
     ChevronDown,
     Table2,
-    Braces,
-    Network,
     Sparkles,
     AlertTriangle,
 } from 'lucide-react';
@@ -21,7 +19,6 @@ import { tags as t } from '@lezer/highlight';
 import './sqleditor.css';
 import type { SqlEditorRequest, SqlEditorResult, SqlRunResult, SqlStudioTable } from './types';
 import type { ErdRelationship } from '../erd/model';
-import ErDiagram from '../erd/ErDiagram';
 import AiPane from './AiPane';
 
 // Theme the editor with the app's own tokens so it tracks Duckle's light/dark
@@ -74,8 +71,6 @@ interface SqlEditorProps {
     onRun?: (nodeId: string, sqlText: string) => Promise<SqlRunResult>;
 }
 
-type StudioTab = 'sql' | 'er';
-
 // SQL Studio surface. Authors a code.sqlstudio node's SQL in a read-only DuckDB
 // studio: a working-DB catalog (left), a CodeMirror editor + live preview grid
 // (center). Runtime is identical to Inline SQL — "Apply to node" writes the SQL
@@ -91,8 +86,6 @@ export default function SqlEditor({
     const [nodeName, setNodeName] = useState<string | undefined>(undefined);
     const [tables, setTables] = useState<SqlStudioTable[]>([]);
     const [relationships, setRelationships] = useState<ErdRelationship[]>([]);
-    const [fromWorkingDb, setFromWorkingDb] = useState(false);
-    const [tab, setTab] = useState<StudioTab>('sql');
     const [showAi, setShowAi] = useState(false);
     const [running, setRunning] = useState(false);
     const [result, setResult] = useState<SqlRunResult | null>(null);
@@ -110,10 +103,8 @@ export default function SqlEditor({
         setNodeName(openRequest.nodeName);
         setTables(openRequest.tables ?? []);
         setRelationships(openRequest.relationships ?? []);
-        setFromWorkingDb(!!openRequest.fromWorkingDb);
         setResult(null);
         setSort(null);
-        setTab('sql');
     }, [openRequest]);
 
     const canApply = nodeId != null && onApplyToNode != null;
@@ -267,17 +258,6 @@ export default function SqlEditor({
                     </button>
                 </div>
 
-                <div className="sqlstudio-tabs">
-                    <button className={tab === 'sql' ? 'on' : ''} onClick={() => setTab('sql')}>
-                        <Braces size={14} /> SQL Editor
-                    </button>
-                    <button className={tab === 'er' ? 'on' : ''} onClick={() => setTab('er')}>
-                        <Network size={14} /> ER Diagram
-                    </button>
-                </div>
-
-                {tab === 'sql' ? (
-                    <>
                         <div className="sqlstudio-editor">
                             <CodeMirror
                                 value={sqlText}
@@ -365,67 +345,19 @@ export default function SqlEditor({
                                 </div>
                             )}
                         </div>
-                    </>
-                ) : (
-                    <ErView
-                        tables={tables}
-                        relationships={relationships}
-                        fromWorkingDb={fromWorkingDb}
-                    />
-                )}
             </div>
-            {showAi && (
-                <AiPane
-                    tables={tables}
-                    relationships={relationships}
-                    workspacePath={workspacePath}
-                    onInsert={sql => {
-                        setSqlText(sql);
-                        setResult(null);
-                    }}
-                />
-            )}
-        </div>
-    );
-}
-
-// Read-only view of the ERD inherited from the upstream Working DB (SE-11).
-// A textual/card view for now; the ReactFlow diagram lands in 4b. Editing the
-// model happens only on the Working DB node — never here.
-function ErView({
-    tables,
-    relationships,
-    fromWorkingDb,
-}: {
-    tables: SqlStudioTable[];
-    relationships: ErdRelationship[];
-    fromWorkingDb: boolean;
-}) {
-    if (!fromWorkingDb) {
-        return (
-            <div className="sqlstudio-soon">
-                <span className="sqlstudio-glyph">
-                    <Network size={16} />
-                </span>
-                <b>No ER model</b>
-                <p>
-                    Wire this SQL Studio to a <b>Working DB</b> node to inherit its
-                    entity-relationship model. A studio on a single source has just one{' '}
-                    <code>input</code> table, so there are no relationships to show.
-                </p>
-            </div>
-        );
-    }
-    return (
-        <div className="sqlstudio-er-wrap">
-            <div className="sqlstudio-er-note">
-                Inherited from the upstream <b>Working DB</b> · read-only.{' '}
-                {relationships.length > 0
-                    ? `${relationships.length} relationship${relationships.length === 1 ? '' : 's'}`
-                    : 'No relationships yet'}{' '}
-                · edit the model on the Working DB node.
-            </div>
-            <ErDiagram tables={tables} relationships={relationships} readOnly />
+            {/* Always mounted so collapsing the pane keeps its conversation. */}
+            <AiPane
+                visible={showAi}
+                onCollapse={() => setShowAi(false)}
+                tables={tables}
+                relationships={relationships}
+                workspacePath={workspacePath}
+                onInsert={sql => {
+                    setSqlText(sql);
+                    setResult(null);
+                }}
+            />
         </div>
     );
 }

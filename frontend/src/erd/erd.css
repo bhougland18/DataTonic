@@ -264,3 +264,173 @@
     color: var(--danger, #ff4d6d);
     background: var(--bg-3);
 }
+
+/* ---- ERD authoring rail surface (Working DB) ---- */
+.erd-ws {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-0);
+    color: var(--text-1);
+    overflow: hidden;
+}
+.erd-ws-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-3);
+    font-size: 13px;
+}
+.erd-ws-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-1);
+}
+.erd-ws-glyph {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+.erd-ws-titles {
+    display: flex;
+    flex-direction: column;
+}
+.erd-ws-titles b {
+    font-size: 13px;
+    font-weight: 600;
+}
+.erd-ws-titles small {
+    font-size: 10.5px;
+    color: var(--text-3);
+}
+.erd-ws-spacer {
+    flex: 1;
+}
+.erd-ws-body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+}
+.erd-ws-body .erd-diagram {
+    flex: 1;
+    border-right: 1px solid var(--border);
+}
+.erd-ws-side {
+    width: 320px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-1);
+    overflow-y: auto;
+}
+.erd-ws-side-head {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 14px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+    color: var(--text-3);
+    border-bottom: 1px solid var(--border);
+}
+.erd-ws-add {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.erd-ws-add-row {
+    display: flex;
+    gap: 6px;
+}
+.erd-ws-add-row select {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 12px;
+    padding: 5px 7px;
+}
+.erd-ws-add-arrow {
+    display: flex;
+    justify-content: center;
+    color: var(--accent);
+}
+.erd-ws-add-btn {
+    justify-content: center;
+    margin-top: 2px;
+}
+.erd-ws-hint {
+    padding: 10px 14px;
+    font-size: 11.5px;
+    color: var(--text-3);
+    line-height: 1.5;
+    border-bottom: 1px solid var(--border);
+}
+.erd-ws-empty-list {
+    padding: 12px 14px;
+    font-size: 12px;
+    color: var(--text-3);
+}
+.erd-ws-rels {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px;
+}
+.erd-ws-rel {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+}
+.erd-ws-rel code {
+    flex: 1;
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 11px;
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.erd-ws-rel .tag {
+    font-size: 8.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-3);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 4px;
+}
+.erd-ws-rel-rm {
+    display: inline-flex;
+    align-items: center;
+    border: none;
+    background: transparent;
+    color: var(--text-4);
+    cursor: pointer;
+    padding: 2px;
+    border-radius: 4px;
+}
+.erd-ws-rel-rm:hover {
+    color: var(--danger, #ff4d6d);
+    background: var(--bg-3);
+}

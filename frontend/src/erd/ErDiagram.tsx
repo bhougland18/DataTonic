@@ -13,7 +13,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import './erd.css';
-import type { ErdRelationship, ErdTable } from './model';
+import { inferBetween, type ErdRelationship, type ErdTable } from './model';
 
 interface ErDiagramProps {
     tables: ErdTable[];
@@ -119,7 +119,21 @@ export default function ErDiagram({
     const onConnect = useCallback(
         (conn: Connection) => {
             if (readOnly || !onRelationshipsChange) return;
-            if (!conn.source || !conn.target || !conn.sourceHandle || !conn.targetHandle) return;
+            if (!conn.source || !conn.target || conn.source === conn.target) return;
+            // Auto-infer the join for the connected table PAIR rather than using
+            // whichever columns the drag landed on — the common case (a key
+            // column named like the other table) is chosen correctly. Fall back
+            // to the exact dragged columns only when nothing can be inferred
+            // (a genuine custom join with no name match).
+            const existing = new Set(relationships.map(r => r.id));
+            const inferred = inferBetween(tables, conn.source, conn.target).filter(
+                r => !existing.has(r.id),
+            );
+            if (inferred.length) {
+                onRelationshipsChange([...relationships, ...inferred]);
+                return;
+            }
+            if (!conn.sourceHandle || !conn.targetHandle) return;
             const base = {
                 fromTable: conn.source,
                 fromColumn: conn.sourceHandle,
@@ -128,10 +142,10 @@ export default function ErDiagram({
                 inferred: false,
             };
             const id = relId(base);
-            if (relationships.some(r => r.id === id)) return;
+            if (existing.has(id)) return;
             onRelationshipsChange([...relationships, { id, ...base }]);
         },
-        [readOnly, onRelationshipsChange, relationships],
+        [readOnly, onRelationshipsChange, relationships, tables],
     );
 
     const onEdgesDelete = useCallback(

@@ -559,6 +559,25 @@
     border-left: 1px solid var(--border);
     min-height: 0;
 }
+.sqlstudio-ai--hidden {
+    display: none;
+}
+.sqlstudio-ai-collapse {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border: none;
+    background: transparent;
+    color: var(--text-3);
+    cursor: pointer;
+    border-radius: 5px;
+}
+.sqlstudio-ai-collapse:hover {
+    background: var(--bg-3);
+    color: var(--text-1);
+}
 .sqlstudio-ai-head {
     display: flex;
     align-items: center;

@@ -1,11 +1,12 @@
 import type { ComponentType } from 'react';
-import { Waypoints, Plug, Database, FileText, LayoutDashboard } from 'lucide-react';
+import { Waypoints, Plug, Database, Network, FileText, LayoutDashboard } from 'lucide-react';
 
 // The rail-selectable modes. Canvas is the existing pipeline designer; the
 // others are the new DataTonic modules, added incrementally. Keeping the
 // full set listed (even before each ships) is deliberate — see RAIL-5.
-// `sql` is the SQL Studio surface, opened from a code.sqlstudio node.
-export type AppMode = 'canvas' | 'playground' | 'sql' | 'reports' | 'dashboards';
+// `sql` is the SQL Studio surface (code.sqlstudio); `erd` is the ER-model
+// authoring surface (code.workingdb).
+export type AppMode = 'canvas' | 'playground' | 'sql' | 'erd' | 'reports' | 'dashboards';
 
 // Version-agnostic icon shape: lucide-react icons are components taking a
 // `size`/`strokeWidth`. Typed structurally so we don't depend on a specific
@@ -25,6 +26,7 @@ export const RAIL_MODES: RailModeMeta[] = [
     { id: 'canvas', label: 'Canvas', icon: Waypoints, enabled: true },
     { id: 'playground', label: 'API Playground', icon: Plug, enabled: true },
     { id: 'sql', label: 'SQL Studio', icon: Database, enabled: true },
+    { id: 'erd', label: 'ER Model', icon: Network, enabled: true },
     { id: 'reports', label: 'Typst Reports', icon: FileText, enabled: false },
     { id: 'dashboards', label: 'HTML/JS Dashboards', icon: LayoutDashboard, enabled: false },
 ];

@@ -56,7 +56,7 @@ import type {
     SqlStudioTable,
 } from './sqleditor/types';
 import { buildErdModel, type ErdModel, type ErdTable } from './erd/model';
-import ErdEditor from './erd/ErdEditor';
+import ErdWorkspace, { type ErdWorkspaceRequest } from './erd/ErdWorkspace';
 import GitPanel from './workflow-ui/GitPanel';
 import WindowControls from './workflow-ui/WindowControls';
 import WindowResizeHandles from './workflow-ui/WindowResizeHandles';
@@ -1505,46 +1505,50 @@ export default function App() {
         [nodes, edges, repo, activeJobId, workspacePathState],
     );
 
-    // Working DB ER-model authoring (SE-11 / 4c). Opened from the Working DB
-    // node; edits/persists the `erdModel` prop that downstream Studios inherit.
-    const [erdEditorNodeId, setErdEditorNodeId] = useState<string | null>(null);
-    const erdEditorData = useMemo(() => {
-        if (!erdEditorNodeId) return null;
-        const wdb = nodes.find(n => n.id === erdEditorNodeId);
-        if (!wdb) return null;
-        const byId = new Map(nodes.map(n => [n.id, n]));
-        const sourceIds = Array.from(
-            new Set(edges.filter(e => e.target === erdEditorNodeId).map(e => e.source)),
-        );
-        const tables: ErdTable[] = sourceIds.map(id => {
-            const s = byId.get(id);
-            return {
-                name: (s?.data.alias || s?.data.label || id).toString(),
-                columns: Array.isArray(s?.data.schema)
-                    ? s!.data.schema.map(c => ({
-                          name: c.name,
-                          type: c.type,
-                          nullable: c.nullable,
-                          primaryKey: (c as { primaryKey?: boolean }).primaryKey,
-                      }))
-                    : [],
-            };
-        });
-        const persisted = (wdb.data.properties as { erdModel?: ErdModel } | undefined)?.erdModel;
-        const model = buildErdModel(tables, persisted);
-        return {
-            nodeName: (wdb.data.alias || wdb.data.label || wdb.id).toString(),
-            tables,
-            relationships: model.relationships,
-        };
-    }, [erdEditorNodeId, nodes, edges]);
-    const handleOpenErdEditor = useCallback((nodeId: string) => setErdEditorNodeId(nodeId), []);
+    // Working DB ER-model authoring (SE-11). Opened from the Working DB node
+    // into the `erd` rail surface; edits/persist the `erdModel` prop downstream
+    // Studios inherit. Nonce re-fires the surface's load effect (like the others).
+    const [erdRequest, setErdRequest] = useState<ErdWorkspaceRequest | null>(null);
+    const handleOpenErdEditor = useCallback(
+        (nodeId: string) => {
+            const wdb = nodes.find(n => n.id === nodeId);
+            if (!wdb) return;
+            const byId = new Map(nodes.map(n => [n.id, n]));
+            const sourceIds = Array.from(
+                new Set(edges.filter(e => e.target === nodeId).map(e => e.source)),
+            );
+            const tables: ErdTable[] = sourceIds.map(id => {
+                const s = byId.get(id);
+                return {
+                    name: (s?.data.alias || s?.data.label || id).toString(),
+                    columns: Array.isArray(s?.data.schema)
+                        ? s!.data.schema.map(c => ({
+                              name: c.name,
+                              type: c.type,
+                              nullable: c.nullable,
+                              primaryKey: (c as { primaryKey?: boolean }).primaryKey,
+                          }))
+                        : [],
+                };
+            });
+            const persisted = (wdb.data.properties as { erdModel?: ErdModel } | undefined)?.erdModel;
+            const model = buildErdModel(tables, persisted);
+            setErdRequest(r => ({
+                nonce: (r?.nonce ?? 0) + 1,
+                nodeId,
+                nodeName: (wdb.data.alias || wdb.data.label || wdb.id).toString(),
+                tables,
+                relationships: model.relationships,
+            }));
+            setMode('erd');
+        },
+        [nodes, edges, setMode],
+    );
     const handleSaveErd = useCallback(
-        (model: ErdModel) => {
-            if (!erdEditorNodeId) return;
+        (nodeId: string, model: ErdModel) => {
             setNodes(ns =>
                 ns.map(n =>
-                    n.id === erdEditorNodeId
+                    n.id === nodeId
                         ? {
                               ...n,
                               data: {
@@ -1555,9 +1559,9 @@ export default function App() {
                         : n,
                 ),
             );
-            setErdEditorNodeId(null);
+            setMode('canvas');
         },
-        [erdEditorNodeId, setNodes],
+        [setNodes, setMode],
     );
 
     const handleMapperSave = useCallback(
@@ -1686,6 +1690,11 @@ export default function App() {
         () => nodes.some(n => (n.data.componentId ?? '') === 'code.sqlstudio'),
         [nodes],
     );
+    // ER Model surface is code.workingdb-node-driven.
+    const hasWorkingDbNode = useMemo(
+        () => nodes.some(n => (n.data.componentId ?? '') === 'code.workingdb'),
+        [nodes],
+    );
     const hasInforNode = useMemo(
         () => nodes.some(n => (n.data.componentId ?? '') === 'src.infor'),
         [nodes],
@@ -1705,9 +1714,13 @@ export default function App() {
                 handleOpenSqlEditor(selectedNode!.id);
                 return;
             }
+            if (next === 'erd' && (selectedNode?.data.componentId ?? '') === 'code.workingdb') {
+                handleOpenErdEditor(selectedNode!.id);
+                return;
+            }
             setMode(next);
         },
-        [selectedNode, handleOpenPlayground, handleOpenSqlEditor, setMode],
+        [selectedNode, handleOpenPlayground, handleOpenSqlEditor, handleOpenErdEditor, setMode],
     );
 
     const openNewPipelineModal = useCallback((parentId: string = 'pipelines') => {
@@ -3152,6 +3165,8 @@ export default function App() {
                             return mode === 'playground' || hasInforNode;
                         // SQL Studio is code.sqlstudio-node-driven, same pattern.
                         if (m.id === 'sql') return mode === 'sql' || hasSqlStudioNode;
+                        // ER Model surface is code.workingdb-node-driven.
+                        if (m.id === 'erd') return mode === 'erd' || hasWorkingDbNode;
                         return true;
                     }}
                 />
@@ -3184,16 +3199,13 @@ export default function App() {
                         onRun={handleRunSqlEditor}
                     />
                 </div>
-                {erdEditorData && (
-                    <ErdEditor
-                        open
-                        nodeName={erdEditorData.nodeName}
-                        tables={erdEditorData.tables}
-                        initialRelationships={erdEditorData.relationships}
+                <div style={{ display: mode === 'erd' ? 'flex' : 'none', flex: 1, minWidth: 0 }}>
+                    <ErdWorkspace
+                        openRequest={erdRequest}
                         onSave={handleSaveErd}
-                        onClose={() => setErdEditorNodeId(null)}
+                        onClose={() => setMode('canvas')}
                     />
-                )}
+                </div>
                 {mode === 'canvas' && (
                   <>
                 <LeftSidebar

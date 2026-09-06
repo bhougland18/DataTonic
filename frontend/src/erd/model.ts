@@ -79,6 +79,14 @@ export function inferRelationships(tables: TableLike[]): ErdRelationship[] {
     return rels;
 }
 
+// Infer the join(s) between exactly two tables — used when the user draws an
+// edge table-to-table, so the correct key columns are chosen for them instead
+// of whatever columns the drag happened to land on.
+export function inferBetween(tables: TableLike[], a: string, b: string): ErdRelationship[] {
+    const pair = tables.filter(t => t.name === a || t.name === b);
+    return inferRelationships(pair);
+}
+
 // Build a model from tables, using a persisted model's relationships when
 // present (so user edits on the Working DB survive) and inferring otherwise.
 export function buildErdModel(tables: ErdTable[], persisted?: ErdModel | null): ErdModel {
