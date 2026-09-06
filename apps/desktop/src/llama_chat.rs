@@ -285,13 +285,16 @@ pub fn chat_stream<F: FnMut(ChatEvent)>(
     endpoint: &str,
     api_key: Option<&str>,
     model: &str,
+    // Override the default Duckie (pipeline) system prompt. The SQL Studio's
+    // text-to-SQL pane passes a SQL-focused prompt + the ERD/schema as context.
+    system: Option<&str>,
     history: &[ChatMessage],
     mut on_event: F,
 ) -> Result<(), String> {
     let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history.len() + 1);
     messages.push(serde_json::json!({
         "role": "system",
-        "content": SYSTEM_PROMPT,
+        "content": system.unwrap_or(SYSTEM_PROMPT),
     }));
     for m in history {
         messages.push(serde_json::json!({

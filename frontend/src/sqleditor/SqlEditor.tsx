@@ -10,6 +10,7 @@ import {
     Table2,
     Braces,
     Network,
+    Sparkles,
     AlertTriangle,
 } from 'lucide-react';
 import CodeMirror from '@uiw/react-codemirror';
@@ -21,6 +22,7 @@ import './sqleditor.css';
 import type { SqlEditorRequest, SqlEditorResult, SqlRunResult, SqlStudioTable } from './types';
 import type { ErdRelationship } from '../erd/model';
 import ErDiagram from '../erd/ErDiagram';
+import AiPane from './AiPane';
 
 // Theme the editor with the app's own tokens so it tracks Duckle's light/dark
 // mode automatically (var(--bg-1) etc. resolve per theme), instead of a fixed
@@ -78,7 +80,12 @@ type StudioTab = 'sql' | 'er';
 // studio: a working-DB catalog (left), a CodeMirror editor + live preview grid
 // (center). Runtime is identical to Inline SQL — "Apply to node" writes the SQL
 // back. See docs/plans/sql-editor-node.md.
-export default function SqlEditor({ openRequest, onApplyToNode, onRun }: SqlEditorProps) {
+export default function SqlEditor({
+    workspacePath,
+    openRequest,
+    onApplyToNode,
+    onRun,
+}: SqlEditorProps) {
     const [sqlText, setSqlText] = useState('');
     const [nodeId, setNodeId] = useState<string | null>(null);
     const [nodeName, setNodeName] = useState<string | undefined>(undefined);
@@ -86,6 +93,7 @@ export default function SqlEditor({ openRequest, onApplyToNode, onRun }: SqlEdit
     const [relationships, setRelationships] = useState<ErdRelationship[]>([]);
     const [fromWorkingDb, setFromWorkingDb] = useState(false);
     const [tab, setTab] = useState<StudioTab>('sql');
+    const [showAi, setShowAi] = useState(false);
     const [running, setRunning] = useState(false);
     const [result, setResult] = useState<SqlRunResult | null>(null);
     const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' } | null>(null);
@@ -228,6 +236,14 @@ export default function SqlEditor({ openRequest, onApplyToNode, onRun }: SqlEdit
                     <span className="sqlstudio-spacer" />
                     <button
                         type="button"
+                        className={`sqlstudio-btn${showAi ? ' sqlstudio-btn--on' : ''}`}
+                        onClick={() => setShowAi(v => !v)}
+                        title="Ask AI to write SQL (text-to-SQL)"
+                    >
+                        <Sparkles size={14} strokeWidth={2} /> Ask AI
+                    </button>
+                    <button
+                        type="button"
                         className="sqlstudio-btn"
                         onClick={run}
                         disabled={running || !onRun}
@@ -358,6 +374,17 @@ export default function SqlEditor({ openRequest, onApplyToNode, onRun }: SqlEdit
                     />
                 )}
             </div>
+            {showAi && (
+                <AiPane
+                    tables={tables}
+                    relationships={relationships}
+                    workspacePath={workspacePath}
+                    onInsert={sql => {
+                        setSqlText(sql);
+                        setResult(null);
+                    }}
+                />
+            )}
         </div>
     );
 }

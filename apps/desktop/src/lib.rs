@@ -1162,6 +1162,8 @@ async fn chat_send(
     history: Vec<ChatMessage>,
     on_event: Channel<ChatEvent>,
     workspace: Option<String>,
+    // Optional system-prompt override (SQL Studio text-to-SQL). None = Duckie.
+    system: Option<String>,
 ) -> Result<(), String> {
     // #92: route to an external OpenAI-compatible endpoint when one is
     // configured for this workspace, instead of booting the local Qwen model.
@@ -1171,7 +1173,7 @@ async fn chat_send(
         let model = model.unwrap_or_else(|| "gpt-4o-mini".to_string());
         return tokio::task::spawn_blocking(move || {
             if let Err(e) =
-                llama_chat::chat_stream(&endpoint, key.as_deref(), &model, &history, |evt| {
+                llama_chat::chat_stream(&endpoint, key.as_deref(), &model, system.as_deref(), &history, |evt| {
                     let _ = on_event.send(evt);
                 })
             {
@@ -1207,7 +1209,7 @@ async fn chat_send(
             }
         };
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
-        if let Err(e) = llama_chat::chat_stream(&url, None, "qwen2.5-coder", &history, |evt| {
+        if let Err(e) = llama_chat::chat_stream(&url, None, "qwen2.5-coder", system.as_deref(), &history, |evt| {
             let _ = on_event.send(evt);
         }) {
             let _ = on_event.send(ChatEvent::Error { message: e.clone() });

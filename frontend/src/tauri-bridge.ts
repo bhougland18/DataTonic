@@ -521,6 +521,8 @@ export async function chatSend(
     history: ChatMessage[],
     onEvent: (e: ChatEvent) => void,
     workspace?: string | null,
+    // Optional system-prompt override (SQL Studio text-to-SQL). Omit for Duckie.
+    system?: string | null,
 ): Promise<void> {
     if (!isTauri()) {
         onEvent({ kind: 'error', message: 'Chat is only available in the desktop app.' });
@@ -530,7 +532,12 @@ export async function chatSend(
     channel.onmessage = onEvent;
     try {
         // workspace lets the backend route to an external AI endpoint if configured (#92).
-        await invoke('chat_send', { history, onEvent: channel, workspace: workspace ?? null });
+        await invoke('chat_send', {
+            history,
+            onEvent: channel,
+            workspace: workspace ?? null,
+            system: system ?? null,
+        });
     } catch (err) {
         onEvent({ kind: 'error', message: String(err) });
     }
