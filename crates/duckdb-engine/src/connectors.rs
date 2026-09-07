@@ -2106,7 +2106,30 @@ impl DuckdbEngine {
         // Truncate + insert write mode (#138): clear existing rows but keep the
         // table (and its grants / indexes) before the plain-insert path. Only
         // for non-upsert writes; upsert has its own MERGE path below.
+        //
+        // Not on an empty upstream. Every other clearing sink checks this first
+        // and SnowflakeSinkSpec.truncate_first states the rule: "Only applied
+        // when there are rows to write. A run that produced nothing leaves the
+        // target alone rather than emptying it on the strength of an upstream
+        // that may simply have failed to produce." Only the COLUMNS were checked
+        // here, which an empty view still has, so a source that hiccuped or a
+        // filter that matched nothing emptied the Oracle table and put nothing
+        // back.
+        //
+        // LIMIT 1 rather than a count: the question is whether ANY row exists,
+        // and the rows are materialized further down anyway.
         if spec.upsert_keys.is_empty() && spec.mode == "truncate" {
+            let probe = format!(
+                "SELECT 1 FROM {} LIMIT 1",
+                plan::quote_ident(&spec.from_view)
+            );
+            let rows = self.run_rows(Some(db), &probe)?;
+            if rows.is_empty() {
+                return Ok(format!(
+                    "oracle: 0 rows upstream, left {} as it was",
+                    qualified
+                ));
+            }
             conn.execute(&format!("TRUNCATE TABLE {}", qualified), &[])
                 .map_err(|e| EngineError::Query(format!("oracle truncate: {}", e)))?;
         }

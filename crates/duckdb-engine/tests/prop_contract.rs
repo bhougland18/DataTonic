@@ -837,3 +837,74 @@ fn every_component_declares_at_least_one_key_its_builder_reads() {
          in changes nothing about the run: {deaf:#?}"
     );
 }
+
+/// A sink that CLEARS its target must check for rows before clearing it.
+///
+/// SnowflakeSinkSpec.truncate_first states the rule: "Only applied when there
+/// are rows to write. A run that produced nothing leaves the target alone
+/// rather than emptying it on the strength of an upstream that may simply have
+/// failed to produce." An upstream that returns nothing because a source
+/// hiccuped, a filter matched nothing or an API answered empty must not empty
+/// the table it was going to replace.
+///
+/// Six of the seven clearing sinks did this. run_oracle_sink checked only that
+/// the view had COLUMNS, then issued TRUNCATE TABLE, so an empty upstream wiped
+/// the Oracle table and inserted nothing in its place.
+///
+/// Read from the SOURCE rather than exercised, deliberately: these paths need a
+/// live Snowflake / Oracle / Db2 / Teradata to run, and run_oracle_sink sits
+/// behind `#[cfg(feature = "oracle")]` so no default test binary even compiles
+/// it. A source-level contract is the only check that covers all seven.
+#[test]
+fn a_sink_that_clears_its_target_checks_for_rows_first() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("connectors.rs");
+    let src = std::fs::read_to_string(&path).expect("connectors.rs");
+    let lines: Vec<&str> = src.lines().collect();
+
+    let sig = regex::Regex::new(r"^\s*pub\(crate\) fn (run_\w*sink\w*)\(").unwrap();
+    // Statements that empty or drop the thing being written to.
+    let clears =
+        regex::Regex::new(r"TRUNCATE TABLE|DELETE FROM|DROP TABLE|drop_collection|delete_many")
+            .unwrap();
+    // The guard every other sink uses: nothing came out of the upstream.
+    let guard = regex::Regex::new(r"rows\.is_empty\(\)|has_rows|no_rows").unwrap();
+
+    let mut starts: Vec<(String, usize)> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if let Some(c) = sig.captures(l) {
+            starts.push((c[1].to_string(), i));
+        }
+    }
+    assert!(
+        starts.len() >= 5,
+        "found only {} sink runners, so this check has stopped matching and a green \
+         result would mean nothing",
+        starts.len()
+    );
+
+    let mut unguarded: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for (n, (name, start)) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).map(|(_, e)| *e).unwrap_or(lines.len());
+        let body = &lines[*start..end];
+        let Some(clear_at) = body.iter().position(|l| clears.is_match(l)) else { continue };
+        checked += 1;
+        let guarded = body[..clear_at].iter().any(|l| guard.is_match(l));
+        if !guarded {
+            unguarded.push(format!(
+                "{name} clears the target at connectors.rs:{} with no check that the upstream \
+                 produced anything, so an empty run empties the table",
+                start + clear_at + 1
+            ));
+        }
+    }
+    assert!(checked >= 5, "only {checked} clearing sinks found; the pattern has drifted");
+    unguarded.sort();
+    assert!(
+        unguarded.is_empty(),
+        "sinks that clear their target without checking for rows:\n  {}",
+        unguarded.join("\n  ")
+    );
+}
