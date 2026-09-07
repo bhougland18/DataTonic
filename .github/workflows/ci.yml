@@ -47,6 +47,12 @@ jobs:
       - name: Every visibleWhen condition is satisfiable
         run: npm --prefix frontend run check-visible-when
 
+      # A value the engine redacts from logs and refuses on deploy must not sit
+      # on screen in the clear. The needles come from the Rust source, so the
+      # two cannot drift apart quietly.
+      - name: Every credential field is masked
+        run: npm --prefix frontend run check-secret-fields
+
       - name: Catalog is in sync with the manifests
         run: |
           npm --prefix frontend run export-catalog

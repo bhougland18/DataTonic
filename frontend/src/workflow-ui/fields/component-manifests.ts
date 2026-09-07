@@ -1667,6 +1667,66 @@ function withDeadLetter(id: string, m: ComponentManifest): ComponentManifest {
     return { ...m, sections: [...m.sections, { label: 'Bad rows', fields: deadLetterFields() }] };
 }
 
+/// Property keys whose VALUE is a credential.
+///
+/// Mirrors the engine's `is_secret_prop_key` (crates/duckdb-engine/src/util.rs),
+/// which decides what is redacted from run logs and refused on deploy. A value
+/// the engine calls a secret should not sit on screen in the clear - in a
+/// screen share, a screenshot or over a shoulder.
+///
+/// Three groups are deliberately absent, and each is a value the reader NEEDS
+/// to see:
+///   - paths (`privateKeyPath`, `credentialsPath`) - the point of the field is
+///     which file, and a masked path cannot be checked for a typo;
+///   - identifiers (`accessKeyId`) - AWS publishes these in ARNs; the matching
+///     `secretAccessKey` is the secret;
+///   - endpoints and mechanisms (`tokenUrl`, `saslMechanism`, `saslUsername`),
+///     which the engine no longer treats as credentials either.
+const CREDENTIAL_KEYS = new Set([
+    'password',
+    'passwd',
+    'passphrase',
+    'keyPassphrase',
+    'saslPassword',
+    'apiKey',
+    'authToken',
+    'accessToken',
+    'sessionToken',
+    'token',
+    'pat',
+    'accessKey',
+    'secretKey',
+    'secretAccessKey',
+    'clientSecret',
+    'privateKey',
+    'connectionString',
+]);
+
+/// Mask credential inputs, in one place rather than on ~50 declarations.
+///
+/// Setting `secret: true` field by field is how the flag ends up on some and
+/// not others: `password` was declared by 46 fields and marked on one. This
+/// runs over whatever the manifest produced, so a new component gets it for
+/// free and cannot forget.
+///
+/// Only `text` honours the flag - `TextField` is the sole renderer with a
+/// masked input. An `expression` field carrying a PEM or a connection string
+/// stays visible, because setting a flag its renderer ignores would be another
+/// control that claims to do something and does not.
+function withMaskedCredentials(m: ComponentManifest): ComponentManifest {
+    let changed = false;
+    const sections = m.sections.map(section => ({
+        ...section,
+        fields: section.fields.map(field => {
+            if (field.secret || field.kind !== 'text') return field;
+            if (!CREDENTIAL_KEYS.has(field.key)) return field;
+            changed = true;
+            return { ...field, secret: true };
+        }),
+    }));
+    return changed ? { ...m, sections } : m;
+}
+
 export function getManifest(componentId: string | undefined): ComponentManifest | undefined {
     if (!componentId) return undefined;
     // #307: an external component's form comes from its own manifest. Checked
@@ -1680,10 +1740,12 @@ export function getManifest(componentId: string | undefined): ComponentManifest 
     }
     const built = MANIFESTS[componentId] ?? synthesizeManifest(componentId);
     const m = built
-        ? withoutFanOut(
-              withoutGraphqlPaging(
-                  componentId,
-                  withCloudReadOptions(componentId, withDeadLetter(componentId, built)),
+        ? withMaskedCredentials(
+              withoutFanOut(
+                  withoutGraphqlPaging(
+                      componentId,
+                      withCloudReadOptions(componentId, withDeadLetter(componentId, built)),
+                  ),
               ),
           )
         : built;

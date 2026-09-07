@@ -10,6 +10,7 @@
     "lint": "tsc --noEmit",
     "export-catalog": "node scripts/build-catalog.mjs",
     "check-visible-when": "node scripts/check-visible-when.mjs",
+    "check-secret-fields": "node scripts/check-secret-fields.mjs",
     "gen-icons": "node scripts/gen-brand-icons.mjs"
   },
   "dependencies": {

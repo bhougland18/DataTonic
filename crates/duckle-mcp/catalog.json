@@ -1064,7 +1064,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "privateKey",
@@ -1076,7 +1077,8 @@
                 "key": "keyPassphrase",
                 "label": "Key passphrase",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -1100,20 +1102,23 @@
                 "key": "accessKey",
                 "label": "Access key",
                 "kind": "text",
-                "description": "For an s3:// URI. Pick a saved S3 connection instead and these are filled from it at run time, which keeps the credential out of the pipeline file."
+                "description": "For an s3:// URI. Pick a saved S3 connection instead and these are filled from it at run time, which keeps the credential out of the pipeline file.",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "Session token",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "For temporary STS credentials."
+                "description": "For temporary STS credentials.",
+                "secret": true
               },
               {
                 "key": "region",
@@ -1601,19 +1606,22 @@
                 "key": "accessKey",
                 "label": "S3 access key",
                 "kind": "text",
-                "description": "For s3:// documents. Pick a saved S3 connection instead and these fill from it at run time. A PDF has to be read as a FILE - its cross-reference table is at the end - so a remote document is fetched to a temporary file, one at a time, and removed as soon as it has been parsed."
+                "description": "For s3:// documents. Pick a saved S3 connection instead and these fill from it at run time. A PDF has to be read as a FILE - its cross-reference table is at the end - so a remote document is fetched to a temporary file, one at a time, and removed as soon as it has been parsed.",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "S3 secret key",
                 "kind": "text",
-                "placeholder": "secret"
+                "placeholder": "secret",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "S3 session token",
                 "kind": "text",
-                "placeholder": "token"
+                "placeholder": "token",
+                "secret": true
               },
               {
                 "key": "region",
@@ -1683,7 +1691,8 @@
                 "key": "password",
                 "label": "SFTP password",
                 "kind": "text",
-                "placeholder": "password"
+                "placeholder": "password",
+                "secret": true
               },
               {
                 "key": "privateKey",
@@ -1695,7 +1704,8 @@
                 "key": "keyPassphrase",
                 "label": "SFTP key passphrase",
                 "kind": "text",
-                "placeholder": "passphrase"
+                "placeholder": "passphrase",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -1921,19 +1931,22 @@
                 "key": "accessKey",
                 "label": "S3 access key",
                 "kind": "text",
-                "description": "For s3:// documents. Pick a saved S3 connection instead and these fill from it at run time. A PDF has to be read as a FILE - its cross-reference table is at the end - so a remote document is fetched to a temporary file, one at a time, and removed as soon as it has been parsed."
+                "description": "For s3:// documents. Pick a saved S3 connection instead and these fill from it at run time. A PDF has to be read as a FILE - its cross-reference table is at the end - so a remote document is fetched to a temporary file, one at a time, and removed as soon as it has been parsed.",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "S3 secret key",
                 "kind": "text",
-                "placeholder": "secret"
+                "placeholder": "secret",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "S3 session token",
                 "kind": "text",
-                "placeholder": "token"
+                "placeholder": "token",
+                "secret": true
               },
               {
                 "key": "region",
@@ -2003,7 +2016,8 @@
                 "key": "password",
                 "label": "SFTP password",
                 "kind": "text",
-                "placeholder": "password"
+                "placeholder": "password",
+                "secret": true
               },
               {
                 "key": "privateKey",
@@ -2015,7 +2029,8 @@
                 "key": "keyPassphrase",
                 "label": "SFTP key passphrase",
                 "kind": "text",
-                "placeholder": "passphrase"
+                "placeholder": "passphrase",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -2354,20 +2369,23 @@
                 "label": "SFTP password",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Only used when the path is an sftp:// URL. Leave blank for local files or http(s):// URLs."
+                "description": "Only used when the path is an sftp:// URL. Leave blank for local files or http(s):// URLs.",
+                "secret": true
               },
               {
                 "key": "privateKey",
                 "label": "SFTP private key (PEM)",
                 "kind": "text",
                 "placeholder": "-----BEGIN OPENSSH PRIVATE KEY-----",
-                "description": "OpenSSH private key for SFTP key-based auth (instead of a password). You can also set privateKeyPath to a key file."
+                "description": "OpenSSH private key for SFTP key-based auth (instead of a password). You can also set privateKeyPath to a key file.",
+                "secret": true
               },
               {
                 "key": "keyPassphrase",
                 "label": "SFTP key passphrase",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -2427,19 +2445,22 @@
                 "key": "accessKey",
                 "label": "S3 access key",
                 "kind": "text",
-                "description": "For s3:// documents. Pick a saved S3 connection instead and these fill from it at run time. A PDF has to be read as a FILE - its cross-reference table is at the end - so a remote document is fetched to a temporary file, one at a time, and removed as soon as it has been parsed."
+                "description": "For s3:// documents. Pick a saved S3 connection instead and these fill from it at run time. A PDF has to be read as a FILE - its cross-reference table is at the end - so a remote document is fetched to a temporary file, one at a time, and removed as soon as it has been parsed.",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "S3 secret key",
                 "kind": "text",
-                "placeholder": "secret"
+                "placeholder": "secret",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "S3 session token",
                 "kind": "text",
-                "placeholder": "token"
+                "placeholder": "token",
+                "secret": true
               },
               {
                 "key": "region",
@@ -2509,7 +2530,8 @@
                 "key": "password",
                 "label": "SFTP password",
                 "kind": "text",
-                "placeholder": "password"
+                "placeholder": "password",
+                "secret": true
               },
               {
                 "key": "privateKey",
@@ -2521,7 +2543,8 @@
                 "key": "keyPassphrase",
                 "label": "SFTP key passphrase",
                 "kind": "text",
-                "placeholder": "passphrase"
+                "placeholder": "passphrase",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -4846,7 +4869,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -5070,7 +5094,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -5212,7 +5237,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -5348,7 +5374,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "database",
@@ -5451,7 +5478,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -5574,7 +5602,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "useSsl",
@@ -5783,7 +5812,8 @@
                 "key": "authToken",
                 "label": "Auth token",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "tableName",
@@ -5944,7 +5974,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "database",
@@ -6043,7 +6074,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -6360,7 +6392,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "database",
@@ -6378,7 +6411,8 @@
                 "label": "ODBC connection string (optional)",
                 "kind": "text",
                 "placeholder": "DRIVER={Teradata Database ODBC Driver 17.20};DBCNAME=...;UID=...;PWD=...",
-                "description": "Full ODBC connection string. When set, it is used verbatim and every field above is ignored."
+                "description": "Full ODBC connection string. When set, it is used verbatim and every field above is ignored.",
+                "secret": true
               }
             ]
           },
@@ -6492,7 +6526,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -6602,7 +6637,8 @@
                 "key": "pat",
                 "label": "Personal Access Token (PAT mode)",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "user",
@@ -6831,7 +6867,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -6999,7 +7036,8 @@
                 "label": "Personal Access Token",
                 "kind": "text",
                 "required": true,
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "warehouseId",
@@ -7124,7 +7162,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "database",
@@ -7221,7 +7260,8 @@
                 "key": "token",
                 "label": "MotherDuck token",
                 "kind": "text",
-                "description": "Optional. If empty, MOTHERDUCK_TOKEN from the environment is used."
+                "description": "Optional. If empty, MOTHERDUCK_TOKEN from the environment is used.",
+                "secret": true
               },
               {
                 "key": "mode",
@@ -7320,7 +7360,8 @@
                 "label": "Token",
                 "kind": "text",
                 "placeholder": "super_secret",
-                "description": "Auth token; matches the value passed to quack_serve(token=...). Leave empty for unauthenticated test servers."
+                "description": "Auth token; matches the value passed to quack_serve(token=...). Leave empty for unauthenticated test servers.",
+                "secret": true
               }
             ]
           },
@@ -7428,7 +7469,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "${ENV:GIZMOSQL_PASSWORD}"
+                "placeholder": "${ENV:GIZMOSQL_PASSWORD}",
+                "secret": true
               },
               {
                 "key": "tls",
@@ -7549,13 +7591,15 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "region",
@@ -7776,18 +7820,21 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "Session token",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -8093,18 +8140,21 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "Session token",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -8410,18 +8460,21 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "Session token",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -8727,18 +8780,21 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "Session token",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -9044,18 +9100,21 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "Session token",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -9422,7 +9481,8 @@
                 "key": "saslPassword",
                 "label": "SASL password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -9613,7 +9673,8 @@
                 "key": "saslPassword",
                 "label": "SASL password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -9790,7 +9851,8 @@
                 "key": "saslPassword",
                 "label": "SASL password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -10225,7 +10287,8 @@
                 "key": "saslPassword",
                 "label": "SASL password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -10567,7 +10630,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -11044,7 +11108,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -11369,7 +11434,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -11829,7 +11895,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -12250,7 +12317,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -12710,7 +12778,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -13141,7 +13210,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -13572,7 +13642,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -13973,7 +14044,8 @@
                 "key": "password",
                 "label": "Password (optional)",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "keyspace",
@@ -14056,7 +14128,8 @@
                 "key": "password",
                 "label": "Password (optional)",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "keyspace",
@@ -14128,7 +14201,8 @@
                 "label": "Connection URL",
                 "kind": "text",
                 "required": true,
-                "placeholder": "redis://default:pass@host:6379/0"
+                "placeholder": "redis://default:pass@host:6379/0",
+                "secret": true
               },
               {
                 "key": "keyPattern",
@@ -14300,7 +14374,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "cypher",
@@ -14378,7 +14453,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -14500,7 +14576,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -14708,7 +14785,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -15077,7 +15155,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -15095,13 +15174,15 @@
                 "label": "Private key (PEM)",
                 "kind": "text",
                 "placeholder": "-----BEGIN OPENSSH PRIVATE KEY-----",
-                "description": "Paste the key instead of naming a file. Takes precedence over the file above."
+                "description": "Paste the key instead of naming a file. Takes precedence over the file above.",
+                "secret": true
               },
               {
                 "key": "keyPassphrase",
                 "label": "Key passphrase",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -15274,7 +15355,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -15679,7 +15761,8 @@
                 "label": "Password",
                 "kind": "text",
                 "required": true,
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "mailbox",
@@ -15904,7 +15987,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -16056,7 +16140,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "collection",
@@ -16341,7 +16426,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "collection",
@@ -16637,7 +16723,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "for db:// LanceDB Cloud"
+                "placeholder": "for db:// LanceDB Cloud",
+                "secret": true
               },
               {
                 "key": "region",
@@ -21149,7 +21236,8 @@
                 "key": "password",
                 "label": "SFTP password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "privateKey",
@@ -21161,7 +21249,8 @@
                 "key": "keyPassphrase",
                 "label": "Key passphrase",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -21178,19 +21267,22 @@
                 "key": "accessKey",
                 "label": "Access key",
                 "kind": "text",
-                "description": "Used for whichever side is s3://, source or destination. Pick a saved S3 connection instead and these fill from it at run time. One credential set: copying between two different S3 accounts is not supported here."
+                "description": "Used for whichever side is s3://, source or destination. Pick a saved S3 connection instead and these fill from it at run time. One credential set: copying between two different S3 accounts is not supported here.",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "Session token",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "region",
@@ -21415,19 +21507,22 @@
                 "key": "accessKey",
                 "label": "Access key",
                 "kind": "text",
-                "description": "Used for whichever side is s3://, the archive or the destination. Pick a saved S3 connection instead and these fill from it at run time."
+                "description": "Used for whichever side is s3://, the archive or the destination. Pick a saved S3 connection instead and these fill from it at run time.",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "secret"
+                "placeholder": "secret",
+                "secret": true
               },
               {
                 "key": "sessionToken",
                 "label": "Session token",
                 "kind": "text",
-                "placeholder": "token"
+                "placeholder": "token",
+                "secret": true
               },
               {
                 "key": "region",
@@ -21496,7 +21591,8 @@
                 "key": "password",
                 "label": "SFTP password",
                 "kind": "text",
-                "placeholder": "password"
+                "placeholder": "password",
+                "secret": true
               },
               {
                 "key": "privateKey",
@@ -21508,7 +21604,8 @@
                 "key": "keyPassphrase",
                 "label": "SFTP key passphrase",
                 "kind": "text",
-                "placeholder": "passphrase"
+                "placeholder": "passphrase",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -27288,7 +27385,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "outputColumn",
@@ -27460,7 +27558,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "baseUrl",
@@ -27904,7 +28003,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "outputColumn",
@@ -31117,7 +31217,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -31129,7 +31230,8 @@
                 "label": "Private key (PEM)",
                 "kind": "text",
                 "placeholder": "-----BEGIN OPENSSH PRIVATE KEY-----",
-                "description": "OpenSSH private key for SFTP key-based auth (instead of a password)."
+                "description": "OpenSSH private key for SFTP key-based auth (instead of a password).",
+                "secret": true
               },
               {
                 "key": "privateKeyPath",
@@ -31141,7 +31243,8 @@
                 "key": "keyPassphrase",
                 "label": "Key passphrase",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "hostFingerprint",
@@ -31570,7 +31673,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -31829,7 +31933,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -32088,7 +32193,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -32272,7 +32378,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -32450,7 +32557,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "database",
@@ -32644,7 +32752,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -32787,7 +32896,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "dsn",
@@ -32800,7 +32910,8 @@
                 "label": "ODBC connection string (optional)",
                 "kind": "text",
                 "placeholder": "DRIVER={Teradata Database ODBC Driver 17.20};DBCNAME=...;UID=...;PWD=...",
-                "description": "Full ODBC connection string. When set, it is used verbatim and every field above is ignored."
+                "description": "Full ODBC connection string. When set, it is used verbatim and every field above is ignored.",
+                "secret": true
               }
             ]
           },
@@ -32905,7 +33016,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "useSsl",
@@ -33179,7 +33291,8 @@
                 "key": "authToken",
                 "label": "Auth token",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "tableName",
@@ -33424,7 +33537,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "database",
@@ -33530,7 +33644,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "connString",
@@ -33660,7 +33775,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -33810,7 +33926,8 @@
                 "key": "token",
                 "label": "MotherDuck token",
                 "kind": "text",
-                "description": "Optional. If empty, MOTHERDUCK_TOKEN from the environment is used."
+                "description": "Optional. If empty, MOTHERDUCK_TOKEN from the environment is used.",
+                "secret": true
               },
               {
                 "key": "schemaName",
@@ -33959,7 +34076,8 @@
                 "label": "Token",
                 "kind": "text",
                 "placeholder": "super_secret",
-                "description": "Auth token; matches the value passed to quack_serve(token=...)."
+                "description": "Auth token; matches the value passed to quack_serve(token=...).",
+                "secret": true
               }
             ]
           },
@@ -34098,7 +34216,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "${ENV:GIZMOSQL_PASSWORD}"
+                "placeholder": "${ENV:GIZMOSQL_PASSWORD}",
+                "secret": true
               },
               {
                 "key": "tls",
@@ -34209,7 +34328,8 @@
                 "label": "Personal Access Token (PAT mode)",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Required when Auth type is PAT."
+                "description": "Required when Auth type is PAT.",
+                "secret": true
               },
               {
                 "key": "user",
@@ -34539,7 +34659,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -34762,7 +34883,8 @@
                 "label": "Personal Access Token",
                 "kind": "text",
                 "required": true,
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "warehouseId",
@@ -34934,7 +35056,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "database",
@@ -35663,13 +35786,15 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "region",
@@ -35897,13 +36022,15 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -36104,13 +36231,15 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -36311,13 +36440,15 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -36518,13 +36649,15 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -36725,13 +36858,15 @@
               {
                 "key": "accessKey",
                 "label": "Access key",
-                "kind": "text"
+                "kind": "text",
+                "secret": true
               },
               {
                 "key": "secretKey",
                 "label": "Secret key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "connectionRef",
@@ -37645,7 +37780,8 @@
                 "key": "authToken",
                 "label": "Token",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -37809,7 +37945,8 @@
                 "key": "authToken",
                 "label": "Token",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -38181,7 +38318,8 @@
                 "key": "authToken",
                 "label": "Token",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -38477,7 +38615,8 @@
                 "key": "password",
                 "label": "Password (optional)",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "keyspace",
@@ -38554,7 +38693,8 @@
                 "key": "password",
                 "label": "Password (optional)",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "keyspace",
@@ -38620,7 +38760,8 @@
                 "label": "Connection URL",
                 "kind": "text",
                 "required": true,
-                "placeholder": "redis://localhost:6379"
+                "placeholder": "redis://localhost:6379",
+                "secret": true
               },
               {
                 "key": "keyColumn",
@@ -38713,7 +38854,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "label",
@@ -38801,7 +38943,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -38873,7 +39016,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -38965,7 +39109,8 @@
                 "key": "password",
                 "label": "Password",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -39190,7 +39335,8 @@
                 "label": "API key",
                 "kind": "text",
                 "required": true,
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -39262,7 +39408,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -39327,7 +39474,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -39391,7 +39539,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               },
               {
                 "key": "collection",
@@ -39545,7 +39694,8 @@
                 "key": "apiKey",
                 "label": "API key (Bearer)",
                 "kind": "text",
-                "placeholder": "••••••••"
+                "placeholder": "••••••••",
+                "secret": true
               }
             ]
           },
@@ -39704,7 +39854,8 @@
                 "key": "apiKey",
                 "label": "API key",
                 "kind": "text",
-                "placeholder": "for db:// LanceDB Cloud"
+                "placeholder": "for db:// LanceDB Cloud",
+                "secret": true
               },
               {
                 "key": "region",
@@ -45150,7 +45301,8 @@
                     "key": "authType",
                     "equals": "bearer"
                   }
-                ]
+                ],
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -45789,7 +45941,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -46220,7 +46373,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -46651,7 +46805,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -47082,7 +47237,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -47513,7 +47669,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -47944,7 +48101,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -48375,7 +48533,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -48806,7 +48965,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -49237,7 +49397,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -49668,7 +49829,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -50099,7 +50261,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -50530,7 +50693,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -50961,7 +51125,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -51375,7 +51540,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -51700,7 +51866,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -52084,7 +52251,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -52474,7 +52642,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -52905,7 +53074,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -53319,7 +53489,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -53650,7 +53821,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -54081,7 +54253,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -54512,7 +54685,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -54943,7 +55117,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -55374,7 +55549,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -55805,7 +55981,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -56236,7 +56413,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
@@ -56667,7 +56845,8 @@
                 "label": "Token / API key",
                 "kind": "text",
                 "placeholder": "••••••••",
-                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON."
+                "description": "Bearer: the token. API key: the key. Basic: user:password, which is base64-encoded for you, so do not paste an already-encoded value. Use ${ENV:...} to keep the secret out of the pipeline JSON.",
+                "secret": true
               },
               {
                 "key": "authHeader",
