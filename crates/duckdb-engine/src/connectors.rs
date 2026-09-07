@@ -2551,6 +2551,18 @@ impl DuckdbEngine {
             }
             count += 1;
             if count % 25_000 == 0 {
+                // Stop has to be felt DURING the fetch. An Oracle extract is
+                // the longest single thing this engine does - minutes on a
+                // multi-million-row table - and this streaming path checked
+                // nothing, so Cancel did not take effect until the whole
+                // result set had been drained. The Arrow path beside it
+                // (oracle_write_parquet_part) already checks per batch.
+                //
+                // On the existing progress cadence rather than per row: the
+                // check is one relaxed atomic load, but so is the branch it
+                // rides on, and 25k rows of a prefetched buffer is well under
+                // a second.
+                self.check_cancelled()?;
                 mark(&format!("fetched {} rows", count));
             }
         }
