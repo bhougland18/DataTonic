@@ -26,6 +26,24 @@ for (const category of PALETTE) {
     for (const group of category.groups) components.push(...group.components);
 }
 
+// Deliberately unreachable, with a reason.
+//
+// A generic condition can be correct and still never fire on one component,
+// when that component narrows the controlling field's options. Dropping the
+// field is NOT the fix: the property has to stay declared, because
+// `duckle-runner validate` reads the same manifests and fails an undeclared
+// property with "does not read <key>" - so removing it would reject a
+// hand-authored pipeline the engine still honours.
+//
+// Anything added here needs that second half to be true: the engine reads the
+// property, and only the route through this component's form is closed.
+const DELIBERATE = new Set([
+    // src.salesforce offers bearer and OAuth client credentials only, so
+    // "show under API-key auth" never fires. api_key_header() still reads
+    // authHeader if a pipeline sets authType = apikey by hand.
+    'src.salesforce.authHeader',
+]);
+
 const problems = [];
 let conditions = 0;
 
@@ -83,7 +101,7 @@ for (const component of components) {
                 if (!allowed) continue;
 
                 const impossible = wanted.map(String).filter(w => !allowed.includes(w));
-                if (impossible.length) {
+                if (impossible.length && !DELIBERATE.has(where)) {
                     problems.push(
                         `${where}: waits for ${cond.key}=${JSON.stringify(impossible)}, but ` +
                             `${cond.key} can only be ${JSON.stringify(allowed)} - the field ` +
@@ -98,6 +116,9 @@ for (const component of components) {
 console.log(
     `check-visible-when: ${conditions} conditions across ${components.length} components`,
 );
+if (DELIBERATE.size) {
+    console.log(`deliberately unreachable, by name: ${[...DELIBERATE].join(', ')}`);
+}
 if (problems.length) {
     console.error(`\n${problems.length} unsatisfiable condition(s):\n`);
     for (const p of problems) console.error(`  ${p}`);

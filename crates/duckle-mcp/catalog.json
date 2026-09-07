@@ -45153,6 +45153,23 @@
                 ]
               },
               {
+                "key": "authHeader",
+                "label": "API key header",
+                "kind": "text",
+                "placeholder": "X-API-Key",
+                "description": "Header name for API key auth (e.g. X-API-Key or X-Redmine-API-Key). Used only when Auth type is API key; leave blank to default to X-API-Key.",
+                "visibleWhen": [
+                  {
+                    "key": "connectionRef",
+                    "empty": true
+                  },
+                  {
+                    "key": "authType",
+                    "equals": "apikey"
+                  }
+                ]
+              },
+              {
                 "key": "loginUrl",
                 "label": "Login URL",
                 "kind": "text",

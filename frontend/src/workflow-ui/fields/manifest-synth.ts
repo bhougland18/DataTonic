@@ -4635,24 +4635,25 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                         ? { visibleWhen: [whenNoConnection(), { key: 'authType', equals: 'bearer' }] }
                         : {}),
                 },
-                // Salesforce has no API-key header auth - its Auth type offers
-                // bearer and OAuth client credentials only - so the field is
-                // omitted there rather than carried with a condition on
-                // `apikey`, a value that dropdown cannot produce. Same result,
-                // but "never shown" now reads as never shown instead of as a
-                // condition someone has to evaluate to discover is impossible.
-                ...(isSalesforce
-                    ? []
-                    : [
-                          {
-                              key: 'authHeader',
-                              label: 'API key header',
-                              kind: 'text' as const,
-                              placeholder: 'X-API-Key',
-                              description:
-                                  'Header name for API key auth (e.g. X-API-Key or X-Redmine-API-Key). Used only when Auth type is API key; leave blank to default to X-API-Key.',
-                          },
-                      ]),
+                {
+                    key: 'authHeader',
+                    label: 'API key header',
+                    kind: 'text',
+                    placeholder: 'X-API-Key',
+                    description: 'Header name for API key auth (e.g. X-API-Key or X-Redmine-API-Key). Used only when Auth type is API key; leave blank to default to X-API-Key.',
+                    // Salesforce's Auth type offers bearer and OAuth client
+                    // credentials only, so this never shows there. The
+                    // condition is still the right one - "only under API-key
+                    // auth" - and it stays rather than the field being dropped,
+                    // because the property must remain DECLARED: the engine
+                    // honours it if a hand-authored pipeline sets
+                    // authType = apikey, and an undeclared property fails
+                    // `duckle-runner validate` with "does not read authHeader".
+                    // check-visible-when knows about this pair by name.
+                    ...(isSalesforce
+                        ? { visibleWhen: [whenNoConnection(), { key: 'authType', equals: 'apikey' }] }
+                        : {}),
+                },
                 ...(isSalesforce
                     ? [
                           { key: 'loginUrl', label: 'Login URL', kind: 'text' as const, placeholder: 'https://acme.my.salesforce.com', description: 'Your My Domain base. Mints a fresh token per run at {loginUrl}/services/oauth2/token so you stop pasting an expiring token (#166).', visibleWhen: [whenNoConnection(), { key: 'authType', equals: 'oauth_client_credentials' }] },
