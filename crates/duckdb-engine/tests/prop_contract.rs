@@ -908,3 +908,79 @@ fn a_sink_that_clears_its_target_checks_for_rows_first() {
         unguarded.join("\n  ")
     );
 }
+
+/// A field the FORM presents as a secret must be one the redactor recognises.
+///
+/// `is_secret_prop_key` drives two protections. `collect_secrets` scrubs values
+/// out of connect errors before they reach, in lib.rs's own words, "the UI,
+/// run-history JSON, and NDJSON run logs"; `literal_secrets` is what
+/// `duckle-runner build` uses to refuse to package a pipeline carrying a
+/// credential in the clear. A key the predicate does not know gets neither.
+///
+/// The two lists are written in different places - the bullet placeholder in
+/// the manifest, the needle list in util.rs - so they drift. `keyPassphrase`
+/// had: the editor showed it as ●●●●●●●● on snk.ftp, src.ftp, src.changed,
+/// src.xml and xf.artifact.copy, and the passphrase protecting an SSH private
+/// key was the one credential of the twelve that was neither scrubbed from a
+/// log nor blocked at packaging.
+#[test]
+fn every_field_the_form_calls_a_secret_is_one_the_redactor_knows() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("duckle-mcp")
+        .join("catalog.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("catalog")).expect("json");
+
+    // The two ways a manifest says "this is a credential": the explicit flag,
+    // and the bullet placeholder the text field renders as a password box.
+    const BULLETS: &str = "••••••••";
+    fn walk(n: &serde_json::Value, out: &mut BTreeSet<String>) {
+        match n {
+            serde_json::Value::Object(m) => {
+                if let Some(k) = m.get("key").and_then(|k| k.as_str()) {
+                    let flagged = m.get("secret").and_then(|s| s.as_bool()).unwrap_or(false);
+                    let bulleted =
+                        m.get("placeholder").and_then(|p| p.as_str()) == Some(BULLETS);
+                    if flagged || bulleted {
+                        out.insert(k.to_string());
+                    }
+                }
+                for x in m.values() {
+                    walk(x, out);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    walk(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut marked: BTreeSet<String> = BTreeSet::new();
+    for c in v["components"].as_array().expect("components") {
+        if c["availability"].as_str() != Some("available") {
+            continue;
+        }
+        walk(&c["manifest"], &mut marked);
+    }
+    assert!(
+        marked.len() >= 8,
+        "only {} secret-marked fields found, so this check has stopped matching and a \
+         green result would mean nothing",
+        marked.len()
+    );
+
+    let unprotected: Vec<&String> = marked
+        .iter()
+        .filter(|k| !duckle_duckdb_engine::is_secret_prop_key(k))
+        .collect();
+    assert!(
+        unprotected.is_empty(),
+        "the editor shows these as secrets and is_secret_prop_key does not know them, so \
+         their values are neither scrubbed from run logs nor blocked at packaging: \
+         {unprotected:?}"
+    );
+}

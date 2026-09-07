@@ -21,7 +21,7 @@ pub fn is_secret_prop_key(key: &str) -> bool {
         return true;
     }
     [
-        "password", "passwd", "secret", "token", "apikey", "api_key",
+        "password", "passwd", "passphrase", "secret", "token", "apikey", "api_key",
         "privatekey", "private_key", "accesskey", "access_key",
         "clientsecret", "client_secret", "connectionstring", "connection_string",
         "sas", "credential",
