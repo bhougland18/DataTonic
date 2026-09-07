@@ -418,7 +418,15 @@ fn is_reserved_param(name: &str) -> bool {
     // these is not filling in a parameter, it is redefining a builtin: overriding
     // ${workspace} or ${projectroot} repoints every path the pipeline reads and
     // writes, and ${ENV:...} is meant to come from secrets, never from the request.
-    name.starts_with("ENV:") || name == "workspace" || name == "projectroot" || is_time_builtin(name)
+    // ${VAULT:...} is the same statement about the vault, and it was missing: the
+    // run-time passes happen to resolve the vault before parameters on every
+    // surface today, so nothing could be overridden, but "the same set" has to
+    // actually be the same set or the next reordering makes it untrue.
+    name.starts_with("ENV:")
+        || name.starts_with("VAULT:")
+        || name == "workspace"
+        || name == "projectroot"
+        || is_time_builtin(name)
 }
 
 /// Substitute caller-supplied `${KEY}` values into node properties.
@@ -653,12 +661,17 @@ fn collect_param_names(
 ) {
     // Path builtins resolved automatically; the date/time family (including
     // offset forms like date+1d, #191) is excluded via is_time_builtin.
+    // ENV: and VAULT: are both fetched at run time from somewhere the pipeline
+    // author is not meant to reach - the process environment and the host's
+    // DUCKLE_VAULT_COMMAND. Offering either as a parameter asks the author to
+    // type the credential the mechanism exists to keep out of the pipeline.
     const PATH_BUILTINS: [&str; 2] = ["workspace", "projectroot"];
     match value {
         JsonValue::String(s) => {
             for caps in re.captures_iter(s) {
                 let name = caps[1].trim();
                 if name.starts_with("ENV:")
+                    || name.starts_with("VAULT:")
                     || PATH_BUILTINS.contains(&name)
                     || is_time_builtin(name)
                 {
@@ -1482,6 +1495,30 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a_vault_reference_is_not_a_run_parameter() {
+        // ${VAULT:NAME} is fetched at run time by apply_vault from the host's
+        // DUCKLE_VAULT_COMMAND. Offering it as a parameter asks the pipeline's
+        // AUTHOR to type the credential the vault exists to keep out of their
+        // hands - and on the desktop the typed value is substituted in the
+        // frontend, so apply_vault then finds no placeholder and the vault is
+        // never consulted at all.
+        let doc: crate::PipelineDoc = serde_json::from_str(
+            r#"{"nodes":[{"id":"s","position":{"x":0,"y":0},"data":{"label":"P","componentId":"snk.parquet","properties":{"password":"${VAULT:PROD_DB_PW}","path":"out/${REGION}.parquet"}}}],"edges":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(super::discover_parameters(&doc), vec!["REGION".to_string()]);
+    }
+
+    #[test]
+    fn a_vault_reference_cannot_be_supplied_as_a_parameter() {
+        // is_reserved_param documents itself as "exactly what
+        // discover_parameters refuses to offer", so the two have to agree.
+        assert!(super::is_reserved_param("VAULT:PROD_DB_PW"));
+        assert!(super::is_reserved_param("ENV:PROD_DB_PW"));
+        assert!(!super::is_reserved_param("REGION"));
+    }
+
     fn discover_parameters_excludes_offset_builtins() {
         // #191: date+1d / now-2h are builtins, not user parameters.
         let doc: crate::PipelineDoc = serde_json::from_str(

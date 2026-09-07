@@ -290,7 +290,13 @@ export function discoverParams(
         if (typeof value === 'string') {
             for (const m of value.matchAll(/\$\{([^}]+)\}/g)) {
                 const key = String(m[1]).trim();
-                if (!key || key.startsWith('ENV:')) continue;
+                // ENV: and VAULT: are resolved at run time from the process
+                // environment and the host's vault command. Prompting for
+                // either asks the author for a credential they are not meant
+                // to hold - and worse, a typed value is substituted right
+                // here, so the engine's apply_vault then finds no placeholder
+                // and never consults the vault at all.
+                if (!key || key.startsWith('ENV:') || key.startsWith('VAULT:')) continue;
                 if (PARAM_BUILTINS.has(key) || resolveTimeBuiltin(key) !== null) continue;
                 if (Object.prototype.hasOwnProperty.call(knownVars, key)) continue;
                 found.add(key);
