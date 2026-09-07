@@ -2656,7 +2656,7 @@ function synthNewConnector(comp: ComponentDef): ComponentManifest | null {
                             { label: 'Replace', value: 'replace' },
                             { label: 'Fail the run', value: 'error' },
                         ],
-                        description: 'Skip suits an immutable raw zone: re-running does not re-extract what already landed. The row still comes out.',
+                        description: 'Skip suits an immutable raw zone: re-running does not re-extract what already landed, and the row still comes out. It means "the destination already IS this member", so a member whose size differs from the file already there stops the run rather than leaving the older bytes in place under a name that now promises the newer ones - use Replace for a source that re-issues changed members under the same name.',
                     },
                     {
                         key: 'onError',
@@ -2746,6 +2746,14 @@ function synthNewConnector(comp: ComponentDef): ComponentManifest | null {
                             { label: 'Fail the run', value: 'error' },
                         ],
                         description: 'Skip is what a raw zone wants: re-running a feed does not re-upload what already landed. The row still comes out, with copied = false.',
+                        // Content-addressed naming answers this question by
+                        // itself and the engine takes an earlier path for it:
+                        // a key that already exists holds the same bytes by
+                        // construction, so copy_one_artifact returns before it
+                        // ever reads ifExists. Left visible, "Fail the run" did
+                        // not fail and "Replace" did not replace - both quietly
+                        // skipped. The control is shown only where it acts.
+                        visibleWhen: [{ key: 'naming', equals: ['keep', 'path'] }],
                     },
                     { key: 'partSizeMb', label: 'Part size (MB)', kind: 'integer', defaultValue: 8,
                       description: 'Bytes held in memory per object while uploading to S3, and the size of each multipart part. Below 5 MB is raised to 5: S3 rejects a smaller non-final part.' },
@@ -2833,8 +2841,8 @@ function synthNewConnector(comp: ComponentDef): ComponentManifest | null {
             {
                 label: 'Retention',
                 fields: [
-                    { key: 'olderThan', label: 'Older than', kind: 'text', placeholder: '2026-01-01 or now() - INTERVAL 30 DAY',
-                      description: 'The retention boundary. DuckLake expires NOTHING without one, so a scheduled job that forgot its boundary does nothing rather than deleting history - that default is surfaced here, not replaced.' },
+                    { key: 'olderThan', label: 'Older than', kind: 'text', placeholder: '2026-01-01 or ${date-30d}',
+                      description: 'The retention boundary, as a timestamp VALUE rather than an expression: whatever is typed here is passed to DuckLake quoted, so `now() - INTERVAL 30 DAY` arrives as that text and not as the date it describes. For a rolling boundary use ${date-30d}, which the run substitutes to a real date before the call (offsets take d, h, m, s). DuckLake expires NOTHING without a boundary, so a scheduled job that forgot one does nothing rather than deleting history - that default is surfaced here, not replaced.' },
                     { key: 'versions', label: 'Snapshot versions', kind: 'text', placeholder: '3, 4, 5',
                       description: 'Expire these snapshot ids specifically, instead of everything older than a date.' },
                     { key: 'cleanupAll', label: 'Include files still inside the retention window', kind: 'bool', defaultValue: false,

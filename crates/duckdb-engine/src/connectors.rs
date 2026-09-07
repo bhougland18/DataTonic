@@ -6466,6 +6466,14 @@ impl DuckdbEngine {
             self.check_cancelled()?;
             match self.extract_one_archive(spec, archive, &mut out, artifacts) {
                 Ok(()) => {}
+                // "When an archive cannot be opened" is what this field says it
+                // governs, so it skips READ failures only. It used to catch
+                // every error, which disarmed two things the operator had
+                // deliberately armed: ifExists = "Fail the run" did not fail,
+                // and the member limit - whose own description says "reaching
+                // it fails the run" - was reduced to an arbitrary truncation
+                // that left a prefix of the archive on disk and reported ok.
+                Err(EngineError::Config(e)) => return Err(EngineError::Config(e)),
                 Err(e) if spec.on_error == "skip" => {
                     eprintln!("duckle: archive.extract: skipping {}: {e}", archive.uri);
                     skipped_archives += 1;
@@ -6709,7 +6717,11 @@ impl DuckdbEngine {
                 return Ok(());
             }
             "error" if self.archive_dest_size(spec, &dest)?.is_some() => {
-                return Err(EngineError::Query(format!(
+                // Config, not Query: this is the operator's own policy firing,
+                // and `onError = skip` governs archives that cannot be READ.
+                // As a Query error it was swallowed by that arm, so "Fail the
+                // run" quietly did not.
+                return Err(EngineError::Config(format!(
                     "archive: {} already exists and ifExists is 'error'",
                     dest
                 )))
@@ -22253,8 +22265,27 @@ fn media_type_for(name: &str) -> &'static str {
 /// naming. Leading slashes are dropped so joining cannot escape the prefix.
 fn source_path_of(src: &str) -> String {
     let after_scheme = src.split_once("://").map(|(_, r)| r).unwrap_or(src);
-    let path = after_scheme.split_once('/').map(|(_, r)| r).unwrap_or(after_scheme);
-    path.trim_start_matches('/').replace('\\', "/")
+    let path = match src.split_once("://") {
+        // s3://bucket/a/b -> a/b. The first segment is the host or bucket.
+        Some(_) => after_scheme.split_once('/').map(|(_, r)| r).unwrap_or(after_scheme),
+        // A local path has no host or bucket to drop, and taking everything
+        // after its first slash would eat a real directory.
+        None => src,
+    };
+    let path = path.replace('\\', "/");
+    let path = path.trim_start_matches('/');
+    // A Windows source kept its drive letter, so the join produced
+    // `<dest>/C:/Users/...` - a segment with a colon in it, which no
+    // filesystem will create. Only a single letter before the colon is a
+    // drive; a key that legitimately contains one keeps it.
+    match path.split_once(':') {
+        Some((drive, rest))
+            if drive.len() == 1 && drive.chars().all(|c| c.is_ascii_alphabetic()) =>
+        {
+            rest.trim_start_matches('/').to_string()
+        }
+        _ => path.to_string(),
+    }
 }
 
 /// Join a destination prefix and a key, without doubling or dropping the slash.
@@ -22506,7 +22537,11 @@ struct MemberBudget {
 impl MemberBudget {
     fn take_member(&mut self, name: &str) -> Result<(), EngineError> {
         if self.remaining_members == 0 {
-            return Err(EngineError::Query(format!(
+            // Config, not Query: the limit is the operator's own, and its
+            // description says reaching it fails the run. As a Query error the
+            // `onError = skip` arm swallowed it, turning a stated ceiling into
+            // a silent truncation that left an arbitrary prefix on disk.
+            return Err(EngineError::Config(format!(
                 "archive: {} holds more members than the limit allows (stopped at '{}'). Raise \
                  the member limit, or narrow the include filter.",
                 self.archive_uri, name
@@ -22688,5 +22723,54 @@ fn pretty(v: f64) -> String {
         format!("{}", v as i64)
     } else {
         format!("{:.4}", v)
+    }
+}
+
+/// xf.artifact.copy naming = "path" ("Preserve the source path under the
+/// prefix") could not run at all against local files on Windows.
+///
+/// source_path_of strips a host or bucket by taking everything after the FIRST
+/// "/" beyond "://". A local path has neither, so the drive letter survived and
+/// the join produced `<dest>/C:/Users/.../file` - which no filesystem will
+/// create: "creating ...: The filename, directory name, or volume label syntax
+/// is incorrect". Measured against a real src.artifact upstream; naming = keep
+/// and hash both worked on the same input, so the naming value was the only
+/// difference.
+#[cfg(test)]
+mod source_path_of_tests {
+    use super::source_path_of;
+
+    #[test]
+    fn a_bucket_or_host_is_stripped() {
+        assert_eq!(source_path_of("s3://bucket/a/b.txt"), "a/b.txt");
+        assert_eq!(source_path_of("https://host/x/y.pdf"), "x/y.pdf");
+    }
+
+    #[test]
+    fn a_windows_drive_is_not_carried_into_the_destination() {
+        // The colon is the part that made this unusable - a path segment
+        // cannot contain one.
+        for src in [
+            r"C:\Users\me\src\sub\inner.txt",
+            "C:/Users/me/src/sub/inner.txt",
+            r"D:\data\f.csv",
+        ] {
+            let got = source_path_of(src);
+            assert!(!got.contains(':'), "drive letter survived for {src}: {got}");
+            assert!(!got.starts_with('/'), "leading slash would escape the prefix: {got}");
+        }
+        assert_eq!(source_path_of(r"C:\Users\me\src\sub\inner.txt"), "Users/me/src/sub/inner.txt");
+    }
+
+    #[test]
+    fn a_unix_absolute_path_keeps_its_layout_without_the_leading_slash() {
+        assert_eq!(source_path_of("/data/in/sub/f.csv"), "data/in/sub/f.csv");
+    }
+
+    #[test]
+    fn a_colon_that_is_not_a_drive_is_left_alone() {
+        // Only a single-letter prefix is a drive. A key that legitimately
+        // contains a colon keeps it.
+        assert_eq!(source_path_of("s3://bucket/odd:name/f.txt"), "odd:name/f.txt");
     }
 }
