@@ -21911,3 +21911,52 @@ fn a_wired_reject_port_binds_when_no_parent_failed() {
         r.error
     );
 }
+
+/// Every kind xf.ip.parse offers has to actually run.
+///
+/// DuckDB's inet extension provides exactly five functions - host, family,
+/// netmask, network, broadcast. The builder emitted `hostmask(...)` and
+/// `masklen(...)` for two of its seven kinds, and neither exists:
+///   Catalog Error: Scalar Function with name masklen does not exist!
+///
+/// Same shape as qa.standardize's INITCAP, and it survived the same way: the
+/// generated SQL is well formed, so only running each kind catches it. This
+/// test runs all of them rather than a representative one, which is the whole
+/// lesson - a test of one option says nothing about the other six.
+#[test]
+fn every_ip_parse_kind_runs() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "ip\n192.168.1.5/24\n10.0.0.1\n");
+
+    for kind in ["host", "family", "broadcast", "netmask", "network", "masklen"] {
+        let out = out_path(tmp.path(), &format!("out_{kind}.csv"));
+        let d = doc(
+            json!([
+                node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node("p", "xf.ip.parse", json!({
+                    "column": "ip", "kind": kind, "outputColumn": "got"
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "p"), main_edge("e2", "p", "k")]),
+        );
+        let r = engine.execute_pipeline(&d);
+        assert_eq!(r.status, "ok", "kind {kind} failed to run: {:?}", r.error);
+    }
+
+    // masklen is derived rather than provided: an explicit prefix wins, and an
+    // address without one takes the full width for its family, which is what
+    // PostgreSQL's masklen answers too.
+    let out = out_path(tmp.path(), "out_masklen.csv");
+    let got = scalar_string(&format!(
+        "SELECT CAST(got AS VARCHAR) FROM read_csv_auto('{}') WHERE ip = '192.168.1.5/24'",
+        out
+    ));
+    assert_eq!(got, "24", "explicit prefix: got {got}");
+    let bare = scalar_string(&format!(
+        "SELECT CAST(got AS VARCHAR) FROM read_csv_auto('{}') WHERE ip = '10.0.0.1'",
+        out
+    ));
+    assert_eq!(bare, "32", "no prefix means the whole address: got {bare}");
+}

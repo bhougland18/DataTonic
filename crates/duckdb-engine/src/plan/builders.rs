@@ -8501,21 +8501,42 @@ pub(crate) fn build_ip_parse(inputs: &NodeInputs, props: &JsonValue) -> Result<S
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "IP Parse needs an input column".to_string())?;
     let kind = string_prop(props, "kind").unwrap_or_else(|| "host".into());
+    // DuckDB's inet extension provides exactly five of these: host, family,
+    // netmask, network, broadcast. `hostmask` and `masklen` were emitted as if
+    // they existed too, and picking either failed the run with "Catalog Error:
+    // Scalar Function with name masklen does not exist!".
+    //
+    // masklen is derived instead. An explicit prefix wins; an address written
+    // without one takes the full width for its family, which is the answer
+    // PostgreSQL's masklen gives as well. `CASE family(..) WHEN` rather than an
+    // ELSE, so a NULL address stays NULL instead of being called a /32.
+    //
+    // hostmask has no such derivation - it is the bitwise complement of the
+    // netmask, and doing that in SQL across both a dotted quad and a v6 hex
+    // group is not worth what it would cost to read. The option is gone from
+    // the form rather than left pretending, and an old pipeline naming it now
+    // gets `host` like any other unrecognised kind.
     let fn_name = match kind.as_str() {
         "family" => "family",
         "broadcast" => "broadcast",
         "netmask" => "netmask",
-        "hostmask" => "hostmask",
-        "masklen" => "masklen",
         "network" => "network",
+        "masklen" => "masklen",
         _ => "host",
     };
     let output = string_prop(props, "outputColumn")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{}_{}", column, fn_name));
+    let col = quote_ident(&column);
+    let expr = if fn_name == "masklen" {
+        format!(
+            "COALESCE(TRY_CAST(NULLIF(split_part(CAST(CAST({col} AS INET) AS VARCHAR), '/', 2), '')              AS INTEGER), CASE family(CAST({col} AS INET)) WHEN 6 THEN 128 WHEN 4 THEN 32 END)"
+        )
+    } else {
+        format!("{fn_name}(CAST({col} AS INET))")
+    };
     Ok(format!(
-        "SELECT *, {fn_name}(CAST({col} AS INET)) AS {out} FROM {up}",
-        col = quote_ident(&column),
+        "SELECT *, {expr} AS {out} FROM {up}",
         out = quote_ident(&output),
         up = quote_ident(upstream)
     ))

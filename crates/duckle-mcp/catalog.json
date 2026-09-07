@@ -23431,10 +23431,6 @@
                     "value": "netmask"
                   },
                   {
-                    "label": "Hostmask",
-                    "value": "hostmask"
-                  },
-                  {
                     "label": "Mask length (bits)",
                     "value": "masklen"
                   },

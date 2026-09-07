@@ -6201,7 +6201,11 @@ function synthStringTransform(comp: ComponentDef): ComponentManifest {
                             { label: 'Family (4 or 6)', value: 'family' },
                             { label: 'Broadcast address', value: 'broadcast' },
                             { label: 'Netmask', value: 'netmask' },
-                            { label: 'Hostmask', value: 'hostmask' },
+                            // Hostmask was offered and could not run: DuckDB's
+                            // inet extension has no hostmask function, and it
+                            // is the one kind here with no clean derivation -
+                            // the bitwise complement of the netmask, across a
+                            // dotted quad and a v6 hex group both.
                             { label: 'Mask length (bits)', value: 'masklen' },
                             { label: 'Network (address & netmask)', value: 'network' },
                         ],
