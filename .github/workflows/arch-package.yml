@@ -77,6 +77,24 @@ jobs:
           namcap PKGBUILD || true
           namcap ./*.pkg.tar.* || true
 
+      # .SRCINFO is what the AUR reads to index a package, and it rejects a
+      # push without one. Generating it needs makepkg, so it is produced here
+      # and attached to the run - that way the first manual submission does not
+      # require an Arch machine of your own.
+      - name: Generate .SRCINFO
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/packaging/arch/${{ matrix.pkg }}"
+          su builder -c "cd '$PWD' && makepkg --printsrcinfo" > .SRCINFO
+          echo "--- .SRCINFO ---"
+          cat .SRCINFO
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: srcinfo-${{ matrix.pkg }}
+          path: packaging/arch/${{ matrix.pkg }}/.SRCINFO
+          if-no-files-found: error
+
       - name: The desktop entry is valid
         if: matrix.pkg == 'duckle-bin'
         run: |
