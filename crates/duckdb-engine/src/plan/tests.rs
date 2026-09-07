@@ -6678,3 +6678,31 @@ mod mysql_sink_transactions {
         assert!(!src.contains("enable_transactions"), "a source needs no write transaction: {src}");
     }
 }
+
+/// The engine is shared by the desktop app, the headless runner and the
+/// console, so its errors have to be actionable in all three.
+///
+/// Measured on a clean Arch container with `duckle-runner` installed from a
+/// package: a pipeline failed with "DuckDB engine isn't installed yet. Open
+/// Setup to install it." There is no Setup on a headless install - it is a
+/// window only the desktop app can show - so the one instruction given was the
+/// one thing that reader could not do. The same run succeeded immediately once
+/// a duckdb was on PATH, which is what the message should have said.
+#[test]
+fn the_missing_duckdb_message_helps_a_reader_with_no_desktop_app() {
+    let msg = crate::duckdb_missing_message(std::path::Path::new("/opt/duckle/bin/duckdb"));
+
+    assert!(
+        msg.contains("/opt/duckle/bin/duckdb"),
+        "it must name the path it looked in: {msg}"
+    );
+    assert!(
+        msg.contains("DUCKLE_DUCKDB_BIN"),
+        "it must name the environment variable that fixes it headlessly: {msg}"
+    );
+    assert!(
+        msg.contains("PATH"),
+        "installing a duckdb on PATH is the other fix, and the one a package \
+         manager performs: {msg}"
+    );
+}

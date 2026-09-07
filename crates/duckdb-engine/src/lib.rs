@@ -341,6 +341,21 @@ fn reposition(
     d
 }
 
+/// What to say when there is no DuckDB CLI where the engine expected one.
+///
+/// Deliberately not "Open Setup": this engine is shared by the desktop app,
+/// the headless runner and the console, and Setup only exists in the first.
+/// Measured on a clean Arch container with the runner installed from a
+/// package - the advice was to open a window that install has no way to show.
+pub(crate) fn duckdb_missing_message(bin: &std::path::Path) -> String {
+    format!(
+        "DuckDB engine not found at {}. In the desktop app, install it from \
+         Setup. Otherwise point DUCKLE_DUCKDB_BIN (or --duckdb) at a DuckDB \
+         CLI, or install one on PATH.",
+        bin.display()
+    )
+}
+
 impl DuckdbEngine {
     /// Construct an engine pointing at a DuckDB CLI binary. The binary
     /// need not exist yet - calls fail with a clear error if it's
@@ -1346,10 +1361,7 @@ impl DuckdbEngine {
         }
 
         if !self.bin.exists() {
-            return RunResult::failed(
-                total_start,
-                "DuckDB engine isn't installed yet. Open Setup to install it.".into(),
-            );
+            return RunResult::failed(total_start, duckdb_missing_message(&self.bin));
         }
 
         // #298: a property no builder reads changed nothing, and before this
