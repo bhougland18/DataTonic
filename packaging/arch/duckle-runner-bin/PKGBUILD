@@ -1,0 +1,33 @@
+# Maintainer: SlothFlowLabs <hello@duckle.org>
+#
+# The headless runner: no GUI, no desktop libraries, statically linked against
+# musl. This is the package a server wants, and the one most likely to install
+# cleanly anywhere, which is why it is separated from the desktop app rather
+# than shipped as one package with optional dependencies.
+
+pkgname=duckle-runner-bin
+pkgver=0.7.1
+pkgrel=1
+pkgdesc="Headless runner for Duckle data pipelines (static binary)"
+arch=('x86_64')
+url="https://github.com/slothflowlabs/duckle"
+license=('MIT OR Apache-2.0')
+provides=('duckle-runner')
+conflicts=('duckle-runner')
+options=('!strip')
+
+# Fetched over https from the tagged release. The checksum below is the one
+# published in SHA256SUMS.txt for the same tag, so it is verifiable against the
+# release rather than against this file.
+source=("duckle-runner-${pkgver}::${url}/releases/download/v${pkgver}/duckle-runner-linux-x64"
+        "LICENSE-MIT-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-MIT"
+        "LICENSE-APACHE-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-APACHE")
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP')
+
+package() {
+  install -Dm755 "${srcdir}/duckle-runner-${pkgver}" "${pkgdir}/usr/bin/duckle-runner"
+  install -Dm644 "${srcdir}/LICENSE-MIT-${pkgver}" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+  install -Dm644 "${srcdir}/LICENSE-APACHE-${pkgver}" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
+}

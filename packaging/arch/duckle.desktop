@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Duckle
+GenericName=Data Pipeline Editor
+Comment=Local-first ETL/ELT and streaming platform with a visual editor
+Exec=duckle %F
+Icon=duckle
+Terminal=false
+Categories=Development;Database;
+Keywords=ETL;ELT;data;pipeline;DuckDB;SQL;
+MimeType=application/json;
+StartupWMClass=Duckle

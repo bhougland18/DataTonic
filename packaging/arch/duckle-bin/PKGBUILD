@@ -1,0 +1,49 @@
+# Maintainer: SlothFlowLabs <hello@duckle.org>
+#
+# The desktop application. Tauri, so it links the system WebKitGTK rather than
+# bundling a browser - which is why this package has real dependencies and the
+# runner package has none.
+
+pkgname=duckle-bin
+pkgver=0.7.1
+pkgrel=1
+pkgdesc="Local-first ETL/ELT and streaming platform with a visual pipeline editor"
+arch=('x86_64' 'aarch64')
+url="https://github.com/slothflowlabs/duckle"
+license=('MIT OR Apache-2.0')
+# The set Tauri v2 needs at run time. unixodbc is NOT here: the release
+# workflow refuses to publish a Linux binary that requires libodbc.so, so the
+# ODBC support is linked statically.
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'libayatana-appindicator')
+optdepends=('duckle-runner-bin: run pipelines headlessly from the command line')
+provides=('duckle')
+conflicts=('duckle')
+options=('!strip')
+
+source_x86_64=("duckle-${pkgver}-x86_64::${url}/releases/download/v${pkgver}/Duckle-linux-x64")
+source_aarch64=("duckle-${pkgver}-aarch64::${url}/releases/download/v${pkgver}/Duckle-linux-arm64")
+source=("duckle-${pkgver}.desktop::${url}/raw/v${pkgver}/packaging/arch/duckle.desktop"
+        "duckle-${pkgver}-32.png::${url}/raw/v${pkgver}/apps/desktop/icons/32x32.png"
+        "duckle-${pkgver}-64.png::${url}/raw/v${pkgver}/apps/desktop/icons/64x64.png"
+        "duckle-${pkgver}-128.png::${url}/raw/v${pkgver}/apps/desktop/icons/128x128.png"
+        "LICENSE-MIT-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-MIT"
+        "LICENSE-APACHE-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-APACHE")
+
+# Replace with the values from the release's SHA256SUMS.txt before submitting.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm755 "${srcdir}/duckle-${pkgver}-${CARCH}" "${pkgdir}/usr/bin/duckle"
+  install -Dm644 "${srcdir}/duckle-${pkgver}.desktop" \
+    "${pkgdir}/usr/share/applications/duckle.desktop"
+  for size in 32 64 128; do
+    install -Dm644 "${srcdir}/duckle-${pkgver}-${size}.png" \
+      "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/duckle.png"
+  done
+  install -Dm644 "${srcdir}/LICENSE-MIT-${pkgver}" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+  install -Dm644 "${srcdir}/LICENSE-APACHE-${pkgver}" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
+}
