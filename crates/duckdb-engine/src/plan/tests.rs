@@ -5868,6 +5868,65 @@ fn pii_doc(sink_props: &str) -> PipelineDoc {
     ))
 }
 
+/// A quality gate that is not configured must refuse, not pass every row.
+///
+/// Measured before the fix, through the runner, on three rows where one held a
+/// NULL: qa.notnull with no columns, qa.schemavalidate with no expectedColumns,
+/// and qa.range with a column but neither min nor max each reported `ok` and
+/// emitted all three rows. `quality_pass_predicate` returned "TRUE" for an
+/// empty configuration, so the gate evaluated to a tautology.
+///
+/// That is worse than an error. The node exists only to reject rows, so a run
+/// with one in it is a run someone believes is checked - and it reported
+/// success while checking nothing. Every sibling gate already refuses: qa.mask,
+/// qa.expect, qa.unique, qa.dedupe and qa.contract all fail when unconfigured,
+/// and qa.range itself fails when its column is missing. These three were the
+/// inconsistency.
+#[test]
+fn an_unconfigured_quality_gate_refuses_rather_than_passing_everything() {
+    use crate::plan::builders::quality_pass_predicate;
+
+    for (component, props) in [
+        ("qa.notnull", serde_json::json!({})),
+        ("qa.notnull", serde_json::json!({ "columns": [] })),
+        ("qa.schemavalidate", serde_json::json!({})),
+        // A column, but nothing to compare it against.
+        ("qa.range", serde_json::json!({ "column": "amt" })),
+    ] {
+        let got = quality_pass_predicate(component, &props);
+        assert!(
+            got.is_err(),
+            "{component} with {props} produced {got:?} instead of refusing"
+        );
+    }
+}
+
+/// And the configured forms keep working, so the refusal above cannot be
+/// satisfied by refusing everything.
+#[test]
+fn a_configured_quality_gate_still_builds_its_predicate() {
+    use crate::plan::builders::quality_pass_predicate;
+
+    let nn = quality_pass_predicate("qa.notnull", &serde_json::json!({ "columns": ["amt"] }))
+        .expect("columns given");
+    assert!(nn.contains("IS NOT NULL"), "got: {nn}");
+
+    let sv = quality_pass_predicate(
+        "qa.schemavalidate",
+        &serde_json::json!({ "expectedColumns": ["amt"] }),
+    )
+    .expect("expectedColumns given");
+    assert!(sv.contains("IS NOT NULL"), "got: {sv}");
+
+    let lo = quality_pass_predicate("qa.range", &serde_json::json!({ "column": "amt", "min": 1 }))
+        .expect("a min alone is a real bound");
+    assert!(lo.contains(">="), "got: {lo}");
+
+    let hi = quality_pass_predicate("qa.range", &serde_json::json!({ "column": "amt", "max": 9 }))
+        .expect("a max alone is a real bound");
+    assert!(hi.contains("<="), "got: {hi}");
+}
+
 #[test]
 fn a_pii_column_reaching_a_sink_is_refused() {
     let err = compile(&pii_doc("")).expect_err("a tagged column reached a sink unmasked");

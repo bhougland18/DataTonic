@@ -3611,7 +3611,16 @@ pub(crate) fn quality_pass_predicate(component_id: &str, props: &JsonValue) -> R
             };
             let cols = columns_list(props, key);
             if cols.is_empty() {
-                return Ok("TRUE".into());
+                // Refuse, rather than evaluate to a tautology. This returned
+                // "TRUE", so a gate with no columns passed every row and the
+                // run reported ok - and a run with a quality gate in it is a
+                // run someone believes is checked. Every sibling already
+                // refuses when unconfigured, qa.range below included.
+                return Err(if component_id == "qa.schemavalidate" {
+                    "Schema Validate needs at least one expected column".to_string()
+                } else {
+                    "Not Null check needs at least one column".to_string()
+                });
             }
             Ok(cols
                 .iter()
@@ -3633,7 +3642,13 @@ pub(crate) fn quality_pass_predicate(component_id: &str, props: &JsonValue) -> R
             if let Some(max) = num_prop(props, "max") {
                 parts.push(format!("{} {} {}", c, le, max));
             }
-            Ok(if parts.is_empty() { "TRUE".into() } else { parts.join(" AND ") })
+            // A column with no bound to compare it against checks nothing. It
+            // already refuses a missing column; a missing range is the same
+            // omission one field along.
+            if parts.is_empty() {
+                return Err("Range check needs a min, a max, or both".to_string());
+            }
+            Ok(parts.join(" AND "))
         }
         "qa.regex" => {
             let col = string_prop(props, "column")
