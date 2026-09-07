@@ -100,9 +100,8 @@ extract. Hence `duckle.desktop` here, and the icons installed explicitly.
    per package and attaches it to the run as `srcinfo-<pkgname>`, so the first
    submission needs no Arch machine of your own - download it from the run.
 
-5. **Set the `Maintainer:` line.** Both PKGBUILDs carry an explicit placeholder.
-   The AUR publishes this address and uses it to reach whoever keeps the package
-   working, so it has to be one that is read.
+5. **`Maintainer:` line: set.** Both PKGBUILDs name a real maintainer. The AUR
+   publishes that address, so it is a public one by the time the package is.
 
 6. **Test the first-run flow in a clean container**, per section 4.
 

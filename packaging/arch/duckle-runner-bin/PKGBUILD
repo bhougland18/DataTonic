@@ -1,8 +1,4 @@
-# Maintainer: FILL IN BEFORE SUBMITTING <your-address@example.com>
-#
-# The AUR shows this line to users and uses it to reach whoever keeps the
-# package working. It is deliberately a placeholder rather than a plausible
-# address: a wrong one that looks right would be published and never noticed.
+# Maintainer: Sourav Roy <souravroy7864@gmail.com>
 #
 # The headless runner: no GUI, no desktop libraries, statically linked against
 # musl. This is the package a server wants, and the one most likely to install
