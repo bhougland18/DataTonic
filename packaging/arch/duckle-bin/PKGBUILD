@@ -3,6 +3,11 @@
 # The desktop application. Tauri, so it links the system WebKitGTK rather than
 # bundling a browser - which is why this package has real dependencies and the
 # runner package has none.
+#
+# The release publishes a BARE BINARY, not a bundle: the release workflow runs
+# `cargo build --release`, so the Tauri bundler never runs and there is no .deb
+# to unpack, no generated .desktop and no installed icons. This package
+# provides all three itself.
 
 pkgname=duckle-bin
 pkgver=0.7.1
@@ -15,39 +20,46 @@ license=('MIT OR Apache-2.0')
 # workflow refuses to publish a Linux binary that requires libodbc.so, so the
 # ODBC support is linked statically.
 depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'libayatana-appindicator')
+makedepends=('imagemagick')
 optdepends=('duckle-runner-bin: run pipelines headlessly from the command line')
 provides=('duckle')
 conflicts=('duckle')
 options=('!strip')
 
-source_x86_64=("duckle-${pkgver}-x86_64::${url}/releases/download/v${pkgver}/Duckle-linux-x64")
-source_aarch64=("duckle-${pkgver}-aarch64::${url}/releases/download/v${pkgver}/Duckle-linux-arm64")
-# A full hicolor set, so the launcher and any icon theme render Duckle crisply
-# at whatever size they ask for instead of rescaling a single PNG.
+# A full hicolor set, so a launcher renders Duckle crisply at whatever size it
+# asks for instead of rescaling one PNG. Derived at build time from the 512px
+# master rather than fetched size by size: the master is the only icon
+# guaranteed to exist at every tag, and generating from it cannot drift from it.
 _icon_sizes=(16 32 48 64 128 256 512)
 
-source=("duckle-${pkgver}.desktop::${url}/raw/v${pkgver}/packaging/arch/duckle.desktop"
+source_x86_64=("duckle-${pkgver}-x86_64::${url}/releases/download/v${pkgver}/Duckle-linux-x64")
+source_aarch64=("duckle-${pkgver}-aarch64::${url}/releases/download/v${pkgver}/Duckle-linux-arm64")
+# duckle.desktop is a LOCAL file, committed beside this PKGBUILD, not fetched
+# from the tag. Packaging metadata that is only needed here should not have to
+# wait for a release to exist: fetching it from v${pkgver} 404s for every
+# version released before the file was written, which is exactly what happened.
+source=("duckle.desktop"
+        "duckle-${pkgver}-icon.png::${url}/raw/v${pkgver}/apps/desktop/icons/icon.png"
         "LICENSE-MIT-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-MIT"
         "LICENSE-APACHE-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-APACHE")
-for _s in "${_icon_sizes[@]}"; do
-  source+=("duckle-${pkgver}-${_s}.png::${url}/raw/v${pkgver}/apps/desktop/icons/${_s}x${_s}.png")
-done
 
 # Replace every SKIP before submitting. `updpkgsums` fills them in, and the
 # binary's value is the one already published in the release's SHA256SUMS.txt.
 sha256sums_x86_64=('SKIP')
 sha256sums_aarch64=('SKIP')
-sha256sums=('SKIP' 'SKIP' 'SKIP')
-for _s in "${_icon_sizes[@]}"; do sha256sums+=('SKIP'); done
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 package() {
   install -Dm755 "${srcdir}/duckle-${pkgver}-${CARCH}" "${pkgdir}/usr/bin/duckle"
-  install -Dm644 "${srcdir}/duckle-${pkgver}.desktop" \
+  install -Dm644 "${srcdir}/duckle.desktop" \
     "${pkgdir}/usr/share/applications/duckle.desktop"
+
   for size in "${_icon_sizes[@]}"; do
-    install -Dm644 "${srcdir}/duckle-${pkgver}-${size}.png" \
+    install -d "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps"
+    magick "${srcdir}/duckle-${pkgver}-icon.png" -resize "${size}x${size}" \
       "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/duckle.png"
   done
+
   install -Dm644 "${srcdir}/LICENSE-MIT-${pkgver}" \
     "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
   install -Dm644 "${srcdir}/LICENSE-APACHE-${pkgver}" \

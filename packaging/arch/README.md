@@ -58,8 +58,8 @@ extract. Hence `duckle.desktop` here, and the icons installed explicitly.
 
 | Item | State |
 | :--- | :--- |
-| `.desktop` file | **Added here.** Did not exist - the bare binary had no menu entry at all. |
-| Icons | **Completed.** `apps/desktop/icons/` had 32/64/128; 16, 48, 256 and 512 generated from the 512px master, so the hicolor set is whole. |
+| `.desktop` file | **Added here**, as a local file beside the PKGBUILD rather than fetched from the tag. It did not exist before - the bare binary had no menu entry at all - so fetching it from `v${pkgver}` 404s for every release made before it was written. The CI job below caught exactly that. |
+| Icons | **Completed.** `apps/desktop/icons/` had 32/64/128; 16, 48, 256 and 512 added. The PKGBUILD does not fetch them size by size - it derives every size from the 512px master at build time, because the master is the only icon guaranteed to exist at any given tag. |
 | XDG paths | **Verified correct, in the code.** Both the desktop app and the runner resolve Windows→`APPDATA`, macOS→`~/Library/Application Support`, and everything else→`XDG_DATA_HOME` falling back to `~/.local/share`, then `io.duckle.app`. The macOS branch is `cfg!`-gated, so there is no macOS-first path leaking onto Linux. |
 | `StartupWMClass` | **Unverified.** Set to `duckle` to match the installed binary name, which is what GTK reports as WM_CLASS. Confirm with `xprop WM_CLASS` or `hyprctl clients` before relying on window grouping under Hyprland. |
 | First-run network fetch | **Unverified.** Duckle fetches the DuckDB CLI on first launch, and the local model separately. Needs testing in a clean Arch container with no caches - different XDG defaults are exactly where this breaks, and a silent failure here is the likeliest source of "doesn't work" reports. |
