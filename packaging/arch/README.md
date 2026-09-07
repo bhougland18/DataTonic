@@ -1,52 +1,70 @@
-# Arch Linux packaging
+# Arch Linux packaging, and the route to Omarchy
 
-Draft packaging for Arch, and the route to Omarchy.
-
-**Status: written, not yet built.** These PKGBUILDs have not been run through
-`makepkg` - that needs an Arch machine or container, and neither exists in this
-repo's CI yet. Treat them as a starting point that still has to be built once
-before submission. The verification step is in section 4.
+**Status: written, not yet built.** Neither PKGBUILD has been through
+`makepkg` - that needs an Arch machine or container, and this repo's CI has
+neither. Treat them as a starting point that must be built once before
+submission. The verification steps are in section 5.
 
 ---
 
-## 1. Which route
+## 1. What "publish to Omarchy" actually means
 
-**AUR, not the official repositories.** `[extra]` requires an Arch package
-maintainer to adopt the software; there is no self-service path and no useful
-way to accelerate it. The AUR is where Arch users expect third-party
-applications to be, it is self-service, and `yay`/`paru` install from it with no
-extra configuration. It is also the prerequisite for Omarchy (section 3).
+Omarchy's Install menu (`Super + Alt + Space` → *Install*) is a thin fzf UI over
+three sources, none of which is an app store Duckle can submit to directly:
+
+| Source | Reachable? |
+| :--- | :--- |
+| Official Arch repos (`core`/`extra`) | No. Requires an Arch package maintainer to adopt the software; no self-service path. |
+| **OPR** (`pkgs.omarchy.org`) | No. Basecamp's own infrastructure, holding essentially `omarchy` and `omarchy-settings`. No public submission process. |
+| **AUR** | **Yes.** Open, self-service, and what `omarchy-pkg-aur-install` searches. |
+
+There is a fourth entry, *Install → Web App*, but it wraps a URL in a frameless
+browser window. It does not apply to a native Tauri binary.
+
+**So the deliverable is a well-formed AUR package.** Bundled inclusion in OPR is
+a separate, much higher bar - realistically only reachable after AUR traction
+and community requests - and is section 7, not the main path.
 
 ## 2. Two packages, not one
 
-| Package | What it installs | Dependencies |
+| Package | Installs | Dependencies |
 | :--- | :--- | :--- |
 | `duckle-runner-bin` | The headless runner | **none** - statically linked against musl |
 | `duckle-bin` | The desktop application | `webkit2gtk-4.1 gtk3 libsoup3 libayatana-appindicator` |
 
-Split because they have nothing in common at install time. A server wants the
-runner and should not pull in a browser engine to get it; a laptop wants the
-editor. `duckle-bin` lists the runner as an `optdepends` so the connection is
-discoverable without being forced.
+Split because they share nothing at install time. A server wants the runner and
+should not pull in a browser engine to get it. `duckle-bin` lists the runner as
+`optdepends` so the connection is discoverable without being forced.
 
-`unixodbc` is deliberately absent from both. The release workflow refuses to
-publish a Linux binary that requires `libodbc.so`, so ODBC support is linked in
-statically - that check exists because a build once shipped needing it.
+`unixodbc` is deliberately absent from both: the release workflow refuses to
+publish a Linux binary that requires `libodbc.so`, so ODBC is linked statically.
+That check exists because a build once shipped needing it.
 
-## 3. Omarchy
+## 3. Binary, not source - and there is no `.deb`
 
-Omarchy is an opinionated Arch setup; getting included means a pull request to
-its repository adding Duckle to the installable set. It installs through
-`pacman`/`yay`, so **being in the AUR is the prerequisite**, not a parallel
-track. The order is: publish both AUR packages, let them settle, then propose
-the addition with the AUR package name.
+`duckle-bin` repackages the released binary rather than building from source.
+Source-building means the full Rust + Node toolchain in `makepkg`, and every
+toolchain bump becomes a package break; that is worth doing once the `-bin`
+package is stable and someone owns keeping it green, not first.
 
-Worth being realistic: Omarchy's list is curated and deliberately short. The
-case for Duckle there is the desktop editor being genuinely local-first with no
-account and no telemetry, which fits that project's stated position better than
-most data tooling does.
+**One correction worth having up front:** the release workflow runs
+`cargo build --release`, **not** `cargo tauri build`. The Tauri bundler never
+runs, so there is **no `.deb`, no generated `.desktop` file, and no icon
+installation** - the release publishes a bare `Duckle-linux-x64` executable.
+A PKGBUILD that extracts `data.tar.*` from a `.deb` would have nothing to
+extract. Hence `duckle.desktop` here, and the icons installed explicitly.
 
-## 4. What has to happen before submitting
+## 4. Desktop integration: what was checked
+
+| Item | State |
+| :--- | :--- |
+| `.desktop` file | **Added here.** Did not exist - the bare binary had no menu entry at all. |
+| Icons | **Completed.** `apps/desktop/icons/` had 32/64/128; 16, 48, 256 and 512 generated from the 512px master, so the hicolor set is whole. |
+| XDG paths | **Verified correct, in the code.** Both the desktop app and the runner resolve Windows→`APPDATA`, macOS→`~/Library/Application Support`, and everything else→`XDG_DATA_HOME` falling back to `~/.local/share`, then `io.duckle.app`. The macOS branch is `cfg!`-gated, so there is no macOS-first path leaking onto Linux. |
+| `StartupWMClass` | **Unverified.** Set to `duckle` to match the installed binary name, which is what GTK reports as WM_CLASS. Confirm with `xprop WM_CLASS` or `hyprctl clients` before relying on window grouping under Hyprland. |
+| First-run network fetch | **Unverified.** Duckle fetches the DuckDB CLI on first launch, and the local model separately. Needs testing in a clean Arch container with no caches - different XDG defaults are exactly where this breaks, and a silent failure here is the likeliest source of "doesn't work" reports. |
+
+## 5. What has to happen before submitting
 
 1. **Build both, on Arch.** Nothing here has been through `makepkg`:
 
@@ -58,36 +76,56 @@ most data tooling does.
      namcap /src/packaging/arch/duckle-runner-bin/*.pkg.tar.zst'
    ```
 
-   `namcap` is the lint Arch reviewers run; fix what it reports before
-   submitting rather than after.
+   `namcap` is the lint AUR reviewers run. Fix what it reports before
+   submitting, not after.
 
-2. **Replace every `SKIP` checksum.** The values are already published per
-   release in `SHA256SUMS.txt`, so they can be taken from there and are
-   verifiable against the release rather than trusted from this file.
-   `updpkgsums` fills them in automatically.
+2. **Replace every `SKIP` checksum** with `updpkgsums`. The binary's value is
+   already published per release in `SHA256SUMS.txt`, so it is verifiable
+   against the release rather than trusted from this file.
 
-3. **Confirm the desktop dependency list against the actual binary**, rather
-   than against Tauri's documentation:
+3. **Confirm the desktop dependency list against the real binary**, not against
+   Tauri's documentation - this is the most likely thing here to be wrong:
 
    ```bash
    ldd Duckle-linux-x64 | awk '{print $1}' | sort -u
+   pacman -F <each .so>
    ```
 
-   Then map each `.so` to its owning package with `pacman -F`. The list in the
-   PKGBUILD is Tauri v2's usual set and is the most likely thing here to be
-   wrong.
-
-4. **Generate `.SRCINFO`** (`makepkg --printsrcinfo > .SRCINFO`); the AUR
+4. **Generate `.SRCINFO`** (`makepkg --printsrcinfo > .SRCINFO`). The AUR
    rejects a push without it.
 
-5. **Automate the version bump.** Every release changes `pkgver` and six
-   checksums. That belongs in the release workflow, next to the step that
-   publishes `SHA256SUMS.txt`, or the AUR package will silently fall behind.
+5. **Test the first-run flow in a clean container**, per section 4.
 
-## 5. The gap this exposed
+## 6. Publishing, and keeping it alive
 
-The Linux release is a **bare binary**, not a bundle - no `.desktop` entry and
-no icons. Anyone who downloads it today gets an executable with no menu entry,
-no icon, and no MIME association. `duckle.desktop` here is the first of those to
-exist; it is installed by the PKGBUILD, and it should probably be installed by
-whatever the non-Arch Linux instructions tell people to do as well.
+An AUR package is a bare git repo; pushing is publishing.
+
+```bash
+git clone ssh://aur@aur.archlinux.org/duckle-runner-bin.git
+# add PKGBUILD + .SRCINFO, commit, push
+```
+
+Then test the real end-user path - `omarchy-pkg-aur-install` from Omarchy's own
+Install menu, and launching from Walker - rather than only `yay -S`.
+
+**Automate the version bump.** Every release changes `pkgver` and ten
+checksums. That belongs in the release workflow beside the step that publishes
+`SHA256SUMS.txt`, or the package silently falls behind, gets flagged
+out-of-date, and eventually orphaned.
+
+## 7. Bundled inclusion (stretch, do not block on it)
+
+OPR has no public submission process. The realistic sequence is AUR first,
+visible install numbers and community mentions second, and only then a GitHub
+issue on `basecamp/omarchy` making the case with usage data rather than
+speculatively. Community storefronts such as `omarchy-plugins` are a
+lower-friction visibility channel in the meantime.
+
+## 8. Ongoing
+
+- [ ] Each release: bump `pkgver`, refresh checksums, regenerate `.SRCINFO`, push
+- [ ] Watch AUR comments - Omarchy users are a subset of a wider Arch audience
+      (CachyOS, EndeavourOS) who will hit different environments
+- [ ] Re-check `.desktop`, icons and XDG behaviour after any Tauri major bump
+- [ ] Periodically re-run the full `omarchy-pkg-aur-install` → launch → first-run
+      path on a current Omarchy release
