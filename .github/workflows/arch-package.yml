@@ -34,8 +34,12 @@ jobs:
       matrix:
         pkg: [duckle-runner-bin, duckle-bin]
     steps:
+      # imagemagick is duckle-bin's makedepend. It has to be installed here
+      # because the build below passes --nodeps, and makepkg's --nodeps skips
+      # makedepends as well as depends - which is how the first run of this job
+      # got as far as package() and then died on "magick: command not found".
       - name: Install the toolchain
-        run: pacman -Syu --noconfirm --needed base-devel git namcap
+        run: pacman -Syu --noconfirm --needed base-devel git namcap imagemagick desktop-file-utils
 
       - uses: actions/checkout@v7
 
@@ -77,6 +81,5 @@ jobs:
         if: matrix.pkg == 'duckle-bin'
         run: |
           set -e
-          pacman -S --noconfirm --needed desktop-file-utils
-          desktop-file-validate "$GITHUB_WORKSPACE/packaging/arch/duckle.desktop"
+          desktop-file-validate "$GITHUB_WORKSPACE/packaging/arch/duckle-bin/duckle.desktop"
           echo "duckle.desktop is valid"
