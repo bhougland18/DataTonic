@@ -1631,6 +1631,49 @@ function withoutGraphqlPaging(id: string, m: ComponentManifest): ComponentManife
     };
 }
 
+// The REST fan-out fields describe UPSTREAM ROWS: "URL per upstream row",
+// "Carry upstream column", "How many upstream rows are requested at the same
+// time", "When a row request fails". They only mean anything on a node an edge
+// can be wired INTO.
+//
+// #257 gave that optional main input to src.rest alone - "the vendor aliases
+// keep their plain source shape" (manifest-synth.ts) - and src.http is not a
+// REST source at all: the engine routes it beside src.s3 / src.gcs and reads
+// the URL as a file. All 31 of them were drawn the six fan-out controls anyway,
+// with no way to connect the upstream every one of them talks about.
+//
+// Keyed off the PORTS rather than a list of ids, so a component that gains or
+// loses its main input is handled without anyone remembering to edit this.
+// Manifests that carry no ports are left alone rather than guessed at.
+//
+// Filtered out of the BUILT manifest rather than cut from the synthesizer's
+// shared `fields:` array, which is what withoutGraphqlPaging does and for the
+// same reason: those arrays are shared with the REST sources that DO fan out,
+// and slicing one by hand has twice removed the wrong half.
+// `urlTemplate`, `parentKeyColumn` and `onParentError` exist only to fan out
+// over an upstream, so their presence is what identifies a node as having been
+// drawn the block. The other three are ordinary words that mean something else
+// elsewhere - src.pdf's `concurrency` is how many DOCUMENTS it extracts at
+// once, and src.webhook has its own `maxRequests` - so they are removed only
+// alongside a marker, never on their own. Stripping them by name cost both of
+// those their real controls, which the engine-side contract test caught.
+const FAN_OUT_MARKERS = ['urlTemplate', 'parentKeyColumn', 'onParentError'];
+const FAN_OUT_KEYS = new Set([...FAN_OUT_MARKERS, 'maxRequests', 'concurrency', 'checkpoint']);
+
+function withoutFanOut(m: ComponentManifest): ComponentManifest {
+    const ports = m.ports;
+    if (!ports) return m;
+    if ((ports.inputs ?? []).some(i => i.id === 'main')) return m;
+    const drawnTheBlock = m.sections.some(sec =>
+        sec.fields.some(f => FAN_OUT_MARKERS.includes(f.key)),
+    );
+    if (!drawnTheBlock) return m;
+    const sections = m.sections
+        .map(sec => ({ ...sec, fields: sec.fields.filter(f => !FAN_OUT_KEYS.has(f.key)) }))
+        .filter(sec => sec.fields.length > 0);
+    return { ...m, sections };
+}
+
 function withDeadLetter(id: string, m: ComponentManifest): ComponentManifest {
     if (!DEAD_LETTER_SINKS.has(id)) return m;
     // A branch that already draws them keeps its own wording and placement.
@@ -1651,9 +1694,11 @@ export function getManifest(componentId: string | undefined): ComponentManifest 
     }
     const built = MANIFESTS[componentId] ?? synthesizeManifest(componentId);
     const m = built
-        ? withoutGraphqlPaging(
-              componentId,
-              withCloudReadOptions(componentId, withDeadLetter(componentId, built)),
+        ? withoutFanOut(
+              withoutGraphqlPaging(
+                  componentId,
+                  withCloudReadOptions(componentId, withDeadLetter(componentId, built)),
+              ),
           )
         : built;
     if (m && !m.ports) {

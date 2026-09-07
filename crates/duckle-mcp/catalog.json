@@ -11452,27 +11452,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -11485,41 +11464,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -11958,27 +11902,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -11991,41 +11914,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -12445,27 +12333,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -12478,41 +12345,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -12961,27 +12793,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -12994,41 +12805,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -13448,27 +13224,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -13481,41 +13236,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -13935,27 +13655,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -13968,41 +13667,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -15127,27 +14791,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -15160,41 +14803,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -15717,62 +15325,6 @@
                 "label": "Max pages (safety cap)",
                 "kind": "integer",
                 "defaultValue": 100
-              },
-              {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -45834,27 +45386,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -45867,41 +45398,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -46542,27 +46038,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -46575,41 +46050,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -47029,27 +46469,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -47062,41 +46481,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -47516,27 +46900,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -47549,41 +46912,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -48003,27 +47331,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -48036,41 +47343,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -48490,27 +47762,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -48523,41 +47774,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -48977,27 +48193,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -49010,41 +48205,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -49464,27 +48624,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -49497,41 +48636,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -49951,27 +49055,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -49984,41 +49067,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -50438,27 +49486,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -50471,41 +49498,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -50925,27 +49917,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -50958,41 +49929,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -51412,27 +50348,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -51445,41 +50360,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -51899,27 +50779,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -51932,41 +50791,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -52386,27 +51210,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -52419,41 +51222,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -53181,27 +51949,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -53214,41 +51961,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -53621,27 +52333,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -53654,41 +52345,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -54067,27 +52723,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -54100,41 +52735,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -54554,27 +53154,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -54587,41 +53166,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -55355,27 +53899,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -55388,41 +53911,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -55842,27 +54330,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -55875,41 +54342,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -56329,27 +54761,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -56362,41 +54773,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -56816,27 +55192,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -56849,41 +55204,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -57303,27 +55623,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -57336,41 +55635,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -57790,27 +56054,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -57823,41 +56066,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -58277,27 +56485,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -58310,41 +56497,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
@@ -58764,27 +56916,6 @@
                 "defaultValue": 100
               },
               {
-                "key": "urlTemplate",
-                "label": "URL per upstream row",
-                "kind": "text",
-                "placeholder": "https://api.example.com/companies/{id}/officers",
-                "description": "Makes one request per row of the connected input, substituting {column} from that row. This is how a parent endpoint feeds a child one: /companies, then /companies/{id}/officers. Leave blank for a single request to the URL above. A column name that does not exist fails the run rather than requesting an empty path."
-              },
-              {
-                "key": "parentKeyColumn",
-                "label": "Carry upstream column",
-                "kind": "text",
-                "placeholder": "id",
-                "description": "Stamped onto every row the child returns, so the results can be joined back to the row that produced them. /companies/42/officers returns officers with nothing in them saying 42."
-              },
-              {
-                "key": "maxRequests",
-                "label": "Max requests (safety cap)",
-                "kind": "integer",
-                "defaultValue": 1000,
-                "description": "How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm."
-              },
-              {
                 "key": "incrementalField",
                 "label": "Incremental field",
                 "kind": "text",
@@ -58797,41 +56928,6 @@
                 "kind": "text",
                 "placeholder": "1970-01-01",
                 "description": "What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as \"from the beginning\". The mark is saved only when the whole pipeline succeeds, and only when it moved forward."
-              },
-              {
-                "key": "concurrency",
-                "label": "Requests in flight",
-                "kind": "integer",
-                "defaultValue": 1,
-                "description": "How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice."
-              },
-              {
-                "key": "checkpoint",
-                "label": "Remember completed rows",
-                "kind": "bool",
-                "defaultValue": false,
-                "description": "Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer."
-              },
-              {
-                "key": "onParentError",
-                "label": "When a row request fails",
-                "kind": "select",
-                "defaultValue": "fail",
-                "options": [
-                  {
-                    "label": "Stop the run",
-                    "value": "fail"
-                  },
-                  {
-                    "label": "Skip that row and carry on",
-                    "value": "skip"
-                  },
-                  {
-                    "label": "Send it to the reject output",
-                    "value": "reject"
-                  }
-                ],
-                "description": "One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log."
               },
               {
                 "key": "responseMetadata",
