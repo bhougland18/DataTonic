@@ -4382,6 +4382,21 @@ fn run_file_op(spec: &FileOpSpec) -> Result<String, EngineError> {
                 // into an archive is the last step of a great many batch jobs,
                 // and doing it with a shell command means one pipeline per
                 // platform.
+                //
+                // The same guard the copy/move arm applies. It used to live only
+                // there, and File::create below TRUNCATES, so archiving over an
+                // existing archive destroyed it however the Overwrite box was
+                // set - against FileOpSpec.overwrite's own documented meaning,
+                // "Off means an existing file is an error".
+                if dst.exists() && !spec.overwrite {
+                    return Err(format!("destination exists: {}", spec.destination));
+                }
+                if let Some(parent) = dst.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
+                    }
+                }
                 let f = std::fs::File::create(dst)
                     .map_err(|e| format!("create {}: {}", spec.destination, e))?;
                 let mut zip = zip::ZipWriter::new(f);
@@ -8343,5 +8358,76 @@ mod component_extension_tests {
         assert_eq!(extensions_for_component("qa.geomvalidate", &none), vec!["spatial".to_string()]);
         // A component with no prelude reports nothing rather than guessing.
         assert!(extensions_for_component("src.csv", &none).is_empty());
+    }
+}
+
+/// ctl.file's "Overwrite an existing destination" guard covered copy and move
+/// and not archive.
+///
+/// FileOpSpec.overwrite is documented as "Off means an existing file is an
+/// error", and the check that enforces it lives in the catch-all `op =>` arm.
+/// The "archive" arm returns before ever reaching it and opens the destination
+/// with File::create, which TRUNCATES. So archiving over yesterday's archive
+/// destroyed it with the box unticked.
+#[cfg(test)]
+mod file_op_overwrite {
+    use super::*;
+
+    fn spec(op: &str, src: &str, dst: &str, overwrite: bool) -> FileOpSpec {
+        FileOpSpec {
+            op: op.to_string(),
+            source: src.to_string(),
+            destination: dst.to_string(),
+            overwrite,
+            fail_on_error: true,
+        }
+    }
+
+    #[test]
+    fn archive_refuses_an_existing_destination_unless_overwrite_is_set() {
+        let tmp = std::env::temp_dir().join(format!("duckle-archive-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("data.txt");
+        let dst = tmp.join("out.zip");
+        std::fs::write(&src, b"fresh").unwrap();
+        std::fs::write(&dst, b"an archive somebody already cared about").unwrap();
+        let before = std::fs::read(&dst).unwrap();
+
+        let err = run_file_op(&spec(
+            "archive",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+            false,
+        ));
+        assert!(err.is_err(), "archive must refuse to clobber an existing destination");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            before,
+            "the existing file must still be there, byte for byte"
+        );
+
+        // With overwrite on it goes ahead, which is the whole point of the box.
+        run_file_op(&spec("archive", src.to_str().unwrap(), dst.to_str().unwrap(), true))
+            .expect("overwrite=true must archive");
+        assert_ne!(std::fs::read(&dst).unwrap(), before, "overwrite=true must replace it");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn archive_still_writes_when_the_destination_is_new() {
+        let tmp = std::env::temp_dir().join(format!("duckle-archive-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("data.txt");
+        let dst = tmp.join("new.zip");
+        std::fs::write(&src, b"fresh").unwrap();
+
+        run_file_op(&spec("archive", src.to_str().unwrap(), dst.to_str().unwrap(), false))
+            .expect("a destination that does not exist yet is not a clobber");
+        assert!(dst.exists(), "the archive should have been written");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

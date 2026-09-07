@@ -8161,14 +8161,31 @@ impl DuckdbEngine {
             // a panic here would take the whole run down rather than failing one
             // stage with a message naming the file.
             let path_owned = file.clone();
+            // "Skip it and carry on" used to cover only the two OPEN failures
+            // above - fetching the bytes, and lopdf parsing the structure - so a
+            // document that opened cleanly and then failed HERE took the whole
+            // run down with it. That is the failure people choose skip for: one
+            // unreadable file among thousands, and by the note above it is also
+            // the likeliest one, since the text extractor panics on malformed
+            // input where lopdf is happy with the structure.
             let texts: Vec<String> =
                 match std::panic::catch_unwind(move || pdf_extract::extract_text_by_pages(&path_owned)) {
                     Ok(Ok(t)) => t,
+                    Ok(Err(e)) if spec.on_error == "skip" => {
+                        eprintln!("duckle: pdf: skipping {uri}: extract text: {e}");
+                        skipped += 1;
+                        return Ok(());
+                    }
                     Ok(Err(e)) => {
                         return Err(EngineError::Query(format!(
                             "pdf: extract text from {}: {}",
                             file, e
                         )))
+                    }
+                    Err(_) if spec.on_error == "skip" => {
+                        eprintln!("duckle: pdf: skipping {uri}: the file is malformed, or uses a feature the text extractor cannot read");
+                        skipped += 1;
+                        return Ok(());
                     }
                     Err(_) => {
                         return Err(EngineError::Query(format!(
@@ -15863,15 +15880,22 @@ impl DuckdbEngine {
         // The reject relation is built even when empty, so a downstream node
         // wired to it binds on a clean run instead of failing on a missing
         // table - the same reason the main output is typed when empty.
-        if reject_policy == "reject" {
-            materialize_jsonobjects_as_table_typed(
-                &self.bin,
-                db,
-                &format!("{}__reject", spec.node_id),
-                &rejects,
-                Some(&parent_failure_schema()),
-            )?;
-        }
+        //
+        // This used to sit behind `if reject_policy == "reject"`, which defeated
+        // the sentence above: with any other policy the table was never made, so
+        // wiring the reject port failed the run with "Catalog Error: Table with
+        // name <node>__reject does not exist!". The dropdown defaults to "fail"
+        // and the port is drawn on the tile, so connecting it was enough to kill
+        // a run in which nothing had gone wrong. `rejects` is simply empty under
+        // the other policies, which is exactly what a downstream node should
+        // bind to.
+        materialize_jsonobjects_as_table_typed(
+            &self.bin,
+            db,
+            &format!("{}__reject", spec.node_id),
+            &rejects,
+            Some(&parent_failure_schema()),
+        )?;
         // #257: queued, not written. The deferred queue flushes only when the
         // WHOLE run succeeds, so a pipeline that fails after this stage does
         // not advance the cursor past rows no sink ever received.

@@ -3950,7 +3950,13 @@ function synthWarehouseSink(comp: ComponentDef): ComponentManifest {
                         options: [
                             { label: 'Create or replace', value: 'overwrite' },
                             { label: 'Append (insert)', value: 'append' },
-                            { label: 'Truncate + insert', value: 'truncate' },
+                            // Truncate was offered and the planner refuses it:
+                            // DuckDB cannot TRUNCATE a Quack table, which is a
+                            // streaming scan rather than a base table, so
+                            // picking it could only ever end in a config error.
+                            // The refusal stays for pipelines already saved
+                            // with it, and names overwrite as the way to
+                            // replace the contents.
                         ],
                     },
                 ],
@@ -5478,7 +5484,13 @@ function synthFieldsTransform(comp: ComponentDef): ComponentManifest {
                         description: 'Applied to any column above whose On error is left at Default.',
                         options: [
                             { label: 'Set to NULL', value: 'null' },
-                            { label: 'Reject row', value: 'reject' },
+                            // "Reject row" was offered here and could not reject:
+                            // the builder sends it to TRY_CAST exactly like null
+                            // (builders.rs, "row-level rejection isn't wired for
+                            // cast yet"), and xf.cast declares no reject output
+                            // port for a row to go to. A pipeline saved with the
+                            // old value still nulls, which is what it always did.
+                            // Use a qa.* gate upstream to route bad rows.
                             { label: 'Fail pipeline', value: 'fail' },
                         ],
                     },

@@ -2530,6 +2530,43 @@ fn standardize_trims_and_uppercases() {
     assert_eq!(v, "HELLO WORLD", "got {}", v);
 }
 
+/// qa.standardize offered a "Title Case" option that emitted `INITCAP(...)`,
+/// and DuckDB has no such function - the pinned 1.5.4 answers
+/// "Catalog Error: Scalar Function with name initcap does not exist!". Picking
+/// it could never work.
+///
+/// The sibling test above only ever exercised `upper`, which is why this went
+/// unnoticed: the generated SQL looks perfectly well-formed, so nothing short
+/// of running it catches a function that is not there.
+#[test]
+fn standardize_title_case_runs_and_title_cases() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "name\nhello world\nALL CAPS TEXT\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let d = doc(
+        json!([
+            node("s1", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("c1", "qa.standardize", json!({ "columns": ["name"], "case": "title" })),
+            node("k1", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s1", "c1"), main_edge("e2", "c1", "k1")]),
+    );
+    let result = engine.execute_pipeline(&d);
+    assert_eq!(result.status, "ok", "run failed: {:?}", result.error);
+    let first = scalar_string(&format!(
+        "SELECT name FROM read_csv_auto('{}') WHERE lower(name) = 'hello world'",
+        out
+    ));
+    assert_eq!(first, "Hello World", "got {}", first);
+    // An already-shouting value must come DOWN to title case, not stay as it was.
+    let second = scalar_string(&format!(
+        "SELECT name FROM read_csv_auto('{}') WHERE lower(name) = 'all caps text'",
+        out
+    ));
+    assert_eq!(second, "All Caps Text", "got {}", second);
+}
+
 #[test]
 fn fuzzy_dedupe_collapses_near_duplicates() {
     let engine = engine_or_skip!();
@@ -21799,5 +21836,78 @@ fn a_parquet_append_does_not_destroy_what_is_already_there() {
     assert!(
         rows.contains('1') && rows.contains('2'),
         "the refused run must leave the original rows untouched, got {rows:?}"
+    );
+}
+
+/// Wiring a REST source's reject output broke runs in which nothing failed.
+///
+/// `<node>__reject` was materialized only under `onParentError == "reject"`,
+/// while the comment immediately above that guard says the opposite and gives
+/// the reason: "The reject relation is built even when empty, so a downstream
+/// node wired to it binds on a clean run instead of failing on a missing
+/// table". The dropdown defaults to "fail" and the reject port is drawn on the
+/// tile, so connecting it before touching the dropdown was enough to end a
+/// perfectly good run with
+///   Catalog Error: Table with name <node>__reject does not exist!
+#[test]
+fn a_wired_reject_port_binds_when_no_parent_failed() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock http");
+    let port = listener.local_addr().unwrap().port();
+
+    // Every request succeeds. Nothing should ever reach the reject port.
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            stream.set_read_timeout(Some(Duration::from_millis(250))).ok();
+            stream.set_nodelay(true).ok();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk);
+            let body = r#"[{"v":1}]"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let parents = write_file(tmp.path(), "parents.csv", "id\n1\n2\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let rej = out_path(tmp.path(), "rej.csv");
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("p", "src.csv", json!({ "path": parents, "hasHeader": true })),
+            // onParentError deliberately left unset: "fail" is the default, and
+            // the default is the configuration that broke.
+            node("c", "src.rest", json!({
+                "url": base,
+                "method": "GET",
+                "urlTemplate": format!("{}/thing/{{id}}", base),
+                "parentKeyColumn": "id"
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            node("kr", "snk.csv", json!({ "path": rej, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "p", "c"),
+            main_edge("e2", "c", "k"),
+            port_edge("e3", "c", "reject", "kr"),
+        ]),
+    ));
+    let _ = handle.join();
+    assert_eq!(
+        r.status, "ok",
+        "a clean run must not fail just because the reject port is wired: {:?}",
+        r.error
     );
 }

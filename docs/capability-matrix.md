@@ -169,7 +169,7 @@ How a sink writes, and what it does with rows it cannot.
 | `snk.clickhouse` | - | - | - |
 | `snk.execsource` | overwrite, create | - | - |
 | `snk.motherduck` | overwrite, append, truncate, upsert, merge | - | - |
-| `snk.quack` | overwrite, append, truncate | - | - |
+| `snk.quack` | overwrite, append | - | - |
 | `snk.gizmosql` | append, overwrite | - | - |
 | `snk.snowflake` | overwrite, append, truncate, upsert | - | - |
 | `snk.bigquery` | overwrite, append, truncate | - | - |

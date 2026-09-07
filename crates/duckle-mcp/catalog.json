@@ -17194,10 +17194,6 @@
                     "value": "null"
                   },
                   {
-                    "label": "Reject row",
-                    "value": "reject"
-                  },
-                  {
                     "label": "Fail pipeline",
                     "value": "fail"
                   }
@@ -34474,10 +34470,6 @@
                   {
                     "label": "Append (insert)",
                     "value": "append"
-                  },
-                  {
-                    "label": "Truncate + insert",
-                    "value": "truncate"
                   }
                 ]
               }

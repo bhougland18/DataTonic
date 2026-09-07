@@ -3355,7 +3355,21 @@ pub(crate) fn build_standardize(inputs: &NodeInputs, props: &JsonValue) -> Resul
             expr = match case.as_str() {
                 "upper" => format!("UPPER({})", expr),
                 "lower" => format!("LOWER({})", expr),
-                "title" => format!("INITCAP({})", expr),
+                // DuckDB has no INITCAP, and no title-case function under any
+                // other name - the pinned 1.5.4 answers "Catalog Error: Scalar
+                // Function with name initcap does not exist!", so picking
+                // "Title Case" could never run. Built from functions it does
+                // have: split on spaces, upper the first character of each word
+                // and lower the rest, join back with the same separator.
+                //
+                // `lambda w:` rather than the `->` arrow, which 1.5.4 warns is
+                // deprecated and drops in the next release. Verified against
+                // 1.5.4 for empty strings, NULL, single characters, repeated
+                // spaces (preserved) and already-uppercase input.
+                "title" => format!(
+                    "array_to_string(list_transform(string_split({}, ' '),                      lambda w: upper(w[1]) || lower(w[2:])), ' ')",
+                    expr
+                ),
                 _ => expr,
             };
             if collapse {
