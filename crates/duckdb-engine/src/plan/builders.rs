@@ -3141,10 +3141,22 @@ pub(crate) fn build_outlier(inputs: &NodeInputs, props: &JsonValue, reject: bool
         ),
     };
     let exclude = if method == "zscore" { "__dq_mean, __dq_sd" } else { "__dq_q1, __dq_q3" };
-    let guard = if reject { "NOT COALESCE" } else { "COALESCE" };
-    Ok(format!(
-        "SELECT * EXCLUDE ({exclude}) FROM (SELECT *, {helpers} FROM {up}) WHERE {guard}(({inlier}), TRUE)",
-        up = quote_ident(upstream)
+    let sql = |guard: &str| {
+        format!(
+            "SELECT * EXCLUDE ({exclude}) FROM (SELECT *, {helpers} FROM {up}) WHERE {guard}(({inlier}), TRUE)",
+            up = quote_ident(upstream)
+        )
+    };
+    if reject {
+        return Ok(sql("NOT COALESCE"));
+    }
+    // The outliers are what "failed", so they are the reject side.
+    Ok(apply_on_fail(
+        "qa.outlier",
+        props,
+        upstream,
+        sql("COALESCE"),
+        &sql("NOT COALESCE"),
     ))
 }
 
@@ -3454,6 +3466,47 @@ pub(crate) fn build_record_match(inputs: &NodeInputs, props: &JsonValue) -> Resu
     ))
 }
 
+/// "On failure" applied wherever a gate produces its PASS rows.
+///
+/// In one place because it has now been missed twice. Both branches used to
+/// live inside build_quality's PREDICATE path, and two gates never reach it:
+/// qa.unique returns early from its own branch at the top of that function,
+/// and qa.outlier is a separate builder. Both declared the field and honoured
+/// none of it - a gate set to `fail` let the load through and reported
+/// success, and `warn`, labelled "Keep row", dropped the row anyway.
+///
+/// `fail` is expressed over the gate's OWN reject SQL rather than a
+/// per-component predicate, so any gate can be wired to it without knowing how
+/// that gate decides what failed.
+pub(crate) fn apply_on_fail(
+    component_id: &str,
+    props: &JsonValue,
+    from_view: &str,
+    pass_sql: String,
+    reject_sql: &str,
+) -> String {
+    match string_prop(props, "onFail")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        // Everything continues down main. The failing rows are still on the
+        // reject port, which carries them whatever this says.
+        "warn" => format!("SELECT * FROM {}", quote_ident(from_view)),
+        "fail" => {
+            let msg =
+                format!("{component_id}: a row failed the check and On failure is set to fail");
+            format!(
+                "SELECT * FROM ({pass_sql}) WHERE CASE WHEN \
+                 (SELECT count(*) FROM ({reject_sql})) > 0 THEN error('{}') ELSE TRUE END",
+                sql_escape(&msg)
+            )
+        }
+        // reject, and anything unset, is what the gate already did.
+        _ => pass_sql,
+    }
+}
+
 /// Data-quality validators. `reject = false` yields the passing rows;
 /// `reject = true` yields the failing rows for the node's reject port.
 pub(crate) fn build_quality(
@@ -3488,10 +3541,17 @@ pub(crate) fn build_quality(
             let ob = order.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
             format!("ROW_NUMBER() OVER (PARTITION BY {} ORDER BY {})", partition, ob)
         };
-        return Ok(format!(
-            "SELECT * EXCLUDE (__dq_rn) FROM (SELECT *, {} AS __dq_rn FROM {}) WHERE __dq_rn {} 1",
-            window, from, cmp
-        ));
+        let sql = |op: &str| {
+            format!(
+                "SELECT * EXCLUDE (__dq_rn) FROM (SELECT *, {} AS __dq_rn FROM {}) WHERE __dq_rn {} 1",
+                window, from, op
+            )
+        };
+        if reject {
+            return Ok(sql(cmp));
+        }
+        // The duplicates are what "failed", so they are the reject side.
+        return Ok(apply_on_fail(component_id, props, upstream, sql("="), &sql(">")));
     }
     let predicate = quality_pass_predicate(component_id, props)?;
     if reject {

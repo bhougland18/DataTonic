@@ -5829,27 +5829,30 @@ function synthJoinTransform(comp: ComponentDef): ComponentManifest {
     // The consolidated 'xf.join' node (#153) drives its kind purely from the
     // joinType dropdown, so it defaults to INNER; the legacy per-type ids
     // (xf.join.left, xf.semi, ...) still seed the dropdown from their suffix.
-    const joinType = comp.id === 'xf.join' ? 'inner' : (comp.id.split('.').pop() ?? 'inner');
-    // The plain Join node only implements inner/left/right/full via joinType;
-    // cross/semi/anti are distinct shapes kept as their own palette nodes, so
-    // only offer them on those legacy ids (avoids the misleading no-op options
-    // the reporter flagged in #153).
+    // #153 offered cross/semi/anti on the legacy ids on the reasoning that they
+    // ARE those shapes. Measured, that is backwards. xf.semi and xf.anti go to
+    // build_semi, which never mentions joinType; xf.join.cross goes to
+    // build_cross_join, which takes no props at all. On those three the
+    // dropdown is a no-op in all seven positions - their shape IS the
+    // component - so the control is gone rather than left pretending.
+    //
+    // xf.lookup does read it, through build_join, whose match covers exactly
+    // inner/left/right/full. cross/semi/anti fell to the default and silently
+    // became LEFT, so they are gone from its list too.
+    const FIXED_BY_COMPONENT = [
+        'xf.semi', 'xf.semi.join', 'xf.anti', 'xf.anti.join', 'xf.join.cross',
+    ];
+    const showsJoinType = !FIXED_BY_COMPONENT.includes(comp.id);
+    // Was `comp.id.split('.').pop()`, which handed xf.lookup a default of
+    // 'lookup' - a value absent from its own options, so the box showed
+    // something unselectable while the engine quietly used LEFT.
+    const joinType = comp.id === 'xf.join' ? 'inner' : 'left';
     const joinTypeOptions =
-        comp.id === 'xf.join'
-            ? [
+        [
                   { label: 'INNER', value: 'inner' },
                   { label: 'LEFT', value: 'left' },
                   { label: 'RIGHT', value: 'right' },
                   { label: 'FULL OUTER', value: 'full' },
-              ]
-            : [
-                  { label: 'INNER', value: 'inner' },
-                  { label: 'LEFT', value: 'left' },
-                  { label: 'RIGHT', value: 'right' },
-                  { label: 'FULL OUTER', value: 'full' },
-                  { label: 'CROSS', value: 'cross' },
-                  { label: 'SEMI', value: 'semi' },
-                  { label: 'ANTI', value: 'anti' },
               ];
     return base(comp, [
         {
@@ -5863,7 +5866,7 @@ function synthJoinTransform(comp: ComponentDef): ComponentManifest {
                 { key: 'multipleKeys', label: 'Multi-column key (left/right pairs)', kind: 'key-value' },
             ],
         },
-        {
+        ...(showsJoinType ? [{
             label: 'Join type',
             fields: [
                 {
@@ -5879,7 +5882,7 @@ function synthJoinTransform(comp: ComponentDef): ComponentManifest {
                 // xf.filter work. A second control that has to agree with the
                 // wiring is how the two drift apart.
             ],
-        },
+        }] as FormSection[] : []),
     ], 'declared');
 }
 
@@ -6252,12 +6255,23 @@ function synthStringTransform(comp: ComponentDef): ComponentManifest {
 }
 
 const TIME_UNITS = ['year', 'quarter', 'month', 'week', 'day', 'hour', 'minute', 'second', 'dayofweek', 'isodow', 'dayofyear', 'epoch'];
-const unitField = (label: string): Field => ({
+// The four that are parts of a date but not amounts of time. date_part and
+// date_trunc take them happily (checked against the pinned 1.5.4), so Extract,
+// Truncate and Diff keep all twelve. ADD cannot: it builds `INTERVAL 1 <unit>`,
+// and interval_unit maps anything it does not recognise to DAY - so "add 1
+// epoch" silently added a DAY rather than a second, wrong by 86,400x, and
+// dayofweek / isodow / dayofyear were meaningless as amounts and became a day
+// too. The SQL was always valid, which is why nothing caught it.
+const NOT_INTERVAL_UNITS = ['dayofweek', 'isodow', 'dayofyear', 'epoch'];
+const unitField = (label: string, addable = false): Field => ({
     key: 'unit',
     label,
     kind: 'select',
     defaultValue: 'day',
-    options: TIME_UNITS.map(u => ({ label: u, value: u })),
+    options: TIME_UNITS.filter(u => !addable || !NOT_INTERVAL_UNITS.includes(u)).map(u => ({
+        label: u,
+        value: u,
+    })),
 });
 const outColField = (placeholder = 'leave blank to replace the column'): Field => ({
     key: 'outputColumn',
@@ -6335,7 +6349,7 @@ function synthDateTimeTransform(comp: ComponentDef): ComponentManifest {
         return base(comp, [{ label: 'Date add', fields: [
             col,
             { key: 'amount', label: 'Amount (negative subtracts)', kind: 'integer', defaultValue: 1 },
-            unitField('Unit'),
+            unitField('Unit', true),
             outColField(),
         ] }], 'upstream');
     }

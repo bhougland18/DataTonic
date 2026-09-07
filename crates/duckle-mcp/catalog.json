@@ -18878,47 +18878,6 @@
                 "kind": "key-value"
               }
             ]
-          },
-          {
-            "label": "Join type",
-            "fields": [
-              {
-                "key": "joinType",
-                "label": "Type",
-                "kind": "select",
-                "defaultValue": "cross",
-                "options": [
-                  {
-                    "label": "INNER",
-                    "value": "inner"
-                  },
-                  {
-                    "label": "LEFT",
-                    "value": "left"
-                  },
-                  {
-                    "label": "RIGHT",
-                    "value": "right"
-                  },
-                  {
-                    "label": "FULL OUTER",
-                    "value": "full"
-                  },
-                  {
-                    "label": "CROSS",
-                    "value": "cross"
-                  },
-                  {
-                    "label": "SEMI",
-                    "value": "semi"
-                  },
-                  {
-                    "label": "ANTI",
-                    "value": "anti"
-                  }
-                ]
-              }
-            ]
           }
         ],
         "ports": {
@@ -19164,7 +19123,7 @@
                 "key": "joinType",
                 "label": "Type",
                 "kind": "select",
-                "defaultValue": "lookup",
+                "defaultValue": "left",
                 "options": [
                   {
                     "label": "INNER",
@@ -19181,18 +19140,6 @@
                   {
                     "label": "FULL OUTER",
                     "value": "full"
-                  },
-                  {
-                    "label": "CROSS",
-                    "value": "cross"
-                  },
-                  {
-                    "label": "SEMI",
-                    "value": "semi"
-                  },
-                  {
-                    "label": "ANTI",
-                    "value": "anti"
                   }
                 ]
               }
@@ -19291,47 +19238,6 @@
                 "kind": "key-value"
               }
             ]
-          },
-          {
-            "label": "Join type",
-            "fields": [
-              {
-                "key": "joinType",
-                "label": "Type",
-                "kind": "select",
-                "defaultValue": "semi",
-                "options": [
-                  {
-                    "label": "INNER",
-                    "value": "inner"
-                  },
-                  {
-                    "label": "LEFT",
-                    "value": "left"
-                  },
-                  {
-                    "label": "RIGHT",
-                    "value": "right"
-                  },
-                  {
-                    "label": "FULL OUTER",
-                    "value": "full"
-                  },
-                  {
-                    "label": "CROSS",
-                    "value": "cross"
-                  },
-                  {
-                    "label": "SEMI",
-                    "value": "semi"
-                  },
-                  {
-                    "label": "ANTI",
-                    "value": "anti"
-                  }
-                ]
-              }
-            ]
           }
         ],
         "ports": {
@@ -19418,47 +19324,6 @@
                 "key": "multipleKeys",
                 "label": "Multi-column key (left/right pairs)",
                 "kind": "key-value"
-              }
-            ]
-          },
-          {
-            "label": "Join type",
-            "fields": [
-              {
-                "key": "joinType",
-                "label": "Type",
-                "kind": "select",
-                "defaultValue": "anti",
-                "options": [
-                  {
-                    "label": "INNER",
-                    "value": "inner"
-                  },
-                  {
-                    "label": "LEFT",
-                    "value": "left"
-                  },
-                  {
-                    "label": "RIGHT",
-                    "value": "right"
-                  },
-                  {
-                    "label": "FULL OUTER",
-                    "value": "full"
-                  },
-                  {
-                    "label": "CROSS",
-                    "value": "cross"
-                  },
-                  {
-                    "label": "SEMI",
-                    "value": "semi"
-                  },
-                  {
-                    "label": "ANTI",
-                    "value": "anti"
-                  }
-                ]
               }
             ]
           }
@@ -23940,22 +23805,6 @@
                   {
                     "label": "second",
                     "value": "second"
-                  },
-                  {
-                    "label": "dayofweek",
-                    "value": "dayofweek"
-                  },
-                  {
-                    "label": "isodow",
-                    "value": "isodow"
-                  },
-                  {
-                    "label": "dayofyear",
-                    "value": "dayofyear"
-                  },
-                  {
-                    "label": "epoch",
-                    "value": "epoch"
                   }
                 ]
               },

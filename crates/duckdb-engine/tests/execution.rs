@@ -21960,3 +21960,159 @@ fn every_ip_parse_kind_runs() {
     ));
     assert_eq!(bare, "32", "no prefix means the whole address: got {bare}");
 }
+
+/// xf.dt.add offered every unit its three siblings use, and four of them are
+/// not units you can ADD.
+///
+/// `interval_unit` maps anything it does not recognise to DAY, so the SQL is
+/// always valid and always runs - which is why nothing caught this. Adding
+/// "1 epoch" is a second in every other tool that has the notion; here it
+/// silently added a DAY, wrong by 86,400x. dayofweek / isodow / dayofyear were
+/// meaningless as amounts and quietly became a day too.
+///
+/// The list is shared with xf.dt.extract / trunc / diff, which legitimately
+/// take all twelve - date_part and date_trunc accept them, verified against
+/// 1.5.4. Only the one that builds an INTERVAL needed the narrower set.
+#[test]
+fn date_add_units_mean_what_they_say() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "ts\n2024-01-01 00:00:00\n");
+
+    let add = |unit: &str, out: &str| -> String {
+        let d = doc(
+            json!([
+                node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node("t", "xf.dt.add", json!({
+                    "column": "ts", "amount": 1, "unit": unit, "outputColumn": "got"
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "t"), main_edge("e2", "t", "k")]),
+        );
+        let r = engine.execute_pipeline(&d);
+        assert_eq!(r.status, "ok", "unit {unit} failed: {:?}", r.error);
+        scalar_string(&format!("SELECT CAST(got AS VARCHAR) FROM read_csv_auto('{}')", out))
+    };
+
+    // Every unit the form still offers has to move the clock by ITS OWN amount.
+    let second = add("second", &out_path(tmp.path(), "s.csv"));
+    assert!(second.contains("00:00:01"), "second should add a second: {second}");
+    let day = add("day", &out_path(tmp.path(), "d.csv"));
+    assert!(day.contains("2024-01-02"), "day should add a day: {day}");
+    let hour = add("hour", &out_path(tmp.path(), "h.csv"));
+    assert!(hour.contains("01:00:00"), "hour should add an hour: {hour}");
+    let month = add("month", &out_path(tmp.path(), "m.csv"));
+    assert!(month.contains("2024-02-01"), "month should add a month: {month}");
+
+    // And the form must not offer a unit that cannot be added. `epoch` is the
+    // one that mattered: it silently added a day.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("duckle-mcp")
+        .join("catalog.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).expect("catalog")).expect("json");
+    let comp = v["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "xf.dt.add")
+        .expect("xf.dt.add in catalog");
+    let text = comp.to_string();
+    for bad in ["dayofweek", "isodow", "dayofyear", "epoch"] {
+        assert!(
+            !text.contains(bad),
+            "xf.dt.add still offers '{bad}', which interval_unit turns into DAY"
+        );
+    }
+}
+
+/// Every gate that offers "On failure" has to honour all three of its values.
+///
+/// The warn and fail branches lived in build_quality's PREDICATE path, and two
+/// gates never reach it: qa.unique returns early from its own branch at the top
+/// of that function, and qa.outlier is a separate builder entirely. Both
+/// declared the field and honoured none of it -
+///   fail: a gate asked to STOP the load let it through and reported success
+///   warn: labelled "Keep row" and dropped the row anyway
+/// which is the same pair of bugs that were fixed for the predicate gates, in
+/// the two places the fix did not reach.
+///
+/// qa.notnull is included as the control: it takes the predicate path, so it
+/// proves the harness is measuring the right thing rather than passing by
+/// accident.
+#[test]
+fn every_on_fail_gate_honours_all_three_values() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Each gate, with input where exactly ONE of four rows fails its check.
+    let cases: Vec<(&str, &str, &str, serde_json::Value)> = vec![
+        (
+            "qa.notnull",
+            "id,name\n1,a\n2,b\n3,\n4,d\n",
+            "name",
+            json!({ "columns": ["name"] }),
+        ),
+        (
+            "qa.unique",
+            "id,k\n1,a\n2,b\n3,b\n4,d\n",
+            "k",
+            json!({ "columns": ["k"] }),
+        ),
+        (
+            "qa.outlier",
+            "id,amt\n1,10\n2,11\n3,12\n4,100000\n",
+            "amt",
+            json!({ "column": "amt", "method": "iqr" }),
+        ),
+    ];
+
+    for (component, csv_body, _col, base_props) in cases {
+        let csv = write_file(tmp.path(), &format!("{}.csv", component.replace('.', "_")), csv_body);
+
+        let run = |on_fail: &str, out: &str| {
+            let mut props = base_props.clone();
+            props["onFail"] = json!(on_fail);
+            let d = doc(
+                json!([
+                    node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                    node("t", component, props),
+                    node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+                ]),
+                json!([main_edge("e1", "s", "t"), main_edge("e2", "t", "k")]),
+            );
+            engine.execute_pipeline(&d)
+        };
+
+        // fail: a row fails the check, so the run must STOP.
+        let out = out_path(tmp.path(), &format!("{}_fail.csv", component.replace('.', "_")));
+        let r = run("fail", &out);
+        assert_eq!(
+            r.status, "error",
+            "{component}: On failure = fail must stop the run when a row fails, got {:?}",
+            r.status
+        );
+
+        // warn: labelled "keep row", so every row must come out.
+        let out = out_path(tmp.path(), &format!("{}_warn.csv", component.replace('.', "_")));
+        let r = run("warn", &out);
+        assert_eq!(r.status, "ok", "{component}: warn must not fail: {:?}", r.error);
+        let n = scalar_string(&format!(
+            "SELECT CAST(count(*) AS VARCHAR) FROM read_csv_auto('{}')",
+            out
+        ));
+        assert_eq!(n, "4", "{component}: warn says it keeps the row, so all 4 must survive");
+
+        // reject (the default): the failing row is dropped from main.
+        let out = out_path(tmp.path(), &format!("{}_reject.csv", component.replace('.', "_")));
+        let r = run("reject", &out);
+        assert_eq!(r.status, "ok", "{component}: reject must not fail: {:?}", r.error);
+        let n = scalar_string(&format!(
+            "SELECT CAST(count(*) AS VARCHAR) FROM read_csv_auto('{}')",
+            out
+        ));
+        assert_eq!(n, "3", "{component}: reject drops the failing row, so 3 must remain");
+    }
+}

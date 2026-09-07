@@ -1319,7 +1319,7 @@ COMPONENTS = {
     'xf.anti': {
         'kind': 'transform',
         'summary': '',
-        'params': ['leftKey', 'rightKey', 'multipleKeys', 'joinType'],
+        'params': ['leftKey', 'rightKey', 'multipleKeys'],
     },
     'xf.approx.quantile': {
         'kind': 'transform',
@@ -1649,7 +1649,7 @@ COMPONENTS = {
     'xf.join.cross': {
         'kind': 'transform',
         'summary': '',
-        'params': ['leftKey', 'rightKey', 'multipleKeys', 'joinType'],
+        'params': ['leftKey', 'rightKey', 'multipleKeys'],
     },
     'xf.join.spatial': {
         'kind': 'transform',
@@ -1854,7 +1854,7 @@ COMPONENTS = {
     'xf.semi': {
         'kind': 'transform',
         'summary': '',
-        'params': ['leftKey', 'rightKey', 'multipleKeys', 'joinType'],
+        'params': ['leftKey', 'rightKey', 'multipleKeys'],
     },
     'xf.sessionize': {
         'kind': 'transform',
