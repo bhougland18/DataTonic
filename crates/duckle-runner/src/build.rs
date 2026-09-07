@@ -1119,6 +1119,33 @@ fn render_manifest(
 
 #[cfg(test)]
 mod tests {
+
+    /// A bundled pipeline must keep the endpoint it authenticates against.
+    ///
+    /// `is_secret_key` decides what gets rewritten to `${ENV:NAME}` in the
+    /// packaged artifact. `tokenUrl` matched the `token` needle, so an OAuth
+    /// endpoint - a public URL, declared by 37 fields across the REST family -
+    /// was replaced by a variable nobody sets, and the bundle failed at run
+    /// time looking for it. Exactly the failure the `pat` / `path` fix above
+    /// describes, one needle over.
+    ///
+    /// This crate already refined `pat` and `sas` to delimited words, which is
+    /// why `saslMechanism` and `saslUsername` were safe HERE while the engine
+    /// still called them credentials; the two now agree.
+    #[test]
+    fn a_public_endpoint_is_not_bundled_away_as_a_secret() {
+        for key in ["tokenUrl", "saslMechanism", "saslUsername", "path", "filePath"] {
+            assert!(!super::is_secret_key(key), "{key} must survive the bundle intact");
+        }
+        for key in [
+            "authToken", "sessionToken", "password", "apiKey", "clientSecret",
+            "privateKey", "pat", "saslPassword",
+            // A path that reaches a credential stays redacted on purpose.
+            "credentialsPath", "privateKeyPath",
+        ] {
+            assert!(super::is_secret_key(key), "{key} must not be bundled in the clear");
+        }
+    }
     use super::*;
     use sha2::{Digest, Sha256};
 

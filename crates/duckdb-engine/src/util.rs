@@ -20,6 +20,38 @@ pub fn is_secret_prop_key(key: &str) -> bool {
     if k == "pat" {
         return true;
     }
+    // The same trap from the other side. `pat` was rescued from `path`; these
+    // are the keys the remaining needles swallow, and each is declared by real
+    // components:
+    //
+    //   tokenUrl        the endpoint a token is fetched FROM   (37 fields)
+    //   saslMechanism   "PLAIN" / "SCRAM-SHA-256"              (4)
+    //   saslUsername    a username                             (4)
+    //   max*Tokens, *UsdPerMillionTokens - a count of tokens is not a token
+    //
+    // `privateKeyPath` and `credentialsPath` are NOT here, deliberately.
+    // `path_like_keys_are_not_treated_as_secrets` asserts they keep matching:
+    // a pipeline whose credential comes from a local file path is one that
+    // should not be deployed, because the path will not exist on the server.
+    //
+    // This is not cosmetic: `literal_secrets` is what `duckle-runner build` and
+    // the desktop deploy path REFUSE on, so a false positive blocks packaging
+    // and deploying and tells the author to replace a public URL with
+    // ${ENV:NAME}. Matched as whole keys, because the needle list cannot
+    // express "token but not tokenUrl".
+    const NAMES_SOMETHING_PUBLIC: [&str; 8] = [
+        "tokenurl",
+        "saslmechanism",
+        "saslusername",
+        "maxtokens",
+        "maxinputtokens",
+        "maxoutputtokens",
+        "inputusdpermilliontokens",
+        "outputusdpermilliontokens",
+    ];
+    if NAMES_SOMETHING_PUBLIC.contains(&k.as_str()) {
+        return false;
+    }
     [
         "password", "passwd", "passphrase", "secret", "token", "apikey", "api_key",
         "privatekey", "private_key", "accesskey", "access_key",
@@ -1285,6 +1317,71 @@ mod tests {
 
         let found = literal_secrets(&doc);
         assert_eq!(found, ["Postgres / password"], "found: {found:?}");
+    }
+
+    /// A key can contain a credential needle and still name something public.
+    ///
+    /// This is not cosmetic. `literal_secrets` is what `duckle-runner build`
+    /// and the desktop deploy path use to REFUSE, so a false positive does not
+    /// merely warn - it blocks packaging and deploying, and tells the author to
+    /// replace a public value with ${ENV:NAME}.
+    ///
+    /// Every key below is one a real component declares:
+    ///   tokenUrl        37 fields - the endpoint a token is fetched FROM
+    ///   saslMechanism    4 fields - "PLAIN" / "SCRAM-SHA-256"
+    ///   saslUsername     4 fields - a username
+    ///
+    /// The same trap the `pat` special case above already documents: a needle
+    /// that is a substring of an innocent word. `pat` was fixed for `path`;
+    /// `token` and `sas` were not.
+    ///
+    /// `privateKeyPath` and `credentialsPath` stay secret on purpose - see
+    /// `path_like_keys_are_not_treated_as_secrets`, which asserts it.
+    #[test]
+    fn a_key_that_names_an_endpoint_or_a_path_is_not_a_credential() {
+        for key in [
+            "tokenUrl",
+            "saslMechanism",
+            "saslUsername",
+            // Numeric in every manifest that declares them, so `as_str()`
+            // spares them today - but nothing says they must stay numeric,
+            // and a count of tokens is not a token.
+            "maxTokens",
+            "maxInputTokens",
+            "maxOutputTokens",
+            "inputUsdPerMillionTokens",
+            "outputUsdPerMillionTokens",
+        ] {
+            assert!(!is_secret_prop_key(key), "{key} is not a credential");
+        }
+
+        // And the credentials those keys are near are still caught.
+        for key in [
+            "authToken", "sessionToken", "accessToken", "token",
+            "saslPassword", "privateKey", "clientSecret", "apiKey",
+        ] {
+            assert!(is_secret_prop_key(key), "{key} IS a credential");
+        }
+    }
+
+    /// The refusal path, end to end on a document: a pipeline whose only
+    /// "credentials" are an endpoint and a mechanism must package and deploy.
+    #[test]
+    fn a_pipeline_carrying_only_public_values_is_not_refused() {
+        let doc = serde_json::json!({
+            "nodes": [
+                { "id": "n1", "data": { "label": "REST", "properties": {
+                    "url": "https://api.example.com/v1/rows",
+                    "tokenUrl": "https://login.example.com/oauth2/token" } } },
+                { "id": "n2", "data": { "label": "Kafka", "properties": {
+                    "saslMechanism": "SCRAM-SHA-256", "saslUsername": "svc_reader" } } }
+            ]
+        });
+        assert!(
+            literal_secrets(&doc).is_empty(),
+            "refused a pipeline with no credential in it: {:?}",
+            literal_secrets(&doc)
+        );
     }
 
     /// The shapes that must not panic or report: no nodes, no data, no properties.
