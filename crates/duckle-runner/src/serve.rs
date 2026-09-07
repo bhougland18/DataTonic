@@ -5816,6 +5816,39 @@ mod tests {
 
     /// The other half, and the more important one: opening a hole for probes must not open
     /// one for anything else.
+        /// The console's ENTIRE unauthenticated surface, asserted as an exact set.
+    ///
+    /// `nothing_else_is_reachable_without_signing_in` below is a denylist: it
+    /// proves a handful of named routes are not public. It cannot notice a
+    /// route being ADDED to PUBLIC_ROUTES, which is the change that actually
+    /// costs something - and the one most likely to be made in passing, while
+    /// making a probe or a callback work.
+    ///
+    /// So this asserts the whole list. An eighth entry fails here, and whoever
+    /// adds it has to come to this test and say what it is and why it cannot
+    /// hold a credential.
+    #[test]
+    fn the_unauthenticated_surface_is_exactly_these_seven_routes() {
+        let mut got: Vec<String> =
+            super::PUBLIC_ROUTES.iter().map(|(m, p)| format!("{m} {p}")).collect();
+        got.sort();
+        let mut want = vec![
+            // Signing in cannot require being signed in.
+            "POST /api/session".to_string(),
+            format!("GET {}", OIDC_LOGIN_PATH),
+            format!("GET {}", OIDC_CALLBACK_PATH),
+            // An orchestrator probe holds no credential, and a probe that 401s
+            // gets the pod killed and restarted forever.
+            format!("GET {}", super::HEALTH_PATH),
+            format!("GET {}", super::READY_PATH),
+            // Claiming a server nobody administers yet. Refused once claimed.
+            format!("GET {}", super::SETUP_PATH),
+            format!("POST {}", super::SETUP_CLAIM_PATH),
+        ];
+        want.sort();
+        assert_eq!(got, want, "the unauthenticated surface changed");
+    }
+
     #[test]
     fn nothing_else_is_reachable_without_signing_in() {
         for (method, path) in [

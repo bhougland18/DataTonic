@@ -37,6 +37,7 @@ Direct, step-by-step instructions to solve specific operational security problem
 * **[How to Configure Secrets Management](how-to/configure-secrets-management.md)**: Store encrypted connection profiles, manage workspace keys, and supply production secrets securely via runtime environment variables.
 * **[How to Report and Patch Vulnerabilities](how-to/vulnerability-reporting-patching.md)**: Follow disclosure procedures, verify binary checksums, and apply emergency security updates without downtime.
 * **[How to Integrate Audit Logs with SIEM using Vector](how-to/siem-vector-integration.md)**: Forward append-only `audit.ndjson` events to Datadog, Splunk, AWS CloudWatch, and Elasticsearch.
+* **[Business Continuity and Recovery](how-to/business-continuity-and-recovery.md)**: What to back up, what each part costs you if lost, restoring incremental state without duplicating or skipping rows, and an annual drill that measures the real RTO.
 * **[How to Execute Incident Response Runbooks](how-to/incident-handling-runbook.md)**: Step-by-step containment procedures for compromised tokens, workspace access breaches, and forensic audits.
 
 ---
@@ -57,6 +58,8 @@ Discussions of architecture, design philosophy, and security models:
 
 * **[Trust Boundary & Threat Model](explanation/trust-boundary-and-threat-model.md)**: Why Duckle is local-first/self-hosted, our "we hold nothing" architectural boundary, and the shared responsibility model.
 * **[SSDLC & TDD Philosophy](explanation/ssdlc-and-tdd-philosophy.md)**: Test-driven security engineering, cross-platform contract testing, static analysis gates, and supply chain provenance.
+* **[Security Testing Program](explanation/security-testing-program.md)**: What is tested continuously, what those methods structurally cannot find, and the scope and cadence of independent penetration testing.
+* **[Security Governance](explanation/security-governance.md)**: Accountability, where security decisions are recorded, the review cadence, and separation of duties with its limits stated.
 * **[Supply Chain Assurance](explanation/supply-chain-assurance.md)**: SBOM, keyless build provenance, dependency scanning on a schedule, and a plain statement of what is not covered.
 * **[Encryption & Key Hierarchy](explanation/encryption-and-key-hierarchy.md)**: Deep dive into AES-256-GCM encryption, workspace key lifecycle, and memory hygiene.
 
