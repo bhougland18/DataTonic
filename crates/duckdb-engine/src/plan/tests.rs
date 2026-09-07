@@ -6706,3 +6706,53 @@ fn the_missing_duckdb_message_helps_a_reader_with_no_desktop_app() {
          manager performs: {msg}"
     );
 }
+
+/// #335: a SQLite source with no table produced `sqlite_scan(db, '')`, and
+/// DuckDB answered with an internal assertion:
+///
+///   SQLite: INTERNAL Error: GetTableInfo - table "" not found
+///   This error signals an assertion failure within DuckDB
+///
+/// Reported against "standard node configuration", which is exactly right: the
+/// form marks neither `tableName` nor `sql` required, because either will do,
+/// so a node with neither is accepted, validates ok, and fails at run time
+/// with a message about DuckDB's internals rather than about the node.
+///
+/// The sibling `build_duckdb_source` already handles the empty case. This one
+/// did not.
+#[test]
+fn a_sqlite_source_with_no_table_says_so_instead_of_asserting() {
+    use crate::plan::builders::build_sqlite_source;
+
+    let err = build_sqlite_source(&serde_json::json!({ "database": "/tmp/north.db" }))
+        .expect_err("a source with nothing to read from must refuse");
+    assert!(
+        err.to_lowercase().contains("table"),
+        "the message must name what is missing: {err}"
+    );
+    assert!(
+        !err.contains("GetTableInfo"),
+        "and must not be DuckDB's assertion: {err}"
+    );
+
+    // Blank is the same as absent - the form writes "" for a touched-then-
+    // cleared box.
+    assert!(build_sqlite_source(&serde_json::json!({ "database": "d", "tableName": "" })).is_err());
+    assert!(build_sqlite_source(
+        &serde_json::json!({ "database": "d", "tableName": "  ", "sql": "" })
+    )
+    .is_err());
+
+    // Either one on its own is enough, and both still build.
+    let by_table = build_sqlite_source(
+        &serde_json::json!({ "database": "d", "tableName": "Orders" }),
+    )
+    .expect("a table is enough");
+    assert!(by_table.contains("Orders"), "{by_table}");
+
+    let by_sql = build_sqlite_source(
+        &serde_json::json!({ "database": "d", "sql": "SELECT 1" }),
+    )
+    .expect("a query is enough");
+    assert!(by_sql.contains("SELECT 1"), "{by_sql}");
+}

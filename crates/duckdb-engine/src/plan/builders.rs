@@ -16,7 +16,7 @@ pub fn source_select_for_format(format: &str, props: &JsonValue) -> Option<Strin
         "tsv" => build_tsv_source(props, None),
         "parquet" => build_parquet_source(props),
         "json" | "jsonl" | "ndjson" => build_json_source(props),
-        "sqlite" => build_sqlite_source(props),
+        "sqlite" => return build_sqlite_source(props).ok(),
         "duckdb" => build_duckdb_source(props),
         "excel" => build_excel_source(props, None),
         "avro" => build_avro_source(props),
@@ -204,7 +204,7 @@ pub(crate) fn build_view_sql(
         }),
         "src.parquet" => Ok(build_parquet_source(props)),
         "src.json" | "src.jsonl" => Ok(build_json_source(props)),
-        "src.sqlite" => Ok(build_sqlite_source(props)),
+        "src.sqlite" => build_sqlite_source(props),
         "src.duckdb" => Ok(build_duckdb_source(props)),
         "src.ducklake.diff" => Ok(build_ducklake_diff(props)),
         "src.s3" | "src.gcs" | "src.azureblob" | "src.http"
@@ -5645,18 +5645,25 @@ pub(crate) fn build_json_source(props: &JsonValue) -> String {
     }
 }
 
-pub(crate) fn build_sqlite_source(props: &JsonValue) -> String {
+pub(crate) fn build_sqlite_source(props: &JsonValue) -> Result<String, String> {
     let database = string_prop(props, "database").unwrap_or_default();
-    let table = string_prop(props, "tableName").unwrap_or_default();
-    let sql = string_prop(props, "sql");
-    let from_arg = sql
-        .filter(|s| !s.is_empty())
-        .unwrap_or(table);
-    format!(
+    // A query wins over a table name, which is what this always did. What it
+    // also did was accept NEITHER: `tableName` defaulted to "" and went
+    // straight into sqlite_scan, so DuckDB answered with an internal assertion
+    // about a table named "" (#335). Either field satisfies the node, which is
+    // why the form requires neither - but "neither" is not a third option, and
+    // saying so here covers the GUI, MCP, a hand-written file and the headless
+    // runner at once. It also reaches `validate`, which compiles without
+    // running, so the mistake is caught before a connection is opened.
+    let trimmed = |k: &str| string_prop(props, k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let from_arg = trimmed("sql").or_else(|| trimmed("tableName")).ok_or_else(|| {
+        "SQLite source: set a table name, or a SQL query to run against the database".to_string()
+    })?;
+    Ok(format!(
         "SELECT * FROM sqlite_scan('{}', '{}')",
         sql_escape(&database),
         sql_escape(&from_arg)
-    )
+    ))
 }
 
 pub(crate) fn build_duckdb_source(props: &JsonValue) -> String {
