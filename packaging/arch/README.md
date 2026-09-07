@@ -81,9 +81,12 @@ extract. Hence `duckle.desktop` here, and the icons installed explicitly.
    `namcap` is the lint AUR reviewers run. Fix what it reports before
    submitting, not after.
 
-2. **Replace every `SKIP` checksum** with `updpkgsums`. The binary's value is
-   already published per release in `SHA256SUMS.txt`, so it is verifiable
-   against the release rather than trusted from this file.
+2. **Checksums: automated.** `packaging/arch/bump.py` sets `pkgver` and every
+   checksum from a published release, and the `Arch package bump` workflow runs
+   it on `release: published`. Run it by hand with
+   `python packaging/arch/bump.py <version>`. The binaries take their value
+   from the release's own `SHA256SUMS.txt`, so the PKGBUILD carries what the
+   release published rather than a separately computed number.
 
 3. **Dependency list: done, from evidence.** namcap reads the released
    binary's dynamic dependencies in CI, and the list in the PKGBUILD is now
@@ -110,10 +113,17 @@ git clone ssh://aur@aur.archlinux.org/duckle-runner-bin.git
 Then test the real end-user path - `omarchy-pkg-aur-install` from Omarchy's own
 Install menu, and launching from Walker - rather than only `yay -S`.
 
-**Automate the version bump.** Every release changes `pkgver` and its
-checksums. That belongs in the release workflow beside the step that publishes
-`SHA256SUMS.txt`, or the package silently falls behind, gets flagged
-out-of-date, and eventually orphaned.
+**The version bump is automated.** `Arch package bump` fires on
+`release: published` - not on the tag push, because the release workflow
+creates a draft and a draft's assets cannot be downloaded - runs `bump.py`, and
+commits to main. That commit touches `packaging/arch/`, which is what
+`Arch package` watches, so the bumped PKGBUILDs are built and their new
+checksums validated in a real Arch container without anything else being
+arranged.
+
+AUR publishing is in the same job but gated on an `AUR_SSH_KEY` secret that
+does not exist yet. Until it does, the job leaves the repository correct and
+says once what is missing rather than failing every release.
 
 ## 7. Bundled inclusion (stretch, do not block on it)
 
@@ -125,7 +135,8 @@ lower-friction visibility channel in the meantime.
 
 ## 8. Ongoing
 
-- [ ] Each release: bump `pkgver`, refresh checksums, regenerate `.SRCINFO`, push
+- [x] Each release: bump `pkgver` and refresh checksums - automated
+- [ ] Add the `AUR_SSH_KEY` secret so the same job pushes to the AUR
 - [ ] Watch AUR comments - Omarchy users are a subset of a wider Arch audience
       (CachyOS, EndeavourOS) who will hit different environments
 - [ ] Re-check `.desktop`, icons and XDG behaviour after any Tauri major bump
