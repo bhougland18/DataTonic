@@ -9,7 +9,11 @@ import {
     ChevronRight,
     ChevronDown,
     Table2,
+    PanelLeftClose,
+    PanelLeftOpen,
+    AlignLeft,
 } from 'lucide-react';
+import { format as formatSqlText } from 'sql-formatter';
 import './sqleditor.css';
 import type { SqlEditorRequest, SqlEditorResult, SqlRunResult, SqlStudioTable } from './types';
 import type { ErdRelationship } from '../erd/model';
@@ -39,6 +43,7 @@ export default function SqlEditor({
     const [tables, setTables] = useState<SqlStudioTable[]>([]);
     const [relationships, setRelationships] = useState<ErdRelationship[]>([]);
     const [showAi, setShowAi] = useState(false);
+    const [showCatalog, setShowCatalog] = useState(true);
     const [mainSql, setMainSql] = useState('');
     // The AI's editable draft; non-null opens the split.
     const [aiDraft, setAiDraft] = useState<string | null>(null);
@@ -79,6 +84,19 @@ export default function SqlEditor({
         setAiDraft(null);
     }, [aiDraft]);
 
+    // Pretty-print the main query (DuckDB ≈ PostgreSQL). Leaves it unchanged if
+    // it can't be parsed, so a half-written query is never mangled.
+    const formatMain = useCallback(() => {
+        setMainSql(s => {
+            if (!s.trim()) return s;
+            try {
+                return formatSqlText(s, { language: 'postgresql' });
+            } catch {
+                return s;
+            }
+        });
+    }, []);
+
     if (nodeId == null) {
         return (
             <div className="sqlstudio">
@@ -94,10 +112,20 @@ export default function SqlEditor({
     return (
         <div className="sqlstudio">
             {/* Catalog sidebar */}
-            <aside className="sqlstudio-side">
+            <aside className={`sqlstudio-side${showCatalog ? '' : ' sqlstudio-side--hidden'}`}>
                 <div className="sqlstudio-side-head">
                     <Database size={15} strokeWidth={1.8} />
                     <span>Working DB</span>
+                    <span className="sqlstudio-spacer" />
+                    <button
+                        type="button"
+                        className="sqlstudio-icon-btn"
+                        onClick={() => setShowCatalog(false)}
+                        title="Collapse table catalog"
+                        aria-label="Collapse table catalog"
+                    >
+                        <PanelLeftClose size={15} />
+                    </button>
                 </div>
                 <div className="sqlstudio-catalog">
                     {tables.length === 0 ? (
@@ -114,6 +142,17 @@ export default function SqlEditor({
             {/* Main */}
             <div className="sqlstudio-main">
                 <div className="sqlstudio-top">
+                    {!showCatalog && (
+                        <button
+                            type="button"
+                            className="sqlstudio-icon-btn"
+                            onClick={() => setShowCatalog(true)}
+                            title="Show table catalog"
+                            aria-label="Show table catalog"
+                        >
+                            <PanelLeftOpen size={16} />
+                        </button>
+                    )}
                     <div className="sqlstudio-ctx">
                         <span className="sqlstudio-glyph">
                             <Database size={15} strokeWidth={1.8} />
@@ -127,6 +166,14 @@ export default function SqlEditor({
                         <Lock size={12} strokeWidth={2} /> Read-only
                     </span>
                     <span className="sqlstudio-spacer" />
+                    <button
+                        type="button"
+                        className="sqlstudio-btn"
+                        onClick={formatMain}
+                        title="Auto-format the query"
+                    >
+                        <AlignLeft size={14} strokeWidth={2} /> Format
+                    </button>
                     <button
                         type="button"
                         className={`sqlstudio-btn${showAi ? ' sqlstudio-btn--on' : ''}`}

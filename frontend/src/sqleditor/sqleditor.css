@@ -816,3 +816,25 @@
     padding: 5px 10px;
     font-size: 12px;
 }
+
+/* ---- Catalog collapse + icon buttons ---- */
+.sqlstudio-side--hidden {
+    display: none;
+}
+.sqlstudio-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-3);
+    cursor: pointer;
+    border-radius: 6px;
+    flex-shrink: 0;
+}
+.sqlstudio-icon-btn:hover {
+    background: var(--bg-3);
+    color: var(--text-1);
+}
