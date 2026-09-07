@@ -146,23 +146,34 @@ jobs:
                      "targetHandle":"main","data":{"connectionType":"main"}}]}
           JSON
 
-          echo "===== with no duckdb anywhere on the system ====="
-          set +e
-          duckle-runner --pipeline p.json 2>&1 | tail -20
-          echo "exit=${PIPESTATUS[0]}"
-          set -e
-
-          echo
-          echo "===== after installing Arch's duckdb package ====="
-          pacman -S --noconfirm duckdb
-          duckdb --version
+          echo "===== the user's path: install the package, run a pipeline ====="
+          # duckdb arrives as a declared dependency of the package, which is the
+          # whole point - before it was declared, this install ran nothing.
+          command -v duckdb && duckdb --version
           set +e
           duckle-runner --pipeline p.json 2>&1 | tail -20
           rc=${PIPESTATUS[0]}
           set -e
           echo "exit=$rc"
           echo "----- output -----"
-          cat out.csv || echo "(no output file)"
-          # Only the second run has to succeed. The first is reported, not
-          # enforced: what it does is the finding.
-          [ "$rc" = "0" ] || { echo "::error::a clean Arch install cannot run a pipeline even with duckdb present"; exit 1; }
+          cat out.csv
+          [ "$rc" = "0" ] || { echo "::error::a package install cannot run a pipeline"; exit 1; }
+          grep -q alice out.csv || { echo "::error::the pipeline produced no rows"; exit 1; }
+
+          echo
+          echo "===== negative control: take duckdb away again ====="
+          # -Rdd ignores the dependency, which is the only way to reach the
+          # state the declaration exists to prevent. Without this the test
+          # would pass just as well with no `depends` at all.
+          pacman -Rdd --noconfirm duckdb
+          set +e
+          out=$(duckle-runner --pipeline p.json 2>&1)
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$out" | tail -8
+          [ "$rc" != "0" ] || { echo "::error::running without duckdb should fail"; exit 1; }
+          # And the failure has to be actionable HERE, where there is no Setup
+          # window to open - which is what it used to tell people to do.
+          echo "$out" | grep -q 'DUCKLE_DUCKDB_BIN' || {
+            echo "::error::the error does not say how to fix this on a headless install"; exit 1; }
+          echo "refused, and said how to fix it"
