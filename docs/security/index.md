@@ -47,6 +47,7 @@ Authoritative, factual technical specifications, schemas, and control matrices:
 * **[SOC 2 & ISO 27001 Control Matrix](reference/soc2-iso27001-control-matrix.md)**: Detailed mapping of Duckle capabilities against SOC 2 Type II Trust Services Criteria and ISO/IEC 27001:2022 Annex A controls.
 * **[Security Audit Event Schema](reference/audit-event-schema.md)**: The JSON field definitions, actor attribution rules, and complete action dictionary for `audit.ndjson`.
 * **[Enterprise SSO and MFA](reference/sso-okta-architecture-spec.md)**: OIDC single sign-on for the console - authorization code flow with PKCE, IdP group-to-role mapping, and MFA enforcement through the `acr` and `amr` claims. Configuration for Okta, Entra ID and Keycloak.
+* **[Dependency Advisories](reference/dependency-advisories.md)**: Every known advisory in the dependency tree, its reachability in this codebase, and what would let the exception be removed.
 * **[Security CLI Reference](reference/security-cli-reference.md)**: Command-line reference for `duckle-runner console key-add`, key revocation, and CLI audit inspections.
 
 ---
@@ -56,6 +57,7 @@ Discussions of architecture, design philosophy, and security models:
 
 * **[Trust Boundary & Threat Model](explanation/trust-boundary-and-threat-model.md)**: Why Duckle is local-first/self-hosted, our "we hold nothing" architectural boundary, and the shared responsibility model.
 * **[SSDLC & TDD Philosophy](explanation/ssdlc-and-tdd-philosophy.md)**: Test-driven security engineering, cross-platform contract testing, static analysis gates, and supply chain provenance.
+* **[Supply Chain Assurance](explanation/supply-chain-assurance.md)**: SBOM, keyless build provenance, dependency scanning on a schedule, and a plain statement of what is not covered.
 * **[Encryption & Key Hierarchy](explanation/encryption-and-key-hierarchy.md)**: Deep dive into AES-256-GCM encryption, workspace key lifecycle, and memory hygiene.
 
 ---

@@ -1,0 +1,45 @@
+# Accepted dependency advisories.
+#
+# Read this with docs/security/reference/dependency-advisories.md, which records
+# the reachability analysis behind every entry. Nothing is listed here without a
+# corresponding section there, and nothing is listed here that has a fix
+# available - if an upgrade exists, the upgrade is the answer.
+#
+# The point of this file is that CI fails on a NEW advisory. An empty ignore
+# list would mean CI is permanently red and therefore ignored by everyone, which
+# is how a scanner stops being a control.
+#
+# Review date: 2026-12-07. Each entry below states what would let it be removed.
+
+[advisories]
+ignore = [
+    # rsa 0.9 - Marvin timing sidechannel. No fixed version exists upstream.
+    # NOT REACHABLE: the crate is used at one site (crates/duckdb-engine, the
+    # Snowflake key-pair auth path) to read a LOCAL private key and derive the
+    # public-key SHA-256 fingerprint for the JWT issuer string. There is no RSA
+    # decryption anywhere in the tree, and the JWT itself is signed by
+    # jsonwebtoken. Marvin requires chosen-ciphertext decryption timing.
+    # Remove when: the rsa crate publishes a constant-time release.
+    "RUSTSEC-2023-0071",
+
+    # rustls-webpki 0.101.7 and 0.102.8 - certificate path validation defects.
+    # Pulled in by tiberius 0.12.3 (SQL Server, via rustls 0.21) and imap
+    # 3.0.0-alpha.15 (via rustls-connector 0.19 and rustls 0.22). Both are the
+    # newest published versions of those crates, so there is no upgrade to take.
+    # Duckle's own TLS - the console, the HTTP sources, the updater - is on
+    # rustls-webpki 0.103.15, which is unaffected.
+    # Remove when: tiberius or imap publish a release on rustls 0.23+.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+
+    # quick-xml 0.38 and 0.39 - denial of service on hostile XML.
+    # Duckle's own XML reading is on quick-xml 0.42, which is past the fix. These
+    # two come only through the optional duckle-lance sidecar, inside
+    # object_store and opendal, where the XML parsed is a storage provider's own
+    # list response rather than pipeline input.
+    # Remove when: lancedb takes object_store and opendal releases on 0.41+.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

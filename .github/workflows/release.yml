@@ -349,6 +349,38 @@ jobs:
           asset="${{ matrix.asset }}"
           gh release upload "$REL_TAG" "_release/$asset" --clobber
 
+  # Publish a software bill of materials with the release, so a deployment can
+  # answer "does this version contain <crate>?" against the artifact it actually
+  # installed, rather than against whatever the repository looks like today.
+  # CycloneDX because that is what the scanners consume.
+  sbom:
+    name: Publish SBOM
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          format: cyclonedx-json
+          output-file: duckle-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: duckle-sbom.cdx.json
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REL_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: gh release upload "$REL_TAG" duckle-sbom.cdx.json --clobber
+
   # Publish SHA256SUMS.txt covering the 6 binaries so the in-app self-updater
   # can verify a downloaded build before swapping it in. Uploads are per-matrix
   # job, so checksums must be a separate job that pulls the finished assets back.
@@ -368,6 +400,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Build provenance is signed with this workflow's own short-lived OIDC
+      # identity through Sigstore, so it needs no signing key or certificate of
+      # ours to manage, rotate or lose.
+      id-token: write
+      attestations: write
     steps:
       - name: Download assets, checksum, upload
         shell: bash
@@ -392,3 +429,28 @@ jobs:
             > SHA256SUMS.txt
           cat SHA256SUMS.txt
           gh release upload "$REL_TAG" SHA256SUMS.txt --clobber
+
+      # What SHA256SUMS.txt cannot say: WHERE a binary came from. The checksum
+      # proves a download was not altered in flight; it says nothing about who
+      # built it, from which commit, or on what workflow - so a substituted
+      # asset with a matching, also-substituted sums file passes. Provenance
+      # binds each digest to this repository, this commit and this run, and a
+      # consumer checks it without trusting the release page:
+      #
+      #   gh attestation verify Duckle-linux-x64 --repo ${{ github.repository }}
+      #
+      # Deliberately not the same thing as code signing. Authenticode and
+      # macOS notarization still need a purchased certificate; this is the
+      # supply-chain half, and it is free and keyless.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            _sums/Duckle-linux-x64
+            _sums/Duckle-linux-arm64
+            _sums/Duckle-macos-x64
+            _sums/Duckle-macos-arm64
+            _sums/Duckle-windows-x64.exe
+            _sums/Duckle-windows-arm64.exe
+            _sums/duckle-runner-linux-x64
+            _sums/SHA256SUMS.txt
