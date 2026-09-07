@@ -97,6 +97,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+
+      # duckle-runner links unixODBC statically, so building it needs the
+      # system libraries even though this job only wants the registry JSON.
+      # Without them the job died on `could not find native static library
+      # odbc` - after the whole workspace had compiled - and v0.7.2 built every
+      # binary but shipped no capabilities.json. libltdl-dev goes alongside
+      # unixodbc-dev for the static link (#131), the same pair ci.yml installs.
+      - name: Install ODBC build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev libltdl-dev
+
       - name: Generate the registry
         env:
           REL_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
