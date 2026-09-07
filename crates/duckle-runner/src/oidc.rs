@@ -75,6 +75,23 @@ pub struct Config {
     /// deployment that wants everyone in says so.
     #[serde(default)]
     pub default_role: Option<Role>,
+    /// Authentication context values this deployment demands, e.g.
+    /// `urn:okta:loa:2fa:any`. Sent as `acr_values` on the authorization
+    /// request AND required back in the token's `acr` claim.
+    ///
+    /// Both halves matter. Only asking lets a provider ignore the request and
+    /// return a single-factor token; only checking means a compliant provider
+    /// is never told what to ask the person for, so the login fails instead of
+    /// stepping up. Empty means neither.
+    #[serde(default)]
+    pub acr_values: Vec<String>,
+    /// Authentication methods, any one of which satisfies the requirement,
+    /// checked against the token's `amr` claim - `mfa`, `otp`, `hwk`, `phr`.
+    ///
+    /// This is the portable half: Entra ID reports a second factor as `mfa` in
+    /// `amr`, and Okta reports the method it used. Empty means not checked.
+    #[serde(default)]
+    pub amr_required: Vec<String>,
 }
 
 fn default_scopes() -> Vec<String> {
@@ -236,6 +253,15 @@ pub fn begin(cfg: &Config, endpoints: &Endpoints) -> (String, Pending) {
         ("code_challenge", pkce_challenge(&pending.verifier)),
         ("code_challenge_method", "S256".to_string()),
     ]
+    .into_iter()
+    .chain(
+        // Only when configured: an empty `acr_values` parameter is not the
+        // same as no parameter, and some providers reject it.
+        (!cfg.acr_values.is_empty())
+            .then(|| ("acr_values", cfg.acr_values.join(" ")))
+            .into_iter(),
+    )
+    .collect::<Vec<_>>()
     .iter()
     .map(|(k, v)| format!("{k}={}", urlencode(v)))
     .collect::<Vec<_>>()
@@ -367,6 +393,57 @@ pub fn check_claims(
     }
     if s("sub").is_empty() {
         return Err("token has no subject".into());
+    }
+    Ok(())
+}
+
+/// Whether the person authenticated the way this deployment requires.
+///
+/// Separate from [`check_claims`] because it answers a different question:
+/// that one asks whether the token is genuinely for this login, this one asks
+/// whether the login was strong enough. Pure, so every rule below is tested
+/// without a provider.
+pub fn check_authentication_strength(
+    claims: &Value,
+    acr_values: &[String],
+    amr_required: &[String],
+) -> Result<(), String> {
+    if !acr_values.is_empty() {
+        // Absent is refused, not waived. A provider that returns no `acr` has
+        // not said the context was met, and reading silence as consent is how
+        // a control like this ends up enforcing nothing.
+        let got = claims.get("acr").and_then(Value::as_str).unwrap_or_default();
+        if got.is_empty() {
+            return Err(format!(
+                "the identity provider returned no acr claim, and this console requires one of: {}",
+                acr_values.join(", ")
+            ));
+        }
+        if !acr_values.iter().any(|want| want == got) {
+            return Err(format!(
+                "authentication context {got:?} is not one this console accepts: {}",
+                acr_values.join(", ")
+            ));
+        }
+    }
+    if !amr_required.is_empty() {
+        // `amr` is an array of the methods actually used. Any one of the
+        // accepted methods is enough - a deployment naming both `otp` and
+        // `hwk` is saying either second factor will do, not both.
+        let Some(got) = claims.get("amr").and_then(Value::as_array) else {
+            return Err(format!(
+                "the identity provider returned no amr claim, so it did not report multi-factor                  authentication; this console requires one of: {}",
+                amr_required.join(", ")
+            ));
+        };
+        let used: Vec<&str> = got.iter().filter_map(Value::as_str).collect();
+        if !used.iter().any(|u| amr_required.iter().any(|want| want == u)) {
+            return Err(format!(
+                "the login used amr [{}], and this console requires one of: {}",
+                used.join(", "),
+                amr_required.join(", ")
+            ));
+        }
     }
     Ok(())
 }
@@ -528,6 +605,9 @@ pub fn verify(
     // have covered everything: the nonce is not something it knows about, and
     // the rest is cheap to re-state and easy to test on its own.
     check_claims(&data.claims, cfg.issuer.trim_end_matches('/'), &cfg.client_id, nonce, now_unix)?;
+    // Was the login strong enough, as well as genuine? A deployment that
+    // requires a second factor says so here, and the token has to show it.
+    check_authentication_strength(&data.claims, &cfg.acr_values, &cfg.amr_required)?;
 
     let role = map_role(&data.claims, &cfg.role_mappings, cfg.default_role).ok_or_else(|| {
         "signed in, but no role mapping matched and no defaultRole is configured".to_string()
@@ -542,6 +622,117 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_for_test() -> Config {
+        Config {
+            issuer: "https://idp.example.com".into(),
+            client_id: "duckle-console".into(),
+            client_secret: String::new(),
+            redirect_uri: "https://console.example.com/auth/oidc/callback".into(),
+            scopes: default_scopes(),
+            role_mappings: Vec::new(),
+            default_role: None,
+            acr_values: Vec::new(),
+            amr_required: Vec::new(),
+        }
+    }
+
+    fn endpoints_for_test() -> Endpoints {
+        Endpoints {
+            authorization: "https://idp.example.com/authorize".into(),
+            token: "https://idp.example.com/token".into(),
+            jwks: "https://idp.example.com/jwks".into(),
+            issuer: "https://idp.example.com".into(),
+        }
+    }
+
+    fn claims_with(acr: Option<&str>, amr: Option<Vec<&str>>) -> Value {
+        let mut c = serde_json::json!({"sub": "u1"});
+        if let Some(a) = acr {
+            c["acr"] = Value::String(a.to_string());
+        }
+        if let Some(m) = amr {
+            c["amr"] = Value::Array(m.into_iter().map(|s| Value::String(s.into())).collect());
+        }
+        c
+    }
+
+    #[test]
+    fn a_deployment_that_asks_for_nothing_gets_the_behaviour_it_had() {
+        // No requirement configured must stay exactly as permissive as before,
+        // or every existing OIDC deployment breaks on upgrade.
+        assert!(check_authentication_strength(&claims_with(None, None), &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn a_single_factor_login_is_refused_when_mfa_is_required() {
+        let amr = vec!["mfa".to_string()];
+        let e = check_authentication_strength(&claims_with(None, Some(vec!["pwd"])), &[], &amr)
+            .unwrap_err();
+        assert!(e.contains("amr"), "the error should say what was missing: {e}");
+    }
+
+    #[test]
+    fn a_multi_factor_login_is_admitted() {
+        let amr = vec!["mfa".to_string()];
+        assert!(
+            check_authentication_strength(&claims_with(None, Some(vec!["pwd", "mfa"])), &[], &amr)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn any_one_of_the_accepted_methods_is_enough() {
+        let amr = vec!["otp".to_string(), "hwk".to_string()];
+        assert!(
+            check_authentication_strength(&claims_with(None, Some(vec!["pwd", "hwk"])), &[], &amr)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_token_with_no_amr_claim_at_all_is_refused_not_admitted() {
+        // Fail closed. A provider that does not report how it authenticated
+        // has not told us the requirement was met, and "no evidence" is not
+        // "satisfied" - that reading is how an MFA control silently does
+        // nothing.
+        let amr = vec!["mfa".to_string()];
+        assert!(check_authentication_strength(&claims_with(None, None), &[], &amr).is_err());
+    }
+
+    #[test]
+    fn the_acr_must_be_one_the_deployment_named() {
+        let acr = vec!["urn:okta:loa:2fa:any".to_string()];
+        assert!(
+            check_authentication_strength(&claims_with(Some("urn:okta:loa:2fa:any"), None), &acr, &[])
+                .is_ok()
+        );
+        assert!(
+            check_authentication_strength(&claims_with(Some("urn:okta:loa:1fa:any"), None), &acr, &[])
+                .is_err()
+        );
+        // Missing, again, is refused rather than waved through.
+        assert!(check_authentication_strength(&claims_with(None, None), &acr, &[]).is_err());
+    }
+
+    #[test]
+    fn the_authorization_request_asks_the_provider_for_the_acr() {
+        // Checking the answer without asking the question makes a compliant
+        // provider fail the login instead of stepping the person up.
+        let mut cfg = cfg_for_test();
+        cfg.acr_values = vec!["urn:okta:loa:2fa:any".to_string()];
+        let (url, _) = begin(&cfg, &endpoints_for_test());
+        assert!(
+            url.contains("acr_values=urn%3Aokta%3Aloa%3A2fa%3Aany"),
+            "acr_values must be on the authorization request: {url}"
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_no_acr_configured_sends_none() {
+        let (url, _) = begin(&cfg_for_test(), &endpoints_for_test());
+        assert!(!url.contains("acr_values"), "{url}");
+    }
 
     fn mappings() -> Vec<RoleMapping> {
         vec![
@@ -786,6 +977,8 @@ mod tests {
             scopes: default_scopes(),
             role_mappings: mappings(),
             default_role: None,
+            acr_values: Vec::new(),
+            amr_required: Vec::new(),
         };
         let endpoints = Endpoints {
             authorization: "https://idp.example.com/authorize".into(),

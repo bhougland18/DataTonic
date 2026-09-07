@@ -132,11 +132,13 @@ Search via DuckDB `vss` / `fts`) ships today.
 
 ### Enterprise Identity & Access Management (SSO / MFA)
 
+OIDC single sign-on, IdP group-to-role mapping and MFA enforcement all ship
+today. See [Enterprise SSO and MFA](security/reference/sso-okta-architecture-spec.md).
+What remains on this list is SAML alone.
+
 | Capability | Notes |
 |---|---|
-| `auth.oidc` / `auth.saml` | Okta / Entra ID / Google Workspace SSO integration via OIDC Authorization Code Flow with PKCE and SAML 2.0 Web Browser SSO. See [Okta SSO Architecture Spec](security/reference/sso-okta-architecture-spec.md). |
-| `auth.mfa` | Upstream IdP MFA step-up enforcement (`amr`/`acr` claim validation for admin role operations). |
-| `auth.rbac-sync` | Automated IdP group-to-role synchronization (`admin`, `operator`, `viewer`). |
+| `auth.saml` | SAML 2.0 Web Browser SSO. Not planned: every provider this would target (Entra ID, Okta, Google Workspace, Ping, Auth0, Keycloak) speaks OIDC natively, and OIDC is the smaller attack surface. A deployment that must use SAML can terminate it in a SAML-to-OIDC gateway. |
 
 ### Other
 

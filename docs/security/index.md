@@ -46,7 +46,7 @@ Authoritative, factual technical specifications, schemas, and control matrices:
 
 * **[SOC 2 & ISO 27001 Control Matrix](reference/soc2-iso27001-control-matrix.md)**: Detailed mapping of Duckle capabilities against SOC 2 Type II Trust Services Criteria and ISO/IEC 27001:2022 Annex A controls.
 * **[Security Audit Event Schema](reference/audit-event-schema.md)**: The JSON field definitions, actor attribution rules, and complete action dictionary for `audit.ndjson`.
-* **[Okta SSO & MFA Integration Specification](reference/sso-okta-architecture-spec.md)**: Architectural roadmap specification for OIDC/SAML 2.0 authentication, Okta Verify MFA, and IdP group-to-role mappings.
+* **[Enterprise SSO and MFA](reference/sso-okta-architecture-spec.md)**: OIDC single sign-on for the console - authorization code flow with PKCE, IdP group-to-role mapping, and MFA enforcement through the `acr` and `amr` claims. Configuration for Okta, Entra ID and Keycloak.
 * **[Security CLI Reference](reference/security-cli-reference.md)**: Command-line reference for `duckle-runner console key-add`, key revocation, and CLI audit inspections.
 
 ---
