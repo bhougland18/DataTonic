@@ -21,7 +21,7 @@ pub fn source_select_for_format(format: &str, props: &JsonValue) -> Option<Strin
         "excel" => build_excel_source(props, None),
         "avro" => build_avro_source(props),
         "inline" => build_inline_source(props),
-        "filelist" => build_filelist_source(props),
+        "filelist" => return build_filelist_source(props).ok(),
         "iceberg" => build_iceberg_source(props),
         "delta" => build_delta_source(props),
         "spatial" => build_spatial_source(props),
@@ -222,7 +222,7 @@ pub(crate) fn build_view_sql(
         "src.avro" => Ok(build_avro_source(props)),
         "src.excel" => Ok(build_excel_source(props, declared)),
         "src.inline" => Ok(build_inline_source(props)),
-        "src.filelist" => Ok(build_filelist_source(props)),
+        "src.filelist" => build_filelist_source(props),
         "src.artifact" => Ok(build_artifact_source(props)),
         "src.iceberg" => Ok(build_iceberg_source(props)),
         "src.delta" => Ok(build_delta_source(props)),
@@ -8958,17 +8958,26 @@ pub(crate) fn build_artifact_source(props: &JsonValue) -> String {
     )
 }
 
-pub(crate) fn build_filelist_source(props: &JsonValue) -> String {
+pub(crate) fn build_filelist_source(props: &JsonValue) -> Result<String, String> {
     // An explicit `path` is used verbatim, which makes the component double as
     // an existence test: pointed at one file it yields one row, or none. That
     // is what a job's file-exists check needs, and it needs no second component.
     if let Some(path) = string_prop(props, "path").filter(|s| !s.trim().is_empty()) {
-        return format!(
+        return Ok(format!(
             "SELECT file, parse_filename(file) AS filename FROM glob('{}')",
             sql_escape(path.trim())
-        );
+        ));
     }
-    let dir = string_prop(props, "directory").unwrap_or_default();
+    // Either field will do, so the form requires neither - and NEITHER built
+    // `glob('/*')`, the filesystem root. On Windows that returns nothing, so
+    // the run reported ok with an empty result and no reason; elsewhere the
+    // root is not empty. Same hole as src.sqlite (#335) and src.duckdb.
+    let dir = string_prop(props, "directory")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "File list: set a folder to list, or a single file path".to_string()
+        })?;
     let pattern = string_prop(props, "pattern")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "*".into());
@@ -8984,10 +8993,10 @@ pub(crate) fn build_filelist_source(props: &JsonValue) -> String {
     };
     // parse_filename rather than a regex: the separator differs per platform,
     // and the glob above may have been written with either.
-    format!(
+    Ok(format!(
         "SELECT file, parse_filename(file) AS filename FROM glob('{}')",
         sql_escape(&glob)
-    )
+    ))
 }
 
 /// Iceberg source via the DuckDB iceberg extension's `iceberg_scan`.

@@ -2051,13 +2051,13 @@
     fn a_file_list_pointed_at_one_path_is_an_existence_test() {
         // Pointed at a single file the listing yields one row, or none. That is
         // what a job's file-exists check needs, and it needs no second component.
-        let one = build_filelist_source(&serde_json::json!({ "path": "/data/in/today.csv" }));
+        let one = build_filelist_source(&serde_json::json!({ "path": "/data/in/today.csv" })).expect("configured");
         assert!(one.contains("glob('/data/in/today.csv')"), "got: {one}");
         // An explicit path wins over directory + pattern rather than being
         // silently combined with them into a path that names nothing.
         let both = build_filelist_source(&serde_json::json!({
             "path": "/data/in/today.csv", "directory": "/elsewhere", "pattern": "*.txt"
-        }));
+        })).expect("configured");
         assert!(both.contains("glob('/data/in/today.csv')"), "got: {both}");
         assert!(!both.contains("/elsewhere"), "got: {both}");
     }
@@ -2092,16 +2092,16 @@
     fn a_file_list_globs_the_directory_and_names_each_file() {
         let flat = build_filelist_source(&serde_json::json!({
             "directory": "/data/in/", "pattern": "*.csv"
-        }));
+        })).expect("configured");
         // The trailing separator must not double up.
         assert!(flat.contains("glob('/data/in/*.csv')"), "got: {flat}");
         assert!(flat.contains("parse_filename(file) AS filename"), "got: {flat}");
         let deep = build_filelist_source(&serde_json::json!({
             "directory": "/data/in", "pattern": "*.csv", "recursive": true
-        }));
+        })).expect("configured");
         assert!(deep.contains("glob('/data/in/**/*.csv')"), "got: {deep}");
         // No pattern lists everything rather than nothing.
-        let all = build_filelist_source(&serde_json::json!({ "directory": "/data/in" }));
+        let all = build_filelist_source(&serde_json::json!({ "directory": "/data/in" })).expect("configured");
         assert!(all.contains("glob('/data/in/*')"), "got: {all}");
     }
 
@@ -6789,4 +6789,43 @@ fn a_duckdb_source_with_no_table_refuses_instead_of_returning_a_placeholder() {
     assert!(build_duckdb_source(&serde_json::json!({ "tableName": "t", "schema": "main" }))
         .expect("schema-qualified")
         .contains("main"));
+}
+
+/// Third instance of the shape #335 reported, found by sweeping for source
+/// components whose form marks nothing required.
+///
+/// `src.filelist` takes either a folder to list or a single file path, so
+/// neither is required - and with neither, `directory` defaulted to "" and the
+/// glob became `/*`, the filesystem root. Measured on Windows: the run
+/// reported ok and produced zero rows, so a user who forgot the folder got an
+/// empty result and nothing saying why. A root that is not empty would be a
+/// different surprise.
+#[test]
+fn a_file_list_with_no_folder_and_no_path_refuses() {
+    use crate::plan::builders::build_filelist_source;
+
+    let err = build_filelist_source(&serde_json::json!({}))
+        .expect_err("nothing to list must refuse");
+    assert!(
+        err.to_lowercase().contains("folder") || err.to_lowercase().contains("file"),
+        "name what is missing: {err}"
+    );
+    // Whitespace is the same omission with a space in it.
+    assert!(build_filelist_source(&serde_json::json!({ "directory": "   " })).is_err());
+    // And it must never build a glob rooted at the filesystem root.
+    for props in [serde_json::json!({}), serde_json::json!({ "directory": "" })] {
+        if let Ok(sql) = build_filelist_source(&props) {
+            assert!(!sql.contains("glob('/"), "globbed the root: {sql}");
+        }
+    }
+
+    // Either field on its own still works, including the recursive form.
+    assert!(build_filelist_source(&serde_json::json!({ "path": "/data/today.csv" }))
+        .expect("a single path is enough")
+        .contains("today.csv"));
+    let deep = build_filelist_source(
+        &serde_json::json!({ "directory": "/data/in", "recursive": true, "pattern": "*.csv" }),
+    )
+    .expect("a folder is enough");
+    assert!(deep.contains("/data/in/**/*.csv"), "{deep}");
 }
