@@ -1,6 +1,12 @@
 import type { ComponentManifest, AutodetectFn, FormSection } from './types';
 import type { Column } from '../../pipeline-types';
-import { synthesizeManifest, portsForComponent, deadLetterFields } from './manifest-synth';
+import {
+    synthesizeManifest,
+    portsForComponent,
+    deadLetterFields,
+    delimiterField,
+    encodingField,
+} from './manifest-synth';
 import { getExternalManifest, PALETTE } from '../palette-data';
 import { tauriAutodetect } from '../../tauri-bridge';
 
@@ -95,19 +101,13 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         defaultValue: true,
                         placeholder: 'Use the first row as column names',
                     },
-                    {
-                        key: 'delimiter',
-                        label: 'Delimiter',
-                        kind: 'select',
-                        defaultValue: ',',
-                        options: [
-                            { label: 'Comma  ,', value: ',' },
-                            { label: 'Tab  \\t', value: '\t' },
-                            { label: 'Semicolon  ;', value: ';' },
-                            { label: 'Pipe  |', value: '|' },
-                            { label: 'Space', value: ' ' },
-                        ],
-                    },
+                    // Shared with the synthesized readers rather than listed
+                    // again here. This manifest is hand-written, so getManifest
+                    // returns it and src.csv never reached the synthesizer -
+                    // which is how it kept a five-option, non-typable delimiter
+                    // and a four-option encoding while every other delimited
+                    // reader had grown past both.
+                    delimiterField(','),
                     {
                         key: 'quoteChar',
                         label: 'Quote character',
@@ -119,18 +119,7 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                             { label: 'None', value: '' },
                         ],
                     },
-                    {
-                        key: 'encoding',
-                        label: 'Encoding',
-                        kind: 'select',
-                        defaultValue: 'utf-8',
-                        options: [
-                            { label: 'UTF-8', value: 'utf-8' },
-                            { label: 'UTF-16', value: 'utf-16' },
-                            { label: 'Latin-1 (ISO-8859-1)', value: 'latin-1' },
-                            { label: 'Windows-1252', value: 'windows-1252' },
-                        ],
-                    },
+                    encodingField(),
                     {
                         key: 'skipLines',
                         label: 'Skip lines (top)',
@@ -1019,17 +1008,14 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         kind: 'bool',
                         defaultValue: true,
                     },
-                    {
-                        key: 'encoding',
-                        label: 'Encoding',
-                        kind: 'select',
-                        defaultValue: 'utf-8',
-                        options: [
-                            { label: 'UTF-8', value: 'utf-8' },
-                            { label: 'UTF-16', value: 'utf-16' },
-                            { label: 'Latin-1', value: 'latin-1' },
-                        ],
-                    },
+                    // No Encoding here, deliberately. DuckDB writes UTF-8 and
+                    // refuses the option outright - COPY answers "Option
+                    // ENCODING is not supported for writing - only for
+                    // reading" - and nothing in the engine transcodes
+                    // afterwards. Measured: a sink set to CP1251 wrote UTF-8
+                    // bytes and reported ok, so the control could only mislead.
+                    // Writing a non-UTF-8 file is a real feature; it needs a
+                    // transcode pass, not a dropdown.
                     {
                         // build_csv_sink emits NULLSTR from this
                         // (builders.rs:9170) and the panel never offered it, so

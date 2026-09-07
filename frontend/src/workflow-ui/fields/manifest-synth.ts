@@ -83,7 +83,7 @@ function placeholderAutodetect(format?: string): (
 // carries the names people actually need, spelled the way DuckDB accepts them,
 // and the field stays typable for the rest. Every value below was checked
 // against DuckDB 1.5.4.
-const encodingField = (): Field => ({
+export const encodingField = (): Field => ({
     key: 'encoding',
     label: 'Encoding',
     kind: 'select',
@@ -119,6 +119,35 @@ const encodingField = (): Field => ({
         { label: 'CP866  DOS Cyrillic', value: 'CP866' },
         { label: 'CP437  DOS US', value: 'CP437' },
     ],
+});
+
+/// The delimiter a delimited-text reader splits on.
+///
+/// Typable as well as pickable: a delimiter is whatever the system that wrote
+/// the file chose, and no list of options closes that set. DuckDB's `delim`
+/// takes a string rather than a character, so `||` and `<=>` are as valid as
+/// `,` - both measured against DuckDB 1.5.4.
+export const delimiterField = (defaultValue: string): Field => ({
+    key: 'delimiter',
+    label: 'Delimiter',
+    kind: 'select',
+    allowCustom: true,
+    placeholder: 'pick one, or type it - any length',
+    defaultValue,
+    options: [
+        { label: 'Comma  ,', value: ',' },
+        { label: 'Tab  \\t', value: '\t' },
+        { label: 'Semicolon  ;', value: ';' },
+        { label: 'Pipe  |', value: '|' },
+        { label: 'Space', value: ' ' },
+        { label: 'Colon  :', value: ':' },
+        { label: 'Caret  ^', value: '^' },
+        { label: 'Tilde  ~', value: '~' },
+        { label: 'Hash  #', value: '#' },
+        { label: 'Unit separator  0x1F', value: '' },
+    ],
+    description:
+        'Leave blank to let DuckDB sniff it. Anything not listed can be typed in, including a multi-character delimiter such as || or <=>.',
 });
 
 const writeModeField = (): Field => ({
@@ -1700,31 +1729,7 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                 label: 'Format',
                 fields: [
                     { key: 'hasHeader', label: 'Has header row', kind: 'bool', defaultValue: true },
-                    {
-                        key: 'delimiter',
-                        label: 'Delimiter',
-                        kind: 'select',
-                        // Typable as well as pickable: a delimiter is whatever
-                        // the system that wrote the file chose, and no list of
-                        // options closes that set.
-                        allowCustom: true,
-                        placeholder: 'pick one, or type the character',
-                        defaultValue: id.endsWith('.tsv') ? '\t' : ',',
-                        options: [
-                            { label: 'Comma  ,', value: ',' },
-                            { label: 'Tab  \\t', value: '\t' },
-                            { label: 'Semicolon  ;', value: ';' },
-                            { label: 'Pipe  |', value: '|' },
-                            { label: 'Space', value: ' ' },
-                            { label: 'Colon  :', value: ':' },
-                            { label: 'Caret  ^', value: '^' },
-                            { label: 'Tilde  ~', value: '~' },
-                            { label: 'Hash  #', value: '#' },
-                            { label: 'Unit separator  0x1F', value: '' },
-                        ],
-                        description:
-                            'Leave blank to let DuckDB sniff it. Anything not listed can be typed in.',
-                    },
+                    delimiterField(id.endsWith('.tsv') ? '\t' : ','),
                     {
                         key: 'quoteChar',
                         label: 'Quote character',
