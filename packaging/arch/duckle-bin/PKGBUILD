@@ -57,11 +57,15 @@ source=("duckle.desktop"
         "LICENSE-MIT-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-MIT"
         "LICENSE-APACHE-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-APACHE")
 
-# Replace every SKIP before submitting. `updpkgsums` fills them in, and the
-# binary's value is the one already published in the release's SHA256SUMS.txt.
-sha256sums_x86_64=('SKIP')
-sha256sums_aarch64=('SKIP')
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+# Maintained by packaging/arch/bump.py, which the release workflow runs when a
+# release is published. The binary's value is the one the release itself
+# publishes in SHA256SUMS.txt, not one computed separately here.
+sha256sums_x86_64=('ac7f0b759880b26170cab8ad4136c31cdd9185e8e9d429943249fb0e2a71f04f')
+sha256sums_aarch64=('02dea7b7249de7bb56e6d4dc7c4375284a80b7ac25ce6a3810742329dc8a2f61')
+sha256sums=('34a473a360487e3210fc4a9227b739a25cbccc8419a4117b40a05ef8095b3c81'
+            '8dccc57fbe4f2474d01b2e4d15d93a4b27cf3f75c498be5d8e906d961c4b26f8'
+            '95935915cc360fbaf736ecbe22229671c404fc0bc53dab63663a58a9352fcea9'
+            '1e7e1bc923e0f439d5aefb15b19be5082079f2929f86da51ae1339d1db5bce2b')
 
 package() {
   install -Dm755 "${srcdir}/duckle-${pkgver}-${CARCH}" "${pkgdir}/usr/bin/duckle"

@@ -1,0 +1,115 @@
+name: Arch package bump
+
+# Points the Arch PKGBUILDs at a newly published release.
+#
+# Triggered on `release: published`, NOT on the tag push that builds it. The
+# release workflow creates a DRAFT and never un-drafts it, so on a tag push the
+# assets are not anonymously downloadable and the checksums could not be read.
+# Publishing is the moment they become real.
+#
+# The commit this pushes to main touches packaging/arch/**, which is what the
+# `Arch package` workflow watches - so the bumped PKGBUILDs get built with
+# their new checksums in a real Arch container without anything else being
+# arranged. A wrong checksum fails there, loudly, rather than on a user's
+# machine.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Released version to point the PKGBUILDs at, without the leading v (e.g. 0.7.2).'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arch-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      # main, not the tag: the bump is a change to the packaging that lives on
+      # the branch, and a tag is not a branch to commit onto.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Work out the version
+        id: v
+        run: |
+          set -euo pipefail
+          raw="${{ github.event.inputs.version || github.event.release.tag_name }}"
+          version="${raw#v}"
+          if [ -z "$version" ]; then
+            echo "::error::no version to bump to"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "bumping to $version"
+
+      - name: Point the PKGBUILDs at it
+        run: python3 packaging/arch/bump.py "${{ steps.v.outputs.version }}"
+
+      - name: Commit if it changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- packaging/arch; then
+            echo "already at ${{ steps.v.outputs.version }}; nothing to do"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packaging/arch
+          git commit -m "chore(packaging): Arch packages to ${{ steps.v.outputs.version }}"
+          # Rebase rather than force: this must never overwrite work that landed
+          # while the release was being published.
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
+
+      # Publishing to the AUR is a separate credential and a separate decision.
+      # Without it this job still does its job - the PKGBUILDs in the repo are
+      # correct and building - so it says what is missing once rather than
+      # failing every release.
+      - name: Publish to the AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUR_SSH_KEY:-}" ]; then
+            echo "::notice::PKGBUILDs updated in the repository. Set the AUR_SSH_KEY secret to also push them to the AUR; until then the AUR packages are published by hand."
+            exit 0
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for pkg in duckle-runner-bin duckle-bin; do
+            rm -rf "/tmp/aur-$pkg"
+            # A package that has not been created on the AUR yet is skipped
+            # rather than failing the release.
+            if ! git clone "ssh://aur@aur.archlinux.org/${pkg}.git" "/tmp/aur-$pkg" 2>/dev/null; then
+              echo "::warning::${pkg} does not exist on the AUR yet; skipping"
+              continue
+            fi
+            cp "packaging/arch/${pkg}/PKGBUILD" "/tmp/aur-$pkg/"
+            [ -f "packaging/arch/${pkg}/duckle.desktop" ] && \
+              cp "packaging/arch/${pkg}/duckle.desktop" "/tmp/aur-$pkg/"
+            ( cd "/tmp/aur-$pkg"
+              # .SRCINFO is generated from the PKGBUILD; the AUR rejects a push
+              # without it and will not regenerate it itself.
+              docker run --rm -v "$PWD:/pkg" -w /pkg archlinux:base-devel \
+                bash -c 'useradd -m b && chown -R b /pkg && su b -c "makepkg --printsrcinfo" > .SRCINFO'
+              git add PKGBUILD .SRCINFO duckle.desktop 2>/dev/null || git add PKGBUILD .SRCINFO
+              git diff --cached --quiet && { echo "$pkg unchanged"; exit 0; }
+              git commit -m "Update to ${{ steps.v.outputs.version }}"
+              git push )
+          done
