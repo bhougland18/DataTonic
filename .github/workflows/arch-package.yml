@@ -1,0 +1,82 @@
+name: Arch package
+
+# Builds the AUR PKGBUILDs in a real Arch container and lints them with namcap.
+#
+# The point is that "the PKGBUILD is fine" stops being an assertion. A PKGBUILD
+# is only correct if makepkg runs it, and neither the maintainers' machines nor
+# the rest of this CI is Arch - so without this, the packaging in
+# packaging/arch/ could only ever be reviewed by reading.
+#
+# Scoped to packaging changes and tags rather than every push: it downloads
+# release assets over the network, and nothing else in the repo can break it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/arch/**'
+      - '.github/workflows/arch-package.yml'
+  pull_request:
+    paths:
+      - 'packaging/arch/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  makepkg:
+    name: makepkg + namcap
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [duckle-runner-bin, duckle-bin]
+    steps:
+      - name: Install the toolchain
+        run: pacman -Syu --noconfirm --needed base-devel git namcap
+
+      - uses: actions/checkout@v7
+
+      # makepkg refuses to run as root, which is what a container runs as.
+      - name: Prepare an unprivileged build user
+        run: |
+          set -e
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+
+      - name: Build the package
+        run: |
+          set -e
+          # --nodeps because the runtime dependencies of a -bin package are not
+          # needed to assemble it, and pulling WebKitGTK into this container
+          # would only slow the check down without testing anything.
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch/${{ matrix.pkg }}' && makepkg --nodeps --noconfirm"
+
+      - name: What the package actually contains
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/packaging/arch/${{ matrix.pkg }}"
+          pkg=$(ls *.pkg.tar.* | head -1)
+          echo "built: $pkg"
+          bsdtar -tf "$pkg" | grep -v '^\.' | sort
+
+      # namcap is the lint AUR reviewers run. Reported, not enforced: a -bin
+      # package always trips a few of its rules (no source build, stripped
+      # binaries), and failing the job on those would just train people to
+      # ignore it. Read the output when changing packaging.
+      - name: namcap
+        continue-on-error: true
+        run: |
+          cd "$GITHUB_WORKSPACE/packaging/arch/${{ matrix.pkg }}"
+          namcap PKGBUILD || true
+          namcap ./*.pkg.tar.* || true
+
+      - name: The desktop entry is valid
+        if: matrix.pkg == 'duckle-bin'
+        run: |
+          set -e
+          pacman -S --noconfirm --needed desktop-file-utils
+          desktop-file-validate "$GITHUB_WORKSPACE/packaging/arch/duckle.desktop"
+          echo "duckle.desktop is valid"
