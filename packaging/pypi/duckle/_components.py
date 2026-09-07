@@ -432,7 +432,7 @@ COMPONENTS = {
     'snk.mariadb': {
         'kind': 'sink',
         'summary': 'Write to MariaDB via the DuckDB mysql extension (MariaDB speaks the MySQL wire protocol)',
-        'params': ['connectionRef', 'host', 'port', 'database', 'username', 'password', 'schemaName', 'tableName', 'mode', 'conflictColumns', 'deleteColumn', 'deleteValue', 'validateBeforeInsert', 'deadLetterPath', 'deadLetterFormat'],
+        'params': ['connectionRef', 'host', 'port', 'database', 'username', 'password', 'schemaName', 'tableName', 'mode', 'conflictColumns', 'deleteColumn', 'deleteValue', 'validateBeforeInsert', 'deadLetterPath', 'deadLetterFormat', 'transactions'],
     },
     'snk.milvus': {
         'kind': 'sink',
@@ -462,7 +462,7 @@ COMPONENTS = {
     'snk.mysql': {
         'kind': 'sink',
         'summary': 'Write to MySQL via the DuckDB mysql extension',
-        'params': ['connectionRef', 'host', 'port', 'database', 'username', 'password', 'schemaName', 'tableName', 'mode', 'conflictColumns', 'deleteColumn', 'deleteValue', 'validateBeforeInsert', 'deadLetterPath', 'deadLetterFormat'],
+        'params': ['connectionRef', 'host', 'port', 'database', 'username', 'password', 'schemaName', 'tableName', 'mode', 'conflictColumns', 'deleteColumn', 'deleteValue', 'validateBeforeInsert', 'deadLetterPath', 'deadLetterFormat', 'transactions'],
     },
     'snk.nats': {
         'kind': 'sink',

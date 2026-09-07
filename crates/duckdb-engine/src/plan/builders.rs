@@ -5984,9 +5984,28 @@ pub(crate) fn db_attach(props: &JsonValue, extension: &str, default_port: u64, r
         );
     let mode = if attach_read_only { ", READ_ONLY" } else { "" };
     let type_name = extension.to_uppercase();
+    // #332: a MySQL write is one `INSERT INTO ... SELECT`, and DuckDB wraps it
+    // in a single transaction - which an InnoDB Cluster feels as one enormous
+    // commit, with the replication cost that implies. `mysql_enable_transactions`
+    // turns that off ("Whether to run 'START TRANSACTION'/'COMMIT'/'ROLLBACK' on
+    // MySQL connections", default true in the pinned 1.5.4).
+    //
+    // Emitted after LOAD and before ATTACH, which is where the SQL Server path
+    // already puts `SET mssql_insert_batch_size`. MySQL only: Postgres exposes
+    // no equivalent, so emitting it there would be an unrecognized-parameter
+    // error. Sinks only: a source attaches READ_ONLY and writes nothing.
+    let transactions = if extension == "mysql"
+        && !is_source
+        && matches!(props.get("transactions"), Some(JsonValue::Bool(false)))
+    {
+        "SET mysql_enable_transactions = false; "
+    } else {
+        ""
+    };
     format!(
-        "LOAD {ext}; ATTACH '{conn}' AS {alias} (TYPE {type_name}{mode}); ",
+        "LOAD {ext}; {tx}ATTACH '{conn}' AS {alias} (TYPE {type_name}{mode}); ",
         ext = extension,
+        tx = transactions,
         conn = sql_escape(&connstr),
         alias = alias,
         type_name = type_name,

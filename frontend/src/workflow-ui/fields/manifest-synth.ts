@@ -3411,11 +3411,32 @@ function synthDbSink(comp: ComponentDef): ComponentManifest {
             },
         ], 'upstream');
     }
+    // #332: this generic tail is shared by snk.postgres, snk.cockroach,
+    // snk.mysql, snk.mariadb and snk.jdbc, so anything added here lands on all
+    // five. `mysql_enable_transactions` is a MySQL-extension setting - Postgres
+    // exposes no equivalent - so the control is offered only where the engine
+    // can act on it.
+    const isMysql = comp.id === 'snk.mysql' || comp.id === 'snk.mariadb';
     return base(
         comp,
         [
             { label: 'Connection', fields: dbConnectionFields(comp.id) },
-            { label: 'Destination', fields: dbWriteFields() },
+            {
+                label: 'Destination',
+                fields: [
+                    ...dbWriteFields(),
+                    ...(isMysql
+                        ? ([{
+                              key: 'transactions',
+                              label: 'Wrap the write in a transaction',
+                              kind: 'bool',
+                              defaultValue: true,
+                              description:
+                                  'On, the whole write commits or rolls back as one transaction. A load of many millions of rows is then a single very large commit, which an InnoDB Cluster pays for in replication lag. Turn it off to let MySQL commit as it goes: faster and gentler on a cluster, but a failed run leaves the rows it already wrote.',
+                          }] as Field[])
+                        : []),
+                ],
+            },
         ],
         'upstream',
     );

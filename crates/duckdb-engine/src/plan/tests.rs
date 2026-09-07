@@ -6484,3 +6484,78 @@ mod quality_gate_on_fail {
         }
     }
 }
+
+/// #332: the MySQL sink gave no way to control transaction behaviour.
+///
+/// snk.mysql writes through DuckDB's mysql extension - db_attach emitted only
+/// `LOAD mysql; ATTACH ...`, with no SET of any kind, and the write itself is a
+/// single `INSERT INTO ... SELECT`. DuckDB wraps that in one transaction, which
+/// is what an InnoDB Cluster feels as one enormous commit.
+///
+/// `mysql_enable_transactions` is a real setting in the pinned 1.5.4 - measured:
+///   duckdb -c "LOAD mysql; SELECT name, value, description FROM duckdb_settings()
+///              WHERE name = 'mysql_enable_transactions';"
+///   -> true, "Whether to run 'START TRANSACTION'/'COMMIT'/'ROLLBACK' on MySQL connections"
+///
+/// Emitted the way the SQL Server path already emits mssql_insert_batch_size:
+/// after LOAD, before ATTACH.
+#[cfg(test)]
+mod mysql_sink_transactions {
+    use super::*;
+
+    fn attach(props: serde_json::Value) -> String {
+        crate::plan::builders::db_attach(&props, "mysql", 3306, false)
+    }
+
+    #[test]
+    fn transactions_off_disables_them_on_the_connection() {
+        let sql = attach(serde_json::json!({ "host": "h", "database": "d", "transactions": false }));
+        assert!(
+            sql.contains("SET mysql_enable_transactions = false;"),
+            "asked for no transaction and got none of it: {sql}"
+        );
+        // After LOAD and before ATTACH, like the mssql path.
+        let load = sql.find("LOAD mysql;").expect("LOAD");
+        let set = sql.find("SET mysql_enable_transactions").expect("SET");
+        let att = sql.find("ATTACH").expect("ATTACH");
+        assert!(load < set && set < att, "the SET must sit between LOAD and ATTACH: {sql}");
+    }
+
+    #[test]
+    fn the_default_leaves_the_connection_alone() {
+        for props in [
+            serde_json::json!({ "host": "h", "database": "d" }),
+            serde_json::json!({ "host": "h", "database": "d", "transactions": true }),
+        ] {
+            let sql = attach(props);
+            assert!(
+                !sql.contains("mysql_enable_transactions"),
+                "an untouched sink must emit exactly what it emitted before: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn it_is_mysql_only_and_sink_only() {
+        // Postgres has no such setting - 1.5.4 exposes only
+        // pg_idle_in_transaction_timeout_millis - so emitting it would be a
+        // "Catalog Error: unrecognized configuration parameter".
+        let pg = crate::plan::builders::db_attach(
+            &serde_json::json!({ "host": "h", "database": "d", "transactions": false }),
+            "postgres",
+            5432,
+            false,
+        );
+        assert!(!pg.contains("enable_transactions"), "postgres has no such setting: {pg}");
+
+        // A source ATTACH is read-only and writes nothing, so it has no
+        // transaction behaviour worth changing.
+        let src = crate::plan::builders::db_attach(
+            &serde_json::json!({ "host": "h", "database": "d", "transactions": false }),
+            "mysql",
+            3306,
+            true,
+        );
+        assert!(!src.contains("enable_transactions"), "a source needs no write transaction: {src}");
+    }
+}

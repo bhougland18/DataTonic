@@ -32667,6 +32667,13 @@
                     "value": "json"
                   }
                 ]
+              },
+              {
+                "key": "transactions",
+                "label": "Wrap the write in a transaction",
+                "kind": "bool",
+                "defaultValue": true,
+                "description": "On, the whole write commits or rolls back as one transaction. A load of many millions of rows is then a single very large commit, which an InnoDB Cluster pays for in replication lag. Turn it off to let MySQL commit as it goes: faster and gentler on a cluster, but a failed run leaves the rows it already wrote."
               }
             ]
           }
@@ -32844,6 +32851,13 @@
                     "value": "json"
                   }
                 ]
+              },
+              {
+                "key": "transactions",
+                "label": "Wrap the write in a transaction",
+                "kind": "bool",
+                "defaultValue": true,
+                "description": "On, the whole write commits or rolls back as one transaction. A load of many millions of rows is then a single very large commit, which an InnoDB Cluster pays for in replication lag. Turn it off to let MySQL commit as it goes: faster and gentler on a cluster, but a failed run leaves the rows it already wrote."
               }
             ]
           }
