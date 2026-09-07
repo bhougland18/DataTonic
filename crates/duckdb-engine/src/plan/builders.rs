@@ -9063,7 +9063,15 @@ pub(crate) fn excel_sheet_names(path: &str) -> Vec<String> {
                         // Unescaped through quick-xml: a sheet legitimately
                         // named "R&D" is stored as "R&amp;D", and asking
                         // read_xlsx for the raw spelling would not match it.
-                        if let Ok(v) = attr.unescape_value() {
+                        //
+                        // `Implicit1_0` rather than a guess: the deprecated
+                        // `unescape_value()` this replaces was defined as
+                        // `normalized_value_with(Implicit1_0, 1,
+                        // resolve_predefined_entity)`, so this is the same call
+                        // with the version named instead of assumed. We do not
+                        // read the document's XML declaration, and 1.0 is what
+                        // the specification assumes when it is not consulted.
+                        if let Ok(v) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
                             names.push(v.into_owned());
                         }
                     }
