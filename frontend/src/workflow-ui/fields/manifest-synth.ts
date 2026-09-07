@@ -1015,7 +1015,13 @@ function portsForComponentRaw(comp: ComponentDef): NodePorts {
     // always been. Only the generic component gets the port - the vendor
     // aliases keep their plain source shape.
     if (id === 'src.rest') {
-        return { inputs: [MAIN_IN], outputs: [MAIN_OUT, REJECT_OUT] };
+        // `optional` is load-bearing, and its absence is what made a plain REST
+        // source unrunnable from the canvas: validatePipeline treats any input
+        // without it as required, so an unconnected node was reported as "REST
+        // has no upstream connection." and blocked the run. The engine never
+        // required one - the same pipeline ran through MCP and the headless
+        // runner - so the port declaration was the only thing saying otherwise.
+        return { inputs: [{ ...MAIN_IN, optional: true }], outputs: [MAIN_OUT, REJECT_OUT] };
     }
 
     // Sources: outputs only
