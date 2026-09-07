@@ -94,6 +94,10 @@ jobs:
           name: srcinfo-${{ matrix.pkg }}
           path: packaging/arch/${{ matrix.pkg }}/.SRCINFO
           if-no-files-found: error
+          # .SRCINFO starts with a dot, and the action skips hidden files
+          # unless told otherwise - it reported "No files were found" for a
+          # file that had just been written.
+          include-hidden-files: true
 
       - name: The desktop entry is valid
         if: matrix.pkg == 'duckle-bin'
