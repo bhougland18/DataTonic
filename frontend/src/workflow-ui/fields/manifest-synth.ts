@@ -1838,8 +1838,42 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
             {
                 label: 'Format',
                 fields: [
-                    { key: 'sheet', label: 'Sheet name', kind: 'text', placeholder: 'Sheet1' },
-                    { key: 'range', label: 'Cell range', kind: 'text', placeholder: 'A1:F1000' },
+                    {
+                        key: 'allSheets',
+                        label: 'Read every sheet',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'Reads all sheets in the workbook and stacks them, matching columns by name so the sheets need not be in the same order.',
+                    },
+                    {
+                        key: 'sheet',
+                        label: 'Sheet name(s)',
+                        kind: 'text',
+                        placeholder: 'Sheet1, or January, February',
+                        description:
+                            'One name, or several separated by commas. Leave blank for the first sheet.',
+                        // The condition compares String(value), and allSheets
+                        // defaults to false, so an untouched node evaluates
+                        // this as 'false' and the field shows.
+                        visibleWhen: [{ key: 'allSheets', equals: ['false'] }],
+                    },
+                    {
+                        key: 'sheetColumn',
+                        label: 'Add sheet name column',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'Adds a `sheet_name` column so rows can be told apart after several sheets are stacked.',
+                    },
+                    {
+                        key: 'range',
+                        label: 'Cell range',
+                        kind: 'text',
+                        placeholder: 'A1:F1000',
+                        description:
+                            'Limits the read to a rectangle, for a sheet with a banner or notes around the table.',
+                    },
                     // build_excel_source passes this straight to read_xlsx as
                     // `header =`. It had no field, so a sheet whose first row
                     // is data was read with that row consumed as the names.

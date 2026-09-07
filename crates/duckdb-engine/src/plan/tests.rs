@@ -5882,6 +5882,66 @@ fn pii_doc(sink_props: &str) -> PipelineDoc {
 /// qa.expect, qa.unique, qa.dedupe and qa.contract all fail when unconfigured,
 /// and qa.range itself fails when its column is missing. These three were the
 /// inconsistency.
+/// "Read every sheet" has to learn the sheet names from the file, because
+/// DuckDB cannot tell it: the excel extension exposes `read_xlsx` and nothing
+/// else, so there is no sheet catalogue to query.
+///
+/// Built here as a minimal .xlsx - a zip holding `xl/workbook.xml` - so the
+/// test needs no fixture binary and no spreadsheet library. Verified against a
+/// real three-sheet workbook end to end as well: 2 + 1 + 2 rows came back as 5.
+#[test]
+fn every_sheet_name_is_read_from_the_workbook_in_order() {
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("book.xlsx");
+
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("xl/workbook.xml", opts).unwrap();
+        // An ampersand in a sheet name is stored escaped. Asking read_xlsx for
+        // the raw spelling would not match the sheet, so it has to come back
+        // unescaped.
+        zip.write_all(
+            br#"<?xml version="1.0"?><workbook><sheets>
+                 <sheet name="January" sheetId="1" r:id="rId1"/>
+                 <sheet name="March 2026" sheetId="2" r:id="rId2"/>
+                 <sheet name="R&amp;D" sheetId="3" r:id="rId3"/>
+               </sheets></workbook>"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+    }
+
+    let names = crate::plan::builders::excel_sheet_names(path.to_str().unwrap());
+    assert_eq!(
+        names,
+        vec![
+            "January".to_string(),
+            "March 2026".to_string(),
+            "R&D".to_string()
+        ],
+        "workbook order, with entities decoded"
+    );
+}
+
+/// Anything unreadable returns nothing, and the caller falls back to the
+/// single-sheet read - so a bad path still fails where it always failed,
+/// rather than becoming a confusing error about sheets.
+#[test]
+fn an_unreadable_workbook_yields_no_sheet_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("nope.xlsx");
+    assert!(crate::plan::builders::excel_sheet_names(missing.to_str().unwrap()).is_empty());
+
+    // A .xls (or anything else that is not a zip) must not panic.
+    let not_zip = tmp.path().join("old.xls");
+    std::fs::write(&not_zip, b"not a zip at all").unwrap();
+    assert!(crate::plan::builders::excel_sheet_names(not_zip.to_str().unwrap()).is_empty());
+}
+
 #[test]
 fn an_unconfigured_quality_gate_refuses_rather_than_passing_everything() {
     use crate::plan::builders::quality_pass_predicate;

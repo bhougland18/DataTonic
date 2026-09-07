@@ -8984,6 +8984,69 @@ pub(crate) fn build_delta_source(props: &JsonValue) -> String {
     format!("SELECT * FROM delta_scan('{}')", sql_escape(&path))
 }
 
+/// The sheet names in an `.xlsx`, in workbook order.
+///
+/// "Read every sheet" has to know the names before it can build the reads, and
+/// DuckDB cannot supply them: the excel extension exposes `read_xlsx` and
+/// nothing else, so there is no sheet catalogue to query. An `.xlsx` is a zip
+/// whose `xl/workbook.xml` names them, and both the zip reader and the XML
+/// reader are already dependencies here.
+///
+/// Returns empty for anything it cannot read - a missing file, a `.xls` that is
+/// not a zip, a workbook part that is absent. The caller then falls back to the
+/// single-sheet read, so a bad path still fails exactly where it failed before
+/// rather than turning into a confusing error about sheets.
+pub(crate) fn excel_sheet_names(path: &str) -> Vec<String> {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return Vec::new();
+    };
+    let mut xml = String::new();
+    {
+        let Ok(mut entry) = zip.by_name("xl/workbook.xml") else {
+            return Vec::new();
+        };
+        if entry.read_to_string(&mut xml).is_err() {
+            return Vec::new();
+        }
+    }
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut names = Vec::new();
+    let mut in_sheets = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) if e.local_name().as_ref() == "sheets" => {
+                in_sheets = true;
+            }
+            Ok(quick_xml::events::Event::End(e)) if e.local_name().as_ref() == "sheets" => {
+                break;
+            }
+            // A sheet element is normally empty, but accept a start tag too
+            // rather than depend on how the writer chose to spell it.
+            Ok(quick_xml::events::Event::Empty(e)) | Ok(quick_xml::events::Event::Start(e))
+                if in_sheets && e.local_name().as_ref() == "sheet" =>
+            {
+                for attr in e.attributes().flatten() {
+                    if attr.key.local_name().as_ref() == "name" {
+                        // Unescaped through quick-xml: a sheet legitimately
+                        // named "R&D" is stored as "R&amp;D", and asking
+                        // read_xlsx for the raw spelling would not match it.
+                        if let Ok(v) = attr.unescape_value() {
+                            names.push(v.into_owned());
+                        }
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    names
+}
+
 /// Excel (.xlsx) source via DuckDB v1.2+ `read_xlsx`. Supports an
 /// optional `sheet` form field (omitted defaults to the first sheet)
 /// and a `hasHeader` toggle.
@@ -9000,36 +9063,83 @@ pub(crate) fn build_excel_source(
     // no declared schema the read is unchanged (auto-infer, all columns).
     let typed = declared.filter(|c| !c.is_empty());
 
-    // Extra read_xlsx options (sheet / header) are shared by every file.
+    // Extra read_xlsx options shared by every file and sheet. The sheet is NOT
+    // here: it varies per read once more than one sheet is in play.
     let mut opts: Vec<String> = Vec::new();
-    if let Some(sheet) = string_prop(props, "sheet").filter(|s| !s.is_empty()) {
-        opts.push(format!("sheet = '{}'", sql_escape(&sheet)));
-    }
     if let Some(has_header) = props.get("hasHeader").and_then(JsonValue::as_bool) {
         opts.push(format!("header = {}", has_header));
+    }
+    // The Cell range field existed and was never passed, so a sheet with a
+    // banner above the table could not be trimmed from the form at all.
+    // read_xlsx takes it directly.
+    if let Some(range) = string_prop(props, "range").filter(|s| !s.is_empty()) {
+        opts.push(format!("range = '{}'", sql_escape(&range)));
     }
     if typed.is_some() {
         opts.push("all_varchar = true".to_string());
     }
-    let one = |p: &str| {
+    // Name the sheet a row came from. Unioning sheets otherwise discards the
+    // one piece of information the split carried, and it cannot be recovered
+    // afterwards. Mirrors the CSV reader's filename column.
+    let name_column = props
+        .get("sheetColumn")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let one = |p: &str, sheet: Option<&str>| {
         let mut args = vec![format!("'{}'", sql_escape(p))];
+        if let Some(s) = sheet {
+            args.push(format!("sheet = '{}'", sql_escape(s)));
+        }
         args.extend(opts.iter().cloned());
-        format!("SELECT * FROM read_xlsx({})", args.join(", "))
+        let select = match (name_column, sheet) {
+            (true, Some(s)) => format!("SELECT *, '{}' AS sheet_name", sql_escape(s)),
+            // Without a named sheet read_xlsx takes the first one, and its name
+            // is not something this query knows.
+            (true, None) => "SELECT *, NULL AS sheet_name".to_string(),
+            _ => "SELECT *".to_string(),
+        };
+        format!("{} FROM read_xlsx({})", select, args.join(", "))
     };
+
+    // Which sheets. Blank is the first sheet, as it always was.
+    let all_sheets = props
+        .get("allSheets")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    // A comma-separated list, so one name behaves exactly as it did before.
+    let named: Vec<String> = string_prop(props, "sheet")
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
 
     // DuckDB's excel reader can't glob (duckdb-excel#30): a wildcard or a
     // directory would silently read only the first file. Expand it ourselves
     // and UNION the per-file reads (BY NAME tolerates column-order drift).
     let files = expand_excel_paths(&path);
-    let base = match files.len() {
-        0 => one(&path), // nothing matched (or no fs access) - let DuckDB report it
-        1 => one(&files[0]),
-        _ => files
-            .iter()
-            .map(|f| one(f))
-            .collect::<Vec<_>>()
-            .join(" UNION ALL BY NAME "),
-    };
+    let targets: Vec<String> = if files.is_empty() { vec![path.clone()] } else { files };
+
+    let mut reads: Vec<String> = Vec::new();
+    for f in &targets {
+        // Every sheet means asking the file which sheets it has - DuckDB
+        // cannot say, so `excel_sheet_names` reads the workbook itself. Per
+        // file, because two workbooks need not agree on their sheet names.
+        let sheets: Vec<String> = if all_sheets {
+            excel_sheet_names(f)
+        } else {
+            named.clone()
+        };
+        match sheets.len() {
+            0 => reads.push(one(f, None)),
+            _ => reads.extend(sheets.iter().map(|s| one(f, Some(s)))),
+        }
+    }
+    let base = reads.join(" UNION ALL BY NAME ");
 
     let Some(cols) = typed else {
         return base;

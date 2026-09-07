@@ -68,6 +68,8 @@
                 "key": "delimiter",
                 "label": "Delimiter",
                 "kind": "select",
+                "allowCustom": true,
+                "placeholder": "pick one, or type it - any length",
                 "defaultValue": ",",
                 "options": [
                   {
@@ -89,8 +91,29 @@
                   {
                     "label": "Space",
                     "value": " "
+                  },
+                  {
+                    "label": "Colon  :",
+                    "value": ":"
+                  },
+                  {
+                    "label": "Caret  ^",
+                    "value": "^"
+                  },
+                  {
+                    "label": "Tilde  ~",
+                    "value": "~"
+                  },
+                  {
+                    "label": "Hash  #",
+                    "value": "#"
+                  },
+                  {
+                    "label": "Unit separator  0x1F",
+                    "value": "\u001f"
                   }
-                ]
+                ],
+                "description": "Leave blank to let DuckDB sniff it. Anything not listed can be typed in, including a multi-character delimiter such as || or <=>."
               },
               {
                 "key": "quoteChar",
@@ -116,7 +139,10 @@
                 "key": "encoding",
                 "label": "Encoding",
                 "kind": "select",
+                "allowCustom": true,
+                "placeholder": "utf-8",
                 "defaultValue": "utf-8",
+                "description": "DuckDB accepts any ICU encoding name; the list is the common ones. A name it does not know is an error, not a fallback.",
                 "options": [
                   {
                     "label": "UTF-8",
@@ -127,12 +153,96 @@
                     "value": "utf-16"
                   },
                   {
-                    "label": "Latin-1 (ISO-8859-1)",
+                    "label": "Latin-1  (ISO-8859-1)",
                     "value": "latin-1"
                   },
                   {
-                    "label": "Windows-1252",
+                    "label": "Windows-1252  Western",
                     "value": "windows-1252"
+                  },
+                  {
+                    "label": "Windows-1250  Central European",
+                    "value": "CP1250"
+                  },
+                  {
+                    "label": "Windows-1251  Cyrillic",
+                    "value": "CP1251"
+                  },
+                  {
+                    "label": "Windows-1253  Greek",
+                    "value": "CP1253"
+                  },
+                  {
+                    "label": "Windows-1254  Turkish",
+                    "value": "CP1254"
+                  },
+                  {
+                    "label": "Windows-1255  Hebrew",
+                    "value": "CP1255"
+                  },
+                  {
+                    "label": "Windows-1256  Arabic",
+                    "value": "CP1256"
+                  },
+                  {
+                    "label": "Windows-1257  Baltic",
+                    "value": "CP1257"
+                  },
+                  {
+                    "label": "Windows-1258  Vietnamese",
+                    "value": "CP1258"
+                  },
+                  {
+                    "label": "ISO-8859-2  Central European",
+                    "value": "iso-8859_2-1999"
+                  },
+                  {
+                    "label": "ISO-8859-5  Cyrillic",
+                    "value": "iso-8859_5-1999"
+                  },
+                  {
+                    "label": "ISO-8859-7  Greek",
+                    "value": "iso-8859_7-1987"
+                  },
+                  {
+                    "label": "ISO-8859-15  Western with euro",
+                    "value": "iso-8859_15-1999"
+                  },
+                  {
+                    "label": "Shift-JIS  Japanese",
+                    "value": "SHIFT_JIS"
+                  },
+                  {
+                    "label": "EUC-JP  Japanese",
+                    "value": "EUC_JP"
+                  },
+                  {
+                    "label": "EUC-KR  Korean",
+                    "value": "EUC_KR"
+                  },
+                  {
+                    "label": "Big5  Traditional Chinese",
+                    "value": "BIG5"
+                  },
+                  {
+                    "label": "GB18030  Simplified Chinese",
+                    "value": "GB18030"
+                  },
+                  {
+                    "label": "KOI8-R  Cyrillic",
+                    "value": "KOI8_R"
+                  },
+                  {
+                    "label": "CP852  DOS Central European",
+                    "value": "CP852"
+                  },
+                  {
+                    "label": "CP866  DOS Cyrillic",
+                    "value": "CP866"
+                  },
+                  {
+                    "label": "CP437  DOS US",
+                    "value": "CP437"
                   }
                 ]
               },
@@ -381,7 +491,7 @@
                 "label": "Delimiter",
                 "kind": "select",
                 "allowCustom": true,
-                "placeholder": "pick one, or type the character",
+                "placeholder": "pick one, or type it - any length",
                 "defaultValue": "\t",
                 "options": [
                   {
@@ -425,7 +535,7 @@
                     "value": "\u001f"
                   }
                 ],
-                "description": "Leave blank to let DuckDB sniff it. Anything not listed can be typed in."
+                "description": "Leave blank to let DuckDB sniff it. Anything not listed can be typed in, including a multi-character delimiter such as || or <=>."
               },
               {
                 "key": "quoteChar",
@@ -2628,16 +2738,40 @@
             "label": "Format",
             "fields": [
               {
+                "key": "allSheets",
+                "label": "Read every sheet",
+                "kind": "bool",
+                "defaultValue": false,
+                "description": "Reads all sheets in the workbook and stacks them, matching columns by name so the sheets need not be in the same order."
+              },
+              {
                 "key": "sheet",
-                "label": "Sheet name",
+                "label": "Sheet name(s)",
                 "kind": "text",
-                "placeholder": "Sheet1"
+                "placeholder": "Sheet1, or January, February",
+                "description": "One name, or several separated by commas. Leave blank for the first sheet.",
+                "visibleWhen": [
+                  {
+                    "key": "allSheets",
+                    "equals": [
+                      "false"
+                    ]
+                  }
+                ]
+              },
+              {
+                "key": "sheetColumn",
+                "label": "Add sheet name column",
+                "kind": "bool",
+                "defaultValue": false,
+                "description": "Adds a `sheet_name` column so rows can be told apart after several sheets are stacked."
               },
               {
                 "key": "range",
                 "label": "Cell range",
                 "kind": "text",
-                "placeholder": "A1:F1000"
+                "placeholder": "A1:F1000",
+                "description": "Limits the read to a rectangle, for a sheet with a banner or notes around the table."
               },
               {
                 "key": "hasHeader",
@@ -10307,7 +10441,8 @@
           {
             "id": "main",
             "label": "main",
-            "type": "main"
+            "type": "main",
+            "optional": true
           }
         ],
         "outputs": [
@@ -10776,7 +10911,8 @@
             {
               "id": "main",
               "label": "main",
-              "type": "main"
+              "type": "main",
+              "optional": true
             }
           ],
           "outputs": [
@@ -29340,26 +29476,6 @@
                 "defaultValue": true
               },
               {
-                "key": "encoding",
-                "label": "Encoding",
-                "kind": "select",
-                "defaultValue": "utf-8",
-                "options": [
-                  {
-                    "label": "UTF-8",
-                    "value": "utf-8"
-                  },
-                  {
-                    "label": "UTF-16",
-                    "value": "utf-16"
-                  },
-                  {
-                    "label": "Latin-1",
-                    "value": "latin-1"
-                  }
-                ]
-              },
-              {
                 "key": "nullValue",
                 "label": "Write NULL as",
                 "kind": "text",
@@ -29490,7 +29606,7 @@
                 "label": "Delimiter",
                 "kind": "select",
                 "allowCustom": true,
-                "placeholder": "pick one, or type the character",
+                "placeholder": "pick one, or type it - any length",
                 "defaultValue": "\t",
                 "options": [
                   {
@@ -29534,7 +29650,7 @@
                     "value": "\u001f"
                   }
                 ],
-                "description": "Leave blank to let DuckDB sniff it. Anything not listed can be typed in."
+                "description": "Leave blank to let DuckDB sniff it. Anything not listed can be typed in, including a multi-character delimiter such as || or <=>."
               },
               {
                 "key": "quoteChar",

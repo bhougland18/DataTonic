@@ -332,7 +332,7 @@ COMPONENTS = {
     'snk.csv': {
         'kind': 'sink',
         'summary': '',
-        'params': ['path', 'mode', 'delimiter', 'writeHeader', 'encoding', 'nullValue', 'partitionBy'],
+        'params': ['path', 'mode', 'delimiter', 'writeHeader', 'nullValue', 'partitionBy'],
     },
     'snk.databricks': {
         'kind': 'sink',
@@ -808,7 +808,7 @@ COMPONENTS = {
     'src.excel': {
         'kind': 'source',
         'summary': 'Read .xlsx via the DuckDB excel extension',
-        'params': ['path', 'encoding', 'glob', 'sheet', 'range', 'hasHeader'],
+        'params': ['path', 'encoding', 'glob', 'allSheets', 'sheet', 'sheetColumn', 'range', 'hasHeader'],
     },
     'src.filelist': {
         'kind': 'source',
