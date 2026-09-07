@@ -17,7 +17,7 @@ pub fn source_select_for_format(format: &str, props: &JsonValue) -> Option<Strin
         "parquet" => build_parquet_source(props),
         "json" | "jsonl" | "ndjson" => build_json_source(props),
         "sqlite" => return build_sqlite_source(props).ok(),
-        "duckdb" => build_duckdb_source(props),
+        "duckdb" => return build_duckdb_source(props).ok(),
         "excel" => build_excel_source(props, None),
         "avro" => build_avro_source(props),
         "inline" => build_inline_source(props),
@@ -205,7 +205,7 @@ pub(crate) fn build_view_sql(
         "src.parquet" => Ok(build_parquet_source(props)),
         "src.json" | "src.jsonl" => Ok(build_json_source(props)),
         "src.sqlite" => build_sqlite_source(props),
-        "src.duckdb" => Ok(build_duckdb_source(props)),
+        "src.duckdb" => build_duckdb_source(props),
         "src.ducklake.diff" => Ok(build_ducklake_diff(props)),
         "src.s3" | "src.gcs" | "src.azureblob" | "src.http"
         | "src.minio" | "src.r2" | "src.b2" => {
@@ -5666,23 +5666,36 @@ pub(crate) fn build_sqlite_source(props: &JsonValue) -> Result<String, String> {
     ))
 }
 
-pub(crate) fn build_duckdb_source(props: &JsonValue) -> String {
+pub(crate) fn build_duckdb_source(props: &JsonValue) -> Result<String, String> {
     // The DuckDB file is ATTACHed as `duckle_src` (READ_ONLY) by the
     // stage / inspect prelude; we read from it qualified by that alias.
-    if let Some(table) = string_prop(props, "tableName").filter(|s| !s.is_empty()) {
-        match string_prop(props, "schema").filter(|s| !s.is_empty()) {
+    // Trimmed, not just non-empty: a box touched and cleared can hold spaces,
+    // and `"  "` quoted as an identifier is a table that cannot exist.
+    let trimmed = |k: &str| {
+        string_prop(props, k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    if let Some(table) = trimmed("tableName") {
+        Ok(match trimmed("schema") {
             Some(schema) => format!(
                 "SELECT * FROM duckle_src.{}.{}",
                 quote_ident(&schema),
                 quote_ident(&table)
             ),
             None => format!("SELECT * FROM duckle_src.{}", quote_ident(&table)),
-        }
+        })
     } else if let Some(sql) = string_prop(props, "sql").filter(|s| !s.trim().is_empty()) {
         // Advanced: a custom query. Reference tables as duckle_src.<table>.
-        format!("({})", sql)
+        Ok(format!("({})", sql))
     } else {
-        "SELECT 1 AS placeholder LIMIT 0".into()
+        // Was `SELECT 1 AS placeholder LIMIT 0`, which meant a node nobody had
+        // finished configuring RAN, reported ok, and wrote a file whose only
+        // column was named `placeholder`. A green run that produces the wrong
+        // schema is worse than a failure, because nothing asks about it.
+        //
+        // The rest of the family already refuses - build_relational_source
+        // answers "table name is required" for ducklake / motherduck / quack -
+        // so this was the outlier rather than a policy.
+        Err("DuckDB source: set a table name, or a SQL query to run against the database".into())
     }
 }
 

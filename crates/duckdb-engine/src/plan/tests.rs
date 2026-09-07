@@ -6718,8 +6718,8 @@ fn the_missing_duckdb_message_helps_a_reader_with_no_desktop_app() {
 /// so a node with neither is accepted, validates ok, and fails at run time
 /// with a message about DuckDB's internals rather than about the node.
 ///
-/// The sibling `build_duckdb_source` already handles the empty case. This one
-/// did not.
+/// `build_duckdb_source` had the same hole in a quieter form - it returned a
+/// placeholder SELECT and the run reported ok - and is fixed alongside.
 #[test]
 fn a_sqlite_source_with_no_table_says_so_instead_of_asserting() {
     use crate::plan::builders::build_sqlite_source;
@@ -6755,4 +6755,38 @@ fn a_sqlite_source_with_no_table_says_so_instead_of_asserting() {
     )
     .expect("a query is enough");
     assert!(by_sql.contains("SELECT 1"), "{by_sql}");
+}
+
+/// The same shape as #335, in its worse flavour: not an error, a green run.
+///
+/// `src.duckdb` with neither a table nor a query returned
+/// `SELECT 1 AS placeholder LIMIT 0`. Measured through the runner: status ok,
+/// and the sink wrote a file whose only column was literally named
+/// `placeholder`. Nothing failed, so nothing said the node had not been
+/// configured - the pipeline just quietly produced a wrong-schema empty file.
+///
+/// The rest of the family already refuses: `build_relational_source` answers
+/// "table name is required" for ducklake / motherduck / quack. src.duckdb and
+/// src.sqlite were the two that did not.
+#[test]
+fn a_duckdb_source_with_no_table_refuses_instead_of_returning_a_placeholder() {
+    use crate::plan::builders::build_duckdb_source;
+
+    let err = build_duckdb_source(&serde_json::json!({ "database": "/tmp/a.duckdb" }))
+        .expect_err("a source with nothing to read from must refuse");
+    assert!(err.to_lowercase().contains("table"), "name what is missing: {err}");
+    assert!(!err.contains("placeholder"), "{err}");
+
+    assert!(build_duckdb_source(&serde_json::json!({ "tableName": "  " })).is_err());
+
+    // Either field on its own still builds, and the schema form still works.
+    assert!(build_duckdb_source(&serde_json::json!({ "tableName": "Orders" }))
+        .expect("a table is enough")
+        .contains("Orders"));
+    assert!(build_duckdb_source(&serde_json::json!({ "sql": "SELECT 1" }))
+        .expect("a query is enough")
+        .contains("SELECT 1"));
+    assert!(build_duckdb_source(&serde_json::json!({ "tableName": "t", "schema": "main" }))
+        .expect("schema-qualified")
+        .contains("main"));
 }
