@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "lint": "tsc --noEmit",
     "export-catalog": "node scripts/build-catalog.mjs",
+    "check-visible-when": "node scripts/check-visible-when.mjs",
     "gen-icons": "node scripts/gen-brand-icons.mjs"
   },
   "dependencies": {

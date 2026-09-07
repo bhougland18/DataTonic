@@ -40,6 +40,13 @@ jobs:
       # schema that no longer exists. That happened: removing a dead Encoding
       # control from the file sinks left the catalog advertising it. The export
       # is deterministic, so regenerating and diffing is the whole check.
+      # A field gated on a value its controlling dropdown cannot produce is
+      # invisible forever, and nothing else reports it: the form renders, the
+      # engine still reads the property, and the only symptom is a setting
+      # nobody can reach.
+      - name: Every visibleWhen condition is satisfiable
+        run: npm --prefix frontend run check-visible-when
+
       - name: Catalog is in sync with the manifests
         run: |
           npm --prefix frontend run export-catalog
