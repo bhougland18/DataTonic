@@ -96,10 +96,15 @@ extract. Hence `duckle.desktop` here, and the icons installed explicitly.
    `cairo`, `dbus` and `hicolor-icon-theme`. `glibc` and `libgcc` are reported
    too and deliberately omitted, being in `base`.
 
-4. **Generate `.SRCINFO`** (`makepkg --printsrcinfo > .SRCINFO`). The AUR
-   rejects a push without it.
+4. **`.SRCINFO`: generated for you.** The `Arch package` workflow produces one
+   per package and attaches it to the run as `srcinfo-<pkgname>`, so the first
+   submission needs no Arch machine of your own - download it from the run.
 
-5. **Test the first-run flow in a clean container**, per section 4.
+5. **Set the `Maintainer:` line.** Both PKGBUILDs carry an explicit placeholder.
+   The AUR publishes this address and uses it to reach whoever keeps the package
+   working, so it has to be one that is read.
+
+6. **Test the first-run flow in a clean container**, per section 4.
 
 ## 6. Publishing, and keeping it alive
 
