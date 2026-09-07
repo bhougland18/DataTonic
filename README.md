@@ -46,6 +46,7 @@
 
 - [Where Duckle runs](#where-duckle-runs)
 - [What is Duckle?](#what-is-duckle)
+- [What's new in v0.7.2](#whats-new-in-v072)
 - [What's new in v0.7.1](#whats-new-in-v071)
 - [What's new in v0.7.0](#whats-new-in-v070)
 - [What's new in v0.6.1](#whats-new-in-v061)
@@ -205,7 +206,7 @@ That's a real, native ETL pipeline built and run in under a minute. CSV is just 
 
 ## Download / Install
 
-Pick the binary for your OS from the [latest release](https://github.com/slothflowlabs/duckle/releases/tag/v0.7.1):
+Pick the binary for your OS from the [latest release](https://github.com/slothflowlabs/duckle/releases/tag/v0.7.2):
 
 | OS | Asset | How to run |
 |---|---|---|
@@ -4337,6 +4338,76 @@ git push origin main vX.Y.Z
 # GitHub gets the binaries uploaded; un-draft + mark Latest with:
 gh release edit vX.Y.Z --draft=false --latest
 ```
+
+---
+
+## What's new in v0.7.2
+
+185 commits. Most of them are the same question asked of one component after
+another: does this control do what it says? Sixteen components could not be
+configured from their own form at all, dozens of settings the engine already
+honoured had no field, and a number of dropdown options ran and did something
+other than their label. The rest is scheduling that can be held to account, a
+capability registry the engine answers rather than a document, and a security
+pass that ends in checks rather than in prose.
+
+- **Settings the engine honoured, that the form never offered.** Sixteen
+  components had no usable form. The S3 source now takes the credentials its
+  sink always had; CSV offers the malformed-row handling and a typable
+  delimiter of any length plus the full encoding list; Excel reads every sheet
+  or a named set and honours the cell range; cloud sources expose the read
+  options they already applied; GraphQL takes its query; Synapse draws the
+  connection it actually makes; sort takes more than one column. A REST source
+  with no upstream is no longer reported as broken.
+- **Options that ran and did something else.** A quality gate set to "keep the
+  row" dropped it; `onFail: fail` did not fail the run; the four set operations
+  ignored their column-match setting; a join family advertised a reject port
+  nothing filled; `INITCAP` does not exist in DuckDB; date arithmetic offered
+  units it could not add; the IP parser offered fields DuckDB cannot compute.
+  Each was found by running the option, not by reading it.
+- **A node that is not configured says so.** A quality gate with no columns
+  evaluated to `TRUE` and passed every row while reporting success. A SQLite
+  source with no table asked DuckDB for a table named `""` and got an internal
+  assertion (#335); the DuckDB source returned a placeholder and wrote a file
+  whose only column was named `placeholder`; the file list globbed the
+  filesystem root. All four now refuse, and `duckle-runner validate` catches
+  them before anything is opened.
+- **Scheduling that can be held to account.** A schedule records every
+  occurrence it was due for, catches up what it missed by policy, and honours
+  its zone and exclusion calendar at fire time. A retry replays the parameters
+  the run was given and reuses a verified durable output instead of re-running
+  upstream. Operational ledgers prune without losing what is kept.
+- **Publications, subscriptions and ordered chains.** A durable log of every
+  successful publication, a pipeline that runs when the data it reads is
+  published, a failed delivery that is visible and retryable, and a
+  subscription that refuses to close a trigger loop. An ordered delta chain
+  blocks a slice whose predecessor has not landed.
+- **One capability registry, and the engine answers it.** Which components run
+  a process, which advance durable state, which do incremental reads - reported
+  from the registry rather than asserted in a document, reachable over MCP, and
+  the connector matrices are generated from it.
+- **Security, ending in checks rather than prose.** The console enforces MFA by
+  requiring the `acr` and `amr` claims back, and a missing claim is refused
+  rather than waived. `${VAULT:NAME}` stopped being offered as a run parameter,
+  which had made the editor prompt the author for the credential and then
+  substitute it client-side, so the vault was never consulted. `tokenUrl`
+  matched the `token` needle and was treated as a secret, which blocked deploy
+  and rewrote a public OAuth endpoint to `${ENV:TOKENURL}` in built bundles. A
+  `src.git` revision could carry a `-` and be read as a git option. Credential
+  inputs are masked centrally rather than on 46 declarations, one of which had
+  the flag.
+- **Supply chain.** Dependency scanning on every push and weekly, a CycloneDX
+  SBOM, and keyless build provenance over every release artifact - so a
+  download can be bound to the commit and workflow that produced it, which a
+  checksum cannot do. Every accepted advisory carries a reachability analysis
+  and a review date.
+- **New checks that fail the build.** A field gated on a value its dropdown
+  cannot produce; a credential shown in the clear; the capability matrix, the
+  component catalog and the site index out of step with the manifests.
+- **Arch Linux packaging**, built and linted in a real Arch container on every
+  change, including a clean-install test that runs a pipeline - which is how
+  the runner package was found to install cleanly and be unable to run
+  anything.
 
 ---
 
