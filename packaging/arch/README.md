@@ -1,9 +1,10 @@
 # Arch Linux packaging, and the route to Omarchy
 
-**Status: written, not yet built.** Neither PKGBUILD has been through
-`makepkg` - that needs an Arch machine or container, and this repo's CI has
-neither. Treat them as a starting point that must be built once before
-submission. The verification steps are in section 5.
+**Status: both packages build in a real Arch container**, on every change to
+this directory - see `.github/workflows/arch-package.yml`. What remains
+unverified is the part that needs a running desktop session, listed in section
+4. Building them is what found the three defects noted below; reading them
+would not have.
 
 ---
 
@@ -30,7 +31,7 @@ and community requests - and is section 7, not the main path.
 | Package | Installs | Dependencies |
 | :--- | :--- | :--- |
 | `duckle-runner-bin` | The headless runner | **none** - statically linked against musl |
-| `duckle-bin` | The desktop application | `webkit2gtk-4.1 gtk3 libsoup3 libayatana-appindicator` |
+| `duckle-bin` | The desktop application | `webkit2gtk-4.1 gtk3 libsoup3 glib2 cairo dbus hicolor-icon-theme` |
 
 Split because they share nothing at install time. A server wants the runner and
 should not pull in a browser engine to get it. `duckle-bin` lists the runner as
@@ -66,7 +67,8 @@ extract. Hence `duckle.desktop` here, and the icons installed explicitly.
 
 ## 5. What has to happen before submitting
 
-1. **Build both, on Arch.** Nothing here has been through `makepkg`:
+1. **Build both, on Arch.** CI does this now on every change here. To reproduce
+   locally:
 
    ```bash
    podman run --rm -it -v "$PWD:/src" archlinux:base-devel bash -c '
@@ -83,13 +85,13 @@ extract. Hence `duckle.desktop` here, and the icons installed explicitly.
    already published per release in `SHA256SUMS.txt`, so it is verifiable
    against the release rather than trusted from this file.
 
-3. **Confirm the desktop dependency list against the real binary**, not against
-   Tauri's documentation - this is the most likely thing here to be wrong:
-
-   ```bash
-   ldd Duckle-linux-x64 | awk '{print $1}' | sort -u
-   pacman -F <each .so>
-   ```
+3. **Dependency list: done, from evidence.** namcap reads the released
+   binary's dynamic dependencies in CI, and the list in the PKGBUILD is now
+   what it reported rather than what Tauri's documentation suggests. That
+   removed `libayatana-appindicator` - Tauri names it for tray support, the
+   binary never references it, and Duckle has no tray - and added `glib2`,
+   `cairo`, `dbus` and `hicolor-icon-theme`. `glibc` and `libgcc` are reported
+   too and deliberately omitted, being in `base`.
 
 4. **Generate `.SRCINFO`** (`makepkg --printsrcinfo > .SRCINFO`). The AUR
    rejects a push without it.
@@ -108,7 +110,7 @@ git clone ssh://aur@aur.archlinux.org/duckle-runner-bin.git
 Then test the real end-user path - `omarchy-pkg-aur-install` from Omarchy's own
 Install menu, and launching from Walker - rather than only `yay -S`.
 
-**Automate the version bump.** Every release changes `pkgver` and ten
+**Automate the version bump.** Every release changes `pkgver` and its
 checksums. That belongs in the release workflow beside the step that publishes
 `SHA256SUMS.txt`, or the package silently falls behind, gets flagged
 out-of-date, and eventually orphaned.

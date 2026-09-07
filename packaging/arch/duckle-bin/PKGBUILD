@@ -16,10 +16,24 @@ pkgdesc="Local-first ETL/ELT and streaming platform with a visual pipeline edito
 arch=('x86_64' 'aarch64')
 url="https://github.com/slothflowlabs/duckle"
 license=('MIT OR Apache-2.0')
-# The set Tauri v2 needs at run time. unixodbc is NOT here: the release
-# workflow refuses to publish a Linux binary that requires libodbc.so, so the
-# ODBC support is linked statically.
-depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'libayatana-appindicator')
+# Taken from what namcap read out of the released binary, not from Tauri's
+# documentation. The libraries actually referenced are libwebkit2gtk-4.1 and
+# libjavascriptcoregtk-4.1 (webkit2gtk-4.1), libgtk-3, libgdk-3 and
+# libgdk_pixbuf-2.0 (gtk3), and libsoup-3.0 (libsoup3); namcap additionally
+# names glib2, cairo and dbus, and hicolor-icon-theme because this package
+# installs into that theme.
+#
+# libayatana-appindicator was in this list and is gone: it is what Tauri's docs
+# name for tray support, the binary does not reference it, and Duckle has no
+# tray - no TrayIcon in the source and no trayIcon in tauri.conf.json.
+#
+# glibc and libgcc are also reported by namcap and deliberately omitted: both
+# are in `base`, which Arch's guidelines say need not be declared.
+#
+# unixodbc is absent too - the release workflow refuses to publish a Linux
+# binary that requires libodbc.so, so ODBC is linked statically.
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'glib2' 'cairo' 'dbus'
+         'hicolor-icon-theme')
 makedepends=('imagemagick')
 optdepends=('duckle-runner-bin: run pipelines headlessly from the command line')
 provides=('duckle')
