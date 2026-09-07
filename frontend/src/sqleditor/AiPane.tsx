@@ -91,11 +91,19 @@ export default function AiPane({
     const [streaming, setStreaming] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const bodyRef = useRef<HTMLDivElement>(null);
+    const inputRef = useRef<HTMLTextAreaElement>(null);
+
+    // Grow the input with the request, up to a cap, then scroll.
+    const autosize = (el: HTMLTextAreaElement) => {
+        el.style.height = 'auto';
+        el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    };
 
     const send = async () => {
         const q = input.trim();
         if (!q || streaming) return;
         setInput('');
+        if (inputRef.current) inputRef.current.style.height = 'auto';
         setError(null);
         setMessages(m => [...m, { role: 'user', content: q }, { role: 'assistant', content: '' }]);
         setStreaming(true);
@@ -173,10 +181,15 @@ export default function AiPane({
             </div>
             <div className="sqlstudio-ai-foot">
                 <textarea
+                    ref={inputRef}
                     className="sqlstudio-ai-input"
                     value={input}
+                    rows={1}
                     placeholder="e.g. total amount by region for shipped orders"
-                    onChange={e => setInput(e.target.value)}
+                    onChange={e => {
+                        setInput(e.target.value);
+                        autosize(e.currentTarget);
+                    }}
                     onKeyDown={e => {
                         if (e.key === 'Enter' && !e.shiftKey) {
                             e.preventDefault();
