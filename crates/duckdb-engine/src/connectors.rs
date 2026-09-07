@@ -9905,6 +9905,25 @@ impl DuckdbEngine {
         ))
     }
 
+    /// The trailing arguments both `src.git` modes share: which revision to
+    /// read, and an optional path filter.
+    ///
+    /// `--end-of-options` is load-bearing, not tidiness. The revision is an
+    /// ordinary node property, and git reads a leading `-` as an option: a
+    /// revision of `--output=<path>` made `git log` write its output to that
+    /// path and exit 0, so the node reported success while writing a file
+    /// nobody asked for. The path filter was already protected by `--`; the
+    /// revision cannot use `--` because it has to precede it, and this is the
+    /// separator git provides for that position.
+    fn git_revision_args(spec: &GitSourceSpec) -> Vec<String> {
+        let mut args = vec!["--end-of-options".to_string(), spec.revision.clone()];
+        if let Some(p) = &spec.path_filter {
+            args.push("--".to_string());
+            args.push(p.clone());
+        }
+        args
+    }
+
     /// Local git repo reader. Shells out to the system `git` CLI -
     /// no libgit2 dependency, no extra Rust crate. mode=log captures
     /// commit history as one row per commit; mode=files captures the
@@ -9931,10 +9950,7 @@ impl DuckdbEngine {
                     .arg(&max)
                     .arg("--date=iso-strict")
                     .arg("--pretty=format:%H%x09%h%x09%an%x09%ae%x09%ad%x09%s")
-                    .arg(&spec.revision);
-                if let Some(p) = &spec.path_filter {
-                    cmd.arg("--").arg(p);
-                }
+                    .args(Self::git_revision_args(spec));
                 let out = cmd
                     .output()
                     .map_err(|e| EngineError::Query(format!("git log: spawn: {}", e)))?;
@@ -9960,10 +9976,7 @@ impl DuckdbEngine {
                     .arg("-r")
                     .arg("-z")
                     .arg("--long")
-                    .arg(&spec.revision);
-                if let Some(p) = &spec.path_filter {
-                    cmd.arg("--").arg(p);
-                }
+                    .args(Self::git_revision_args(spec));
                 let out = cmd
                     .output()
                     .map_err(|e| EngineError::Query(format!("git ls-tree: spawn: {}", e)))?;
@@ -22736,6 +22749,73 @@ fn pretty(v: f64) -> String {
 /// is incorrect". Measured against a real src.artifact upstream; naming = keep
 /// and hash both worked on the same input, so the naming value was the only
 /// difference.
+/// `src.git` passes its `revision` property to git as a positional argument,
+/// and git reads a leading `-` as an option rather than a revision.
+///
+/// Measured before the fix, against a real repository:
+///
+///   git -C repo log -z --max-count 50 ... "--output=/path/x"
+///
+/// wrote git's output to `/path/x` and **exited 0**, so the node reported
+/// success while writing a file nobody asked for. `revision` is an ordinary
+/// node property, so it can be a `${param}` a run supplies - and the shell
+/// metacharacter guard that covers executed properties would not have caught
+/// this, because `--output=/path/x` contains no metacharacters.
+///
+/// `--end-of-options` is the fix git provides for exactly this: everything
+/// after it is a revision or a path, never an option. Verified on git 2.53 for
+/// both `log` and `ls-tree` - the hostile value is refused and no file is
+/// written, while an ordinary revision still resolves.
+#[cfg(test)]
+mod git_revision_args_tests {
+    use super::*;
+
+    fn spec(revision: &str, path_filter: Option<&str>) -> GitSourceSpec {
+        GitSourceSpec {
+            node_id: "g".into(),
+            repo: "/tmp/repo".into(),
+            mode: "log".into(),
+            revision: revision.into(),
+            path_filter: path_filter.map(str::to_string),
+            max_rows: 10,
+        }
+    }
+
+    #[test]
+    fn the_revision_can_never_be_read_as_an_option() {
+        let args = DuckdbEngine::git_revision_args(&spec("--output=/tmp/pwned", None));
+        let marker = args
+            .iter()
+            .position(|a| a == "--end-of-options")
+            .expect("the revision must be introduced by --end-of-options");
+        let rev = args
+            .iter()
+            .position(|a| a == "--output=/tmp/pwned")
+            .expect("the revision itself must still be passed");
+        assert!(marker < rev, "the marker must come first: {args:?}");
+    }
+
+    #[test]
+    fn an_ordinary_revision_still_reaches_git() {
+        let args = DuckdbEngine::git_revision_args(&spec("HEAD", None));
+        assert_eq!(args, vec!["--end-of-options".to_string(), "HEAD".to_string()]);
+    }
+
+    #[test]
+    fn a_path_filter_is_still_separated_from_the_revision() {
+        let args = DuckdbEngine::git_revision_args(&spec("main", Some("src/")));
+        assert_eq!(
+            args,
+            vec![
+                "--end-of-options".to_string(),
+                "main".to_string(),
+                "--".to_string(),
+                "src/".to_string(),
+            ]
+        );
+    }
+}
+
 #[cfg(test)]
 mod source_path_of_tests {
     use super::source_path_of;
