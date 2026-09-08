@@ -379,6 +379,30 @@ fn run_one(
         .map(|(run_id, _rows)| run_id)
 }
 
+/// The resolution passes a slice's document gets before it runs.
+///
+/// A slice reads its pipeline straight off disk, so nothing has resolved it:
+/// every other run surface does these itself for exactly that reason - the CLI
+/// at `main.rs`, each `serve` endpoint, and MCP's `prepare_run_doc`. This path
+/// did `apply_time_builtins` and `apply_workspace_context` and stopped, so a
+/// backfill of any pipeline holding `${ENV:...}` or `${VAULT:...}` ran with the
+/// placeholder still in it - a literal path, or a password that is not one.
+///
+/// Order follows MCP's, which is the same shape: time builtins, then env, then
+/// vault, then the workspace pass last so a context value spelled `${ENV:...}`
+/// is already a value when it is read.
+///
+/// `resolve_connection_refs` is NOT here and cannot be: it lives in
+/// `duckle-secrets`, which depends on this crate, so calling it would close a
+/// dependency cycle. A slice of a pipeline that names a saved connection still
+/// runs unresolved.
+fn resolve_slice_doc(doc: &mut crate::PipelineDoc, workspace: &Path) {
+    crate::context::apply_time_builtins(doc);
+    crate::context::apply_env(doc);
+    crate::context::apply_vault(doc);
+    crate::context::apply_workspace_context(doc, workspace);
+}
+
 /// The one place a slice's run happens, whatever produced the document.
 ///
 /// #306: a chunk builds a different document - one source, constrained by its
@@ -424,8 +448,7 @@ pub(crate) fn run_doc(
     let (recorded, sources) =
         crate::context::apply_params_from(&mut doc, &supplied)
             .map_err(|e| (None, e))?;
-    crate::context::apply_time_builtins(&mut doc);
-    crate::context::apply_workspace_context(&mut doc, workspace);
+    resolve_slice_doc(&mut doc, workspace);
 
     let hash = crate::retry::pipeline_hash(&doc);
     let run_id = crate::retry::new_run_id(pipeline, source);
@@ -481,6 +504,44 @@ mod tests {
     use super::*;
     use crate::backfill::{Kind, SliceArtifact};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A slice reads its pipeline straight off disk, so it has to run the same
+    /// resolution passes every other surface runs.
+    ///
+    /// This path did time builtins and the workspace pass and stopped, so a
+    /// backfill of a pipeline holding `${ENV:...}` or `${VAULT:...}` ran with
+    /// the placeholder still in it: a literal path, or a password that is not
+    /// one. Both slice generators reach it - a partition through
+    /// `run_partition`, a chunk through `chunk_exec` - because both go through
+    /// `run_doc`.
+    #[test]
+    fn a_slice_resolves_env_and_the_workspace_before_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::env::set_var("DUCKLE_TEST_SLICE_HOST", "db.internal");
+        let mut doc: crate::PipelineDoc = serde_json::from_str(
+            r#"{"nodes":[{"id":"s","position":{"x":0,"y":0},"data":{"label":"S",
+               "componentId":"src.postgres",
+               "properties":{"host":"${ENV:DUCKLE_TEST_SLICE_HOST}",
+                             "path":"${workspace}/data/orders.parquet"}}}],"edges":[]}"#,
+        )
+        .unwrap();
+
+        super::resolve_slice_doc(&mut doc, ws);
+
+        let props = doc.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(
+            props["host"],
+            serde_json::json!("db.internal"),
+            "a slice ran with ${{ENV:...}} still in it, so the run had no host at all"
+        );
+        let path = props["path"].as_str().unwrap();
+        assert!(
+            !path.contains("${workspace}"),
+            "the workspace pass must still happen: {path}"
+        );
+        std::env::remove_var("DUCKLE_TEST_SLICE_HOST");
+    }
 
     fn slices(keys: &[&str]) -> Backfill {
         Backfill {
