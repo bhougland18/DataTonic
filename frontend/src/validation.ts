@@ -38,6 +38,7 @@ const PATH_REQUIRED_SINKS = new Set<string>([
     'snk.json',
     'snk.jsonl',
     'snk.excel',
+    'snk.xlsx',
     'snk.xml',
     'snk.yaml',
     'snk.toml',

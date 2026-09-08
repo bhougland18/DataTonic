@@ -657,6 +657,37 @@ pub struct QvdSinkSpec {
     pub path: String,
 }
 
+/// How snk.xlsx reconciles the target sheet with a workbook that may
+/// already exist. Both modes preserve every *other* sheet in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcelTabMode {
+    /// Create the sheet if absent; if it already exists, drop it and
+    /// re-create it from the upstream rows (the default; the "overwrite
+    /// that tab" behaviour).
+    Replace,
+    /// Create the sheet if absent; if it already exists, append the
+    /// upstream rows beneath the current data (no repeated header).
+    Append,
+}
+
+/// snk.xlsx: write upstream rows into a single named sheet of an .xlsx
+/// workbook via the pure-Rust `umya-spreadsheet` crate. Unlike the DuckDB
+/// excel extension's COPY (which recreates the whole file on every write),
+/// this opens the existing workbook, adds/replaces/appends only `sheet`,
+/// and leaves the other tabs untouched. Column order follows the first row.
+#[derive(Debug, Clone)]
+pub struct ExcelTabSinkSpec {
+    pub from_view: String,
+    pub path: String,
+    /// Target sheet (tab) name. Defaults to "Sheet1" when unset.
+    pub sheet: String,
+    /// Replace-the-tab vs append-rows behaviour.
+    pub mode: ExcelTabMode,
+    /// Write column names as the first row (only on a newly created sheet;
+    /// an append never re-emits the header).
+    pub header: bool,
+}
+
 /// src.gizmosql: read from a GizmoSQL (Arrow Flight SQL) server via the
 /// clean-room `crate::gizmosql` client. Result is streamed to Parquet and
 /// materialized with DuckDB read_parquet, like the ADBC source.

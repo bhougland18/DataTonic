@@ -6992,6 +6992,148 @@ impl DuckdbEngine {
         ))
     }
 
+    /// snk.xlsx: write the upstream rows into a single named sheet of an
+    /// .xlsx workbook via `umya-spreadsheet`, preserving every other tab.
+    /// This is the multi-tab behaviour the DuckDB excel extension's COPY
+    /// cannot offer - COPY recreates the whole workbook on every write, so a
+    /// second write to a file drops the sheets an earlier one made. umya
+    /// opens the existing workbook (when present), touches only `sheet`, and
+    /// saves the lot. Column order follows the first row (serde_json's
+    /// preserve_order keeps the SELECT order). Replace re-creates the tab from
+    /// scratch; Append adds rows beneath the current data with no new header.
+    pub(crate) fn run_excel_tab_sink(
+        &self,
+        db: &Path,
+        spec: &ExcelTabSinkSpec,
+    ) -> Result<String, EngineError> {
+        let select = format!("SELECT * FROM {}", plan::quote_ident(&spec.from_view));
+        let rows = self.run_rows(Some(db), &select)?;
+        if rows.is_empty() {
+            // Nothing to write: leave the workbook (and the target tab)
+            // untouched rather than blanking a sheet or creating an empty file.
+            return Ok(format!(
+                "xlsx: 0 rows to write to sheet '{}' of {}",
+                spec.sheet, spec.path
+            ));
+        }
+
+        // The column list is fixed from the first row; every row is written
+        // against it so a later row missing a key just leaves that cell blank.
+        let columns: Vec<String> = match rows[0].as_object() {
+            Some(obj) => obj.keys().cloned().collect(),
+            None => {
+                return Err(EngineError::Query(
+                    "xlsx: upstream rows aren't JSON objects".into(),
+                ))
+            }
+        };
+
+        let path = std::path::Path::new(&spec.path);
+
+        // Open the existing workbook so its other tabs survive; only fall back
+        // to a fresh (sheet-less) workbook when the file isn't there yet. A
+        // file that exists but can't be parsed as xlsx is an error, not a
+        // silent overwrite.
+        let mut book = if path.exists() {
+            umya_spreadsheet::reader::xlsx::read(path)
+                .map_err(|e| EngineError::Query(format!("xlsx: open {}: {}", spec.path, e)))?
+        } else {
+            // new_file() would seed a default "Sheet1"; the empty variant has
+            // no worksheets, so we never leave a stray blank tab beside ours.
+            umya_spreadsheet::new_file_empty_worksheet()
+        };
+
+        let sheet_exists = book.get_sheet_by_name(&spec.sheet).is_some();
+        let append = spec.mode == ExcelTabMode::Append && sheet_exists;
+
+        // Replace: drop the old tab so stale rows/columns from a previous,
+        // wider write don't linger. (Append keeps it; a missing sheet in
+        // either mode is simply created below.)
+        if sheet_exists && spec.mode == ExcelTabMode::Replace {
+            book.remove_sheet_by_name(&spec.sheet).map_err(|e| {
+                EngineError::Query(format!("xlsx: replace sheet '{}': {}", spec.sheet, e))
+            })?;
+        }
+
+        // First row this write touches (1-indexed). Append continues beneath
+        // the sheet's current contents; everything else starts at the top.
+        let mut row_idx: u32 = 1;
+        if append {
+            // Safe unwrap: append implies the sheet exists.
+            row_idx = book.get_sheet_by_name(&spec.sheet).unwrap().get_highest_row() + 1;
+        } else {
+            book.new_sheet(&spec.sheet).map_err(|e| {
+                EngineError::Query(format!(
+                    "xlsx: create sheet '{}': {} (Excel sheet names are <=31 chars \
+                     and cannot contain []:*?/\\)",
+                    spec.sheet, e
+                ))
+            })?;
+        }
+
+        let ws = book.get_sheet_by_name_mut(&spec.sheet).ok_or_else(|| {
+            EngineError::Query(format!("xlsx: sheet '{}' missing after create", spec.sheet))
+        })?;
+
+        // Header row only on a freshly written sheet - an append never repeats
+        // the column names.
+        if spec.header && !append {
+            for (c, name) in columns.iter().enumerate() {
+                ws.get_cell_mut((c as u32 + 1, row_idx)).set_value_string(name);
+            }
+            row_idx += 1;
+        }
+
+        let mut written = 0_usize;
+        for row in &rows {
+            self.check_cancelled()?;
+            let Some(obj) = row.as_object() else {
+                return Err(EngineError::Query(
+                    "xlsx: upstream rows aren't JSON objects".into(),
+                ));
+            };
+            for (c, name) in columns.iter().enumerate() {
+                let cell = ws.get_cell_mut((c as u32 + 1, row_idx));
+                match obj.get(name) {
+                    // A NULL (or an absent key) leaves the cell empty.
+                    None | Some(JsonValue::Null) => {}
+                    Some(JsonValue::Bool(b)) => {
+                        cell.set_value_bool(*b);
+                    }
+                    // JSON numbers -> numeric cells (as_f64 is always Some for
+                    // a serde_json number; Excel is f64-precision anyway).
+                    Some(JsonValue::Number(n)) => match n.as_f64() {
+                        Some(f) => {
+                            cell.set_value_number(f);
+                        }
+                        None => {
+                            cell.set_value_string(n.to_string());
+                        }
+                    },
+                    Some(JsonValue::String(s)) => {
+                        cell.set_value_string(s);
+                    }
+                    // Arrays/objects: compact JSON text, matching how the other
+                    // text sinks flatten nested cells.
+                    Some(other) => {
+                        cell.set_value_string(other.to_string());
+                    }
+                }
+            }
+            row_idx += 1;
+            written += 1;
+        }
+
+        umya_spreadsheet::writer::xlsx::write(&book, path)
+            .map_err(|e| EngineError::Query(format!("xlsx: write {}: {}", spec.path, e)))?;
+
+        let verb = if append { "appended" } else { "wrote" };
+        Ok(format!(
+            "xlsx: {} {} row(s) to sheet '{}' of {}",
+            verb, written, spec.sheet, spec.path
+        ))
+    }
+
     /// code.shell: run a single command and emit one row with the
     /// captured stdout/stderr/exit_code/duration_ms. Shell defaults to
     /// cmd.exe on Windows and /bin/sh on Unix; override per stage with

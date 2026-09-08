@@ -31,12 +31,19 @@ function baseName(componentId: string): string {
     return dot >= 0 ? componentId.slice(dot + 1) : componentId;
 }
 
+// Bases that share another connector's brand mark (e.g. the multi-tab
+// snk.xlsx reuses the Excel logo that snk.excel/src.excel already carry).
+const BRAND_ALIAS: Record<string, string> = {
+    xlsx: 'excel',
+};
+
 /** The brand mark for a component, if one exists (e.g. src.postgres -> PostgreSQL). */
 export function brandIconFor(componentId: string): BrandIcon | undefined {
     const base = baseName(componentId);
+    const aliased = BRAND_ALIAS[base] ?? base;
     // Try the full base first (e.g. "excel-online"), then the head before any
     // sub-dot (e.g. "ducklake.changes" -> "ducklake").
-    return BRAND_ICONS[base] ?? BRAND_ICONS[base.split('.')[0]];
+    return BRAND_ICONS[aliased] ?? BRAND_ICONS[aliased.split('.')[0]];
 }
 
 // Generic lucide fallbacks for components without a brand mark, by base name.

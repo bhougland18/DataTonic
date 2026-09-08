@@ -3716,6 +3716,58 @@ fn excel_sink_writes_xlsx() {
     assert_eq!(n, "3", "got {}", n);
 }
 
+// snk.xlsx (multi-tab): the umya-spreadsheet sink writes one named sheet and
+// preserves the workbook's other tabs, which the excel-extension COPY sink
+// (excel_sink_writes_xlsx above) cannot do. This locks in the behaviour that
+// motivated the node: a second write to the same file keeps the first sheet.
+#[test]
+fn xlsx_sink_multi_tab_preserves_and_replaces() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let xlsx = out_path(tmp.path(), "book.xlsx");
+
+    let sheet_count = |sheet: &str| -> String {
+        scalar_string(&format!(
+            "INSTALL excel; LOAD excel; SELECT CAST(count(*) AS VARCHAR) \
+             FROM read_xlsx('{}', sheet = '{}')",
+            xlsx, sheet
+        ))
+    };
+    let run = |csv: &str, sheet: &str, mode: &str| {
+        let src = write_file(tmp.path(), &format!("{}.csv", sheet), csv);
+        let d = doc(
+            json!([
+                node("s", "src.csv", json!({ "path": src, "hasHeader": true })),
+                node(
+                    "k",
+                    "snk.xlsx",
+                    json!({ "path": xlsx, "sheet": sheet, "writeMode": mode, "hasHeader": true }),
+                ),
+            ]),
+            json!([main_edge("e", "s", "k")]),
+        );
+        let r = engine.execute_pipeline(&d);
+        assert_eq!(r.status, "ok", "xlsx {} write failed: {:?}", sheet, r.error);
+    };
+
+    // 1. Create tab Alpha (3 rows), then tab Beta (2 rows) in the same file.
+    run("id,name\n1,a\n2,b\n3,c\n", "Alpha", "replace");
+    run("id,name\n9,x\n8,y\n", "Beta", "replace");
+    // Both tabs survive - the second write did not clobber the first.
+    assert_eq!(sheet_count("Alpha"), "3", "Alpha after Beta write");
+    assert_eq!(sheet_count("Beta"), "2", "Beta after Beta write");
+
+    // 2. Replace Alpha with 1 row; Beta must be untouched.
+    run("id,name\n5,z\n", "Alpha", "replace");
+    assert_eq!(sheet_count("Alpha"), "1", "Alpha after replace");
+    assert_eq!(sheet_count("Beta"), "2", "Beta after Alpha replace");
+
+    // 3. Append 2 rows to Alpha (1 -> 3); Beta still untouched.
+    run("id,name\n6,p\n7,q\n", "Alpha", "append");
+    assert_eq!(sheet_count("Alpha"), "3", "Alpha after append");
+    assert_eq!(sheet_count("Beta"), "2", "Beta after Alpha append");
+}
+
 #[test]
 fn spatial_sink_writes_geojson() {
     if std::env::var("DUCKLE_TEST_SPATIAL").ok().as_deref() != Some("1") {

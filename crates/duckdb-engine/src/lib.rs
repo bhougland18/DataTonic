@@ -66,7 +66,7 @@ use plan::{
     MilvusSourceSpec, MongoSinkSpec,
     MongoSourceSpec,
     NatsSinkSpec, NatsSourceSpec, OracleSinkSpec, OracleSourceSpec, PubSubSinkSpec,
-    PubSubSourceSpec, QdrantSourceSpec, QvdSinkSpec, QvdSourceSpec, RabbitSinkSpec,
+    PubSubSourceSpec, QdrantSourceSpec, QvdSinkSpec, QvdSourceSpec, ExcelTabSinkSpec, ExcelTabMode, RabbitSinkSpec,
     RabbitSourceSpec, RedisSinkSpec,
     RedisSourceSpec, RestPagination, RestResponseFormat, RestSourceSpec, RuntimeSpec, ShellSpec,
     Dhis2SinkSpec, InforSinkSpec, SalesforceBulkSinkSpec, SalesforceBulkSourceSpec, SalesforceSinkSpec, SftpSinkSpec, SftpSourceSpec, SnowflakeAuth,
@@ -1803,6 +1803,11 @@ impl DuckdbEngine {
                     Some(RuntimeSpec::XmlSink(spec)) => self.run_xml_sink(&db_path, spec),
                     Some(RuntimeSpec::AvroSink(spec)) => self.run_avro_sink(&db_path, spec),
                     Some(RuntimeSpec::QvdSink(spec)) => self.run_qvd_sink(&db_path, spec),
+                    // snk.xlsx: write one named sheet into an .xlsx workbook,
+                    // preserving the other tabs (umya-spreadsheet).
+                    Some(RuntimeSpec::ExcelTabSink(spec)) => {
+                        self.run_excel_tab_sink(&db_path, spec)
+                    }
                     Some(RuntimeSpec::GizmoSqlSource(spec)) => {
                         self.run_gizmosql_source(&db_path, spec)
                     }

@@ -311,6 +311,9 @@ pub enum RuntimeSpec {
     XmlSink(XmlSinkSpec),
     AvroSink(AvroSinkSpec),
     QvdSink(QvdSinkSpec),
+    /// snk.xlsx: write rows into one named sheet of an .xlsx workbook,
+    /// preserving the other tabs. See ExcelTabSinkSpec.
+    ExcelTabSink(ExcelTabSinkSpec),
     GizmoSqlSource(GizmoSqlSourceSpec),
     GizmoSqlSink(GizmoSqlSinkSpec),
     RabbitSink(RabbitSinkSpec),
@@ -1495,6 +1498,7 @@ fn build_stage(
     let mut xml_sink: Option<XmlSinkSpec> = None;
     let mut avro_sink: Option<AvroSinkSpec> = None;
     let mut qvd_sink: Option<QvdSinkSpec> = None;
+    let mut excel_tab_sink: Option<ExcelTabSinkSpec> = None;
     let mut gizmosql_source: Option<GizmoSqlSourceSpec> = None;
     let mut gizmosql_sink: Option<GizmoSqlSinkSpec> = None;
     let mut rabbit_sink: Option<RabbitSinkSpec> = None;
@@ -2860,6 +2864,34 @@ fn build_stage(
         qvd_sink = Some(QvdSinkSpec {
             from_view: from_view.to_string(),
             path,
+        });
+        (String::new(), StageKind::Sink, Some(from_view.to_string()))
+    } else if component_id == "snk.xlsx" {
+        // Multi-tab Excel writer via the pure-Rust umya-spreadsheet crate.
+        // Opens the existing workbook (or creates one), writes just the named
+        // sheet, and preserves the other tabs - which the DuckDB excel
+        // extension's COPY cannot do (it recreates the whole file each run).
+        // Column order follows the first upstream row.
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let path = string_prop(&props, "path")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: path required", component_id)))?;
+        let mode = match string_prop(&props, "writeMode").as_deref() {
+            Some("append") => ExcelTabMode::Append,
+            // Default (and explicit "replace"): create-or-overwrite the tab.
+            _ => ExcelTabMode::Replace,
+        };
+        excel_tab_sink = Some(ExcelTabSinkSpec {
+            from_view: from_view.to_string(),
+            path,
+            sheet: string_prop(&props, "sheet")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "Sheet1".into()),
+            mode,
+            header: props
+                .get("hasHeader")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
         });
         (String::new(), StageKind::Sink, Some(from_view.to_string()))
     } else if component_id == "snk.gizmosql" {
@@ -5887,6 +5919,7 @@ fn build_stage(
         .or_else(|| xml_sink.map(RuntimeSpec::XmlSink))
         .or_else(|| avro_sink.map(RuntimeSpec::AvroSink))
         .or_else(|| qvd_sink.map(RuntimeSpec::QvdSink))
+        .or_else(|| excel_tab_sink.map(RuntimeSpec::ExcelTabSink))
         .or_else(|| rabbit_sink.map(RuntimeSpec::RabbitSink))
         .or_else(|| rabbit_source.map(RuntimeSpec::RabbitSource))
         .or_else(|| git_source.map(RuntimeSpec::GitSource))

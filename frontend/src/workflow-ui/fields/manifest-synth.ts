@@ -1248,6 +1248,35 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
             ],
         }];
     }
+    if (id === 'snk.xlsx') {
+        // Multi-tab Excel sink (umya-spreadsheet). Writes one named sheet and
+        // preserves the workbook's other tabs.
+        return [{
+            label: 'Sheet',
+            fields: [
+                {
+                    key: 'sheet',
+                    label: 'Sheet name',
+                    kind: 'text',
+                    defaultValue: 'Sheet1',
+                    placeholder: 'Sheet1',
+                    description: 'The tab to write. Other tabs in the workbook are left untouched. Excel names are max 31 characters and cannot contain []:*?/\\.',
+                },
+                {
+                    key: 'writeMode',
+                    label: 'If the sheet exists',
+                    kind: 'select',
+                    defaultValue: 'replace',
+                    options: [
+                        { label: 'Replace the sheet', value: 'replace' },
+                        { label: 'Append rows', value: 'append' },
+                    ],
+                    description: 'Replace re-creates the tab from these rows (a missing tab is created). Append adds the rows beneath the sheet\'s current data with no repeated header. Either way the workbook\'s other tabs are preserved.',
+                },
+                { key: 'hasHeader', label: 'Write header row', kind: 'bool', defaultValue: true, description: 'Write column names as the first row of a newly written sheet. An append never repeats the header.' },
+            ],
+        }];
+    }
     if (id.endsWith('.csv') || id.endsWith('.tsv')) {
         return [
             {

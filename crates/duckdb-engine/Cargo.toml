@@ -106,6 +106,12 @@ async-nats = "0.50"
 # match as a JSON object) and snk.xml (wraps rows in row elements).
 # Pure Rust.
 quick-xml = "0.41"
+# Pure-Rust .xlsx reader+writer for snk.xlsx (multi-tab Excel sink). Unlike
+# the DuckDB excel extension's COPY - which recreates the whole workbook on
+# every write - umya opens an existing workbook and adds/replaces a single
+# named sheet, leaving the other tabs intact. Pinned to 2.3.3: 3.x requires
+# rustc 1.88 and this workspace's rust-version is 1.80.
+umya-spreadsheet = "=2.3.3"
 # HTML parsing + CSS selection for src.html (#255). Pure Rust (html5ever +
 # cssparser + selectors), no native toolchain, and already resolved in this
 # workspace's lockfile via tauri-utils and wry, so it adds no new dependency

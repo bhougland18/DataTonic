@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 401,
+  "componentCount": 402,
   "components": [
     {
       "id": "src.csv",
@@ -28619,6 +28619,168 @@
                 "label": "Has header row",
                 "kind": "bool",
                 "defaultValue": true
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": []
+        }
+      }
+    },
+    {
+      "id": "snk.xlsx",
+      "label": "Excel — multi-tab (XLSX)",
+      "kind": "sink",
+      "availability": "available",
+      "summary": "Write rows into one named sheet of an .xlsx workbook via the pure-Rust umya-spreadsheet crate, leaving the other tabs intact. Unlike the DuckDB excel sink - whose COPY recreates the whole file on every write - a second run against the same file keeps existing sheets. Pick a Sheet name and a write mode (Replace the tab, or Append rows beneath it).",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": []
+      },
+      "manifest": {
+        "id": "snk.xlsx",
+        "kind": "sink",
+        "label": "Excel — multi-tab (XLSX)",
+        "description": "Write rows into one named sheet of an .xlsx workbook via the pure-Rust umya-spreadsheet crate, leaving the other tabs intact. Unlike the DuckDB excel sink - whose COPY recreates the whole file on every write - a second run against the same file keeps existing sheets. Pick a Sheet name and a write mode (Replace the tab, or Append rows beneath it).",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Destination file",
+            "fields": [
+              {
+                "key": "path",
+                "label": "Output path",
+                "kind": "save-path",
+                "required": true,
+                "filters": [
+                  {
+                    "name": "Excel — multi-tab (XLSX)",
+                    "extensions": [
+                      "xlsx"
+                    ]
+                  },
+                  {
+                    "name": "All files",
+                    "extensions": [
+                      "*"
+                    ]
+                  }
+                ]
+              },
+              {
+                "key": "mode",
+                "label": "Write mode",
+                "kind": "select",
+                "defaultValue": "overwrite",
+                "options": [
+                  {
+                    "label": "Overwrite",
+                    "value": "overwrite"
+                  },
+                  {
+                    "label": "Error if exists",
+                    "value": "error"
+                  }
+                ]
+              },
+              {
+                "key": "encoding",
+                "label": "Encoding",
+                "kind": "select",
+                "defaultValue": "utf-8",
+                "options": [
+                  {
+                    "label": "UTF-8",
+                    "value": "utf-8"
+                  },
+                  {
+                    "label": "UTF-16",
+                    "value": "utf-16"
+                  },
+                  {
+                    "label": "Latin-1",
+                    "value": "latin-1"
+                  },
+                  {
+                    "label": "Windows-1252",
+                    "value": "windows-1252"
+                  }
+                ]
+              },
+              {
+                "key": "compression",
+                "label": "Compression",
+                "kind": "select",
+                "defaultValue": "none",
+                "options": [
+                  {
+                    "label": "None",
+                    "value": "none"
+                  },
+                  {
+                    "label": "Gzip",
+                    "value": "gzip"
+                  },
+                  {
+                    "label": "Zstd",
+                    "value": "zstd"
+                  },
+                  {
+                    "label": "Snappy",
+                    "value": "snappy"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "label": "Sheet",
+            "fields": [
+              {
+                "key": "sheet",
+                "label": "Sheet name",
+                "kind": "text",
+                "defaultValue": "Sheet1",
+                "placeholder": "Sheet1",
+                "description": "The tab to write. Other tabs in the workbook are left untouched. Excel names are max 31 characters and cannot contain []:*?/\\."
+              },
+              {
+                "key": "writeMode",
+                "label": "If the sheet exists",
+                "kind": "select",
+                "defaultValue": "replace",
+                "options": [
+                  {
+                    "label": "Replace the sheet",
+                    "value": "replace"
+                  },
+                  {
+                    "label": "Append rows",
+                    "value": "append"
+                  }
+                ],
+                "description": "Replace re-creates the tab from these rows (a missing tab is created). Append adds the rows beneath the sheet's current data with no repeated header. Either way the workbook's other tabs are preserved."
+              },
+              {
+                "key": "hasHeader",
+                "label": "Write header row",
+                "kind": "bool",
+                "defaultValue": true,
+                "description": "Write column names as the first row of a newly written sheet. An append never repeats the header."
               }
             ]
           }
