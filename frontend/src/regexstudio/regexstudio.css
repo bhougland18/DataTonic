@@ -1054,3 +1054,100 @@
     opacity: 0.5;
     cursor: not-allowed;
 }
+
+/* ---- inline save bar (under the pattern) ---- */
+.rgx-savebar {
+    flex: 1 0 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 2px;
+}
+.rgx-valid {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+.rgx-valid.ok {
+    color: #6ee7a0;
+}
+.rgx-valid.bad {
+    color: #ff92a6;
+}
+.rgx-valid-msg {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #ff92a6;
+}
+.rgx-title {
+    flex: 1;
+    min-width: 140px;
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong, var(--border));
+    border-radius: 6px;
+    padding: 7px 10px;
+    color: var(--text-1);
+    font-size: 12.5px;
+    font-weight: 600;
+    outline: none;
+}
+.rgx-descr-in {
+    flex: 1.5;
+    min-width: 160px;
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong, var(--border));
+    border-radius: 6px;
+    padding: 7px 10px;
+    color: var(--text-2);
+    font-size: 12px;
+    outline: none;
+}
+.rgx-title:focus,
+.rgx-descr-in:focus {
+    border-color: var(--accent);
+}
+.rgx-scope {
+    display: flex;
+    gap: 3px;
+    flex-shrink: 0;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px;
+}
+.rgx-scope button {
+    background: transparent;
+    border: none;
+    color: var(--text-3);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 11px;
+    cursor: pointer;
+}
+.rgx-scope button.on {
+    background: var(--accent);
+    color: #fff;
+    font-weight: 600;
+}
+.rgx-save-icon {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    background: var(--bg-2);
+    border: 1px solid var(--border-strong, var(--border));
+    color: var(--text-1);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.rgx-save-icon:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+.rgx-save-icon:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}

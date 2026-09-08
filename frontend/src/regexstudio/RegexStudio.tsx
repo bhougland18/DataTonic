@@ -147,9 +147,12 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
     // Library
     const [library, setLibrary] = useState<SavedPattern[]>([]);
     const [libFilter, setLibFilter] = useState('');
-    const [saveForm, setSaveForm] = useState<{ name: string; description: string; scope: PatternScope } | null>(
-        null,
-    );
+    // Inline save bar: a title + short description (also fed to the AI as intent)
+    // + a Local/Global scope, saved from the toolbar row under the pattern.
+    const [title, setTitle] = useState('');
+    const [descr, setDescr] = useState('');
+    const [scope, setScope] = useState<PatternScope>('workspace');
+    const [savedFlash, setSavedFlash] = useState(false);
 
     // Persistent AI chat (collapsible, open by default)
     const [chatOpen, setChatOpen] = useState(true);
@@ -187,7 +190,9 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         setChatTurns([]);
         setChatError(null);
         setOneShotOpen(false);
-        setSaveForm(null);
+        setTitle('');
+        setDescr('');
+        setScope('workspace');
     }, [openRequest]);
 
     // Load the saved-pattern library for this workspace.
@@ -319,14 +324,13 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         pinned.map(v => ({ value: v, expected: expected[v] || undefined }));
 
     const doSave = () => {
-        if (!saveForm) return;
-        const name = saveForm.name.trim();
-        if (!name) return;
+        const name = title.trim();
+        if (!name || !pattern.trim() || !lint.ok) return;
         const p: SavedPattern = {
             id: newPatternId(),
             name,
-            description: saveForm.description.trim().slice(0, DESCRIPTION_MAX) || undefined,
-            scope: saveForm.scope,
+            description: descr.trim().slice(0, DESCRIPTION_MAX) || undefined,
+            scope,
             mode,
             pattern,
             replacement: mode === 'replace' ? replacement : undefined,
@@ -338,11 +342,15 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         const next = upsertPattern(library, p);
         setLibrary(next);
         saveLibrary(workspacePath, next);
-        setSaveForm(null);
+        setSavedFlash(true);
+        setTimeout(() => setSavedFlash(false), 1400);
     };
 
     const applySaved = (p: SavedPattern) => {
         setPattern(p.pattern);
+        setTitle(p.name);
+        setDescr(p.description ?? '');
+        setScope(p.scope);
         if (p.replacement !== undefined) setReplacement(p.replacement);
         if (p.groupIndex !== undefined) setGroupIndex(p.groupIndex);
         if (p.groupNames !== undefined) setGroupNames(p.groupNames);
@@ -445,6 +453,17 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                 'Replacement backreferences use \\1 \\2 (not $1).',
         );
         lines.push(`Task: ${MODE_LABEL[mode]} on column "${column}".`);
+        if (title.trim()) {
+            lines.push(
+                `Intent: this regex represents "${title.trim()}"${descr.trim() ? ` — ${descr.trim()}` : ''}. ` +
+                    'Match that real-world format in general.',
+            );
+        }
+        lines.push(
+            'IMPORTANT: the example values are ILLUSTRATIVE samples of the format, NOT the only valid values. ' +
+                'Do NOT hardcode specific digits or letters from any single example (e.g. never force a literal leading "99"); ' +
+                'write the general pattern for the format.',
+        );
 
         const L = labeled();
         if (mode === 'match' || mode === 'quality') {
@@ -621,67 +640,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                     <button onClick={doExport} title="Export the library to .json" disabled={!library.length}>
                         <Upload size={13} /> Export
                     </button>
-                    <button
-                        onClick={() =>
-                            setSaveForm({
-                                name: nodeName ? `${nodeName} pattern` : 'New pattern',
-                                description: '',
-                                scope: 'workspace',
-                            })
-                        }
-                        title="Save the current pattern"
-                        disabled={!pattern.trim() || !lint.ok}
-                    >
-                        <Save size={13} /> Save
-                    </button>
                 </div>
-                {saveForm !== null && (
-                    <div className="rgx-lib-save">
-                        <input
-                            autoFocus
-                            value={saveForm.name}
-                            placeholder="Pattern name"
-                            onChange={e => setSaveForm(f => (f ? { ...f, name: e.target.value } : f))}
-                            onKeyDown={e => {
-                                if (e.key === 'Enter') doSave();
-                                if (e.key === 'Escape') setSaveForm(null);
-                            }}
-                        />
-                        <div className="rgx-lib-save-desc">
-                            <input
-                                value={saveForm.description}
-                                maxLength={DESCRIPTION_MAX}
-                                placeholder="Short description (optional)"
-                                onChange={e =>
-                                    setSaveForm(f => (f ? { ...f, description: e.target.value } : f))
-                                }
-                            />
-                            <span className="count">
-                                {saveForm.description.length}/{DESCRIPTION_MAX}
-                            </span>
-                        </div>
-                        <div className="rgx-lib-save-scope">
-                            <button
-                                className={saveForm.scope === 'workspace' ? 'on' : ''}
-                                onClick={() => setSaveForm(f => (f ? { ...f, scope: 'workspace' } : f))}
-                            >
-                                This workspace
-                            </button>
-                            <button
-                                className={saveForm.scope === 'global' ? 'on' : ''}
-                                onClick={() => setSaveForm(f => (f ? { ...f, scope: 'global' } : f))}
-                            >
-                                Global
-                            </button>
-                        </div>
-                        <div className="rgx-lib-save-actions">
-                            <button className="ok" onClick={doSave} disabled={!saveForm.name.trim()}>
-                                <Check size={13} /> Save
-                            </button>
-                            <button onClick={() => setSaveForm(null)}>Cancel</button>
-                        </div>
-                    </div>
-                )}
                 <div className="rgx-lib-search">
                     <Search size={13} />
                     <input value={libFilter} placeholder="Filter patterns…" onChange={e => setLibFilter(e.target.value)} />
@@ -791,20 +750,56 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                             </div>
                         </>
                     )}
-                    <div className={`rgx-lint ${lint.ok ? 'ok' : 'bad'}`}>
+                    <div className="rgx-savebar">
+                        <span
+                            className={`rgx-valid ${lint.ok ? 'ok' : 'bad'}`}
+                            title={lint.ok ? 'RE2 valid — DuckDB compatible' : `Invalid: ${lint.message}`}
+                        >
+                            {lint.ok ? <CircleCheck size={15} /> : <CircleX size={15} />}
+                        </span>
                         {lint.ok ? (
                             <>
-                                <CircleCheck size={13} /> RE2 valid — DuckDB compatible
-                                {lint.groupCount > 0 && (
-                                    <span className="rgx-lint-note">
-                                        {lint.groupCount} capture group{lint.groupCount > 1 ? 's' : ''}
-                                    </span>
-                                )}
+                                <input
+                                    className="rgx-title"
+                                    value={title}
+                                    placeholder="Pattern title (e.g. US Federal Tax ID)"
+                                    onChange={e => setTitle(e.target.value)}
+                                />
+                                <input
+                                    className="rgx-descr-in"
+                                    value={descr}
+                                    maxLength={DESCRIPTION_MAX}
+                                    placeholder="Short description — also sent to the AI as intent"
+                                    onChange={e => setDescr(e.target.value)}
+                                />
+                                <div className="rgx-scope">
+                                    <button
+                                        className={scope === 'workspace' ? 'on' : ''}
+                                        onClick={() => setScope('workspace')}
+                                        title="Save to this workspace only"
+                                    >
+                                        Local
+                                    </button>
+                                    <button
+                                        className={scope === 'global' ? 'on' : ''}
+                                        onClick={() => setScope('global')}
+                                        title="Save globally (available in every workspace)"
+                                    >
+                                        Global
+                                    </button>
+                                </div>
+                                <button
+                                    className="rgx-save-icon"
+                                    onClick={doSave}
+                                    disabled={!title.trim() || !pattern.trim()}
+                                    title="Save to the Pattern Library"
+                                >
+                                    {savedFlash ? <Check size={15} /> : <Save size={15} />}
+                                    {savedFlash ? 'Saved' : 'Save'}
+                                </button>
                             </>
                         ) : (
-                            <>
-                                <CircleX size={13} /> Not valid for DuckDB (RE2): {lint.message}
-                            </>
+                            <span className="rgx-valid-msg">Not valid for DuckDB (RE2): {lint.message}</span>
                         )}
                     </div>
                 </div>
