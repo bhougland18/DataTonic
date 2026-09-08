@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -522,11 +523,14 @@ fn is_loopback(host: &str) -> bool {
 }
 
 fn hash_token(token: &str) -> Result<String, String> {
-    let mut salt_bytes = [0u8; 16];
-    getrandom::fill(&mut salt_bytes).map_err(|e| format!("salt rng: {e}"))?;
-    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| format!("salt: {e}"))?;
+    // argon2 0.6 generates the salt itself: `hash_password` calls
+    // `try_generate_salt()`, which is `getrandom::fill` into
+    // `[u8; RECOMMENDED_SALT_LEN]` with RECOMMENDED_SALT_LEN = 16 - byte for
+    // byte what the hand-rolled version above it did. The two-argument form is
+    // now `hash_password_with_salt`, and there is no reason to supply a salt
+    // the library derives the same way.
     Argon2::default()
-        .hash_password(token.as_bytes(), &salt)
+        .hash_password(token.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| format!("hash token: {e}"))
 }
@@ -723,6 +727,53 @@ pub fn run() -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    /// Console accounts store an Argon2 PHC string, so upgrading the crate is
+    /// only safe if hashes written by the OLD one still verify.
+    ///
+    /// These two were produced by `hash_token()` under **argon2 0.5.3**, before
+    /// the bump to 0.6, and are pasted here verbatim. If 0.6 had changed the
+    /// format, the parameters or the encoding, this fails and every existing
+    /// console login would have been locked out on upgrade - silently, because
+    /// a failed verify is indistinguishable from a wrong password.
+    ///
+    /// Proof rather than assumption: `$argon2id$v=19$m=19456,t=2,p=1` is what
+    /// `Argon2::default()` chose then, and 0.6 has to read it now.
+    #[test]
+    fn a_hash_written_by_argon2_0_5_still_verifies() {
+        const FROM_0_5: [(&str, &str); 2] = [
+            (
+                "correct horse battery staple",
+                "$argon2id$v=19$m=19456,t=2,p=1$/hHAEL3+m1X2aaIVMLY2zg$3Pnle7heDRhEWsh6WkbKK932FW+NxeVbgKIHzUO8wgU",
+            ),
+            (
+                "s3cr3t-console-token",
+                "$argon2id$v=19$m=19456,t=2,p=1$NS/e02jn+pJJqNkosqiSxA$GggDx/E9aYl5THmA8/xOm1IwotFin6sEvc2eAav3De8",
+            ),
+        ];
+
+        for (token, stored) in FROM_0_5 {
+            let parsed = PasswordHash::new(stored)
+                .unwrap_or_else(|e| panic!("0.6 cannot parse what 0.5 wrote: {e}"));
+            assert!(
+                Argon2::default().verify_password(token.as_bytes(), &parsed).is_ok(),
+                "a stored hash from argon2 0.5 stopped verifying: {stored}"
+            );
+            assert!(
+                Argon2::default().verify_password(b"not the token", &parsed).is_err(),
+                "the wrong token must still be rejected"
+            );
+        }
+    }
+
+    /// And a hash written by 0.6 is still the same format, so a workspace can
+    /// be read by an older build during a staged rollout.
+    #[test]
+    fn a_hash_written_now_is_still_an_argon2id_phc_string() {
+        let h = super::hash_token("whatever").expect("hashes");
+        assert!(h.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "got: {h}");
+        assert!(PasswordHash::new(&h).is_ok());
+    }
+
     use super::*;
 
     #[test]
