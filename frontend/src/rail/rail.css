@@ -43,3 +43,37 @@
     opacity: 0.35;
     cursor: default;
 }
+
+/* Right-click → Close context menu (anchored to the right of the rail). */
+.rail-menu-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+}
+.rail-menu {
+    position: fixed;
+    left: 50px;
+    z-index: 61;
+    min-width: 120px;
+    padding: 4px;
+    background: var(--bg-2);
+    border: 1px solid var(--border-strong, var(--border));
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.rail-menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 12.5px;
+    padding: 7px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+}
+.rail-menu-item:hover {
+    background: var(--bg-3);
+}

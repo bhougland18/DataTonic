@@ -363,6 +363,31 @@ export default function App() {
     const { theme, toggle: toggleTheme } = useTheme();
     // Rail mode switching (RAIL-1..RAIL-5), isolated from the main state block.
     const { mode, setMode } = useAppMode();
+    // Rail modes the user has explicitly closed (right-click → Close). A closed
+    // contextual surface stays hidden even while its node exists, until it's
+    // reopened from the node (which clears the dismissal via undismissMode).
+    const [dismissedModes, setDismissedModes] = useState<Set<AppMode>>(new Set());
+    const undismissMode = useCallback((m: AppMode) => {
+        setDismissedModes(prev => {
+            if (!prev.has(m)) return prev;
+            const next = new Set(prev);
+            next.delete(m);
+            return next;
+        });
+    }, []);
+    const handleCloseRailMode = useCallback(
+        (m: AppMode) => {
+            if (m === 'canvas') return;
+            setDismissedModes(prev => new Set(prev).add(m));
+            if (mode === m) setMode('canvas');
+        },
+        [mode, setMode],
+    );
+    // Whenever a surface becomes active (opened by any path), clear any prior
+    // "closed" dismissal so its rail icon reappears and stays in sync.
+    useEffect(() => {
+        if (mode !== 'canvas') undismissMode(mode);
+    }, [mode, undismissMode]);
     const [runtime, setRuntime] = useState<RuntimeState>('connecting');
     const [engine, setEngine] = useState<EngineId>(() =>
         normalizeEngineId(loadPersisted<EngineId>('engine', 'duckdb')),
@@ -1808,6 +1833,21 @@ export default function App() {
         () => nodes.some(n => (n.data.componentId ?? '') === 'src.infor'),
         [nodes],
     );
+    // Regex Studio surface is *.regex*.studio-node-driven, same pattern.
+    const REGEX_STUDIO_IDS = useMemo(
+        () =>
+            new Set([
+                'xf.regex.studio',
+                'xf.regex.extract.studio',
+                'xf.regex.match.studio',
+                'qa.regex.studio',
+            ]),
+        [],
+    );
+    const hasRegexStudioNode = useMemo(
+        () => nodes.some(n => REGEX_STUDIO_IDS.has(n.data.componentId ?? '')),
+        [nodes, REGEX_STUDIO_IDS],
+    );
 
     // Entering the Playground from the rail binds it to the currently-selected
     // Infor node, so it always reflects whatever node you have selected. Picking
@@ -1827,9 +1867,21 @@ export default function App() {
                 handleOpenErdEditor(selectedNode!.id);
                 return;
             }
+            if (next === 'regex' && REGEX_STUDIO_IDS.has(selectedNode?.data.componentId ?? '')) {
+                handleOpenRegexStudio(selectedNode!.id);
+                return;
+            }
             setMode(next);
         },
-        [selectedNode, handleOpenPlayground, handleOpenSqlEditor, handleOpenErdEditor, setMode],
+        [
+            selectedNode,
+            handleOpenPlayground,
+            handleOpenSqlEditor,
+            handleOpenErdEditor,
+            handleOpenRegexStudio,
+            REGEX_STUDIO_IDS,
+            setMode,
+        ],
     );
 
     const openNewPipelineModal = useCallback((parentId: string = 'pipelines') => {
@@ -3268,6 +3320,9 @@ export default function App() {
                     mode={mode}
                     onSelect={handleRailSelect}
                     isVisible={m => {
+                        // A contextual surface hidden after an explicit Close stays
+                        // hidden until reopened (which clears the dismissal).
+                        if (dismissedModes.has(m.id) && mode !== m.id) return false;
                         // The API Playground is Infor-node-driven: shown while any
                         // src.infor node exists on the canvas (or it's active).
                         if (m.id === 'playground')
@@ -3276,8 +3331,11 @@ export default function App() {
                         if (m.id === 'sql') return mode === 'sql' || hasSqlStudioNode;
                         // ER Model surface is code.workingdb-node-driven.
                         if (m.id === 'erd') return mode === 'erd' || hasWorkingDbNode;
+                        // Regex Studio is *.regex*.studio-node-driven, same pattern.
+                        if (m.id === 'regex') return mode === 'regex' || hasRegexStudioNode;
                         return true;
                     }}
+                    onClose={handleCloseRailMode}
                 />
                 {/* Kept mounted (hidden when inactive) so the Playground's
                     in-session state - Infor sign-in, the current query - survives
