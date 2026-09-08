@@ -31,15 +31,17 @@ interface Msg {
 }
 
 function schemaText(tables: SqlStudioTable[], relationships: ErdRelationship[]): string {
-    const lines: string[] = ['Tables:'];
+    const lines: string[] = [
+        'Schema — each column exists ONLY on the table it is listed under:',
+    ];
     for (const t of tables) {
-        const cols = t.columns.map(c => (c.type ? `${c.name}:${c.type}` : c.name)).join(', ');
-        lines.push(`- ${t.name}(${cols})`);
+        const cols = t.columns.map(c => c.name).join(', ');
+        lines.push(`  ${t.name}: ${cols || '(columns unknown)'}`);
     }
     if (relationships.length) {
-        lines.push('Relationships (join keys):');
+        lines.push('Join keys:');
         for (const r of relationships) {
-            lines.push(`- ${r.fromTable}.${r.fromColumn} = ${r.toTable}.${r.toColumn}`);
+            lines.push(`  ${r.fromTable}.${r.fromColumn} = ${r.toTable}.${r.toColumn}`);
         }
     }
     return lines.join('\n');
@@ -51,14 +53,18 @@ function systemPrompt(
     currentSql?: string,
 ): string {
     const current = currentSql?.trim()
-        ? `\n\nThe user's current query in the editor is:\n\`\`\`sql\n${currentSql.trim()}\n\`\`\`\n` +
-          'When they ask to fix, change, or extend it, modify THIS query and return the full updated SQL.'
+        ? `\n\nThe user's current query in the editor is:\n\`\`\`sql\n${currentSql.trim()}\n\`\`\``
         : '';
     return (
         'You are a SQL assistant embedded in a read-only DuckDB SQL editor. ' +
-        "Write ONE DuckDB SQL SELECT that answers the user's request. " +
-        'Use ONLY the tables, columns, and join keys listed below — do not invent names. ' +
-        'Never write INSERT/UPDATE/DELETE/DDL. Return ONLY the SQL inside a ```sql fenced block.\n\n' +
+        "Write ONE DuckDB SQL SELECT that answers the user's request using the schema below.\n" +
+        'RULES:\n' +
+        '- A column may be referenced on a table ONLY if that table lists it below. ' +
+        'If a needed column lives on a different table, JOIN to that table using the join keys. ' +
+        '(For example, a column is NOT available on a table just because the names look related.)\n' +
+        '- Use only the exact table and column names from the schema; never invent or guess names.\n' +
+        '- Read-only: never write INSERT/UPDATE/DELETE/DDL.\n' +
+        '- Return ONLY the SQL inside a ```sql fenced block, no prose.\n\n' +
         schemaText(tables, relationships) +
         current
     );
@@ -105,11 +111,18 @@ export default function AiPane({
         setInput('');
         if (inputRef.current) inputRef.current.style.height = 'auto';
         setError(null);
+        // Send the whole conversation (prior turns + this one) so the model can
+        // act on its own earlier drafts and the user's corrections — not just the
+        // latest message.
+        const priorTurns = messages
+            .filter(m => m.content.trim().length > 0)
+            .map(m => ({ role: m.role, content: m.content }));
+        const history = [...priorTurns, { role: 'user' as const, content: q }];
         setMessages(m => [...m, { role: 'user', content: q }, { role: 'assistant', content: '' }]);
         setStreaming(true);
         let acc = '';
         await chatSend(
-            [{ role: 'user', content: q }],
+            history,
             e => {
                 if (e.kind === 'token') {
                     acc += e.text;
