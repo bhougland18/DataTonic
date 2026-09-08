@@ -2623,8 +2623,9 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
             let bg = Arc::clone(state);
             let rid = run_id.clone();
             std::thread::spawn(move || {
-                let outcome =
-                    execute_one_with(&bg, &file, "manual", &params, Some(engine), Some(&rid));
+                let outcome = outcome_or_panic_error("the run", || {
+                    execute_one_with(&bg, &file, "manual", &params, Some(engine), Some(&rid))
+                });
                 if let Ok(mut runs) = bg.runs.lock() {
                     let pid = runs.get(&rid).map(|r| r.pipeline_id.clone()).unwrap_or_default();
                     if let Some(live) = runs.get_mut(&rid) {
@@ -4240,6 +4241,23 @@ fn dispatch(
     });
 }
 
+/// Run `f`, turning a panic into an ordinary `Err` so the caller always has an
+/// outcome to record.
+///
+/// A manual run executes on its own thread and reports by writing `finished`
+/// into the shared run map afterwards. An unwind skips that write, and nothing
+/// else ever performs it: `forget_oldest_finished_runs` only reaps entries that
+/// finished, so the run stays `finished: None` for the life of the process and
+/// the editor polls an outcome that never arrives.
+///
+/// The same reasoning as the `catch_unwind` already around command dispatch in
+/// this file - a source that misbehaves should fail one run with a message,
+/// not leave the caller waiting.
+fn outcome_or_panic_error<T>(what: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(format!("{what} failed unexpectedly")))
+}
+
 /// Clears a schedule from `in_flight` however its run ends, including a panic.
 ///
 /// Removing it on the line after `fire_schedule` looks equivalent and is not: a
@@ -4904,6 +4922,34 @@ mod tests {
     ///
     /// Freshness is what notices a schedule that quietly stopped producing, so
     /// losing it costs exactly the alerts it exists to raise.
+    /// A manual run reports by writing `finished` into the shared run map after
+    /// `execute_one_with` returns. An unwind skips that write, and nothing else
+    /// performs it - `forget_oldest_finished_runs` only reaps entries that
+    /// finished - so the run stays `finished: None` for the life of the process
+    /// and the editor polls an outcome that never arrives.
+    #[test]
+    fn a_panicking_manual_run_still_produces_an_outcome_to_record() {
+        let ok: Result<u8, String> = super::outcome_or_panic_error("the run", || Ok(7));
+        assert_eq!(ok, Ok(7), "a run that succeeds is passed through untouched");
+
+        let failed: Result<u8, String> =
+            super::outcome_or_panic_error("the run", || Err("could not start".into()));
+        assert_eq!(
+            failed,
+            Err("could not start".into()),
+            "an ordinary failure keeps its own message"
+        );
+
+        let panicked: Result<u8, String> = super::outcome_or_panic_error("the run", || {
+            panic!("a source misbehaved mid-run");
+        });
+        assert!(
+            panicked.is_err(),
+            "a panic has to become an outcome, or the run is never marked finished \
+             and the entry is never reaped"
+        );
+    }
+
     #[test]
     fn a_panicking_sweep_does_not_wedge_its_busy_flag_forever() {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
