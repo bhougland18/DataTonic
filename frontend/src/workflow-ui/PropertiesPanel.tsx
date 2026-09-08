@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Edge, Node } from '@xyflow/react';
-import { CheckCircle2, ChevronLeft, ChevronRight, MousePointer2, Workflow, FlaskConical, Database } from 'lucide-react';
+import { CheckCircle2, ChevronLeft, ChevronRight, MousePointer2, Workflow, FlaskConical, Database, Regex } from 'lucide-react';
 import { resolveUpstreamSchema, resolveUpstreamSampleRows, resolveOutputSchema } from '../schema-resolve';
 import { buildContextVars, builtinVars, substituteDeep } from '../run-resolve';
 import type { Column, DuckleNodeData } from '../pipeline-types';
@@ -128,6 +128,7 @@ type Props = {
     // Opens the SQL Studio pre-loaded with this node's SQL (code.sqlstudio
     // nodes). Carries the node id so the studio can write the SQL back.
     onOpenSqlEditor?: (nodeId: string) => void;
+    onOpenRegexStudio?: (nodeId: string) => void;
     // Opens the ER-model authoring editor for a Working DB node (code.workingdb).
     onOpenErdEditor?: (nodeId: string) => void;
     focusNameRequest?: number;
@@ -145,6 +146,7 @@ export default function PropertiesPanel({
     onOpenPlayground,
     onOpenUploader,
     onOpenSqlEditor,
+    onOpenRegexStudio,
     onOpenErdEditor,
     focusNameRequest,
 }: Props) {
@@ -544,6 +546,20 @@ export default function PropertiesPanel({
                                     <Database size={14} />
                                     {t('properties.openSqlStudio', {
                                         defaultValue: 'Open in SQL Studio',
+                                    })}
+                                </button>
+                            ) : null}
+                            {['xf.regex.studio', 'xf.regex.extract.studio', 'xf.regex.match.studio', 'qa.regex.studio'].includes(
+                                data.componentId ?? '',
+                            ) && onOpenRegexStudio ? (
+                                <button
+                                    type="button"
+                                    className="properties-mapper-button"
+                                    onClick={() => onOpenRegexStudio(selected.id)}
+                                >
+                                    <Regex size={14} />
+                                    {t('properties.openRegexStudio', {
+                                        defaultValue: 'Open in Regex Studio',
                                     })}
                                 </button>
                             ) : null}

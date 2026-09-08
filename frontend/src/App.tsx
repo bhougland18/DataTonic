@@ -49,6 +49,13 @@ import EngineSetupModal from './workflow-ui/EngineSetupModal';
 import SetupWizard from './workflow-ui/SetupWizard';
 import ChatPanel from './workflow-ui/ChatPanel';
 import SqlEditor from './sqleditor/SqlEditor';
+import RegexStudio from './regexstudio/RegexStudio';
+import type {
+    RegexStudioRequest,
+    RegexStudioResult,
+    RegexColumnFetch,
+    RegexMode,
+} from './regexstudio/types';
 import type {
     SqlEditorRequest,
     SqlEditorResult,
@@ -1500,6 +1507,108 @@ export default function App() {
                     rows: [],
                     error: e instanceof Error ? e.message : String(e),
                 };
+            }
+        },
+        [nodes, edges, repo, activeJobId, workspacePathState],
+    );
+
+    // ---- Regex Studio (DAA.51) ----
+    // Launched from a *.regex*.studio node into the `regex` rail surface. Mode is
+    // fixed by the node's componentId (not switchable). Mirrors the SQL Studio
+    // request/apply seam.
+    const [regexStudioRequest, setRegexStudioRequest] = useState<RegexStudioRequest | null>(null);
+    const handleOpenRegexStudio = useCallback(
+        (nodeId: string) => {
+            const node = nodes.find(n => n.id === nodeId);
+            if (!node) return;
+            const p = (node.data.properties ?? {}) as Record<string, unknown>;
+            const cid = node.data.componentId ?? '';
+            const regexMode: RegexMode =
+                cid === 'xf.regex.extract.studio'
+                    ? 'extract'
+                    : cid === 'xf.regex.match.studio'
+                      ? 'match'
+                      : cid === 'qa.regex.studio'
+                        ? 'quality'
+                        : 'replace';
+            // Available columns = the immediate upstream's schema.
+            const byId = new Map(nodes.map(n => [n.id, n]));
+            const inputEdge = edges.find(e => e.target === nodeId);
+            const upstream = inputEdge ? byId.get(inputEdge.source) : undefined;
+            const columns = Array.isArray(upstream?.data.schema)
+                ? upstream!.data.schema.map(c => ({ name: c.name, type: c.type }))
+                : [];
+            const str = (k: string) => (typeof p[k] === 'string' ? (p[k] as string) : '');
+            const num = (k: string) => (typeof p[k] === 'number' ? (p[k] as number) : 0);
+            setRegexStudioRequest(r => ({
+                nonce: (r?.nonce ?? 0) + 1,
+                nodeId,
+                mode: regexMode,
+                nodeName: node.data.alias || node.data.label || undefined,
+                column: str('column'),
+                columns,
+                pattern: str('pattern'),
+                replacement: str('replacement'),
+                groupIndex: num('groupIndex'),
+                groupNames: str('groupNames'),
+            }));
+            setMode('regex');
+        },
+        [nodes, edges, setMode],
+    );
+
+    // Write the studio's regex props back to the node. Only mode-relevant keys
+    // are touched — runtime contract stays identical to the base regex node.
+    const handleApplyRegexStudio = useCallback(
+        (nodeId: string, result: RegexStudioResult) => {
+            setNodes(ns =>
+                ns.map(n => {
+                    if (n.id !== nodeId) return n;
+                    const next: Record<string, unknown> = { ...(n.data.properties ?? {}) };
+                    next.column = result.column;
+                    next.pattern = result.pattern;
+                    if (result.replacement !== undefined) next.replacement = result.replacement;
+                    if (result.groupIndex !== undefined) next.groupIndex = result.groupIndex;
+                    if (result.groupNames !== undefined) next.groupNames = result.groupNames;
+                    return { ...n, data: { ...n.data, properties: next } };
+                }),
+            );
+        },
+        [setNodes],
+    );
+
+    // Pull the chosen column's values from the node's UPSTREAM (pre-transform),
+    // so the test area shows the input the regex runs against. Reuses the
+    // partial-run path (no new engine command), same as the SQL Studio's Run.
+    const handleFetchColumn = useCallback(
+        async (nodeId: string, column: string): Promise<RegexColumnFetch> => {
+            try {
+                const inputEdge = edges.find(e => e.target === nodeId);
+                const targetId = inputEdge?.source;
+                if (!targetId || !column) return { values: [], total: 0 };
+                const extra = await settingsLoadContextVars(workspacePathState ?? '');
+                const runNodes = resolveForRun(nodes, repo, workspacePathState, extra);
+                const pipelineName = repo.find(r => r.id === activeJobId)?.name ?? activeJobId;
+                const result = await runPipelinePartial(
+                    runNodes,
+                    edges,
+                    targetId,
+                    undefined,
+                    activeJobId,
+                    workspacePathState,
+                    pipelineName,
+                );
+                if (!result) return { values: [], total: 0, error: 'Run is unavailable in this edition.' };
+                if (result.status === 'error') return { values: [], total: 0, error: result.error ?? 'Run failed.' };
+                const preview = result.preview.find(pv => pv.node_id === targetId);
+                const rows = preview?.rows ?? [];
+                const values = rows.map(row => {
+                    const v = (row as Record<string, unknown>)[column];
+                    return v == null ? '' : String(v);
+                });
+                return { values, total: values.length };
+            } catch (e) {
+                return { values: [], total: 0, error: e instanceof Error ? e.message : String(e) };
             }
         },
         [nodes, edges, repo, activeJobId, workspacePathState],
@@ -3206,6 +3315,16 @@ export default function App() {
                         onClose={() => setMode('canvas')}
                     />
                 </div>
+                {/* Regex Studio — kept mounted (hidden when inactive) so an
+                    in-progress pattern survives switching to Canvas and back. */}
+                <div style={{ display: mode === 'regex' ? 'flex' : 'none', flex: 1, minWidth: 0 }}>
+                    <RegexStudio
+                        workspacePath={workspacePathState}
+                        openRequest={regexStudioRequest}
+                        onApplyToNode={handleApplyRegexStudio}
+                        onFetchColumn={handleFetchColumn}
+                    />
+                </div>
                 {mode === 'canvas' && (
                   <>
                 <LeftSidebar
@@ -3294,6 +3413,7 @@ export default function App() {
                     onOpenUploader={handleOpenUploader}
                     onOpenSqlEditor={handleOpenSqlEditor}
                     onOpenErdEditor={handleOpenErdEditor}
+                    onOpenRegexStudio={handleOpenRegexStudio}
                     focusNameRequest={renameRequest}
                 />
                   </>
