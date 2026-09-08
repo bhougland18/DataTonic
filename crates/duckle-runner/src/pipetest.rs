@@ -48,6 +48,27 @@ use std::process::ExitCode;
 
 use duckle_duckdb_engine::{DuckdbEngine, PipelineDoc};
 
+/// Resolve a tested pipeline the way a run resolves it.
+///
+/// The workspace is the pipeline file's parent, which is the convention the
+/// runner already uses - `resolve_workspace` in main.rs is "--workspace, else
+/// the pipeline file's parent", and `drift` falls back the same way. `test`
+/// takes no `--workspace`, so the fallback is all there is.
+///
+/// Order follows the CLI run path: saved connections first, then the env pass
+/// (which carries vault), then time builtins, then the workspace pass. A
+/// connection field stored as an ENV placeholder therefore still resolves.
+fn resolve_for_test(doc: &mut PipelineDoc, pipeline: &Path) -> Result<(), String> {
+    let workspace =
+        pipeline.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let env_file = workspace.join("secrets.env");
+    duckle_secrets::resolve_connection_refs(&workspace, &mut doc.nodes)?;
+    crate::apply_env_pass(doc, &workspace, &env_file)?;
+    duckle_duckdb_engine::context::apply_time_builtins(doc);
+    duckle_duckdb_engine::context::apply_workspace_context(doc, &workspace);
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Case {
     pub name: String,
@@ -532,10 +553,20 @@ fn run_case(
     if let Err(e) = attach_capture_sink(&mut doc_value, &case.node, sink_id, &dump) {
         return Some(e);
     }
-    let parsed: PipelineDoc = match serde_json::from_value(doc_value) {
+    let mut parsed: PipelineDoc = match serde_json::from_value(doc_value) {
         Ok(d) => d,
         Err(e) => return Some(format!("pipeline did not load: {e}")),
     };
+    // The same resolution a run gets. Without it `duckle test` was the one
+    // surface that resolved nothing, so a pipeline using ${date}, ${ENV:...} or
+    // a saved connection ran under `duckle run` and failed under `duckle test` -
+    // the command whose whole job is to tell you the pipeline works.
+    //
+    // Applied AFTER the fixtures are substituted, so a `given` still replaces
+    // the source it names and the resolution only touches what is left.
+    if let Err(e) = resolve_for_test(&mut parsed, pipeline) {
+        return Some(e);
+    }
     let result =
         engine.execute_pipeline_with_events(&parsed, Some(sink_id), Some("test"), |_| {});
     if result.status != "ok" {
@@ -1005,6 +1036,53 @@ pub fn run(duckdb: PathBuf) -> ExitCode {
     // A failing assertion is a real finding about the pipeline, which is exit 1 - the
     // same code a failed run uses, so CI gates on it without special-casing.
     if failures.is_empty() { ExitCode::from(0) } else { ExitCode::from(1) }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    /// `duckle test` resolved nothing, so a pipeline that ran under `duckle run`
+    /// failed under the command whose job is to say the pipeline works.
+    ///
+    /// The workspace is the pipeline file's parent, matching `resolve_workspace`
+    /// in main.rs and the `drift` fallback - `test` takes no `--workspace`, so
+    /// there is nothing else to use.
+    #[test]
+    fn a_tested_pipeline_is_resolved_the_way_a_run_resolves_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let pipeline = ws.join("orders.json");
+        std::fs::write(&pipeline, "{}").unwrap();
+        std::env::set_var("DUCKLE_TEST_PIPETEST_HOST", "db.internal");
+
+        let mut doc: PipelineDoc = serde_json::from_str(
+            r#"{"nodes":[{"id":"s","position":{"x":0,"y":0},"data":{"label":"S",
+               "componentId":"src.postgres",
+               "properties":{"host":"${ENV:DUCKLE_TEST_PIPETEST_HOST}",
+                             "path":"${workspace}/data/orders.parquet"}}}],"edges":[]}"#,
+        )
+        .unwrap();
+
+        resolve_for_test(&mut doc, &pipeline).expect("resolves");
+
+        let props = doc.nodes[0].data.properties.as_ref().unwrap();
+        assert_eq!(
+            props["host"],
+            serde_json::json!("db.internal"),
+            "a tested pipeline kept ${{ENV:...}} verbatim, so the test could not reach the source"
+        );
+        let path = props["path"].as_str().unwrap();
+        assert!(
+            !path.contains("${workspace}"),
+            "the workspace pass did not run, so a ${{workspace}} path stays literal: {path}"
+        );
+        assert!(
+            path.ends_with("data/orders.parquet") || path.ends_with("data\\orders.parquet"),
+            "got: {path}"
+        );
+        std::env::remove_var("DUCKLE_TEST_PIPETEST_HOST");
+    }
 }
 
 #[cfg(test)]
