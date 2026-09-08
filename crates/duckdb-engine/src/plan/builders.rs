@@ -269,6 +269,8 @@ pub(crate) fn build_view_sql(
         "qa.notnull" | "qa.range" | "qa.regex" | "qa.unique" | "qa.schemavalidate" => {
             build_quality(inputs, props, component_id, false)
         }
+        // Regex Match Studio DQ node — same gate as qa.regex, richer UI.
+        "qa.regex.studio" => build_quality(inputs, props, "qa.regex", false),
         "qa.profile" => build_profile(inputs, props),
         "qa.describe" => build_describe(inputs),
         "qa.histogram" => build_histogram(inputs, props),
@@ -307,6 +309,12 @@ pub(crate) fn build_view_sql(
         | "xf.length" | "xf.substring" | "xf.concat" | "xf.split" | "xf.format" => {
             build_string(inputs, props, component_id)
         }
+        // Regex Studio nodes: richer authoring UI, byte-identical run behaviour.
+        // Route to the base builder with the original id so all downstream logic
+        // (props, SQL, reject port) is unchanged.
+        "xf.regex.studio" => build_string(inputs, props, "xf.regex"),
+        "xf.regex.extract.studio" => build_string(inputs, props, "xf.regex.extract"),
+        "xf.regex.match.studio" => build_string(inputs, props, "xf.regex.match"),
         "xf.url.parse" => build_url_parse(inputs, props),
         "xf.assert" => build_assert(inputs, props),
         "xf.hash" => build_hash(inputs, props),
@@ -3470,6 +3478,7 @@ pub(crate) fn build_reject_sql(
         "qa.notnull" | "qa.range" | "qa.regex" | "qa.unique" | "qa.schemavalidate" => {
             Ok(Some(build_quality(inputs, props, component_id, true)?))
         }
+        "qa.regex.studio" => Ok(Some(build_quality(inputs, props, "qa.regex", true)?)),
         // Orphan rows (main key absent from the reference) go to the reject port.
         "qa.refintegrity" => Ok(Some(build_refintegrity(inputs, props, true)?)),
         // Statistical outliers go to the reject port; inliers pass.

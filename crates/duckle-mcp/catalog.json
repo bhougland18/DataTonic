@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 402,
+  "componentCount": 406,
   "components": [
     {
       "id": "src.csv",
@@ -19179,6 +19179,275 @@
         "kind": "transform",
         "label": "Regex Match",
         "description": "Boolean: does the regex match the column? (regexp_matches)",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Regex match",
+            "fields": [
+              {
+                "key": "column",
+                "label": "Column",
+                "kind": "column",
+                "required": true
+              },
+              {
+                "key": "pattern",
+                "label": "Pattern",
+                "kind": "text",
+                "required": true,
+                "placeholder": "^[A-Z]+$"
+              },
+              {
+                "key": "outputColumn",
+                "label": "Output column",
+                "kind": "text",
+                "placeholder": "<column>_matches"
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "xf.regex.studio",
+      "label": "Regex Replace Studio",
+      "kind": "transform",
+      "availability": "available",
+      "summary": "Regex replace with a launched RE2 editor — live tests on pinned rows, capture-group preview, token explanation, and local-AI drafting. Runs identically to Regex Replace.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "xf.regex.studio",
+        "kind": "transform",
+        "label": "Regex Replace Studio",
+        "description": "Regex replace with a launched RE2 editor — live tests on pinned rows, capture-group preview, token explanation, and local-AI drafting. Runs identically to Regex Replace.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "String operation",
+            "fields": [
+              {
+                "key": "column",
+                "label": "Column",
+                "kind": "column",
+                "required": true
+              },
+              {
+                "key": "pattern",
+                "label": "Pattern / args",
+                "kind": "text"
+              },
+              {
+                "key": "replacement",
+                "label": "Replacement",
+                "kind": "text"
+              },
+              {
+                "key": "outputColumn",
+                "label": "Output column",
+                "kind": "text",
+                "placeholder": "leave blank to overwrite"
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "xf.regex.extract.studio",
+      "label": "Regex Extract Studio",
+      "kind": "transform",
+      "availability": "available",
+      "summary": "Regex extract with the launched RE2 editor. Runs identically to Regex Extract.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "xf.regex.extract.studio",
+        "kind": "transform",
+        "label": "Regex Extract Studio",
+        "description": "Regex extract with the launched RE2 editor. Runs identically to Regex Extract.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Regex extract",
+            "fields": [
+              {
+                "key": "column",
+                "label": "Column",
+                "kind": "column",
+                "required": true
+              },
+              {
+                "key": "pattern",
+                "label": "Pattern",
+                "kind": "text",
+                "required": true,
+                "placeholder": "([0-9]+)"
+              },
+              {
+                "key": "groupIndex",
+                "label": "Group",
+                "kind": "number",
+                "defaultValue": 0,
+                "description": "0 = whole match, 1 = first capture group, 2 = second, ..."
+              },
+              {
+                "key": "groupNames",
+                "label": "Group names (optional)",
+                "kind": "text",
+                "placeholder": "id, type",
+                "description": "Comma-separated names for the capture groups. When set, the output is a STRUCT with these named fields (1st name = 1st group) and Group above is ignored."
+              },
+              {
+                "key": "outputColumn",
+                "label": "Output column",
+                "kind": "text",
+                "placeholder": "leave blank to overwrite"
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject",
+              "optional": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "xf.regex.match.studio",
+      "label": "Regex Match Studio",
+      "kind": "transform",
+      "availability": "available",
+      "summary": "Regex match (boolean) with the launched RE2 editor. Runs identically to Regex Match.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject",
+            "optional": true
+          }
+        ]
+      },
+      "manifest": {
+        "id": "xf.regex.match.studio",
+        "kind": "transform",
+        "label": "Regex Match Studio",
+        "description": "Regex match (boolean) with the launched RE2 editor. Runs identically to Regex Match.",
         "schemaSource": "upstream",
         "sections": [
           {
@@ -40114,6 +40383,102 @@
         "kind": "transform",
         "label": "Regex Match",
         "description": "Pass rows matching a pattern; rest to reject",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Regex match",
+            "fields": [
+              {
+                "key": "column",
+                "label": "Column",
+                "kind": "column",
+                "required": true
+              },
+              {
+                "key": "pattern",
+                "label": "Regex pattern",
+                "kind": "text",
+                "required": true,
+                "placeholder": "^[A-Z]{2}\\d{6}$"
+              },
+              {
+                "key": "onFail",
+                "label": "On failure",
+                "kind": "select",
+                "defaultValue": "reject",
+                "options": [
+                  {
+                    "label": "Send to reject port",
+                    "value": "reject"
+                  },
+                  {
+                    "label": "Log warning, keep row",
+                    "value": "warn"
+                  },
+                  {
+                    "label": "Fail pipeline",
+                    "value": "fail"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "pass",
+              "type": "main"
+            },
+            {
+              "id": "reject",
+              "label": "reject",
+              "type": "reject"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "qa.regex.studio",
+      "label": "Regex Match Studio",
+      "kind": "quality",
+      "availability": "available",
+      "summary": "Regex match DQ gate with a launched RE2 editor (live tests, explanation, local-AI drafting). Same gate as Regex Match.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "pass",
+            "type": "main"
+          },
+          {
+            "id": "reject",
+            "label": "reject",
+            "type": "reject"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "qa.regex.studio",
+        "kind": "transform",
+        "label": "Regex Match Studio",
+        "description": "Regex match DQ gate with a launched RE2 editor (live tests, explanation, local-AI drafting). Same gate as Regex Match.",
         "schemaSource": "upstream",
         "sections": [
           {

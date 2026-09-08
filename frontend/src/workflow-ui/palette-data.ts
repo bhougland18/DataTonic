@@ -345,6 +345,9 @@ export const PALETTE: Category[] = [
                     xf('regex', 'Regex Replace', 'available'),
                     xf('regex.extract', 'Regex Extract', 'available', 'Extract a capture group from a column via regexp_extract'),
                     xf('regex.match', 'Regex Match', 'available', 'Boolean: does the regex match the column? (regexp_matches)'),
+                    xf('regex.studio', 'Regex Replace Studio', 'available', 'Regex replace with a launched RE2 editor — live tests on pinned rows, capture-group preview, token explanation, and local-AI drafting. Runs identically to Regex Replace.'),
+                    xf('regex.extract.studio', 'Regex Extract Studio', 'available', 'Regex extract with the launched RE2 editor. Runs identically to Regex Extract.'),
+                    xf('regex.match.studio', 'Regex Match Studio', 'available', 'Regex match (boolean) with the launched RE2 editor. Runs identically to Regex Match.'),
                     xf('url.parse', 'URL Parse', 'available', 'Extract scheme / host / port / path / query / fragment from a URL column'),
                     xf('text.similarity', 'Text Similarity', 'available', 'Pairwise string similarity between two columns - levenshtein / damerau / jaccard / jaro-winkler'),
                     xf('text.base64', 'Base64', 'available', 'Encode a column to base64 text, or decode base64 back to bytes'),
@@ -713,6 +716,7 @@ export const PALETTE: Category[] = [
                 components: [
                     qa('schemavalidate', 'Schema Validate', 'available', 'Reject rows where any expected column is null'),
                     qa('regex', 'Regex Match', 'available', 'Pass rows matching a pattern; rest to reject'),
+                    qa('regex.studio', 'Regex Match Studio', 'available', 'Regex match DQ gate with a launched RE2 editor (live tests, explanation, local-AI drafting). Same gate as Regex Match.'),
                     qa('range', 'Range Check', 'available', 'Pass in-range rows; rest to reject'),
                     qa('notnull', 'Not-Null Check', 'available', 'Pass rows with no nulls; rest to reject'),
                     qa('unique', 'Uniqueness Check', 'available', 'Pass first per key; duplicates to reject'),

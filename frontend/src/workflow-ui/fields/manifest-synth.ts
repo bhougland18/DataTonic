@@ -4446,6 +4446,13 @@ function synthWindowTransform(comp: ComponentDef): ComponentManifest {
 }
 
 function synthStringTransform(comp: ComponentDef): ComponentManifest {
+    // Regex Studio duplicates (xf.regex[.extract|.match].studio) render exactly
+    // their base node's fields; the rich editor is launched from a Properties
+    // button. Delegate to the base id, then keep the studio id on the manifest.
+    if (comp.id.endsWith('.studio')) {
+        const baseId = comp.id.slice(0, -'.studio'.length);
+        return { ...synthStringTransform({ ...comp, id: baseId }), id: comp.id };
+    }
     if (comp.id === 'xf.text.match') {
         return base(comp, [
             {
@@ -5501,6 +5508,12 @@ function synthLoggingControl(comp: ComponentDef): ComponentManifest {
 }
 
 function synthQualityValidation(comp: ComponentDef): ComponentManifest {
+    // Regex Match Studio (qa.regex.studio) reuses qa.regex's fields; the rich
+    // editor is launched from a Properties button.
+    if (comp.id.endsWith('.studio')) {
+        const baseId = comp.id.slice(0, -'.studio'.length);
+        return { ...synthQualityValidation({ ...comp, id: baseId }), id: comp.id };
+    }
     const id = comp.id;
     const onFail: Field = {
         key: 'onFail',

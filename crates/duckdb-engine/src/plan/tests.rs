@@ -5321,3 +5321,47 @@
         assert!(sql.contains("coalesce(BATCH_ID, 0)"), "{sql}");
         assert!(sql.contains("BATCH_ID + 1"), "{sql}");
     }
+
+    // Regex Studio duplicate nodes must run byte-identically to their base
+    // transforms/QA gate — the studio adds only authoring UI, never SQL.
+    #[test]
+    fn regex_studio_nodes_build_identical_sql_to_base() {
+        use crate::plan::builders::build_view_sql;
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["up".into()]);
+
+        let cases: &[(&str, &str, serde_json::Value)] = &[
+            (
+                "xf.regex.studio",
+                "xf.regex",
+                serde_json::json!({ "column": "code", "pattern": "a(b)c", "replacement": r"\1" }),
+            ),
+            (
+                "xf.regex.extract.studio",
+                "xf.regex.extract",
+                serde_json::json!({ "column": "code", "pattern": "([0-9]+)", "groupIndex": 1 }),
+            ),
+            (
+                "xf.regex.match.studio",
+                "xf.regex.match",
+                serde_json::json!({ "column": "code", "pattern": "^[A-Z]+$" }),
+            ),
+            (
+                "qa.regex.studio",
+                "qa.regex",
+                serde_json::json!({ "column": "code", "pattern": r"^[A-Z]{2}\d{6}$" }),
+            ),
+        ];
+
+        for (studio, base, props) in cases {
+            let studio_sql = build_view_sql(studio, props, &ni, None, false).unwrap();
+            let base_sql = build_view_sql(base, props, &ni, None, false).unwrap();
+            assert_eq!(studio_sql, base_sql, "{studio} must match {base}");
+            // and the reject-port SQL for the DQ gate
+            let studio_rej =
+                crate::plan::builders::build_reject_sql(studio, props, &ni, None).unwrap();
+            let base_rej =
+                crate::plan::builders::build_reject_sql(base, props, &ni, None).unwrap();
+            assert_eq!(studio_rej, base_rej, "{studio} reject-port must match {base}");
+        }
+    }
