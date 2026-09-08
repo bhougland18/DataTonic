@@ -52,6 +52,23 @@ use std::path::{Path, PathBuf};
 /// the output cache bakes the build into its key.
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Components that write outside the run without carrying the `snk.` prefix
+/// the refusal was keyed on (#305).
+///
+/// `ctl.file` is a typed filesystem operation - its `op` is copy, move or
+/// delete - and `code.shell` runs a command. Repeating either is precisely "a
+/// side effect nobody asked to repeat", and neither could ever be refused,
+/// because the classification read the prefix. Verified reuse does not rescue
+/// them either: an output is only recorded after an output-cache hit for a
+/// stage that produced a cacheable relation, which neither of these does, so
+/// they land on "nothing durable was recorded for it" and re-execute.
+///
+/// Deliberately short. `xf.dbt` and the `xf.ai.*` transforms also reach outside
+/// the run and are NOT here: dbt is idempotent for most people, and refusing
+/// every dbt retry would teach operators to pass `--rerun-sinks` by reflex,
+/// which costs more than the gap it closes. Add one only with a reason.
+const WRITES_OUTSIDE_THE_RUN: [&str; 2] = ["ctl.file", "code.shell"];
+
 /// One node, as the run left it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -779,7 +796,7 @@ pub fn plan(
             .data
             .component_id
             .as_deref()
-            .is_some_and(|c| c.starts_with("snk."))
+            .is_some_and(|c| c.starts_with("snk.") || WRITES_OUTSIDE_THE_RUN.contains(&c))
             || prior_node.and_then(|n| n.kind.as_deref()) == Some("sink");
 
         let action = if !reuse_allowed {
@@ -840,9 +857,9 @@ pub fn plan(
             run_id,
             "retry:would-rewrite-sinks",
             format!(
-                "this retry would write again to {}: {}. Nothing here can tell a sink that is safe \
-                 to repeat from one that is not, so it will not be decided for you. Re-run with \
-                 --rerun-sinks once you know repeating those writes is safe.",
+                "this retry would write again to {}: {}. Nothing here can tell a write that is \
+                 safe to repeat from one that is not, so it will not be decided for you. Re-run \
+                 with --rerun-sinks once you know repeating those writes is safe.",
                 sinks.len(),
                 sinks.join(", ")
             ),
@@ -1301,6 +1318,63 @@ mod tests {
         let p = plan(tmp.path(), "r1", &d, "r2", false, true, &Default::default());
         assert!(
             matches!(p.decisions[0].action, Action::RewriteSink { .. }),
+            "got {:?}",
+            p.decisions[0].action
+        );
+    }
+
+    /// #305: writing outside the run is not the same thing as being a `snk.`.
+    ///
+    /// `ctl.file` is a typed filesystem operation - its `op` is copy, move or
+    /// delete - and `code.shell` runs a command. Both were classified by prefix
+    /// alone, so both were re-executed silently on every path that re-runs a
+    /// node, while the refusal that exists to stop exactly that fired only for
+    /// `snk.`. A retry of `extract -> ctl.file (archive) -> snk.x` re-ran the
+    /// move against a file that was no longer there; with `op: delete` there
+    /// was nothing to undo.
+    #[test]
+    fn a_file_operation_and_a_shell_command_are_not_repeated_silently() {
+        for comp in ["ctl.file", "code.shell"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let d = doc_with(&[("step", comp)]);
+            let h = pipeline_hash(&d);
+            // Recorded as it really would be: the catalog kind for these is
+            // "control" / "custom", never "sink", so the receipt cannot rescue
+            // them either.
+            write(tmp.path(), &receipt("error", &h, &[("step", "ok", Some("K"), "control")]))
+                .unwrap();
+
+            let p = plan(tmp.path(), "r1", &d, "r2", false, true, &Default::default());
+            assert!(
+                matches!(p.decisions[0].action, Action::RewriteSink { .. }),
+                "{comp} would repeat its side effect: got {:?}",
+                p.decisions[0].action
+            );
+
+            // And without --rerun-sinks the plan is refused rather than made,
+            // which is the whole point of the classification.
+            let refused = plan(tmp.path(), "r1", &d, "r2", false, false, &Default::default());
+            assert_eq!(
+                refused.refusal.as_ref().map(|r| r.code.as_str()),
+                Some("retry:would-rewrite-sinks"),
+                "{comp} should stop the plan until the operator says to repeat it"
+            );
+        }
+    }
+
+    /// A transform is still re-executed rather than refused - broadening the
+    /// classification must not turn every retry into an acknowledgement.
+    #[test]
+    fn an_ordinary_transform_is_still_re_executed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = doc_with(&[("step", "xf.sql")]);
+        let h = pipeline_hash(&d);
+        write(tmp.path(), &receipt("error", &h, &[("step", "error", None, "transform")])).unwrap();
+
+        let p = plan(tmp.path(), "r1", &d, "r2", false, false, &Default::default());
+        assert!(p.refusal.is_none(), "a transform must not refuse: {:?}", p.refusal);
+        assert!(
+            matches!(p.decisions[0].action, Action::ReExecute { .. }),
             "got {:?}",
             p.decisions[0].action
         );
