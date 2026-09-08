@@ -14,9 +14,15 @@ name: LanceDB sidecar
 # 0.75 -> 0.85 removed `vortex::array::arrow`, `into_arrow_preferred` and
 # `ArrayRef::from_arrow`. Nine compile errors, and CI was green on all of them.
 #
-# So: check the sidecar, but only when something that could affect it changed.
-# A `cargo check` rather than a full build - it catches the API breakage that is
-# the actual failure mode here, without paying for codegen on DataFusion.
+# Compiling it is not enough on its own either. vortex 0.85 compiles once the
+# arrow bridge is repointed to `vortex::arrow`, and then refuses to write:
+# "Extension DType vortex.date not permitted by enabled editions", and with the
+# date column removed, "struct column writer finished before all chunks were
+# sent". So this runs the crate's round-trip test, which drives the real
+# subcommands the engine shells out to.
+#
+# Only when something that could affect the sidecar changed, so the minutes are
+# paid on dependency and sidecar edits rather than on every push.
 #
 # The path list is written out twice because GitHub Actions does not support
 # YAML anchors. Keep the two copies in step.
@@ -54,7 +60,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      # --locked so this checks the versions the lockfile actually resolves,
+      # --locked so this exercises the versions the lockfile actually resolves,
       # which is the thing a dependency bump changes.
-      - name: Check the sidecar compiles
-        run: cargo check -p duckle-lance --locked
+      - name: Round-trip a Parquet file through the sidecar
+        run: cargo test -p duckle-lance --locked
