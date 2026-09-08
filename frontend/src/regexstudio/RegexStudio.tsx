@@ -116,18 +116,6 @@ function extractPattern(text: string): string | null {
     return null;
 }
 
-// Flatten the deterministic explanation tree into indented lines — grounding
-// context for the AI one-shot explanation.
-function explainToText(nodes: ExplainNode[], depth = 0): string {
-    return nodes
-        .map(
-            n =>
-                `${'  '.repeat(depth)}- ${n.sym}  ${n.title}: ${n.desc}` +
-                (n.children && n.children.length ? `\n${explainToText(n.children, depth + 1)}` : ''),
-        )
-        .join('\n');
-}
-
 interface ChatTurn {
     role: 'user' | 'assistant';
     content: string;
@@ -612,36 +600,42 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         setOneShot('');
         setOneShotError(null);
         setOneShotStreaming(true);
+        // A COMPACT token summary (not the full nested tree) — the full breakdown
+        // tempted the small model into enumerating example matches endlessly.
+        const summary = explanation.map(n => `${n.sym} = ${n.title.toLowerCase()}`).join('; ');
         const parts: string[] = [];
-        if (title.trim()) {
-            parts.push(`This pattern represents "${title.trim()}"${descr.trim() ? ` — ${descr.trim()}` : ''}.`);
-        }
+        if (title.trim()) parts.push(`Intent: "${title.trim()}"${descr.trim() ? ` — ${descr.trim()}` : ''}.`);
         parts.push(
-            `Regex (RE2): /${pattern}/${mode === 'replace' && replacement ? `   replacement: ${replacement}` : ''}`,
+            `Pattern (RE2): /${pattern}/${mode === 'replace' && replacement ? `  replacement: ${replacement}` : ''}`,
         );
-        if (explanation.length) {
-            parts.push(`Token breakdown:\n${explainToText(explanation)}`);
-        }
-        parts.push(
-            'Using the intent and token breakdown above, explain in plain English for a data analyst what this ' +
-                'matches and any notable edge cases. Be accurate and concise; do not contradict the token breakdown.',
-        );
+        if (summary) parts.push(`Tokens: ${summary}.`);
+        parts.push('In 2–3 short sentences, describe what this matches. Expand only slightly on the tokens.');
         let acc = '';
+        let capped = false;
+        const CAP = 600; // hard stop so a runaway model can't flood the panel
         await chatSend(
-            [{ role: 'user', content: parts.join('\n\n') }],
+            [{ role: 'user', content: parts.join('\n') }],
             e => {
+                if (capped) return;
                 if (e.kind === 'token') {
                     acc += e.text;
+                    if (acc.length > CAP) {
+                        capped = true;
+                        setOneShot(acc.slice(0, CAP).trimEnd() + '…');
+                        setOneShotStreaming(false);
+                        return;
+                    }
                     setOneShot(acc);
                 } else if (e.kind === 'error') {
                     setOneShotError(e.message);
                 }
             },
             workspacePath,
-            'You are a regex tutor for DuckDB RE2 patterns. Explain clearly and briefly, grounded in the intent and ' +
-                'token breakdown the user provides. Plain prose, no code fences.',
+            'You are a regex tutor for DuckDB RE2 patterns. In 2–3 short sentences, plainly describe what the pattern ' +
+                'matches, expanding only slightly on the token list the user gives. Do NOT list example strings, sample ' +
+                'values, or enumerate matches. No bullet lists, no code fences, no examples — just a short description.',
         );
-        setOneShotStreaming(false);
+        if (!capped) setOneShotStreaming(false);
     };
 
     if (!openRequest) {
@@ -893,7 +887,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                                             onClick={() => togglePin(v)}
                                             title="Remove from tests (unpin)"
                                         >
-                                            <X size={13} />
+                                            <Trash2 size={13} />
                                         </button>
                                         <div className="rgx-test-in">
                                             {segments(v, p.ms).map((s, j) => (
