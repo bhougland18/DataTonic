@@ -1841,7 +1841,7 @@ fn api_backfill_action(state: &Arc<State>, req: &Request) -> Reply {
             let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
             std::thread::spawn(move || {
                 if let Err(e) =
-                    duckle_duckdb_engine::backfill_exec::execute_ledger(&ws, &duckdb, plan, force, &|_| {})
+                    duckle_duckdb_engine::backfill_exec::execute_ledger(&ws, &duckdb, plan, force, &|doc| duckle_secrets::resolve_connection_refs(&ws, &mut doc.nodes), &|_| {})
                 {
                     // Accepted-then-failed is still a failure, and a background
                     // thread that swallows it leaves the ledger as the only
@@ -1877,7 +1877,7 @@ fn api_backfill_action(state: &Arc<State>, req: &Request) -> Reply {
                 // A retry is explicit: the operator decided this slice should
                 // run, so it is not skipped as already-done.
                 if let Err(e) =
-                    duckle_duckdb_engine::backfill_exec::execute_ledger(&ws, &duckdb, plan, true, &|_| {})
+                    duckle_duckdb_engine::backfill_exec::execute_ledger(&ws, &duckdb, plan, true, &|doc| duckle_secrets::resolve_connection_refs(&ws, &mut doc.nodes), &|_| {})
                 {
                     // Accepted-then-failed is still a failure, and a background
                     // thread that swallows it leaves the ledger as the only

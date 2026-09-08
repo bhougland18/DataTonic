@@ -144,9 +144,11 @@ pub fn execute(
     // Run every slice even if an identical one already succeeded. The escape
     // hatch #295 asks for: sometimes a slice must genuinely be redone.
     force: bool,
+    resolve: Resolve<'_>,
     on_slice: &(dyn Fn(SliceOutcome) + Sync),
 ) -> Backfill {
     let work = PartitionWork {
+        resolve,
         workspace: workspace.to_path_buf(),
         duckdb: duckdb.to_path_buf(),
         path: PathBuf::from(&plan.pipeline_path),
@@ -162,6 +164,17 @@ pub fn execute(
     execute_with(workspace, plan, force, &work, on_slice)
 }
 
+/// Resolves what only a crate ABOVE this one can resolve.
+///
+/// Saved connection references live in `duckle-secrets`, which depends on this
+/// crate - so a slice cannot expand them itself without closing a dependency
+/// cycle, and it reads its document off disk so no caller can do it first
+/// either. The caller supplies the resolver instead; every one of them is in a
+/// crate that already has it.
+///
+/// `Sync` because slices run concurrently.
+pub type Resolve<'a> = &'a (dyn Fn(&mut crate::PipelineDoc) -> Result<(), String> + Sync);
+
 /// Run a ledger, whichever kind of slice it holds.
 ///
 /// #306: `backfill status`, `backfill retry` and the restart reconciliation all
@@ -175,23 +188,29 @@ pub fn execute_ledger(
     duckdb: &Path,
     plan: Backfill,
     force: bool,
+    resolve: Resolve<'_>,
     on_slice: &(dyn Fn(SliceOutcome) + Sync),
 ) -> Result<Backfill, String> {
     match plan.kind {
-        backfill::Kind::Partition => Ok(execute(workspace, duckdb, plan, force, on_slice)),
+        backfill::Kind::Partition => {
+            Ok(execute(workspace, duckdb, plan, force, resolve, on_slice))
+        }
         backfill::Kind::Chunk => {
-            crate::chunk_exec::execute(workspace, duckdb, plan, force, on_slice)
+            crate::chunk_exec::execute(workspace, duckdb, plan, force, resolve, on_slice)
         }
         // #326: a link of an ordered chain is a run of the pipeline with the
         // object bound, which is the partition path - a slice binding params.
         // What makes it ordered is the claim predicate, not the executor, which
         // is the whole point of not adding a second one.
-        backfill::Kind::Sequence => Ok(execute(workspace, duckdb, plan, force, on_slice)),
+        backfill::Kind::Sequence => {
+            Ok(execute(workspace, duckdb, plan, force, resolve, on_slice))
+        }
     }
 }
 
 /// One partitioned slice: an ordinary durable run with its parameters bound.
-struct PartitionWork {
+struct PartitionWork<'a> {
+    resolve: Resolve<'a>,
     workspace: PathBuf,
     duckdb: PathBuf,
     path: PathBuf,
@@ -201,7 +220,7 @@ struct PartitionWork {
     gates: crate::pools::Gates,
 }
 
-impl SliceWork for PartitionWork {
+impl SliceWork for PartitionWork<'_> {
     fn run(&self, slice: &PartitionRun) -> Result<Done, (Option<String>, String)> {
         run_one(
             &self.workspace,
@@ -212,6 +231,7 @@ impl SliceWork for PartitionWork {
             slice,
             &self.release,
             &self.gates,
+            self.resolve,
         )
         .map(|run_id| Done { run_id, artifact: None })
     }
@@ -370,12 +390,16 @@ fn run_one(
     slice: &PartitionRun,
     release: &Option<String>,
     gates: &crate::pools::Gates,
+    resolve: Resolve<'_>,
 ) -> Result<String, (Option<String>, String)> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| (None, format!("{}: {e}", path.display())))?;
     let doc: crate::PipelineDoc = serde_json::from_str(&text)
         .map_err(|e| (None, format!("{}: {e}", path.display())))?;
-    run_doc(workspace, duckdb, doc, path, pipeline, backfill_id, slice, release, gates, "partition")
+    run_doc(
+        workspace, duckdb, resolve, doc, path, pipeline, backfill_id, slice, release, gates,
+        "partition",
+    )
         .map(|(run_id, _rows)| run_id)
 }
 
@@ -396,11 +420,19 @@ fn run_one(
 /// `duckle-secrets`, which depends on this crate, so calling it would close a
 /// dependency cycle. A slice of a pipeline that names a saved connection still
 /// runs unresolved.
-fn resolve_slice_doc(doc: &mut crate::PipelineDoc, workspace: &Path) {
+fn resolve_slice_doc(
+    doc: &mut crate::PipelineDoc,
+    workspace: &Path,
+    resolve: Resolve<'_>,
+) -> Result<(), String> {
     crate::context::apply_time_builtins(doc);
+    // Saved connections expand BEFORE the env pass, so a connection field
+    // stored as an ENV placeholder still resolves below. Same order as MCP.
+    resolve(doc)?;
     crate::context::apply_env(doc);
     crate::context::apply_vault(doc);
     crate::context::apply_workspace_context(doc, workspace);
+    Ok(())
 }
 
 /// The one place a slice's run happens, whatever produced the document.
@@ -414,6 +446,7 @@ fn resolve_slice_doc(doc: &mut crate::PipelineDoc, workspace: &Path) {
 pub(crate) fn run_doc(
     workspace: &Path,
     duckdb: &Path,
+    resolve: Resolve<'_>,
     mut doc: crate::PipelineDoc,
     // The pipeline this slice belongs to, for the receipt. A chunk runs a
     // document built here, but it belongs to the file the operator named.
@@ -448,7 +481,7 @@ pub(crate) fn run_doc(
     let (recorded, sources) =
         crate::context::apply_params_from(&mut doc, &supplied)
             .map_err(|e| (None, e))?;
-    resolve_slice_doc(&mut doc, workspace);
+    resolve_slice_doc(&mut doc, workspace, resolve).map_err(|e| (None, e))?;
 
     let hash = crate::retry::pipeline_hash(&doc);
     let run_id = crate::retry::new_run_id(pipeline, source);
@@ -519,6 +552,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         std::env::set_var("DUCKLE_TEST_SLICE_HOST", "db.internal");
+        std::env::set_var("DUCKLE_TEST_SLICE_DB", "sales");
         let mut doc: crate::PipelineDoc = serde_json::from_str(
             r#"{"nodes":[{"id":"s","position":{"x":0,"y":0},"data":{"label":"S",
                "componentId":"src.postgres",
@@ -527,7 +561,25 @@ mod tests {
         )
         .unwrap();
 
-        super::resolve_slice_doc(&mut doc, ws);
+        // The caller's resolver stands in for `duckle_secrets::resolve_connection_refs`,
+        // which this crate cannot call: duckle-secrets depends on it, so the
+        // engine asking for it directly would close a dependency cycle. What
+        // matters here is that a slice DOES call whatever it is handed, and
+        // does so before the env pass - a connection field stored as an ENV
+        // placeholder has to still resolve afterwards.
+        let resolved_by_caller = std::sync::atomic::AtomicBool::new(false);
+        super::resolve_slice_doc(&mut doc, ws, &|d| {
+            resolved_by_caller.store(true, Ordering::SeqCst);
+            if let Some(p) = d.nodes[0].data.properties.as_mut() {
+                p["database"] = serde_json::json!("${ENV:DUCKLE_TEST_SLICE_DB}");
+            }
+            Ok(())
+        })
+        .expect("resolves");
+        assert!(
+            resolved_by_caller.load(Ordering::SeqCst),
+            "a slice never called the resolver, so saved connections stay unexpanded"
+        );
 
         let props = doc.nodes[0].data.properties.as_ref().unwrap();
         assert_eq!(
@@ -535,12 +587,19 @@ mod tests {
             serde_json::json!("db.internal"),
             "a slice ran with ${{ENV:...}} still in it, so the run had no host at all"
         );
+        assert_eq!(
+            props["database"],
+            serde_json::json!("sales"),
+            "a connection field the resolver supplied as an ENV placeholder was not \
+             expanded, so the resolver ran too late to be useful"
+        );
         let path = props["path"].as_str().unwrap();
         assert!(
             !path.contains("${workspace}"),
             "the workspace pass must still happen: {path}"
         );
         std::env::remove_var("DUCKLE_TEST_SLICE_HOST");
+        std::env::remove_var("DUCKLE_TEST_SLICE_DB");
     }
 
     fn slices(keys: &[&str]) -> Backfill {
@@ -754,7 +813,7 @@ mod tests {
         // Only the chunk path reads this, so only the chunk path can object.
         plan.chunk_node = None;
 
-        let e = execute_ledger(tmp.path(), Path::new("duckdb"), plan, true, &|_| {})
+        let e = execute_ledger(tmp.path(), Path::new("duckdb"), plan, true, &|_| Ok(()), &|_| {})
             .expect_err("a chunk ledger was run as a partitioned backfill");
         assert!(e.contains("names no source node"), "{e}");
     }

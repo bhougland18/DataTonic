@@ -419,7 +419,8 @@ fn forward_slashes(p: &Path) -> String {
     p.display().to_string().replace(char::from(92), "/")
 }
 
-struct ChunkWork {
+struct ChunkWork<'a> {
+    resolve: crate::backfill_exec::Resolve<'a>,
     workspace: PathBuf,
     duckdb: PathBuf,
     path: PathBuf,
@@ -432,7 +433,7 @@ struct ChunkWork {
     gates: crate::pools::Gates,
 }
 
-impl SliceWork for ChunkWork {
+impl SliceWork for ChunkWork<'_> {
     /// #306: a chunk that committed nothing has not succeeded, whatever the
     /// query returned.
     fn requires_artifact(&self) -> bool {
@@ -456,6 +457,7 @@ impl SliceWork for ChunkWork {
         let (run_id, rows) = crate::backfill_exec::run_doc(
             &self.workspace,
             &self.duckdb,
+            self.resolve,
             doc,
             &self.path,
             &self.pipeline,
@@ -490,6 +492,7 @@ pub fn execute(
     duckdb: &Path,
     plan: Backfill,
     force: bool,
+    resolve: crate::backfill_exec::Resolve<'_>,
     on_slice: &(dyn Fn(SliceOutcome) + Sync),
 ) -> Result<Backfill, String> {
     let path = PathBuf::from(&plan.pipeline_path);
@@ -518,6 +521,7 @@ pub fn execute(
         let _ = backfill::save(workspace, &plan);
     }
     let work = ChunkWork {
+        resolve,
         workspace: workspace.to_path_buf(),
         duckdb: duckdb.to_path_buf(),
         path,
@@ -787,7 +791,7 @@ mod tests {
         plan.pipeline_path = pipeline.display().to_string();
         assert!(plan.is_done(), "the ledger should start out claiming to be complete");
 
-        let done = execute(tmp.path(), Path::new("no-such-duckdb-binary"), plan, false, &|_| {})
+        let done = execute(tmp.path(), Path::new("no-such-duckdb-binary"), plan, false, &|_| Ok(()), &|_| {})
             .expect("running the extract");
         assert_ne!(
             done.partitions[0].state,

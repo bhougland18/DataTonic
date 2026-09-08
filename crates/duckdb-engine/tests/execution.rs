@@ -21456,7 +21456,7 @@ fn a_chunked_extract_reads_every_row_exactly_once_and_resumes() {
     assert_eq!(plan.partitions.len(), 4, "1..100 by 30 is four chunks");
 
     let ran = std::sync::Mutex::new(Vec::<String>::new());
-    let done = duckle_duckdb_engine::chunk_exec::execute(ws, &duckdb, plan, false, &|o| {
+    let done = duckle_duckdb_engine::chunk_exec::execute(ws, &duckdb, plan, false, &|_| Ok(()), &|o| {
         ran.lock().unwrap().push(o.key.clone());
     })
     .expect("running a chunked extract");
@@ -21496,7 +21496,7 @@ fn a_chunked_extract_reads_every_row_exactly_once_and_resumes() {
     assert!(done.is_done(), "the ledger should still claim to be complete");
 
     let again = std::sync::Mutex::new(Vec::<String>::new());
-    let done = duckle_duckdb_engine::chunk_exec::execute(ws, &duckdb, done, false, &|o| {
+    let done = duckle_duckdb_engine::chunk_exec::execute(ws, &duckdb, done, false, &|_| Ok(()), &|o| {
         again.lock().unwrap().push(o.key.clone());
     })
     .expect("resuming a chunked extract");

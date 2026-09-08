@@ -258,6 +258,10 @@ fn extract(
         &duckdb,
         plan,
         force,
+        // Saved connection references live in duckle-secrets, which the engine
+        // cannot call without a dependency cycle - so the resolver is supplied
+        // from here, where it is available.
+        &|doc| duckle_secrets::resolve_connection_refs(workspace, &mut doc.nodes),
         &|o| {
             eprintln!(
                 "  {:<18} {}",
