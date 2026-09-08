@@ -2607,6 +2607,16 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "pipeline".into());
+            // The same per-pipeline lock a scheduled run takes, claimed BEFORE
+            // the 202 for the reason the comment above gives: answering "accepted"
+            // and then refusing on a background thread leaves the caller polling
+            // a run that will never appear. A conflict is the honest answer.
+            let run_lock =
+                match duckle_duckdb_engine::runlock::claim_for_run(&state.workspace, &pipeline_id)
+                {
+                    Ok(l) => l,
+                    Err(e) => return respond_err("409 Conflict", &e),
+                };
             let run_id = new_run_id(&pipeline_id);
             let engine = DuckdbEngine::new(state.duckdb.clone());
             if let Ok(mut runs) = state.runs.lock() {
@@ -2623,6 +2633,10 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
             let bg = Arc::clone(state);
             let rid = run_id.clone();
             std::thread::spawn(move || {
+                // Moved in so it is held for the whole run and released by
+                // dropping, however the run ends - the kernel owns the lock, so
+                // a panic or a kill releases it too.
+                let _run_lock = run_lock;
                 let outcome = outcome_or_panic_error("the run", || {
                     execute_one_with(&bg, &file, "manual", &params, Some(engine), Some(&rid))
                 });

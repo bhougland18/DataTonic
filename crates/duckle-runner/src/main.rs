@@ -504,6 +504,14 @@ fn run_with(args: Args) -> Result<bool, String> {
             .unwrap_or_else(|| "pipeline".into())
     });
 
+    // The same per-pipeline lock a scheduled run takes. Held for the whole run
+    // and released by dropping, including on a panic or a kill, because the
+    // kernel owns it. Without this a headless run could proceed beside a
+    // scheduled run of the same pipeline in the same workspace, which is the
+    // pair the lock exists to prevent - both write the same sink and advance the
+    // same saved state.
+    let _run_lock = duckle_duckdb_engine::runlock::claim_for_run(&workspace, &name)?;
+
     eprintln!("duckle-runner: {} (workspace {})", pipeline.display(), workspace.display());
     // No canvas here, so per-node preview rows have nobody to show them to:
     // a headless run reads them off the wire only to drop them.

@@ -1307,6 +1307,18 @@ fn t_run_pipeline(args: &Value) -> Result<Value, String> {
     // environment the run itself will see.
     let doc = prepare_run_doc(&v, arg_str(args, "workspace"))?;
 
+    // The same per-pipeline lock a scheduled run takes, so an agent cannot start
+    // a run beside one already going in this workspace - both would write the
+    // same sink and advance the same saved state. Only when a workspace is
+    // given: without one there is no shared place for a lock, and nothing else
+    // in this workspace can be running either.
+    let _run_lock = match arg_str(args, "workspace") {
+        Some(ws) => {
+            Some(duckle_duckdb_engine::runlock::claim_for_run(std::path::Path::new(ws), &name)?)
+        }
+        None => None,
+    };
+
     let engine = DuckdbEngine::new(duckdb);
     // #259: a run an agent starts is addressable like any other. Without this,
     // "which run did the agent just do?" had no answer, and MCP is the surface
