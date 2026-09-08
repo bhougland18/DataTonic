@@ -15,6 +15,7 @@ import {
     Upload,
     Save,
     RotateCw,
+    Trash2,
     X,
 } from 'lucide-react';
 import { compile, findMatches, matches as re2matches, extract as re2extract, replace as re2replace } from './re2';
@@ -113,6 +114,18 @@ function extractPattern(text: string): string | null {
     const slash = text.match(/(?:^|\s)\/(.+?)\/[a-z]*(?:\s|$)/);
     if (slash) return slash[1];
     return null;
+}
+
+// Flatten the deterministic explanation tree into indented lines — grounding
+// context for the AI one-shot explanation.
+function explainToText(nodes: ExplainNode[], depth = 0): string {
+    return nodes
+        .map(
+            n =>
+                `${'  '.repeat(depth)}- ${n.sym}  ${n.title}: ${n.desc}` +
+                (n.children && n.children.length ? `\n${explainToText(n.children, depth + 1)}` : ''),
+        )
+        .join('\n');
 }
 
 interface ChatTurn {
@@ -369,6 +382,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
     };
 
     const doExport = () => void exportLibrary(library);
+    const exportOne = (p: SavedPattern) => void exportLibrary([p]);
     const doImport = async () => {
         const imported = await importLibrary();
         if (!imported) return;
@@ -384,14 +398,24 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                 <span className="label">{p.name}</span>
                 <span className="badge">{p.mode}</span>
                 <button
-                    className="del"
-                    title="Delete"
+                    className="act"
+                    title="Export this pattern to .json"
+                    onClick={e => {
+                        e.stopPropagation();
+                        exportOne(p);
+                    }}
+                >
+                    <Upload size={12} />
+                </button>
+                <button
+                    className="act del"
+                    title="Delete this pattern"
                     onClick={e => {
                         e.stopPropagation();
                         deleteSaved(p.id);
                     }}
                 >
-                    <X size={12} />
+                    <Trash2 size={12} />
                 </button>
             </div>
             {p.description && <div className="descr">{p.description}</div>}
@@ -588,16 +612,23 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         setOneShot('');
         setOneShotError(null);
         setOneShotStreaming(true);
+        const parts: string[] = [];
+        if (title.trim()) {
+            parts.push(`This pattern represents "${title.trim()}"${descr.trim() ? ` — ${descr.trim()}` : ''}.`);
+        }
+        parts.push(
+            `Regex (RE2): /${pattern}/${mode === 'replace' && replacement ? `   replacement: ${replacement}` : ''}`,
+        );
+        if (explanation.length) {
+            parts.push(`Token breakdown:\n${explainToText(explanation)}`);
+        }
+        parts.push(
+            'Using the intent and token breakdown above, explain in plain English for a data analyst what this ' +
+                'matches and any notable edge cases. Be accurate and concise; do not contradict the token breakdown.',
+        );
         let acc = '';
         await chatSend(
-            [
-                {
-                    role: 'user',
-                    content: `Explain this DuckDB RE2 regex in plain English for a data analyst, concisely:\n/${pattern}/${
-                        mode === 'replace' && replacement ? `\nreplacement: ${replacement}` : ''
-                    }`,
-                },
-            ],
+            [{ role: 'user', content: parts.join('\n\n') }],
             e => {
                 if (e.kind === 'token') {
                     acc += e.text;
@@ -607,7 +638,8 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                 }
             },
             workspacePath,
-            'You are a regex tutor. Explain the given RE2 pattern clearly and briefly. Do not restate the whole pattern; describe what it matches and any notable edge cases. Plain prose, no code fences.',
+            'You are a regex tutor for DuckDB RE2 patterns. Explain clearly and briefly, grounded in the intent and ' +
+                'token breakdown the user provides. Plain prose, no code fences.',
         );
         setOneShotStreaming(false);
     };
@@ -856,6 +888,13 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                                 const p = preview(v);
                                 return (
                                     <div className="rgx-test" key={`${v}-${i}`}>
+                                        <button
+                                            className="rgx-test-unpin"
+                                            onClick={() => togglePin(v)}
+                                            title="Remove from tests (unpin)"
+                                        >
+                                            <X size={13} />
+                                        </button>
                                         <div className="rgx-test-in">
                                             {segments(v, p.ms).map((s, j) => (
                                                 <span key={j} className={`seg ${s.cls}`}>

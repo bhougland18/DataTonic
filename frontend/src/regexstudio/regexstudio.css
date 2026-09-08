@@ -265,19 +265,22 @@
     border: 1px solid var(--border-strong, var(--border));
     color: var(--text-3);
 }
-.rgx-lib-item .del {
-    margin-left: auto;
+.rgx-lib-item .act {
     background: transparent;
     border: none;
     color: var(--text-4, var(--text-3));
     cursor: pointer;
-    opacity: 0;
-    padding: 0;
+    opacity: 0.55;
+    padding: 0 1px;
+    display: flex;
 }
-.rgx-lib-item:hover .del {
+.rgx-lib-item:hover .act {
     opacity: 1;
 }
-.rgx-lib-item .del:hover {
+.rgx-lib-item .act:hover {
+    color: var(--text-1);
+}
+.rgx-lib-item .act.del:hover {
     color: #ff92a6;
 }
 .rgx-lib-item .pat {
@@ -561,11 +564,32 @@
     padding: 8px 2px;
 }
 .rgx-test {
+    position: relative;
     background: var(--bg-1);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 10px 12px;
     margin-bottom: 9px;
+}
+.rgx-test-unpin {
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    background: transparent;
+    border: none;
+    color: var(--text-4, var(--text-3));
+    cursor: pointer;
+    opacity: 0;
+    padding: 2px;
+    border-radius: 4px;
+    display: flex;
+}
+.rgx-test:hover .rgx-test-unpin {
+    opacity: 1;
+}
+.rgx-test-unpin:hover {
+    color: #ff92a6;
+    background: var(--bg-2);
 }
 .rgx-test-in,
 .rgx-test-out {

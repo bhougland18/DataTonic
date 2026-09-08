@@ -30,7 +30,7 @@ export interface SavedPattern {
     updatedAt: number;
 }
 
-export const DESCRIPTION_MAX = 45;
+export const DESCRIPTION_MAX = 90;
 
 const EXPORT_VERSION = 1;
 interface LibraryFile {
