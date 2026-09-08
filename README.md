@@ -4343,17 +4343,9 @@ gh release edit vX.Y.Z --draft=false --latest
 
 ## What's new in v0.7.2
 
-185 commits. Most of them are the same question asked of one component after
-another: does this control do what it says? Sixteen components could not be
-configured from their own form at all, dozens of settings the engine already
-honoured had no field, and a number of dropdown options ran and did something
-other than their label. The rest is scheduling that can be held to account, a
-capability registry the engine answers rather than a document, and a security
-pass that ends in checks rather than in prose.
+185 commits.
 
-- **Settings the engine honoured, that the form never offered.** Sixteen
-  components had no usable form. The S3 source now takes the credentials its
-  sink always had; CSV offers the malformed-row handling and a typable
+- **Settings the engine honoured, that the form never offered.** CSV offers the malformed-row handling and a typable
   delimiter of any length plus the full encoding list; Excel reads every sheet
   or a named set and honours the cell range; cloud sources expose the read
   options they already applied; GraphQL takes its query; Synapse draws the
