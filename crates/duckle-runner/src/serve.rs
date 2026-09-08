@@ -4235,9 +4235,69 @@ fn dispatch(
     // durable path, so there is no result for the tick to collect - which is
     // the point of handing it over.
     std::thread::spawn(move || {
+        let _clear = InFlight::hold(in_flight, id.clone());
         fire_schedule(&state, &id, &cfg, &pipes);
-        in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
     });
+}
+
+/// Clears a schedule from `in_flight` however its run ends, including a panic.
+///
+/// Removing it on the line after `fire_schedule` looks equivalent and is not: a
+/// panic anywhere in the engine unwinds past it, and the id then stays in the
+/// set for the life of the process. The schedule reports "still running" on
+/// every tick from then on and never fires again.
+///
+/// What makes that the wrong failure is the asymmetry. `in_flight` exists only
+/// to save spawning a thread that the on-disk run lock would turn away anyway -
+/// and that lock is released by unwinding, because it is held through a guard
+/// (`run_scheduled`'s `_lock`). So on a panic the cheap pre-check outlives the
+/// durable thing it stands in for, and becomes permanently stricter than it.
+///
+/// Panics here are not hypothetical: this file already wraps command dispatch
+/// in `catch_unwind` because a source that misbehaves would otherwise unwind
+/// the connection thread, and the PDF source catches them for the same reason.
+struct InFlight {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    id: String,
+}
+
+impl InFlight {
+    fn hold(set: Arc<Mutex<std::collections::HashSet<String>>>, id: String) -> Self {
+        Self { set, id }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
+    }
+}
+
+/// Holds an "already running" flag for work the tick hands to another thread,
+/// and clears it however that work ends.
+///
+/// The same hazard as `InFlight`, and it was live in the freshness sweep:
+/// storing `false` on the line after the call is skipped by an unwind, and the
+/// sweep then never runs again for the life of the process. Freshness is the
+/// thing that notices a schedule which stopped producing, so losing it silently
+/// costs exactly the alerts it exists to raise.
+struct Busy(Arc<std::sync::atomic::AtomicBool>);
+
+impl Busy {
+    /// Claim the flag, or `None` when the previous run has not finished.
+    fn claim(flag: &Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self(Arc::clone(flag)))
+        }
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Fire one schedule that has come due.
@@ -4332,6 +4392,10 @@ fn spawn_scheduler(state: Arc<State>) {
         // from the end of a run.
         let mut last_freshness: Option<Instant> = None;
         let freshness_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // #329: the delivery pump runs pipelines too, so it belongs off this
+        // thread for the same reason schedules do. Guarded so two pumps never
+        // overlap, which keeps deliveries sequential exactly as they were.
+        let deliveries_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // #329: schedules with a run in flight. The tick hands a run to its own
         // thread and moves on, so this is what stops it handing the SAME
         // schedule out twice - the on-disk run lock would refuse the second
@@ -4345,16 +4409,29 @@ fn spawn_scheduler(state: Arc<State>) {
             // map - and unlike freshness it is latency that matters: the point
             // of a data trigger is that the consumer runs when the data lands,
             // not up to a minute later.
-            pump_deliveries(&state);
+            // #329: handed off, not called. A delivered run is an ordinary
+            // pipeline run and just as unboundedly slow, and this sits BEFORE
+            // the schedules are even loaded - so a slow consumer stalled every
+            // schedule exactly as a slow scheduled run used to, which is the
+            // same bug reached through the other trigger.
+            if let Some(busy) = Busy::claim(&deliveries_running) {
+                let st = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    let _busy = busy;
+                    pump_deliveries(&st);
+                });
+            }
             if last_freshness.is_none_or(|t| t.elapsed() >= FRESHNESS_EVERY) {
                 last_freshness = Some(Instant::now());
                 // Off the scheduler's thread, so a slow evaluation delays no
                 // schedule, and guarded so two can never overlap on a workspace
                 // where it takes longer than the interval.
-                let busy = Arc::clone(&freshness_running);
-                if !busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if let Some(busy) = Busy::claim(&freshness_running) {
                     let ws = state.workspace.clone();
                     std::thread::spawn(move || {
+                        // Cleared by dropping, so a panic in the sweep does not
+                        // wedge the flag and stop freshness for good.
+                        let _busy = busy;
                         let (assets, sent) = duckle_duckdb_engine::sla::check_and_alert(
                             &ws,
                             chrono::Utc::now(),
@@ -4372,7 +4449,6 @@ fn spawn_scheduler(state: Arc<State>) {
                                 stale.join(", ")
                             );
                         }
-                        busy.store(false, std::sync::atomic::Ordering::SeqCst);
                     });
                 }
             }
@@ -4781,6 +4857,76 @@ mod tests {
     /// it needs has to be in the projection. Leaving the plan out meant a schedule that
     /// named a plan fired the pipeline it happened to be keyed by, and failed looking for a
     /// file nobody had written.
+    /// #329. The tick now hands each firing to its own thread and keeps an
+    /// `in_flight` set so it does not hand the same schedule out twice. Clearing
+    /// that entry on the line after the run looks equivalent to clearing it in a
+    /// guard, and is not: a panic in the engine unwinds past the plain line, and
+    /// the schedule is then marked "still running" for the life of the process.
+    ///
+    /// This drives the real guard through a real unwind. It does not run a
+    /// pipeline - what it pins is the contract the dispatch thread relies on,
+    /// which is the half that a panic breaks.
+    #[test]
+    fn a_panicking_run_does_not_leave_its_schedule_wedged_forever() {
+        let in_flight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert("nightly".to_string());
+
+        let held = std::sync::Arc::clone(&in_flight);
+        let panicked = std::thread::spawn(move || {
+            let _clear = super::InFlight::hold(held, "nightly".to_string());
+            // Stands in for anything the engine can do on the way down; this
+            // file already catches these on the HTTP path for the same reason.
+            panic!("a source misbehaved mid-run");
+        })
+        .join();
+        assert!(panicked.is_err(), "the run under test has to actually panic");
+
+        assert!(
+            !in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains("nightly"),
+            "the schedule is still marked in flight after a panic, so the tick \
+             would refuse to start it again for the life of the process - and the \
+             on-disk run lock it stands in for was released by the same unwind"
+        );
+    }
+
+    /// #329, the same hazard one branch over. The freshness sweep and the
+    /// delivery pump are handed to their own threads under an "already running"
+    /// flag, and that flag was stored back to `false` on the line after the
+    /// work. An unwind skips it, and then the flag is never free again: no
+    /// freshness evaluation and no deliveries for the life of the process.
+    ///
+    /// Freshness is what notices a schedule that quietly stopped producing, so
+    /// losing it costs exactly the alerts it exists to raise.
+    #[test]
+    fn a_panicking_sweep_does_not_wedge_its_busy_flag_forever() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let claimed = super::Busy::claim(&flag).expect("a free flag can be claimed");
+        assert!(
+            super::Busy::claim(&flag).is_none(),
+            "a claimed flag must refuse a second holder, or two sweeps overlap"
+        );
+
+        let panicked = std::thread::spawn(move || {
+            let _busy = claimed;
+            panic!("the sweep hit something on the way down");
+        })
+        .join();
+        assert!(panicked.is_err(), "the sweep under test has to actually panic");
+
+        assert!(
+            super::Busy::claim(&flag).is_some(),
+            "the flag is still held after a panic, so this sweep never runs again"
+        );
+    }
+
     #[test]
     fn a_schedule_that_names_a_plan_tells_the_scheduler_so() {
         let tmp = tempfile::tempdir().unwrap();
