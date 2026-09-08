@@ -1274,6 +1274,23 @@ fn prepare_run_doc(v: &Value, workspace: Option<&str>) -> Result<PipelineDoc, St
     }
     duckle_duckdb_engine::context::apply_env(&mut doc);
     duckle_duckdb_engine::context::apply_vault(&mut doc);
+    // Last, exactly as the CLI orders it (`main.rs:494`): `${workspace}` and the
+    // workspace context variables resolve after env and vault, so a context
+    // value spelled `${ENV:...}` has already become a value by the time it is
+    // read.
+    //
+    // Without this an MCP run sent `${workspace}/...` to DuckDB verbatim and
+    // failed with "No files found that match the pattern", while the same
+    // pipeline ran from the desktop app and from `duckle-runner --workspace`.
+    // A file-loaded pipeline does not go through the by-id resolver, so nothing
+    // else in this path would ever substitute it - the same reason the CLI and
+    // the serve endpoints each call this themselves.
+    if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
+        duckle_duckdb_engine::context::apply_workspace_context(
+            &mut doc,
+            std::path::Path::new(ws),
+        );
+    }
     Ok(doc)
 }
 
@@ -2067,6 +2084,49 @@ mod verify_tests {
             "the saved connection has to reach the engine, or the run has no host at all"
         );
         assert_eq!(props["database"], "sales");
+    }
+
+    /// A `${workspace}` path has to resolve for an MCP run exactly as it does
+    /// for `duckle-runner --workspace`.
+    ///
+    /// Reported over MCP: `run_pipeline` takes a `workspace` argument, and the
+    /// documented `${workspace}/...` pattern reached DuckDB verbatim -
+    /// `No files found that match the pattern "${workspace}/some/path.parquet"` -
+    /// while the identical pipeline ran from the desktop app and the CLI. The
+    /// CLI resolves it at `main.rs:494`, and `t_schema_drift` / `t_trust_report`
+    /// resolve it in this very file; the tool that actually RUNS a pipeline was
+    /// the one surface that did not.
+    ///
+    /// The cause is the same one the CLI comments on: a file-loaded pipeline
+    /// does not go through the by-id resolver, so nothing else would ever
+    /// substitute it.
+    #[test]
+    fn an_mcp_run_resolves_the_workspace_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let v = json!({
+            "nodes": [{
+                "id": "s",
+                "position": { "x": 0, "y": 0 },
+                "data": {
+                    "label": "s",
+                    "componentId": "src.parquet",
+                    "properties": { "path": "${workspace}/data/orders.parquet" }
+                }
+            }],
+            "edges": []
+        });
+        let doc = prepare_run_doc(&v, ws.to_str()).expect("prepare");
+        let props = doc.nodes[0].data.properties.clone().expect("properties");
+        let path = props["path"].as_str().expect("path is a string");
+        assert!(
+            !path.contains("${workspace}"),
+            "the placeholder reached the engine verbatim, which is the reported IO error: {path}"
+        );
+        assert!(
+            path.ends_with("data/orders.parquet") || path.ends_with("data\\orders.parquet"),
+            "got: {path}"
+        );
     }
 
     #[test]
