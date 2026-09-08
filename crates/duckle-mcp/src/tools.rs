@@ -624,14 +624,12 @@ fn t_pipeline_impact(args: &Value) -> Result<Value, String> {
 
 fn t_schema_drift(args: &Value) -> Result<Value, String> {
     let (v, _name) = load_pipeline_value(args)?;
-    let mut doc = to_doc(&v)?;
-    // Resolve ${workspace}/${date} placeholders in source paths when a
-    // workspace is supplied, so file paths point at the real data.
-    if let Some(ws) = arg_str(args, "workspace") {
-        let wsp = std::path::Path::new(ws);
-        duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
-        duckle_duckdb_engine::context::apply_workspace_context(&mut doc, wsp);
-    }
+    // The same resolution a run gets, rather than a shorter hand-written copy.
+    // This did time builtins and the workspace pass only, so a drift check
+    // against a source behind a saved connection or an ${ENV:...} host read a
+    // placeholder instead of the source - and reported drift, or nothing,
+    // about a thing it never reached.
+    let doc = prepare_run_doc(&v, arg_str(args, "workspace"))?;
     let duckdb = resolve_duckdb(arg_str(args, "duckdb"))
         .ok_or("no DuckDB binary found (set DUCKLE_DUCKDB_BIN or pass 'duckdb')")?;
     std::env::set_var("DUCKLE_DUCKDB_BIN", &duckdb);
@@ -676,17 +674,12 @@ fn t_trust_report(args: &Value) -> Result<Value, String> {
     if arg_bool(args, "checkDrift", false) {
         if let Some(duckdb) = resolve_duckdb(arg_str(args, "duckdb")) {
             std::env::set_var("DUCKLE_DUCKDB_BIN", &duckdb);
-            // Resolve ${workspace}/${date} placeholders before reading sources,
-            // so drift hits the real files rather than a literal path.
-            let resolved = match arg_str(args, "workspace") {
-                Some(ws) => {
-                    let wsp = std::path::Path::new(ws);
-                    duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
-                    duckle_duckdb_engine::context::apply_workspace_context(&mut doc, wsp);
-                    serde_json::to_value(&doc).map_err(|e| e.to_string())?
-                }
-                None => v.clone(),
-            };
+            // The same resolution a run gets, for the same reason as
+            // schema_drift above: this read a placeholder rather than the
+            // source whenever a host or path came from a saved connection, the
+            // environment or a vault.
+            let doc = prepare_run_doc(&v, arg_str(args, "workspace"))?;
+            let resolved = serde_json::to_value(&doc).map_err(|e| e.to_string())?;
             let engine = DuckdbEngine::new(duckdb);
             return Ok(duckle_duckdb_engine::trust::trust_report(&resolved, Some(&engine)));
         }
