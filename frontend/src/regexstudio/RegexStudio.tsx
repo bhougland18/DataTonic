@@ -29,8 +29,10 @@ import {
     newPatternId,
     exportLibrary,
     importLibrary,
+    DESCRIPTION_MAX,
     type SavedPattern,
     type RegexTest,
+    type PatternScope,
 } from './library';
 import { chatSend, type ChatMessage } from '../tauri-bridge';
 import { isTauri } from '../tauri-dialog';
@@ -141,7 +143,9 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
     // Library
     const [library, setLibrary] = useState<SavedPattern[]>([]);
     const [libFilter, setLibFilter] = useState('');
-    const [saveName, setSaveName] = useState<string | null>(null);
+    const [saveForm, setSaveForm] = useState<{ name: string; description: string; scope: PatternScope } | null>(
+        null,
+    );
 
     // Persistent AI chat (collapsible, open by default)
     const [chatOpen, setChatOpen] = useState(true);
@@ -179,7 +183,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         setChatTurns([]);
         setChatError(null);
         setOneShotOpen(false);
-        setSaveName(null);
+        setSaveForm(null);
     }, [openRequest]);
 
     // Load the saved-pattern library for this workspace.
@@ -233,9 +237,16 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
     const libFiltered = useMemo(() => {
         const f = libFilter.trim().toLowerCase();
         return f
-            ? library.filter(p => p.name.toLowerCase().includes(f) || p.pattern.toLowerCase().includes(f))
+            ? library.filter(
+                  p =>
+                      p.name.toLowerCase().includes(f) ||
+                      p.pattern.toLowerCase().includes(f) ||
+                      (p.description ?? '').toLowerCase().includes(f),
+              )
             : library;
     }, [library, libFilter]);
+    const libGlobal = useMemo(() => libFiltered.filter(p => p.scope === 'global'), [libFiltered]);
+    const libWorkspace = useMemo(() => libFiltered.filter(p => p.scope !== 'global'), [libFiltered]);
 
     const togglePin = (v: string) =>
         setPinned(p => (p.includes(v) ? p.filter(x => x !== v) : [...p, v]));
@@ -270,16 +281,48 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         }
     }
 
+    const expectedPlaceholder =
+        mode === 'match' || mode === 'quality'
+            ? 'expect: match / no'
+            : mode === 'extract'
+              ? 'expected capture'
+              : 'expected output';
+
+    // Interpret a free-text expectation for match/quality modes as a boolean.
+    const boolExpected = (s: string): boolean | null => {
+        const t = s.trim().toLowerCase();
+        if (['match', 'matches', 'yes', 'true', 'pass', 'y', '1'].includes(t)) return true;
+        if (['no match', 'nomatch', 'no', 'false', 'fail', 'n', '0'].includes(t)) return false;
+        return null;
+    };
+
+    // Compare an expectation against the live outcome: 'pass' | 'fail' | null
+    // (null when nothing is expected or it can't be interpreted).
+    const checkExpected = (exp: string, p: ReturnType<typeof preview>): 'pass' | 'fail' | null => {
+        if (!exp.trim()) return null;
+        if (p.kind === 'bool') {
+            const want = boolExpected(exp);
+            return want === null ? null : want === p.hit ? 'pass' : 'fail';
+        }
+        if (p.kind === 'replace' || p.kind === 'extract') {
+            return exp.trim() === (p.out ?? '').trim() ? 'pass' : 'fail';
+        }
+        return null;
+    };
+
     // ---- Library actions ----
     const currentTests = (): RegexTest[] =>
         pinned.map(v => ({ value: v, expected: expected[v] || undefined }));
 
     const doSave = () => {
-        const name = (saveName ?? '').trim();
+        if (!saveForm) return;
+        const name = saveForm.name.trim();
         if (!name) return;
         const p: SavedPattern = {
             id: newPatternId(),
             name,
+            description: saveForm.description.trim().slice(0, DESCRIPTION_MAX) || undefined,
+            scope: saveForm.scope,
             mode,
             pattern,
             replacement: mode === 'replace' ? replacement : undefined,
@@ -291,7 +334,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         const next = upsertPattern(library, p);
         setLibrary(next);
         saveLibrary(workspacePath, next);
-        setSaveName(null);
+        setSaveForm(null);
     };
 
     const applySaved = (p: SavedPattern) => {
@@ -323,6 +366,32 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         saveLibrary(workspacePath, next);
     };
 
+    const renderLibItem = (p: SavedPattern) => (
+        <div key={p.id} className="rgx-lib-item" onClick={() => applySaved(p)} title="Apply to editor">
+            <div className="nm">
+                <span className="label">{p.name}</span>
+                <span className="badge">{p.mode}</span>
+                <button
+                    className="del"
+                    title="Delete"
+                    onClick={e => {
+                        e.stopPropagation();
+                        deleteSaved(p.id);
+                    }}
+                >
+                    <X size={12} />
+                </button>
+            </div>
+            {p.description && <div className="descr">{p.description}</div>}
+            <div className="pat">{p.pattern}</div>
+            {p.tests && p.tests.length > 0 && (
+                <div className="meta">
+                    {p.tests.length} test{p.tests.length > 1 ? 's' : ''}
+                </div>
+            )}
+        </div>
+    );
+
     // ---- AI ----
     function aiContext(): string {
         const lines: string[] = [];
@@ -338,9 +407,14 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         if (pattern.trim()) lines.push(`Current pattern: /${pattern}/`);
         if (mode === 'replace' && replacement) lines.push(`Current replacement: ${replacement}`);
         if (pinned.length) {
-            lines.push('Pinned tests (value → expected):');
+            lines.push('Pinned tests (value → current result | expected):');
             for (const v of pinned) {
-                lines.push(`- ${JSON.stringify(v)} → ${expected[v] ? JSON.stringify(expected[v]) : '(unspecified)'}`);
+                const p = preview(v);
+                let actual = '(n/a)';
+                if (p.kind === 'bool') actual = p.hit ? 'match' : 'no match';
+                else if (p.kind === 'replace' || p.kind === 'extract') actual = JSON.stringify(p.out ?? '');
+                const exp = expected[v] ? JSON.stringify(expected[v]) : '(unspecified)';
+                lines.push(`- ${JSON.stringify(v)} → current ${actual} | expected ${exp}`);
             }
         }
         lines.push('Return the regex inside a ```regex fenced block, then a one-line explanation.');
@@ -439,31 +513,64 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                         <Upload size={13} /> Export
                     </button>
                     <button
-                        onClick={() => setSaveName(nodeName ? `${nodeName} pattern` : 'New pattern')}
+                        onClick={() =>
+                            setSaveForm({
+                                name: nodeName ? `${nodeName} pattern` : 'New pattern',
+                                description: '',
+                                scope: 'workspace',
+                            })
+                        }
                         title="Save the current pattern"
                         disabled={!pattern.trim() || !lint.ok}
                     >
                         <Save size={13} /> Save
                     </button>
                 </div>
-                {saveName !== null && (
+                {saveForm !== null && (
                     <div className="rgx-lib-save">
                         <input
                             autoFocus
-                            value={saveName}
+                            value={saveForm.name}
                             placeholder="Pattern name"
-                            onChange={e => setSaveName(e.target.value)}
+                            onChange={e => setSaveForm(f => (f ? { ...f, name: e.target.value } : f))}
                             onKeyDown={e => {
                                 if (e.key === 'Enter') doSave();
-                                if (e.key === 'Escape') setSaveName(null);
+                                if (e.key === 'Escape') setSaveForm(null);
                             }}
                         />
-                        <button onClick={doSave} disabled={!saveName.trim()}>
-                            <Check size={13} />
-                        </button>
-                        <button onClick={() => setSaveName(null)}>
-                            <X size={13} />
-                        </button>
+                        <div className="rgx-lib-save-desc">
+                            <input
+                                value={saveForm.description}
+                                maxLength={DESCRIPTION_MAX}
+                                placeholder="Short description (optional)"
+                                onChange={e =>
+                                    setSaveForm(f => (f ? { ...f, description: e.target.value } : f))
+                                }
+                            />
+                            <span className="count">
+                                {saveForm.description.length}/{DESCRIPTION_MAX}
+                            </span>
+                        </div>
+                        <div className="rgx-lib-save-scope">
+                            <button
+                                className={saveForm.scope === 'workspace' ? 'on' : ''}
+                                onClick={() => setSaveForm(f => (f ? { ...f, scope: 'workspace' } : f))}
+                            >
+                                This workspace
+                            </button>
+                            <button
+                                className={saveForm.scope === 'global' ? 'on' : ''}
+                                onClick={() => setSaveForm(f => (f ? { ...f, scope: 'global' } : f))}
+                            >
+                                Global
+                            </button>
+                        </div>
+                        <div className="rgx-lib-save-actions">
+                            <button className="ok" onClick={doSave} disabled={!saveForm.name.trim()}>
+                                <Check size={13} /> Save
+                            </button>
+                            <button onClick={() => setSaveForm(null)}>Cancel</button>
+                        </div>
                     </div>
                 )}
                 <div className="rgx-lib-search">
@@ -471,29 +578,21 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                     <input value={libFilter} placeholder="Filter patterns…" onChange={e => setLibFilter(e.target.value)} />
                 </div>
                 <div className="rgx-lib-list">
-                    {libFiltered.length === 0 && (
+                    {library.length === 0 && (
                         <div className="rgx-lib-empty">No saved patterns yet. Build one, then Save.</div>
                     )}
-                    {libFiltered.map(p => (
-                        <div key={p.id} className="rgx-lib-item" onClick={() => applySaved(p)} title="Apply to editor">
-                            <div className="nm">
-                                {p.name}
-                                <span className="badge">{p.mode}</span>
-                                <button
-                                    className="del"
-                                    title="Delete"
-                                    onClick={e => {
-                                        e.stopPropagation();
-                                        deleteSaved(p.id);
-                                    }}
-                                >
-                                    <X size={12} />
-                                </button>
-                            </div>
-                            <div className="pat">{p.pattern}</div>
-                            {p.tests && p.tests.length > 0 && <div className="meta">{p.tests.length} test{p.tests.length > 1 ? 's' : ''}</div>}
-                        </div>
-                    ))}
+                    {libGlobal.length > 0 && (
+                        <>
+                            <div className="rgx-lib-sec">Global</div>
+                            {libGlobal.map(renderLibItem)}
+                        </>
+                    )}
+                    {libWorkspace.length > 0 && (
+                        <>
+                            <div className="rgx-lib-sec">This workspace</div>
+                            {libWorkspace.map(renderLibItem)}
+                        </>
+                    )}
                 </div>
             </aside>
 
@@ -686,15 +785,27 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                                                 </span>
                                             )}
                                             {p.kind === 'error' && <span className="tag err">{p.msg}</span>}
-                                            <input
-                                                className="rgx-expected"
-                                                placeholder="expected…"
-                                                value={expected[v] ?? ''}
-                                                onChange={e =>
-                                                    setExpected(x => ({ ...x, [v]: e.target.value }))
-                                                }
-                                                title="Optional expected outcome (sent to the AI as context)"
-                                            />
+                                            {(() => {
+                                                const verdict = checkExpected(expected[v] ?? '', p);
+                                                return (
+                                                    <div className="rgx-expected-wrap">
+                                                        {verdict && (
+                                                            <span className={`rgx-exp-verdict ${verdict}`}>
+                                                                {verdict === 'pass' ? '✓ meets' : '✗ differs'}
+                                                            </span>
+                                                        )}
+                                                        <input
+                                                            className="rgx-expected"
+                                                            placeholder={expectedPlaceholder}
+                                                            value={expected[v] ?? ''}
+                                                            onChange={e =>
+                                                                setExpected(x => ({ ...x, [v]: e.target.value }))
+                                                            }
+                                                            title="Optional expected outcome. Checked live against the result and sent to the AI as context."
+                                                        />
+                                                    </div>
+                                                );
+                                            })()}
                                         </div>
                                     </div>
                                 );

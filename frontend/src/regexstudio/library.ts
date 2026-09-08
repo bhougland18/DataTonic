@@ -13,9 +13,13 @@ export interface RegexTest {
     expected?: string; // optional expected outcome (feeds AI context)
 }
 
+export type PatternScope = 'workspace' | 'global';
+
 export interface SavedPattern {
     id: string;
     name: string;
+    description?: string; // short (<= 45 chars) summary
+    scope: PatternScope; // 'global' = available in every workspace
     mode: RegexMode;
     pattern: string;
     replacement?: string;
@@ -26,6 +30,8 @@ export interface SavedPattern {
     updatedAt: number;
 }
 
+export const DESCRIPTION_MAX = 45;
+
 const EXPORT_VERSION = 1;
 interface LibraryFile {
     kind: 'duckle.regex-library';
@@ -33,24 +39,38 @@ interface LibraryFile {
     patterns: SavedPattern[];
 }
 
-function keyFor(workspace?: string | null): string {
+const GLOBAL_KEY = 'duckle.regexlib::__global__';
+function workspaceKey(workspace?: string | null): string {
     return `duckle.regexlib::${workspace ?? 'default'}`;
 }
 
-export function loadLibrary(workspace?: string | null): SavedPattern[] {
+function readKey(key: string, scope: PatternScope): SavedPattern[] {
     try {
-        const raw = localStorage.getItem(keyFor(workspace));
+        const raw = localStorage.getItem(key);
         if (!raw) return [];
         const parsed = JSON.parse(raw) as SavedPattern[];
-        return Array.isArray(parsed) ? parsed : [];
+        if (!Array.isArray(parsed)) return [];
+        // Trust the store the entry came from for its scope.
+        return parsed.map(p => ({ ...p, scope }));
     } catch {
         return [];
     }
 }
 
+// The combined library for a workspace: global patterns first, then this
+// workspace's own. Each entry carries its `scope`.
+export function loadLibrary(workspace?: string | null): SavedPattern[] {
+    return [...readKey(GLOBAL_KEY, 'global'), ...readKey(workspaceKey(workspace), 'workspace')];
+}
+
+// Persist a combined list by splitting it back into the global and workspace
+// stores according to each entry's scope.
 export function saveLibrary(workspace: string | null | undefined, patterns: SavedPattern[]): void {
     try {
-        localStorage.setItem(keyFor(workspace), JSON.stringify(patterns));
+        const global = patterns.filter(p => p.scope === 'global');
+        const ws = patterns.filter(p => p.scope !== 'global');
+        localStorage.setItem(GLOBAL_KEY, JSON.stringify(global));
+        localStorage.setItem(workspaceKey(workspace), JSON.stringify(ws));
     } catch {
         // Storage full / unavailable — non-fatal; the in-memory list still works.
     }
@@ -118,7 +138,11 @@ function coerce(patterns: unknown): SavedPattern[] {
 function parseLibrary(text: string): SavedPattern[] {
     const data = JSON.parse(text) as LibraryFile | SavedPattern[];
     const patterns = Array.isArray(data) ? data : data?.patterns;
-    return coerce(patterns).map(p => ({ ...p, id: p.id || newPatternId() }));
+    return coerce(patterns).map(p => ({
+        ...p,
+        id: p.id || newPatternId(),
+        scope: p.scope === 'global' ? 'global' : 'workspace',
+    }));
 }
 
 // Returns the imported patterns, or null if cancelled, or throws with a message.

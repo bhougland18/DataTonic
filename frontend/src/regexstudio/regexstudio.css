@@ -79,29 +79,133 @@
 }
 .rgx-lib-save {
     display: flex;
+    flex-direction: column;
     gap: 6px;
-    padding: 0 12px 6px;
-}
-.rgx-lib-save input {
-    flex: 1;
-    background: var(--bg-0);
+    padding: 4px 12px 8px;
+    margin: 0 2px 4px;
     border: 1px solid var(--accent);
+    border-radius: 8px;
+    background: var(--accent-soft, rgba(255, 122, 69, 0.1));
+}
+.rgx-lib-save > input,
+.rgx-lib-save-desc input {
+    width: 100%;
+    background: var(--bg-0);
+    border: 1px solid var(--border-strong, var(--border));
     border-radius: 6px;
     padding: 6px 8px;
     color: var(--text-1);
     font-size: 12px;
     outline: none;
 }
-.rgx-lib-save button {
+.rgx-lib-save > input:focus,
+.rgx-lib-save-desc input:focus {
+    border-color: var(--accent);
+}
+.rgx-lib-save-desc {
+    position: relative;
+}
+.rgx-lib-save-desc .count {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 9.5px;
+    color: var(--text-4, var(--text-3));
+    pointer-events: none;
+}
+.rgx-lib-save-scope {
+    display: flex;
+    gap: 4px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px;
+}
+.rgx-lib-save-scope button {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text-3);
+    border-radius: 4px;
+    padding: 5px 6px;
+    font-size: 11px;
+    cursor: pointer;
+}
+.rgx-lib-save-scope button.on {
+    background: var(--accent);
+    color: #fff;
+    font-weight: 600;
+}
+.rgx-lib-save-actions {
+    display: flex;
+    gap: 6px;
+}
+.rgx-lib-save-actions button {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
     background: var(--bg-2);
     border: 1px solid var(--border);
     color: var(--text-2);
     border-radius: 6px;
-    padding: 0 8px;
+    padding: 6px;
+    font-size: 11.5px;
     cursor: pointer;
 }
-.rgx-lib-save button:hover:not(:disabled) {
-    color: var(--text-1);
+.rgx-lib-save-actions button.ok {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 600;
+}
+.rgx-lib-save-actions button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.rgx-lib-sec {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-4, var(--text-3));
+    padding: 10px 8px 4px;
+}
+.rgx-lib-item .nm .label {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rgx-lib-item .descr {
+    font-size: 10.5px;
+    color: var(--text-2);
+    margin-top: 2px;
+    line-height: 1.4;
+}
+
+/* expected-vs-actual verdict */
+.rgx-expected-wrap {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.rgx-exp-verdict {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+.rgx-exp-verdict.pass {
+    background: rgba(58, 156, 90, 0.16);
+    color: #6ee7a0;
+}
+.rgx-exp-verdict.fail {
+    background: rgba(255, 77, 109, 0.14);
+    color: #ff92a6;
 }
 .rgx-lib-search {
     display: flex;
