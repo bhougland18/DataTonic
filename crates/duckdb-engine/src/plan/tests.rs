@@ -2409,6 +2409,56 @@
     }
 
     #[test]
+    fn the_geospatial_sink_can_hilbert_order_its_geoparquet() {
+        // #241 follow-up. The Geospatial sink writes GeoParquet, but #319 put the
+        // Hilbert option only on snk.parquet - so the sink someone reaches for when
+        // the work IS geospatial was the one without the spatial optimisation, and
+        // the two sinks otherwise emit the same GeoParquet (verified: both footers
+        // carry the same `geo` key, version 1.0.0, primary_column geom).
+        use crate::plan::builders::build_spatial_sink;
+        let sql = build_spatial_sink(
+            &serde_json::json!({
+                "path": "/out/f.parquet", "driver": "GeoParquet", "hilbertColumn": "geom"
+            }),
+            "up",
+        );
+        assert!(sql.contains("ORDER BY ST_Hilbert(\"geom\""), "{sql}");
+        assert!(sql.contains("ST_Extent(ST_Extent_Agg(\"geom\"))"), "{sql}");
+        assert!(sql.contains("FORMAT PARQUET"), "{sql}");
+        // Same reason as the Parquet sink: geometry that arrived from a plain
+        // Parquet file does not taint this stage, and ST_Hilbert would then fail
+        // at write time, after the whole pipeline had already run.
+        assert!(sql.starts_with("INSTALL spatial; LOAD spatial;"), "{sql}");
+
+        // Not on the GDAL drivers. Hilbert ordering buys row-group pruning, and
+        // GeoJSON, Shapefile and friends have no row groups to prune.
+        for d in ["GeoJSON", "GPKG", "ESRI Shapefile"] {
+            let sql = build_spatial_sink(
+                &serde_json::json!({ "path": "/out/f", "driver": d, "hilbertColumn": "geom" }),
+                "up",
+            );
+            assert!(!sql.contains("ST_Hilbert"), "{d}: {sql}");
+            assert!(sql.contains("FORMAT GDAL"), "{d}: {sql}");
+        }
+
+        // A field cleared in the form arrives as "", and ordering by a column
+        // called "" would fail the write.
+        for value in ["", "   "] {
+            let off = build_spatial_sink(
+                &serde_json::json!({
+                    "path": "/out/f.parquet", "driver": "GeoParquet", "hilbertColumn": value
+                }),
+                "up",
+            );
+            assert_eq!(
+                off,
+                "COPY (SELECT * FROM \"up\") TO '/out/f.parquet' (FORMAT PARQUET)",
+                "{value:?} should be byte-for-byte the old output"
+            );
+        }
+    }
+
+    #[test]
     fn json_flatten_is_a_setting_and_repeated_keys_can_keep_their_parent() {
         // #238. Two things, reported together.
         //

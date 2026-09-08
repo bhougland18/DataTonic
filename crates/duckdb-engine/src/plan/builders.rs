@@ -6768,11 +6768,30 @@ pub(crate) fn build_spatial_sink(props: &JsonValue, from_view: &str) -> String {
     // key and the geometry keeps its CRS. So the option sits where it is looked for and
     // goes out through the writer that works.
     if driver.eq_ignore_ascii_case("geoparquet") || driver.eq_ignore_ascii_case("parquet") {
-        return format!(
-            "COPY (SELECT * FROM {}) TO '{}' (FORMAT PARQUET)",
-            quote_ident(from_view),
-            sql_escape(&path)
-        );
+        // #241 follow-up: the Hilbert option (#319) was only on snk.parquet, so the
+        // sink someone reaches for when the work IS geospatial was the one without
+        // the spatial optimisation. Same helper as the Parquet sink rather than a
+        // second copy of the clause, so the two cannot drift.
+        //
+        // Only on this branch: Hilbert ordering earns its keep through row-group
+        // pruning, and the GDAL drivers below have no row groups.
+        return match hilbert_order(props, from_view) {
+            None => format!(
+                "COPY (SELECT * FROM {}) TO '{}' (FORMAT PARQUET)",
+                quote_ident(from_view),
+                sql_escape(&path)
+            ),
+            Some(order_by) => format!(
+                // Spatial is loaded here for the same reason build_parquet_sink
+                // loads it: a GEOMETRY read back from a plain Parquet file does not
+                // taint this stage, and ST_Hilbert would then fail at write time,
+                // after the whole pipeline had already run.
+                "INSTALL spatial; LOAD spatial; COPY (SELECT * FROM {} {}) TO '{}' (FORMAT PARQUET)",
+                quote_ident(from_view),
+                order_by,
+                sql_escape(&path)
+            ),
+        };
     }
     // #328: a Shapefile's .dbf carries no encoding of its own, so GDAL writes
     // the platform default and a reader has nothing to go on - Arabic place

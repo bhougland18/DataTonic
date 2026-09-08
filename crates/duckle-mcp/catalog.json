@@ -31041,6 +31041,8 @@
                   {
                     "name": "Geospatial",
                     "extensions": [
+                      "geoparquet",
+                      "parquet",
                       "geojson",
                       "gpkg",
                       "shp",
@@ -31133,6 +31135,17 @@
                     "value": "GBK"
                   }
                 ]
+              },
+              {
+                "key": "hilbertColumn",
+                "label": "Spatial sort (Hilbert)",
+                "kind": "text",
+                "placeholder": "geometry column, e.g. geom",
+                "visibleWhen": {
+                  "key": "driver",
+                  "equals": "GeoParquet"
+                },
+                "description": "Name a GEOMETRY column to sort rows along a Hilbert curve before writing, so geometries that are close on the ground land in the same row group and a spatial filter can skip more of the file. The curve is scaled to this dataset’s own extent, which costs one extra pass over the data. Leave empty to write rows in the order they arrive."
               }
             ]
           }

@@ -1625,7 +1625,11 @@ function synthFileSink(comp: ComponentDef): ComponentManifest {
                         kind: 'save-path',
                         required: true,
                         filters: [
-                            { name: 'Geospatial', extensions: ['geojson', 'gpkg', 'shp', 'kml', 'gpx'] },
+                            // #241: GeoParquet is a driver here, so the save
+                            // dialog has to offer the extension - a format the
+                            // picker does not list is one nobody finds, which is
+                            // most of why the read side went unnoticed.
+                            { name: 'Geospatial', extensions: ['geoparquet', 'parquet', 'geojson', 'gpkg', 'shp', 'kml', 'gpx'] },
                             { name: 'All files', extensions: ['*'] },
                         ],
                     },
@@ -1673,6 +1677,25 @@ function synthFileSink(comp: ComponentDef): ComponentManifest {
                             { label: 'Shift-JIS  Japanese', value: 'SHIFT_JIS' },
                             { label: 'GBK  Simplified Chinese', value: 'GBK' },
                         ],
+                    },
+                    {
+                        // #241 follow-up. #319 put this on the Parquet sink only,
+                        // so the sink someone reaches for when the work IS
+                        // geospatial was the one without the spatial optimisation.
+                        //
+                        // Only for GeoParquet: the option buys row-group pruning,
+                        // and the GDAL drivers have no row groups. Same single
+                        // field as the Parquet sink rather than a checkbox plus a
+                        // column, because a checkbox ticked with no column chosen
+                        // leaves the engine guessing which column holds the
+                        // geometry.
+                        key: 'hilbertColumn',
+                        label: 'Spatial sort (Hilbert)',
+                        kind: 'text',
+                        placeholder: 'geometry column, e.g. geom',
+                        visibleWhen: { key: 'driver', equals: 'GeoParquet' },
+                        description:
+                            'Name a GEOMETRY column to sort rows along a Hilbert curve before writing, so geometries that are close on the ground land in the same row group and a spatial filter can skip more of the file. The curve is scaled to this dataset’s own extent, which costs one extra pass over the data. Leave empty to write rows in the order they arrive.',
                     },
                 ],
             },
