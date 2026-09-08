@@ -118,7 +118,11 @@ function extractPattern(text: string): string | null {
 interface ChatTurn {
     role: 'user' | 'assistant';
     content: string;
+    // Auto-generated correction turns (the verify-and-retry loop) render subtly.
+    auto?: boolean;
 }
+
+const MAX_AI_ATTEMPTS = 4; // 1 draft + up to 3 self-corrections
 
 export default function RegexStudio({ workspacePath, openRequest, onApplyToNode, onFetchColumn }: Props) {
     const lastNonce = useRef<number | null>(null);
@@ -393,65 +397,170 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
     );
 
     // ---- AI ----
+    interface Labeled {
+        value: string;
+        expected: string;
+    }
+    // Pinned tests that carry an explicit expectation — the AI's hard constraints.
+    const labeled = (): Labeled[] =>
+        pinned
+            .filter(v => (expected[v] ?? '').trim())
+            .map(v => ({ value: v, expected: (expected[v] ?? '').trim() }));
+
+    // Evaluate a CANDIDATE pattern against the labeled tests; return the misses.
+    // This is what closes the loop: the model's draft is checked with real RE2
+    // before we accept it.
+    const verifyCandidate = (pat: string): { value: string; want: string; got: string }[] => {
+        const fails: { value: string; want: string; got: string }[] = [];
+        for (const { value, expected: exp } of labeled()) {
+            let got = '';
+            let ok = false;
+            try {
+                if (mode === 'match' || mode === 'quality') {
+                    const hit = re2matches(pat, value);
+                    got = hit ? 'match' : 'no match';
+                    const want = boolExpected(exp);
+                    ok = want === null ? true : want === hit;
+                } else if (mode === 'replace') {
+                    got = re2replace(pat, value, replacement);
+                    ok = got.trim() === exp.trim();
+                } else {
+                    got = re2extract(pat, value, groupIndex);
+                    ok = got.trim() === exp.trim();
+                }
+            } catch {
+                got = '(invalid)';
+                ok = false;
+            }
+            if (!ok) fails.push({ value, want: exp, got });
+        }
+        return fails;
+    };
+
     function aiContext(): string {
         const lines: string[] = [];
         lines.push(
-            'You write regular expressions for DuckDB, which uses the Google RE2 engine. ' +
+            'You write ONE regular expression for DuckDB, which uses the Google RE2 engine. ' +
                 'RE2 does NOT support lookahead, lookbehind, or backreferences — never use them. ' +
-                'Replacement backreferences use \\1 \\2 syntax (not $1).',
+                'Replacement backreferences use \\1 \\2 (not $1).',
         );
-        lines.push(`Mode: ${MODE_LABEL[mode]} on column "${column}".`);
-        if (values.length) {
+        lines.push(`Task: ${MODE_LABEL[mode]} on column "${column}".`);
+
+        const L = labeled();
+        if (mode === 'match' || mode === 'quality') {
+            const pos = L.filter(x => boolExpected(x.expected) === true).map(x => x.value);
+            const neg = L.filter(x => boolExpected(x.expected) === false).map(x => x.value);
+            if (pos.length || neg.length) {
+                lines.push('HARD REQUIREMENTS — your regex MUST satisfy EVERY example below:');
+                if (pos.length) lines.push(`- MUST fully match: ${pos.map(v => JSON.stringify(v)).join(', ')}`);
+                if (neg.length) lines.push(`- MUST NOT match: ${neg.map(v => JSON.stringify(v)).join(', ')}`);
+                lines.push('Mentally test the regex against each example before answering; if any fails, fix it.');
+            }
+        } else if (L.length) {
+            lines.push('HARD REQUIREMENTS — produce EXACTLY these transformations:');
+            for (const x of L) lines.push(`- ${JSON.stringify(x.value)}  ->  ${JSON.stringify(x.expected)}`);
+            lines.push('Verify each transformation before answering.');
+        }
+
+        const unlabeled = pinned.filter(v => !(expected[v] ?? '').trim());
+        if (unlabeled.length) {
+            lines.push(
+                `Other sample values (no stated expectation): ${unlabeled.slice(0, 10).map(v => JSON.stringify(v)).join(', ')}.`,
+            );
+        } else if (values.length && L.length === 0) {
             lines.push(`Sample values: ${values.slice(0, 15).map(v => JSON.stringify(v)).join(', ')}.`);
         }
-        if (pattern.trim()) lines.push(`Current pattern: /${pattern}/`);
-        if (mode === 'replace' && replacement) lines.push(`Current replacement: ${replacement}`);
-        if (pinned.length) {
-            lines.push('Pinned tests (value → current result | expected):');
-            for (const v of pinned) {
-                const p = preview(v);
-                let actual = '(n/a)';
-                if (p.kind === 'bool') actual = p.hit ? 'match' : 'no match';
-                else if (p.kind === 'replace' || p.kind === 'extract') actual = JSON.stringify(p.out ?? '');
-                const exp = expected[v] ? JSON.stringify(expected[v]) : '(unspecified)';
-                lines.push(`- ${JSON.stringify(v)} → current ${actual} | expected ${exp}`);
-            }
+        if (pattern.trim()) {
+            lines.push(
+                `Current pattern: /${pattern}/${mode === 'replace' && replacement ? ` with replacement ${replacement}` : ''}.`,
+            );
         }
-        lines.push('Return the regex inside a ```regex fenced block, then a one-line explanation.');
+        lines.push('Return the regex inside a ```regex fenced block, then one short line explaining it.');
         return lines.join('\n');
     }
 
-    const sendChat = async () => {
-        const q = chatInput.trim();
-        if (!q || chatStreaming) return;
-        setChatInput('');
-        setChatError(null);
-        const history: ChatMessage[] = [
-            ...chatTurns.map(t => ({ role: t.role, content: t.content }) as ChatMessage),
-            { role: 'user', content: q },
-        ];
-        setChatTurns(t => [...t, { role: 'user', content: q }, { role: 'assistant', content: '' }]);
-        setChatStreaming(true);
-        let acc = '';
-        await chatSend(
-            history,
-            e => {
-                if (e.kind === 'token') {
-                    acc += e.text;
-                    setChatTurns(t => {
-                        const c = [...t];
-                        c[c.length - 1] = { role: 'assistant', content: acc };
-                        return c;
-                    });
-                    chatBodyRef.current?.scrollTo({ top: chatBodyRef.current.scrollHeight });
-                } else if (e.kind === 'error') {
-                    setChatError(e.message);
-                }
-            },
-            workspacePath,
-            aiContext(),
+    const buildCorrection = (
+        draft: string,
+        fails: { value: string; want: string; got: string }[],
+    ): string => {
+        const lines = [`Your pattern /${draft}/ FAILED these required examples:`];
+        for (const f of fails) {
+            lines.push(`- ${JSON.stringify(f.value)} → your regex gives "${f.got}", but it MUST be "${f.want}".`);
+        }
+        lines.push(
+            'Return a corrected RE2 regex in a ```regex block that satisfies ALL required examples. Do not repeat the failing pattern.',
         );
-        setChatStreaming(false);
+        return lines.join('\n');
+    };
+
+    // Drive the model with a verify-and-retry loop: draft → check the draft
+    // against the labeled expectations with real RE2 → if any fail, feed back the
+    // exact misses and ask again, up to MAX_AI_ATTEMPTS. Small local models get
+    // far more reliable with this closed loop than with a single shot.
+    const runAgent = async (seed: string) => {
+        if (chatStreaming || !seed.trim()) return;
+        setChatError(null);
+        const history: ChatMessage[] = chatTurns.map(t => ({ role: t.role, content: t.content }) as ChatMessage);
+        history.push({ role: 'user', content: seed });
+        setChatTurns(t => [...t, { role: 'user', content: seed }]);
+        setChatStreaming(true);
+        try {
+            for (let attempt = 1; attempt <= MAX_AI_ATTEMPTS; attempt++) {
+                setChatTurns(t => [...t, { role: 'assistant', content: '' }]);
+                let acc = '';
+                await chatSend(
+                    history,
+                    e => {
+                        if (e.kind === 'token') {
+                            acc += e.text;
+                            setChatTurns(t => {
+                                const c = [...t];
+                                c[c.length - 1] = { role: 'assistant', content: acc };
+                                return c;
+                            });
+                            chatBodyRef.current?.scrollTo({ top: chatBodyRef.current.scrollHeight });
+                        } else if (e.kind === 'error') {
+                            setChatError(e.message);
+                        }
+                    },
+                    workspacePath,
+                    aiContext(),
+                );
+                history.push({ role: 'assistant', content: acc });
+                const draft = extractPattern(acc);
+                const fails = draft ? verifyCandidate(draft) : [];
+                if (!draft || labeled().length === 0 || fails.length === 0) break;
+                if (attempt >= MAX_AI_ATTEMPTS) {
+                    setChatTurns(t => [
+                        ...t,
+                        {
+                            role: 'assistant',
+                            auto: true,
+                            content: `⚠︎ ${fails.length} expected test${fails.length > 1 ? 's' : ''} still unmet after ${attempt} tries. Refine the pattern or adjust the expectations.`,
+                        },
+                    ]);
+                    break;
+                }
+                history.push({ role: 'user', content: buildCorrection(draft, fails) });
+                setChatTurns(t => [
+                    ...t,
+                    {
+                        role: 'user',
+                        auto: true,
+                        content: `Auto-check: ${fails.length} test${fails.length > 1 ? 's' : ''} still failing — retrying.`,
+                    },
+                ]);
+            }
+        } finally {
+            setChatStreaming(false);
+        }
+    };
+
+    const sendChat = () => {
+        const q = chatInput.trim();
+        if (!q) return;
+        setChatInput('');
+        void runAgent(q);
     };
 
     const runOneShot = async () => {
@@ -891,20 +1000,47 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                                     </div>
                                 )}
                                 {chatTurns.map((t, i) => {
-                                    const draft = t.role === 'assistant' ? extractPattern(t.content) : null;
+                                    const draft = t.role === 'assistant' && !t.auto ? extractPattern(t.content) : null;
+                                    const total = labeled().length;
+                                    const fails = draft && total ? verifyCandidate(draft) : [];
                                     return (
-                                        <div key={i} className={`rgx-msg ${t.role}`}>
+                                        <div key={i} className={`rgx-msg ${t.role}${t.auto ? ' auto' : ''}`}>
                                             <div className="bubble">{t.content || (chatStreaming ? '…' : '')}</div>
                                             {draft && (
-                                                <button className="use" onClick={() => setPattern(draft)}>
-                                                    <Check size={12} /> Use this pattern
-                                                </button>
+                                                <div className="rgx-msg-foot">
+                                                    {total > 0 && (
+                                                        <span className={`chip ${fails.length === 0 ? 'ok' : 'no'}`}>
+                                                            {fails.length === 0
+                                                                ? `✓ passes all ${total}`
+                                                                : `✗ ${fails.length}/${total} failing`}
+                                                        </span>
+                                                    )}
+                                                    <button className="use" onClick={() => setPattern(draft)}>
+                                                        <Check size={12} /> Use this pattern
+                                                    </button>
+                                                </div>
                                             )}
                                         </div>
                                     );
                                 })}
                                 {chatError && <div className="rgx-col-err">{chatError}</div>}
                             </div>
+                            {labeled().length > 0 && (
+                                <div className="rgx-chat-quick">
+                                    <button
+                                        onClick={() =>
+                                            void runAgent(
+                                                `Write a RE2 regex for column "${column}" (${MODE_LABEL[mode]} mode) that satisfies all ${labeled().length} of my expected tests.`,
+                                            )
+                                        }
+                                        disabled={chatStreaming}
+                                        title="Draft a pattern, auto-verify it against your expected values, and retry until it passes"
+                                    >
+                                        <Sparkles size={12} /> Draft to pass my {labeled().length} expected test
+                                        {labeled().length > 1 ? 's' : ''}
+                                    </button>
+                                </div>
+                            )}
                             <div className="rgx-chat-foot">
                                 <textarea
                                     value={chatInput}

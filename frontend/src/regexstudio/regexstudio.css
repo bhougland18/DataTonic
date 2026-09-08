@@ -997,3 +997,60 @@
     opacity: 0.5;
     cursor: not-allowed;
 }
+
+/* verify-and-retry: message chip + auto (self-correction) turns */
+.rgx-msg-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.rgx-msg-foot .chip {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 4px;
+}
+.rgx-msg-foot .chip.ok {
+    background: rgba(58, 156, 90, 0.16);
+    color: #6ee7a0;
+}
+.rgx-msg-foot .chip.no {
+    background: rgba(255, 77, 109, 0.14);
+    color: #ff92a6;
+}
+.rgx-msg.auto {
+    align-items: center;
+}
+.rgx-msg.auto .bubble {
+    background: transparent;
+    border: 1px dashed var(--border-strong, var(--border));
+    border-radius: 6px;
+    padding: 4px 10px;
+    max-width: 100%;
+    color: var(--text-3);
+    font-size: 11px;
+    font-style: italic;
+}
+.rgx-chat-quick {
+    padding: 8px 14px 0;
+}
+.rgx-chat-quick button {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    background: var(--accent-soft, rgba(255, 122, 69, 0.16));
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 11.5px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.rgx-chat-quick button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
