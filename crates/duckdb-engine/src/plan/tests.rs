@@ -1055,6 +1055,48 @@
         assert_eq!(b2, "SELECT * FROM ducklake_table_changes('duckle_src', 'main', 'orders', 1, 3)");
     }
 
+    /// #114. The Visual Mapper's Type column was written by the form into
+    /// `mapper.outputs[].type` and never read here, so the real column type was
+    /// whatever the expression produced. Picking DATE changed nothing, the
+    /// node's declared schema disagreed with its own output, and casting inside
+    /// the expression was the only thing that worked.
+    #[test]
+    fn the_mapper_casts_each_output_to_the_type_it_declares() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["input".into()]);
+        let sql = build_mapper(
+            &ni,
+            &serde_json::json!({
+                "mapper": { "outputs": [
+                    { "name": "dob",    "expression": "date_of_birth", "type": "date" },
+                    { "name": "amount", "expression": "amt",           "type": "int64" },
+                    { "name": "note",   "expression": "memo" },
+                ]}
+            }),
+        )
+        .expect("builds");
+        assert!(sql.contains("CAST(date_of_birth AS DATE) AS \"dob\""), "got: {sql}");
+        assert!(sql.contains("CAST(amt AS BIGINT) AS \"amount\""), "got: {sql}");
+        // An output with no declared type is left exactly as it was, so a
+        // hand-authored or AI-written mapper does not acquire a cast.
+        assert!(sql.contains("memo AS \"note\""), "got: {sql}");
+        assert!(!sql.contains("CAST(memo"), "got: {sql}");
+    }
+
+    /// The key-value `expressions` spellings carry no type, so they must stay
+    /// byte-for-byte what they were.
+    #[test]
+    fn a_mapper_written_as_expressions_is_unchanged() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["input".into()]);
+        let sql = build_mapper(
+            &ni,
+            &serde_json::json!({ "expressions": { "total": "qty * price" } }),
+        )
+        .expect("builds");
+        assert_eq!(sql, "SELECT qty * price AS \"total\" FROM \"input\"");
+    }
+
     #[test]
     fn diffsummary_reduces_change_feed() {
         // xf.diffsummary: counts insert/delete/update_postimage from a change

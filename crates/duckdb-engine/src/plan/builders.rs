@@ -4356,19 +4356,33 @@ pub(crate) struct MapLookup {
     kind: &'static str,
 }
 
+/// Wrap a mapper output in the type its author declared (#114).
+///
+/// Applied after `strip_port_prefixes` / `qualify_port_refs` rather than before,
+/// so those keep rewriting the expression the author wrote rather than a `CAST`
+/// wrapped around it.
+fn cast_to(expr: &str, ty: Option<&str>) -> String {
+    match ty {
+        Some(t) => format!("CAST({expr} AS {t})"),
+        None => expr.to_string(),
+    }
+}
+
 pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<String, String> {
     let upstream = inputs.main().ok_or_else(|| "mapper: missing main input".to_string())?;
 
-    // Collect the output (name, raw expression) pairs. The Map form writes
-    // either `expressions` (key-value: out name -> SQL) or a structured
-    // `mapper.outputs` array ({name, expression}). Both are accepted.
-    let mut outputs: Vec<(String, String)> = Vec::new();
+    // Collect the output (name, raw expression, declared SQL type) triples. The
+    // Map form writes either `expressions` (key-value: out name -> SQL) or a
+    // structured `mapper.outputs` array ({name, expression, type}). Both are
+    // accepted; only the structured form carries a type, so the key-value
+    // spellings stay byte-for-byte what they were.
+    let mut outputs: Vec<(String, String, Option<&'static str>)> = Vec::new();
     if let Some(pairs) = props.get("expressions").and_then(JsonValue::as_array) {
         for kv in pairs {
             let name = kv.get("key").and_then(JsonValue::as_str).unwrap_or("").trim();
             let expr = kv.get("value").and_then(JsonValue::as_str).unwrap_or("").trim();
             if !name.is_empty() && !expr.is_empty() {
-                outputs.push((name.to_string(), expr.to_string()));
+                outputs.push((name.to_string(), expr.to_string(), None));
             }
         }
     }
@@ -4381,7 +4395,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
         for (name, expr) in map {
             let expr = expr.as_str().unwrap_or("").trim();
             if !name.trim().is_empty() && !expr.is_empty() {
-                outputs.push((name.trim().to_string(), expr.to_string()));
+                outputs.push((name.trim().to_string(), expr.to_string(), None));
             }
         }
     }
@@ -4395,8 +4409,23 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
                     .and_then(JsonValue::as_str)
                     .unwrap_or("")
                     .trim();
+                // #114: the Visual Mapper's Type column, which was written here
+                // by the form and read by nothing - so choosing DATE changed
+                // nothing, and the node's declared schema disagreed with the
+                // data it actually produced. An unrecognised or absent type
+                // casts nothing, which is what a hand-authored mapper has.
+                let ty = o
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .and_then(|s| {
+                        serde_json::from_value::<duckle_metadata::DataType>(JsonValue::String(
+                            s.trim().to_string(),
+                        ))
+                        .ok()
+                    })
+                    .map(|d| data_type_to_duckdb_sql(&d));
                 if !name.is_empty() && !expr.is_empty() {
-                    outputs.push((name.to_string(), expr.to_string()));
+                    outputs.push((name.to_string(), expr.to_string(), ty));
                 }
             }
         }
@@ -4469,7 +4498,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
     let configured: std::collections::BTreeSet<&str> =
         lookups.iter().map(|l| l.port.as_str()).collect();
     let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (_, expr) in &outputs {
+    for (_, expr, _) in &outputs {
         referenced.extend(referenced_lookup_ports(expr));
     }
     if let Some(f) = &filter {
@@ -4501,12 +4530,12 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
             let inner: Vec<String> = outputs
                 .iter()
                 .enumerate()
-                .map(|(i, (_, expr))| format!("{} AS \"__m{}\"", strip_port_prefixes(expr), i))
+                .map(|(i, (_, expr, ty))| format!("{} AS \"__m{}\"", cast_to(&strip_port_prefixes(expr), *ty), i))
                 .collect();
             let outer: Vec<String> = outputs
                 .iter()
                 .enumerate()
-                .map(|(i, (name, _))| format!("\"__m{}\" AS {}", i, quote_ident(name)))
+                .map(|(i, (name, _, _))| format!("\"__m{}\" AS {}", i, quote_ident(name)))
                 .collect();
             let mut inner_sql =
                 format!("SELECT {} FROM {}", inner.join(", "), quote_ident(upstream));
@@ -4518,7 +4547,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
         }
         let terms: Vec<String> = outputs
             .iter()
-            .map(|(name, expr)| format!("{} AS {}", strip_port_prefixes(expr), quote_ident(name)))
+            .map(|(name, expr, ty)| format!("{} AS {}", cast_to(&strip_port_prefixes(expr), *ty), quote_ident(name)))
             .collect();
         let mut sql = format!("SELECT {} FROM {}", terms.join(", "), quote_ident(upstream));
         if let Some(predicate) = &filter {
@@ -4541,7 +4570,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
     }
     let terms: Vec<String> = outputs
         .iter()
-        .map(|(name, expr)| format!("{} AS {}", qualify_port_refs(expr, &aliases), quote_ident(name)))
+        .map(|(name, expr, ty)| format!("{} AS {}", cast_to(&qualify_port_refs(expr, &aliases), *ty), quote_ident(name)))
         .collect();
 
     // FROM main JOIN lookup_1 ON main.k = lookup_1.k [AND ...] JOIN ...
@@ -4582,10 +4611,10 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
 ///
 /// Only then does the naming have to be moved out of the way; leaving every other mapper
 /// as it was keeps the SQL it emits, and the tests that read it, unchanged.
-fn shadows_an_input(outputs: &[(String, String)]) -> bool {
+fn shadows_an_input(outputs: &[(String, String, Option<&'static str>)]) -> bool {
     let names: std::collections::BTreeSet<&str> =
-        outputs.iter().map(|(n, _)| n.as_str()).collect();
-    outputs.iter().any(|(_, expr)| {
+        outputs.iter().map(|(n, _, _)| n.as_str()).collect();
+    outputs.iter().any(|(_, expr, _)| {
         let mut in_string = false;
         let mut word = String::new();
         let mut hit = false;
