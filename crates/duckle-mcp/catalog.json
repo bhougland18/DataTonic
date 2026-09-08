@@ -25752,7 +25752,7 @@
                 "label": "Struct column to flatten",
                 "kind": "column",
                 "required": true,
-                "description": "Expands the struct's fields into top-level columns."
+                "description": "Expands the struct's fields into top-level columns, keeping one row. For a LIST or ARRAY column use Explode / Unnest instead, which produces one row per element."
               }
             ]
           }
@@ -26116,7 +26116,7 @@
                 "label": "Array column",
                 "kind": "column",
                 "required": true,
-                "description": "One output row per element, other columns repeated."
+                "description": "A LIST or ARRAY column: one output row per element, other columns repeated. A NULL or empty array still yields one row, so the row is not lost. For a STRUCT column use Flatten instead, which expands its fields into columns and keeps one row."
               }
             ]
           }

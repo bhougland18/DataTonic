@@ -6589,8 +6589,10 @@ function synthJsonTransform(comp: ComponentDef): ComponentManifest {
     }
     if (id === 'xf.json.flatten') {
         return base(comp, [{ label: 'Flatten', fields: [
+            // #118: the other half of the pair. Someone reaching for Explode on
+            // a STRUCT lands here, so say so from this side too.
             { key: 'column', label: 'Struct column to flatten', kind: 'column', required: true,
-              description: "Expands the struct's fields into top-level columns." },
+              description: "Expands the struct's fields into top-level columns, keeping one row. For a LIST or ARRAY column use Explode / Unnest instead, which produces one row per element." },
         ] }], 'declared');
     }
     if (id === 'xf.json.merge') {
@@ -6678,8 +6680,12 @@ function synthArrayTransform(comp: ComponentDef): ComponentManifest {
     }
     if (id === 'xf.arr.explode') {
         return base(comp, [{ label: 'Explode / Unnest', fields: [
+            // #118: says LIST/ARRAY, and names the component that handles the
+            // other case. Pointed at a STRUCT this node fails with DuckDB's
+            // `length(STRUCT(...))` binder error, which names an internal guard
+            // rather than the choice the author actually got wrong.
             { key: 'column', label: 'Array column', kind: 'column', required: true,
-              description: 'One output row per element, other columns repeated.' },
+              description: 'A LIST or ARRAY column: one output row per element, other columns repeated. A NULL or empty array still yields one row, so the row is not lost. For a STRUCT column use Flatten instead, which expands its fields into columns and keeps one row.' },
         ] }], 'declared');
     }
     if (id === 'xf.zip') {
