@@ -1986,7 +1986,15 @@ fn authorize(req: &Request, state: &State) -> Access {
     // machine. The editor has blocked cross-origin state changes since it shipped and the
     // console did not, so `fetch('http://127.0.0.1:8080/api/run', ...)` from a random site
     // ran a workspace pipeline. Same guard, same place in the request.
-    if req.method != "GET" && req.path.starts_with("/api/") && !guard_local(req, &state.host) {
+    //
+    // GHSA-c3jh-48x5-mhpw: and it covers GET too. It did not, because the threat
+    // modelled was a state change - but the exposure in Local mode is READING.
+    // DNS rebinding makes an attacker's page same-origin with the loopback
+    // console, and every GET then answers as a local admin: the audit log names
+    // people, pipelines carry SQL and connection references, logs carry whatever
+    // ran. A guard that stops the writes and serves the reads stops nothing that
+    // matters here.
+    if req.path.starts_with("/api/") && !guard_local(req, &state.host) {
         return Access::Refused(respond_403("blocked: cross-origin or non-local request"));
     }
 
@@ -5189,6 +5197,100 @@ mod tests {
             forwarded_proto: None,
             body: Vec::new(),
         }
+    }
+
+
+    /// A console bound to loopback with nothing configured, which is what
+    /// `duckle-runner serve` does by default.
+    fn local_state(ws: &std::path::Path) -> std::sync::Arc<State> {
+        std::sync::Arc::new(State {
+            workspace: ws.to_path_buf(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(
+                Default::default(),
+            )),
+            running: Mutex::new(std::collections::HashSet::new()),
+            runs: Mutex::new(std::collections::HashMap::new()),
+            console: console_auth::Console::configure(ws, "127.0.0.1", None).unwrap(),
+            host: "127.0.0.1".into(),
+            tick_interval: std::time::Duration::from_secs(15),
+            oidc: None,
+            oidc_endpoints: Mutex::new(None),
+            oidc_logins: Mutex::new(Default::default()),
+        })
+    }
+
+    /// A request that reached a loopback console under an attacker's hostname,
+    /// which is what DNS rebinding produces: the socket is 127.0.0.1, the Host
+    /// header is not.
+    fn rebound(method: &str, path: &str) -> Request {
+        Request {
+            method: method.into(),
+            path: path.into(),
+            query: std::collections::HashMap::new(),
+            origin: Some("http://rebind.attacker.example".into()),
+            host: Some("rebind.attacker.example:8080".into()),
+            authorization: None,
+            cookie: None,
+            forwarded_proto: None,
+            body: Vec::new(),
+        }
+    }
+
+    /// GHSA-c3jh-48x5-mhpw: the rebinding guard skipped GET.
+    ///
+    /// A loopback console with nothing configured is `Mode::Local`, where every
+    /// caller is a local Admin - the reasoning being that reaching the socket
+    /// means already being on the machine. A rebound DNS name breaks that: the
+    /// browser treats the attacker's page as same-origin with 127.0.0.1, so its
+    /// GETs arrive from a page the operator merely visited.
+    ///
+    /// The guard existed and was sound; it was applied only to non-GET, because
+    /// the threat modelled was a state change rather than a read. Reads are the
+    /// whole exposure here: the audit log names people, and pipelines carry SQL
+    /// and connection references.
+    #[test]
+    fn a_rebound_get_cannot_read_a_local_console() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = local_state(tmp.path());
+
+        for path in [
+            "/api/audit",
+            "/api/admin/users",
+            "/api/pipelines",
+            "/api/runs",
+            "/api/log",
+        ] {
+            let reply = route_console(&rebound("GET", path), &state);
+            assert_eq!(
+                reply.code(),
+                403,
+                "{path} answered a request that arrived under an attacker's hostname",
+            );
+        }
+    }
+
+    /// The other half, so the fix is not "refuse everything": the console's own
+    /// GETs still work. Same socket, honest Host.
+    #[test]
+    fn a_local_get_from_the_console_itself_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = local_state(tmp.path());
+        let reply = route_console(&request("GET", "/api/runs", None), &state);
+        assert_ne!(
+            reply.code(),
+            403,
+            "a loopback GET with a loopback Host is the ordinary local case",
+        );
+    }
+
+    /// And the health check, which orchestrators call without a credential and
+    /// which is not under /api at all, is unaffected either way.
+    #[test]
+    fn the_health_check_is_not_caught_by_the_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = local_state(tmp.path());
+        assert_eq!(route_console(&request("GET", HEALTH_PATH, None), &state).code(), 200);
     }
 
     fn guarded_state(ws: &std::path::Path) -> std::sync::Arc<State> {
