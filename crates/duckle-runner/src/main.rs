@@ -899,6 +899,26 @@ fn run_artifact(payload: Vec<u8>) -> ExitCode {
     std::env::set_var("DUCKLE_WORKSPACE", &ws_root);
     std::env::set_var("DUCKLE_LOG_DIR", ws_root.join("logs"));
 
+    // The same lock `run()` takes, for the same reason: an artifact run writes
+    // the pipeline's sinks and advances its saved state like any other run.
+    //
+    // Both workspaces this resolves to are shared. An operator-supplied
+    // DUCKLE_WORKSPACE is the real data dir, and may already have a schedule
+    // firing this pipeline. The self-contained fallback is the extraction cache,
+    // which is hash-keyed and therefore shared by every run OF THIS ARTIFACT -
+    // so two invocations of the same bundle race on one `.duckle/` watermark
+    // even with no workspace supplied.
+    //
+    // Refusing the second is the right answer in both: those two runs write the
+    // same sink paths as well, so they were never independent.
+    let _run_lock = match duckle_duckdb_engine::runlock::claim_for_run(&ws_root, &name) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("duckle-runner: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     // Resolve the operator-supplied secrets.env PER INVOCATION: next to the
     // artifact exe first, then CWD. It is read at its real location and never
     // copied into the shared, hash-keyed extraction cache - copying it there
