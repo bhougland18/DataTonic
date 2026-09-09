@@ -667,8 +667,15 @@ export async function deployTargetClaim(
     name: string,
     url: string,
     adminLabel: string,
+    setupCode: string,
 ): Promise<string> {
-    return await invoke<string>('deploy_target_claim', { workspacePath, name, url, adminLabel });
+    return await invoke<string>('deploy_target_claim', {
+        workspacePath,
+        name,
+        url,
+        adminLabel,
+        setupCode,
+    });
 }
 
 /** Save a server that is already set up, with a key an administrator gave you. */

@@ -1392,8 +1392,9 @@ fn deploy_target_claim(
     name: String,
     url: String,
     admin_label: String,
+    setup_code: String,
 ) -> Result<String, String> {
-    deploy::claim(&ws_path(&workspace_path), &name, &url, &admin_label)
+    deploy::claim(&ws_path(&workspace_path), &name, &url, &admin_label, &setup_code)
 }
 
 #[tauri::command]

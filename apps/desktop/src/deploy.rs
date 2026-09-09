@@ -155,18 +155,32 @@ pub fn probe(url: &str) -> Result<String, String> {
 ///
 /// This is the whole point of the desktop being the setup client: a server can be brought
 /// up in a cloud with no shell session, and finished from here.
+///
+/// `setup_code` is what the server printed to its own output when it started
+/// (GHSA-x7pg-4h32-8r25). The operator reads it from the terminal or from
+/// `docker logs` and pastes it here: reaching the address is not proof of
+/// ownership, and reading the server's output is.
 pub fn claim(
     workspace: &Path,
     name: &str,
     url: &str,
     admin_label: &str,
+    setup_code: &str,
 ) -> Result<String, String> {
     let url = clean_url(url)?;
     let label = admin_label.trim();
     if label.is_empty() {
         return Err("an administrator needs a name".into());
     }
-    let payload = serde_json::to_string(&json!({ "label": label })).map_err(|e| e.to_string())?;
+    let code = setup_code.trim();
+    if code.is_empty() {
+        return Err(
+            "this server needs the setup code it printed when it started. Read it from the              server's own output - the terminal it runs in, or `docker logs` - and paste it here."
+                .into(),
+        );
+    }
+    let payload =
+        serde_json::to_string(&json!({ "label": label, "code": code })).map_err(|e| e.to_string())?;
     let resp = http_client()?
         .post(format!("{url}/api/setup/claim"))
         .header("Content-Type", "application/json")

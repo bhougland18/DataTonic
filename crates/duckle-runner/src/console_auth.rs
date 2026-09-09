@@ -126,6 +126,17 @@ pub struct Console {
     mode: Mutex<Mode>,
     /// When an unclaimed console started, so the window can close.
     opened_at: i64,
+    /// GHSA-x7pg-4h32-8r25: the out-of-band proof that whoever is claiming this
+    /// console can also read its output.
+    ///
+    /// `Some` only in [`Mode::Unclaimed`] - the case where the port is reachable
+    /// off the machine and nothing is configured. Minted per process and never
+    /// stored, so a restart re-opens the window with a NEW code rather than a
+    /// standing password.
+    ///
+    /// Without it, "claiming works exactly once" was the entire defence, and it
+    /// does not hold when the attacker is the one who does it once.
+    setup_code: Option<String>,
     /// Where the credential database lives.
     workspace: PathBuf,
     /// Accounts, sessions and API keys. Behind a mutex because a SQLite connection is Send
@@ -239,12 +250,27 @@ impl Console {
             // when setup means opening a page: there would be nothing to open.
             (true, false) => Mode::Unclaimed,
         };
-        if mode == Mode::Unclaimed {
+        // The setup code exists only for the exposed case. On loopback the
+        // caller is already on the machine, which is the whole point of
+        // Mode::Local, and demanding a code there would break every laptop.
+        let setup_code = match mode {
+            Mode::Unclaimed => Some(mint_setup_code()?),
+            _ => None,
+        };
+        if let Some(code) = &setup_code {
+            // Printed rather than served: reading this is the proof. Whoever can
+            // see the terminal or `docker logs` is the operator; whoever can only
+            // reach the port is not.
             eprintln!(
                 "duckle-runner: NOT SET UP. This console is reachable on {host} and has no \
-                 accounts, so for the next {} minutes anyone who can reach it can claim it \
-                 and become its administrator. Open it now and finish setup, or stop it and \
-                 start again with DUCKLE_CONSOLE_TOKEN set.",
+                 accounts, so for the next {} minutes it can be claimed by someone holding \
+                 the setup code below. Open it now and finish setup, or stop it and start \
+                 again with DUCKLE_CONSOLE_TOKEN set.\n\
+                 \n\
+                 \x20   setup code: {code}\n\
+                 \n\
+                 Anyone who can read this line can take administrator. It is new every time \
+                 the server starts, and it is never written to disk.",
                 CLAIM_WINDOW_SECS / 60
             );
         }
@@ -252,6 +278,7 @@ impl Console {
             ephemeral,
             mode: Mutex::new(mode),
             opened_at: now_secs(),
+            setup_code,
             open: unconfigured && loopback,
             accounts: Mutex::new(accounts),
             store: Mutex::new(store),
@@ -360,11 +387,25 @@ impl Console {
         self.mode() == Mode::Unclaimed && now_secs() - self.opened_at < CLAIM_WINDOW_SECS
     }
 
+    /// The code this process printed, which a claim must quote back.
+    ///
+    /// `None` on loopback, where there is no claim to make.
+    pub fn setup_code(&self) -> Option<String> {
+        self.setup_code.clone()
+    }
+
     /// Take an unclaimed console: create its first administrator and close the window.
     ///
-    /// Returns the new token once. Refuses if the console was already claimed, which is
-    /// what makes this safe to expose without a credential: it works exactly once.
-    pub fn claim(&self, label: &str) -> Result<String, String> {
+    /// Returns the new token once. Refuses if the console was already claimed, and
+    /// refuses unless `code` matches what this process printed to its own output
+    /// (GHSA-x7pg-4h32-8r25). "It works exactly once" was the whole defence and is
+    /// not one: the first caller to reach an exposed port was whoever got there
+    /// first, which on a public address is not the operator.
+    ///
+    /// A wrong code does NOT close the window. Burning it on a failed guess would
+    /// hand anyone who can reach the port the power to stop the operator from ever
+    /// finishing setup; the code is 128 bits, so guessing is not the exposure.
+    pub fn claim(&self, label: &str, code: &str) -> Result<String, String> {
         if self.mode() != Mode::Unclaimed {
             return Err("this console has already been set up".into());
         }
@@ -374,6 +415,18 @@ impl Console {
                  DUCKLE_CONSOLE_TOKEN and set up from there"
                     .into(),
             );
+        }
+        match &self.setup_code {
+            Some(expected) if constant_time_eq(expected.as_bytes(), code.trim().as_bytes()) => {}
+            _ => {
+                return Err(
+                    "that setup code is not the one this server printed when it started. Read \
+                     it from the server's own output - the terminal it runs in, or `docker \
+                     logs` - and enter it here. Being able to read that output is what proves \
+                     you are the operator rather than someone who can reach the port."
+                        .into(),
+                )
+            }
         }
         let label = label.trim();
         if label.is_empty() {
@@ -555,6 +608,27 @@ fn read_accounts_file(workspace: &Path) -> Result<Vec<Account>, String> {
         }
     }
     Ok(accounts)
+}
+
+/// A one-time setup code, 128 bits, for the claim window (GHSA-x7pg-4h32-8r25).
+///
+/// Hex rather than base64 because it is read off a terminal and typed into a
+/// browser by a person, and `-`/`_`/case confusion is how that goes wrong.
+fn mint_setup_code() -> Result<String, String> {
+    let mut raw = [0u8; 16];
+    getrandom::fill(&mut raw).map_err(|e| format!("setup code rng: {e}"))?;
+    Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Compare without leaking where two byte strings first differ.
+///
+/// The code has 128 bits of entropy, so a timing oracle is not the realistic
+/// attack; this costs nothing and removes the question.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Write an account file for `label` with a freshly generated token, returning
@@ -854,7 +928,8 @@ mod tests {
         let ws = tmp.path();
         let console = Console::configure(ws, "0.0.0.0", None).expect("starts");
 
-        let token = console.claim("sourav").expect("claim succeeds");
+        let code = console.setup_code().expect("an exposed console mints one");
+        let token = console.claim("sourav", &code).expect("claim succeeds");
         let claimed = Console::configure(ws, "0.0.0.0", None).expect("starts");
         assert_eq!(claimed.mode(), Mode::Claimed, "claiming must configure it");
 
@@ -871,15 +946,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let console = Console::configure(ws, "0.0.0.0", None).expect("starts");
-        console.claim("first").expect("first claim succeeds");
+        let code = console.setup_code().expect("an exposed console mints one");
+        console.claim("first", &code).expect("first claim succeeds");
 
-        let err = console.claim("second").expect_err("a second claim must be refused");
+        let err = console.claim("second", &code).expect_err("a second claim must be refused");
         assert!(err.contains("already been set up"), "unhelpful refusal: {err}");
 
         // And a fresh process sees a configured console, not a claimable one.
         let after = Console::configure(ws, "0.0.0.0", None).expect("starts");
         assert!(!after.claimable());
-        assert!(after.claim("third").is_err(), "a claimed console stayed claimable");
+        let after_code = after.setup_code().unwrap_or_default();
+        assert!(
+            after.claim("third", &after_code).is_err(),
+            "a claimed console stayed claimable"
+        );
     }
 
     /// A box someone started and walked away from must not stay open to whoever finds it.
@@ -894,7 +974,8 @@ mod tests {
         console.opened_at = now_secs() - CLAIM_WINDOW_SECS - 1;
         assert!(!console.claimable(), "the window should have closed");
 
-        let err = console.claim("late").expect_err("claiming after the window must fail");
+        let code = console.setup_code().expect("an exposed console mints one");
+        let err = console.claim("late", &code).expect_err("claiming after the window must fail");
         assert!(err.contains("Restart"), "the refusal should say how to recover: {err}");
     }
 
@@ -1141,5 +1222,71 @@ mod tests {
         // console back to unauthenticated, which is the worst possible default.
         assert!(Console::configure(ws, "0.0.0.0", None).is_err());
         assert!(Console::configure(ws, "127.0.0.1", None).is_err());
+    }
+
+    /// GHSA-x7pg-4h32-8r25: "it works exactly once" is no protection when the
+    /// attacker is the one who does it once.
+    ///
+    /// An unclaimed console reachable off the machine handed administrator to
+    /// whoever asked first, and every restart re-opened the window. The official
+    /// container shipped exactly that: `--host 0.0.0.0` with no credential.
+    ///
+    /// Claiming from off the machine now needs the setup code the server prints
+    /// to its own stdout. The operator reads it from the terminal or from
+    /// `docker logs`; a network client cannot.
+    #[test]
+    fn claiming_off_the_machine_needs_the_code_printed_to_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let console = Console::configure(ws, "0.0.0.0", None).expect("starts");
+        assert_eq!(console.mode(), Mode::Unclaimed);
+
+        let code = console.setup_code().expect("an exposed console mints a setup code");
+        assert!(code.len() >= 16, "a guessable code is not a guard: {code:?}");
+
+        let err = console.claim("attacker", "").expect_err("no code must be refused");
+        assert!(err.contains("setup code"), "the refusal must name what is missing: {err}");
+        let err = console.claim("attacker", "not-the-code").expect_err("a wrong code is refused");
+        assert!(err.contains("setup code"), "{err}");
+
+        // A wrong guess must not burn the window, or anyone who can reach the
+        // port can stop the operator from ever finishing setup.
+        assert!(console.claimable(), "a failed guess denied the operator their own console");
+
+        let token = console.claim("sourav", &code).expect("the operator has the code");
+        assert!(!token.is_empty());
+        assert_eq!(console.mode(), Mode::Claimed);
+    }
+
+    /// The code is per process. A restart re-opens the claim window - that is
+    /// the behaviour the advisory calls a recurring takeover target - so the
+    /// code it prints has to be a new one, or reading the log once would be
+    /// enough forever.
+    #[test]
+    fn a_restart_mints_a_different_setup_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let first = Console::configure(ws, "0.0.0.0", None).expect("starts");
+        let second = Console::configure(ws, "0.0.0.0", None).expect("restarts");
+        assert_ne!(
+            first.setup_code(),
+            second.setup_code(),
+            "a code that survives a restart is a password nobody chose",
+        );
+        // And the first process's code is no good against the second's window.
+        let stale = first.setup_code().unwrap();
+        assert!(second.claim("sourav", &stale).is_err(), "a stale code still worked");
+    }
+
+    /// Loopback is untouched: the caller is already on the machine, which is the
+    /// whole reason `Mode::Local` exists. There is no code because there is no
+    /// claim - and a local console that started demanding one would break every
+    /// `duckle-runner serve` on a laptop.
+    #[test]
+    fn a_local_console_has_no_setup_code_to_need() {
+        let tmp = tempfile::tempdir().unwrap();
+        let console = Console::configure(tmp.path(), "127.0.0.1", None).expect("starts");
+        assert_eq!(console.mode(), Mode::Local);
+        assert!(console.setup_code().is_none(), "loopback needs no out-of-band proof");
     }
 }

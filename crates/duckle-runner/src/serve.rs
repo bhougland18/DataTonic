@@ -2200,7 +2200,11 @@ fn public_route(req: &Request, state: &State) -> Reply {
     if req.method == "POST" && req.path == SETUP_CLAIM_PATH {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
         let label = body.get("label").and_then(|v| v.as_str()).unwrap_or("");
-        return match state.console.claim(label) {
+        // GHSA-x7pg-4h32-8r25: the code this process printed to its own output.
+        // Reaching the port is not enough; reading the log is what proves the
+        // claimant is the operator.
+        let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        return match state.console.claim(label, code) {
             Ok(token) => {
                 // Worth an audit line of its own: this is the moment the server acquired
                 // an owner, and it is the one event with nobody to attribute it to yet.
@@ -2208,7 +2212,19 @@ fn public_route(req: &Request, state: &State) -> Reply {
                 eprintln!("duckle-runner: claimed by '{label}'; setup is closed");
                 respond_json(&json!({ "token": token, "label": label, "role": "admin" }))
             }
-            Err(e) => respond_err("409 Conflict", &e),
+            // A refused claim is recorded too. Repeated lines here are someone
+            // guessing at the setup code, and that is the one thing an operator
+            // would want to see in the audit log rather than infer from silence.
+            Err(e) => {
+                audit::record(
+                    &state.workspace,
+                    None,
+                    "console.claim_refused",
+                    label,
+                    audit::Outcome::Denied,
+                );
+                respond_err("409 Conflict", &e)
+            }
         };
     }
     sign_in(state, req)

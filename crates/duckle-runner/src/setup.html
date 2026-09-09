@@ -61,12 +61,18 @@
 
     <label for="label">Your name</label>
     <input id="label" autocomplete="username" placeholder="e.g. sourav" autofocus />
+
+    <label for="code">Setup code</label>
+    <input id="code" autocomplete="off" spellcheck="false" placeholder="from the server's own output" />
+
     <button id="go">Claim this server</button>
     <div class="err hide" id="err"></div>
 
     <div class="note">
-      Until someone claims it, anyone who can reach this address can. If that is not what you
-      expected, stop the server now and start it again with <code>DUCKLE_CONSOLE_TOKEN</code> set.
+      The server printed a setup code when it started. Read it from the terminal it runs in, or
+      from <code>docker logs</code>. Being able to see that output is what tells this server you
+      are its operator and not someone who merely reached the address. The code is new every
+      restart and is never stored.
     </div>
   </div>
 
@@ -84,13 +90,15 @@
   const claim = async () => {
     const label = $("label").value.trim();
     if (!label) { $("label").focus(); return; }
+    const code = $("code").value.trim();
+    if (!code) { $("code").focus(); return; }
     $("go").disabled = true;
     $("err").classList.add("hide");
     try {
       const res = await fetch("/api/setup/claim", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ label }),
+        body: JSON.stringify({ label, code }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "setup failed");
@@ -105,5 +113,6 @@
   };
   $("go").addEventListener("click", claim);
   $("label").addEventListener("keydown", (e) => { if (e.key === "Enter") claim(); });
+  $("code").addEventListener("keydown", (e) => { if (e.key === "Enter") claim(); });
   $("continue").addEventListener("click", () => { location.href = "/"; });
 </script>

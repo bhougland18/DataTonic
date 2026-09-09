@@ -127,6 +127,8 @@ export default function SetupWizard({ workspacePath, onDone }: Props) {
     const [url, setUrl] = useState('');
     const [name, setName] = useState('production');
     const [admin, setAdmin] = useState('');
+    // GHSA-x7pg: the code the server printed to its own output when it started.
+    const [setupCode, setSetupCode] = useState('');
     const [apiKey, setApiKey] = useState('');
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -199,13 +201,13 @@ export default function SetupWizard({ workspacePath, onDone }: Props) {
         setBusy(true);
         setError(null);
         try {
-            setAdminToken(await deployTargetClaim(workspacePath, name, url, admin));
+            setAdminToken(await deployTargetClaim(workspacePath, name, url, admin, setupCode));
             setBusy(false);
             setStep('done');
         } catch (e) {
             fail(e);
         }
-    }, [workspacePath, name, url, admin]);
+    }, [workspacePath, name, url, admin, setupCode]);
 
     const saveKey = useCallback(async () => {
         setBusy(true);
@@ -420,6 +422,25 @@ export default function SetupWizard({ workspacePath, onDone }: Props) {
                             placeholder="e.g. sourav"
                             autoFocus
                         />
+                        <label className="setup-label" htmlFor="setup-code">
+                            Setup code
+                        </label>
+                        <input
+                            id="setup-code"
+                            className="setup-input"
+                            value={setupCode}
+                            onChange={(e) => setSetupCode(e.target.value)}
+                            placeholder="from the server's own output"
+                            spellCheck={false}
+                            autoComplete="off"
+                        />
+                        <p className="setup-note">
+                            <ShieldCheck size={14} /> The server printed a setup code when it
+                            started. Read it from the terminal it runs in, or from{' '}
+                            <code>docker logs</code>. Seeing that output is what proves you own
+                            the server rather than merely being able to reach it. The code is new
+                            every restart and is never stored.
+                        </p>
                         <p className="setup-note">
                             <ShieldCheck size={14} /> Its key is saved here, encrypted, and never
                             shown again. That is the whole of what this machine keeps.
@@ -432,7 +453,7 @@ export default function SetupWizard({ workspacePath, onDone }: Props) {
                             <button
                                 className="setup-next"
                                 onClick={claim}
-                                disabled={busy || !admin.trim()}
+                                disabled={busy || !admin.trim() || !setupCode.trim()}
                             >
                                 {busy ? <Loader2 size={15} className="spin" /> : null}
                                 Claim it
