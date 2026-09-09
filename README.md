@@ -1865,6 +1865,15 @@ check runs when the plan is built **and again when it is applied**, so that
 The **audit log is never pruned by age**: it is the record of the prune's own
 deletions, and every prune appends to it.
 
+**The last publication of an asset with a freshness SLA is kept**, whatever
+`--materializations-days` says. Freshness reads the publication log as well as
+run history, and run history is a rolling window per pipeline - so for an asset
+published less often than that window, the log holds the only record that it was
+ever written. Aging that out does not retire a stale fact, it deletes the answer,
+and a declared SLA with no known write reads as **stale**. A 30-day horizon would
+otherwise report a 90-day SLA as breached 45 days early. Superseded publications
+of the same asset still age out, and an asset with no declared SLA is unaffected.
+
 `--dry-run` and a real prune call the same planning function and differ only in
 whether the deletion runs, so the two cannot disagree about what would go.
 

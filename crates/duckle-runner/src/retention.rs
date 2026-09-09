@@ -46,8 +46,22 @@
 //! failed delivery                        -> never pruned BY AGE; it is retryable
 //! event a retained delivery refers to    -> protected
 //! receipt a retained event or delivery names -> protected, whatever the count
+//! last publication of an SLA'd asset     -> protected; freshness reads it
 //! delivered, past the horizon            -> history, and eligible
 //! ```
+//!
+//! That fifth rule is the one that is easy to miss. Freshness is the union of
+//! run history and the publication log, and run history is a rolling window PER
+//! PIPELINE, so for an asset published less often than that window the log holds
+//! the only surviving record that it was ever written. Aging that record out
+//! does not remove a stale fact, it removes the ANSWER - and a declared SLA with
+//! no known write reads as STALE. A 30-day materialization horizon would
+//! otherwise report a 90-day SLA as breached 45 days early, which is retention
+//! raising a false alarm about an asset that is fine.
+//!
+//! The alternative was a documented requirement that materialization retention
+//! must exceed every freshness SLA. Correctness resting on an operator noticing
+//! a relationship between two unrelated-looking numbers is what this avoids.
 //!
 //! And the consequence, which is a semantic and not a side effect:
 //!
@@ -129,6 +143,62 @@ fn horizon(days: u64) -> String {
     (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339()
 }
 
+/// Events that outlive an age horizon, given what else is being kept.
+///
+/// Two things keep an event past its horizon:
+///
+/// - **A retained delivery names it.** That is pending work, not history.
+/// - **It is the last publication of an asset that declares a freshness SLA.**
+///   Freshness is the union of run history and this log, and history is a
+///   rolling window PER PIPELINE, so for an asset published less often than that
+///   window the log holds the only surviving record that it was ever written.
+///   Dropping it does not age out a fact, it destroys the answer: freshness
+///   reads the absence as "never written", which `sla::verdict` reads as STALE.
+///   An asset published 45 days ago against a 90-day SLA is fine, and a 30-day
+///   retention would otherwise report it as failing 45 days early.
+///
+/// Only the LAST publication, and only for an asset that declares an SLA.
+/// Everything it supersedes still ages out, and an asset nobody has declared a
+/// freshness expectation for is pruned as before - an operator who asked for 30
+/// days does not silently get "forever" for every asset in the workspace.
+///
+/// It protects the last publication whether or not that publication is still
+/// INSIDE its SLA, which keeps one rule for both `maximumAge` and
+/// `expectedAfterSchedule`. The schedule-derived deadline cannot be evaluated
+/// here without the schedule, and two rules that disagree about which
+/// publications survive would be worse than one that keeps a little extra: the
+/// cost is one event per SLA'd asset.
+fn protected_events(
+    all_events: &[duckle_duckdb_engine::materialize::Event],
+    kept_deliveries: &[duckle_duckdb_engine::subscribe::Delivery],
+    owners: &duckle_duckdb_engine::catalog::Owners,
+) -> std::collections::BTreeSet<String> {
+    use duckle_duckdb_engine::{materialize::Event, sla};
+
+    let mut protected: std::collections::BTreeSet<String> =
+        kept_deliveries.iter().map(|d| d.event_id.clone()).collect();
+    // Compare rather than take the last appended: the log is written in order,
+    // but two pipelines can publish one asset, which is the same reason
+    // catalog::freshness compares instead of assuming.
+    let mut newest: std::collections::BTreeMap<&str, &Event> = std::collections::BTreeMap::new();
+    for event in all_events {
+        for asset in &event.assets {
+            if !sla::declares_freshness(owners, asset) {
+                continue;
+            }
+            let better = match newest.get(asset.as_str()) {
+                Some(existing) => event.committed_at > existing.committed_at,
+                None => true,
+            };
+            if better {
+                newest.insert(asset.as_str(), event);
+            }
+        }
+    }
+    protected.extend(newest.values().map(|e| e.event_id.clone()));
+    protected
+}
+
 /// #303: what a prune would remove from the materialization and delivery
 /// ledgers, and which runs must survive because something retained names them.
 ///
@@ -158,9 +228,8 @@ pub fn plan_ledgers(
         });
     }
 
-    // An event a retained delivery still refers to is not history yet.
-    let protected: std::collections::BTreeSet<String> =
-        kept_deliveries.iter().map(|d| d.event_id.clone()).collect();
+    let owners = duckle_duckdb_engine::catalog::load_owners(workspace).unwrap_or_default();
+    let protected = protected_events(&all_events, &kept_deliveries, &owners);
     let (kept_events, dropped_events) = match policy.materializations_days {
         Some(days) => materialize::retain(&all_events, &horizon(days), &protected),
         None => (all_events.clone(), Vec::new()),
@@ -171,7 +240,7 @@ pub fn plan_ledgers(
             records: dropped_events.len(),
             kept: kept_events.len(),
             reason: format!(
-                "published more than {days} days ago and unreferenced; a subscription can only replay what is still here"
+                "published more than {days} days ago, unreferenced, and superseded; a subscription can only replay what is still here, and the last publication of each asset is kept so freshness can still see it"
             ),
         });
     }
@@ -195,10 +264,10 @@ pub fn apply_ledgers(workspace: &Path, policy: &Policy) -> Vec<LedgerPrune> {
         let _ = subscribe::keep_only(workspace, &kept_deliveries);
     }
     if let Some(days) = policy.materializations_days {
-        let protected: std::collections::BTreeSet<String> =
-            kept_deliveries.iter().map(|d| d.event_id.clone()).collect();
-        let (kept, _) =
-            materialize::retain(&materialize::read(workspace), &horizon(days), &protected);
+        let all_events = materialize::read(workspace);
+        let owners = duckle_duckdb_engine::catalog::load_owners(workspace).unwrap_or_default();
+        let protected = protected_events(&all_events, &kept_deliveries, &owners);
+        let (kept, _) = materialize::retain(&all_events, &horizon(days), &protected);
         let _ = materialize::keep_only(workspace, &kept);
     }
     // AC5: a prune is auditable, and that has to cover the ledgers too. Records
@@ -709,5 +778,116 @@ mod reference_aware {
         let before = materialize::read(ws.path()).len();
         apply_ledgers(ws.path(), &Policy::default());
         assert_eq!(materialize::read(ws.path()).len(), before);
+    }
+
+    /// #303 x #304: pruning must not destroy the evidence freshness reads.
+    ///
+    /// Freshness is the union of run history and the publication log. History
+    /// is a rolling window per pipeline, so for an asset published less often
+    /// than that window it is the LOG that carries the answer. Age out the last
+    /// publication of an asset that is still well inside its declared SLA and
+    /// freshness sees no write at all, which an SLA reads as stale - a false
+    /// alarm raised by retention, on an asset that is fine.
+    ///
+    /// Retention is 30 days here and the publication is 45 days old, so the
+    /// event IS past the horizon. Keeping it anyway is the point: the last
+    /// publication of an asset is the one fact the log exists to hold.
+    #[test]
+    fn the_last_publication_of_an_asset_survives_its_retention_horizon() {
+        let ws = tempfile::tempdir().unwrap();
+        let asset = "/data/monthly_rollup.parquet";
+        let published = (chrono::Utc::now() - chrono::Duration::days(45)).to_rfc3339();
+
+        // The declared SLA is what makes this publication evidence rather than
+        // history: 90 days, and the write was 45 days ago.
+        std::fs::write(
+            ws.path().join("owners.json"),
+            r#"{"assets":[{"match":"/data/*","owner":"data-eng","maximumAge":"90d"}]}"#,
+        )
+        .unwrap();
+
+        materialize::keep_only(
+            ws.path(),
+            &[materialize::Event {
+                event_id: "mat-45d".into(),
+                pipeline_id: "producer".into(),
+                run_id: None,
+                release_id: None,
+                partition_key: None,
+                trigger: "scheduled".into(),
+                committed_at: published.clone(),
+                assets: vec![asset.into()],
+            }],
+        )
+        .unwrap();
+
+        // The rolling window has moved on: 60 later runs of the same pipeline,
+        // none of which wrote this asset. This is what history looks like by
+        // the time the question is asked, and why the log has to answer it.
+        std::fs::create_dir_all(ws.path().join("runs")).unwrap();
+        let unrelated: Vec<serde_json::Value> = (0..60)
+            .map(|i| {
+                serde_json::json!({
+                    "at": (chrono::Utc::now() - chrono::Duration::days(40 - i)).to_rfc3339(),
+                    "status": "ok",
+                    "durationMs": 1,
+                    "rows": 1,
+                    "nodeCount": 1,
+                    "trigger": "scheduled",
+                    "assets": [],
+                })
+            })
+            .collect();
+        std::fs::write(
+            ws.path().join("runs").join("producer.json"),
+            serde_json::to_string(&unrelated).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            duckle_duckdb_engine::catalog::freshness(ws.path()).contains_key(asset),
+            "precondition: the asset is fresh before the prune",
+        );
+
+        apply_ledgers(ws.path(), &Policy { materializations_days: Some(30), ..Default::default() });
+
+        let fresh = duckle_duckdb_engine::catalog::freshness(ws.path());
+        assert_eq!(
+            fresh.get(asset).map(|f| f.last_written_at.as_str()),
+            Some(published.as_str()),
+            "a 30-day retention must not make a 45-day-old publication vanish; \
+             an asset with a 90-day SLA is still fresh and now reads as never written",
+        );
+    }
+
+    /// The other side of it, so "keep the last one" does not quietly become
+    /// "keep everything": earlier publications of the same asset still age out.
+    #[test]
+    fn only_the_last_publication_is_held_back() {
+        let ws = tempfile::tempdir().unwrap();
+        let asset = "/data/daily.parquet";
+        std::fs::write(
+            ws.path().join("owners.json"),
+            r#"{"assets":[{"match":"/data/*","owner":"data-eng","maximumAge":"90d"}]}"#,
+        )
+        .unwrap();
+        let ev = |id: &str, days: i64| materialize::Event {
+            event_id: id.into(),
+            pipeline_id: "producer".into(),
+            run_id: None,
+            release_id: None,
+            partition_key: None,
+            trigger: "scheduled".into(),
+            committed_at: (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339(),
+            assets: vec![asset.into()],
+        };
+        materialize::keep_only(ws.path(), &[ev("old-1", 90), ev("old-2", 60), ev("newest", 45)])
+            .unwrap();
+
+        apply_ledgers(ws.path(), &Policy { materializations_days: Some(30), ..Default::default() });
+
+        let kept: Vec<String> =
+            materialize::read(ws.path()).into_iter().map(|e| e.event_id).collect();
+        assert_eq!(kept, ["newest"], "the superseded publications are history");
     }
 }

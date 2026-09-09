@@ -99,6 +99,30 @@ pub fn parse_duration(s: &str) -> Option<i64> {
     Some(n * mult)
 }
 
+/// Does this asset declare a freshness SLA of either kind?
+///
+/// #303 x #304: retention needs this. Freshness is the union of run history and
+/// the publication log, and history is a rolling window PER PIPELINE, so for an
+/// asset published less often than that window the log holds the only surviving
+/// record that it was ever written. Aging that record out does not remove a
+/// stale fact, it removes the answer - and `verdict` reads "declared but never
+/// written" as STALE, so retention would report a perfectly fresh asset as
+/// failing its SLA.
+///
+/// First matching rule wins, the order [`crate::catalog::Owners`] documents, so
+/// a specific rule above a general one decides for both.
+pub fn declares_freshness(owners: &crate::catalog::Owners, asset: &str) -> bool {
+    owners
+        .assets
+        .iter()
+        .find(|r| {
+            // A pattern that will not compile matches nothing, exactly as the
+            // catalog's own ownership lookup treats it.
+            glob::Pattern::new(&r.pattern).map(|p| p.matches(asset)).unwrap_or(false)
+        })
+        .is_some_and(|r| r.maximum_age.is_some() || r.expected_after_schedule.is_some())
+}
+
 /// Where one asset stands, given its declared limit and how old it is.
 ///
 /// The single definition of "stale". The clock check and the catalog view both
