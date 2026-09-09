@@ -1429,7 +1429,13 @@ impl DuckdbEngine {
         // export path is already redacted (compile_pipeline_sql_opts); this
         // covers the execution path. (Named distinctly from the SECRET-prelude
         // `secrets` bound later in this fn.)
-        let redact_secrets = collect_secrets(doc);
+        // The workspace as well as the document: a context variable marked
+        // `secret: true` and substituted into an ordinary property is a secret
+        // because of where it came from, and nothing about the property it
+        // landed in says so.
+        let secret_ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.trim().is_empty());
+        let redact_secrets =
+            collect_secrets(doc, secret_ws.as_deref().map(std::path::Path::new));
 
         let compiled = match target {
             Some(t) => plan::compile_partial(doc, t),
@@ -6999,7 +7005,11 @@ pub fn compile_pipeline_sql_opts(
     let secrets = if include_secrets {
         Vec::new()
     } else {
-        collect_secrets(doc)
+        // Same reasoning as the execution path: an exported script would
+        // otherwise carry a context secret in plaintext wherever it was
+        // substituted into a property this does not recognise as secret.
+        let ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.trim().is_empty());
+        collect_secrets(doc, ws.as_deref().map(std::path::Path::new))
     };
     // The batched executor wraps a publish group in one transaction. The export
     // has to show it, or the script a user copies out is not the script that

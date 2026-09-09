@@ -145,8 +145,69 @@ pub(crate) fn secret_placeholder(key: &str) -> String {
 /// are handled at replace time by [`replace_delimited`], not by dropping the
 /// secret. Sorted longest-value-first so a value that contains another is
 /// replaced first.
-pub(crate) fn collect_secrets(doc: &PipelineDoc) -> Vec<Secret> {
+/// The plaintext values of every workspace context variable marked
+/// `secret: true`.
+///
+/// Collected by ORIGIN rather than by the name of the property they end up in.
+/// `collect_secrets` recognises a credential by its key - `password`, `token`
+/// and friends - which is right for a value the author typed into a secret
+/// field and wrong for one that arrived through `${...}`. A context variable
+/// marked secret and substituted into an ordinary property such as `url` was in
+/// no redaction set at all, so a connector error carrying the resolved URL
+/// persisted the plaintext into run history and the NDJSON log, both of which a
+/// viewer can read.
+///
+/// Best-effort, exactly like the loader it mirrors: a missing or unparseable
+/// context file yields nothing rather than failing the run. A secret that
+/// cannot be read cannot leak through substitution either, because it was never
+/// substituted.
+pub(crate) fn secret_context_values(workspace: &std::path::Path) -> Vec<String> {
+    let repo: JsonValue = std::fs::read_to_string(workspace.join("repository.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(JsonValue::Array(Vec::new()));
+    let mut out = Vec::new();
+    for it in repo.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        if it.get("type").and_then(|v| v.as_str()) != Some("context") {
+            continue;
+        }
+        let Some(id) = it.get("id").and_then(|v| v.as_str()) else { continue };
+        let payload: JsonValue = match std::fs::read_to_string(
+            workspace.join("contexts").join(format!("{id}.json")),
+        )
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        for v in payload.get("variables").and_then(|v| v.as_array()).unwrap_or(&Vec::new()) {
+            if v.get("secret").and_then(|s| s.as_bool()) != Some(true) {
+                continue;
+            }
+            if let Some(val) = v.get("value").and_then(|x| x.as_str()) {
+                // Same two exclusions the property scan makes: an empty value
+                // would splice the placeholder across everything, and a `${...}`
+                // is a reference rather than the secret itself.
+                let t = val.trim();
+                if !t.is_empty() && !t.starts_with("${") {
+                    out.push(val.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn collect_secrets(doc: &PipelineDoc, workspace: Option<&std::path::Path>) -> Vec<Secret> {
     let mut out: Vec<Secret> = Vec::new();
+    // Values that are secret because of where they CAME FROM, not because of
+    // the property they landed in.
+    if let Some(ws) = workspace {
+        for value in secret_context_values(ws) {
+            out.push(Secret { value, placeholder: "DUCKLE_CONTEXT_SECRET".to_string() });
+        }
+    }
     for node in &doc.nodes {
         if let Some(JsonValue::Object(props)) = node.data.properties.as_ref() {
             for (key, val) in props {
@@ -1842,5 +1903,77 @@ mod url_resolve_tests {
     fn nothing_usable_is_none_rather_than_an_error() {
         assert_eq!(resolve_url(PAGE, "   "), None);
         assert_eq!(resolve_url("not a url", "x"), None);
+    }
+}
+
+#[cfg(test)]
+mod context_secret_redaction_tests {
+    use super::*;
+
+    /// A context variable marked `secret: true` must be redacted wherever it was
+    /// substituted, not only where the property name looks like a credential.
+    ///
+    /// `collect_secrets` recognised a secret by its KEY - `password`, `token`
+    /// and friends - which is right for a value typed into a secret field and
+    /// wrong for one that arrived through `${...}`. Substituted into an ordinary
+    /// property such as `url`, the value was in no redaction set, so a connector
+    /// error carrying the resolved URL persisted the plaintext into run history
+    /// and the NDJSON log - both readable by the lowest-privilege role.
+    #[test]
+    fn a_secret_context_value_is_redacted_wherever_it_was_substituted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::write(
+            ws.join("repository.json"),
+            r#"[{"type":"context","id":"prod","name":"Prod"}]"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join("contexts")).unwrap();
+        std::fs::write(
+            ws.join("contexts").join("prod.json"),
+            r#"{"variables":[
+                 {"key":"apiKey","value":"s3cr3t-token-value","secret":true},
+                 {"key":"region","value":"eu-west-1","secret":false},
+                 {"key":"blank","value":"","secret":true},
+                 {"key":"ref","value":"${ENV:SOMETHING}","secret":true}
+               ]}"#,
+        )
+        .unwrap();
+
+        let values = secret_context_values(ws);
+        assert!(
+            values.contains(&"s3cr3t-token-value".to_string()),
+            "a secret context value was not collected: {values:?}"
+        );
+        assert!(
+            !values.contains(&"eu-west-1".to_string()),
+            "a NON-secret context value must not be redacted, or ordinary values \
+             disappear from errors: {values:?}"
+        );
+        // Same two exclusions the property scan makes.
+        assert!(!values.iter().any(|v| v.trim().is_empty()), "{values:?}");
+        assert!(!values.iter().any(|v| v.starts_with("${")), "{values:?}");
+
+        // And the whole point: the value reaches the redaction set even though
+        // it was substituted into `url`, which is not a secret-looking key.
+        let doc: PipelineDoc = serde_json::from_str(
+            r#"{"nodes":[{"id":"r","position":{"x":0,"y":0},"data":{"label":"R",
+               "componentId":"src.rest",
+               "properties":{"url":"https://api.example.com/v1?key=s3cr3t-token-value"}}}],
+               "edges":[]}"#,
+        )
+        .unwrap();
+        assert!(
+            collect_secrets(&doc, None)
+                .iter()
+                .all(|s| s.value != "s3cr3t-token-value"),
+            "without the workspace there is nothing to learn the secret from"
+        );
+        assert!(
+            collect_secrets(&doc, Some(ws))
+                .iter()
+                .any(|s| s.value == "s3cr3t-token-value"),
+            "the secret was substituted into `url` and never entered the redaction set"
+        );
     }
 }
