@@ -6654,7 +6654,7 @@ impl DuckdbEngine {
         out: &mut Vec<JsonValue>,
         artifacts: &mut Vec<crate::ArtifactRef>,
     ) -> Result<(), EngineError> {
-        let leaf = name.rsplit('/').next().unwrap_or(name).to_string();
+        let leaf = member_leaf(name).to_string();
         let key = match spec.naming.as_str() {
             "flat" => leaf.clone(),
             // Content-addressed naming would need the hash before the key, and
@@ -22301,14 +22301,36 @@ fn source_path_of(src: &str) -> String {
     }
 }
 
+/// The last component of an archive member's name.
+///
+/// Both `/` and `\` separate. A ZIP is specified to use `/`, but a member name
+/// is attacker-controlled bytes rather than a promise, and reading `\` as an
+/// ordinary character made the whole of `..\..\outside.txt` the "leaf" - so
+/// `flat` naming escaped the destination as readily as `preserve` did.
+fn member_leaf(name: &str) -> &str {
+    name.rsplit(['/', '\\']).next().unwrap_or(name)
+}
+
 /// Join a destination prefix and a key, without doubling or dropping the slash.
 ///
 /// `..` is rejected rather than resolved: a source-derived name reaching a
 /// destination path is exactly the shape that writes outside the prefix, and a
 /// raw zone that can be escaped is not one.
+///
+/// Both `/` and `\` separate. Splitting on `/` alone meant a member named
+/// `..\..\outside.txt` held no separator this recognised: it stayed one segment,
+/// matched neither `.` nor `..`, and was joined verbatim - after which Windows
+/// read the backslashes and the write landed outside the destination. An
+/// absolute, drive-qualified or UNC name is defused the same way, by dropping
+/// the components rather than the name: `C:\x` lands at `<dest>/C/x`, inside.
 fn join_destination(prefix: &str, key: &str) -> String {
     let safe: String = key
-        .split('/')
+        .split(['/', '\\'])
+        // A drive or UNC prefix only means anything at the START of a path, so
+        // once the components are landed under the destination it cannot
+        // reassert itself. The colon goes because Windows will not accept it in
+        // a file name.
+        .map(|seg| seg.trim_end_matches(':'))
         .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
         .collect::<Vec<_>>()
         .join("/");
@@ -22766,6 +22788,83 @@ fn pretty(v: f64) -> String {
 /// after it is a revision or a path, never an option. Verified on git 2.53 for
 /// both `log` and `ls-tree` - the hostile value is refused and no file is
 /// written, while an ordinary revision still resolves.
+#[cfg(test)]
+mod destination_key_tests {
+    use super::*;
+
+    /// A member name must not be able to place a file outside the destination.
+    ///
+    /// The filter split on `/` only and REMOVED `..` rather than refusing it, so
+    /// a ZIP member named `..\..\outside.txt` contained no forward slash at all,
+    /// survived as a single segment, and was joined verbatim - after which
+    /// Windows read the backslashes as separators and the write landed two
+    /// directories above the destination the author chose.
+    ///
+    /// Removal was the second half of the problem: silently relocating a member
+    /// the author never asked for is not a safe default either, and the
+    /// function's own doc already said `..` is rejected.
+    #[test]
+    fn a_member_name_cannot_escape_the_destination() {
+        // The reported proof-of-concept, verbatim. It is defused the way the
+        // forward-slash form always was - the traversal components are dropped
+        // and the member lands INSIDE the destination - rather than by failing
+        // the run, which is what the two end-to-end tests already pin.
+        assert_eq!(join_destination("/dest", "..\\..\\outside.txt"), "/dest/outside.txt");
+        // The forward-slash form, kept as the control so a fix cannot pass by
+        // handling only one separator.
+        assert_eq!(join_destination("/dest", "../../outside.txt"), "/dest/outside.txt");
+        // Mixed, since a member name is bytes rather than a promise.
+        assert_eq!(join_destination("/dest", "a/../../b.txt"), "/dest/a/b.txt");
+        assert_eq!(join_destination("/dest", "a\\..\\..\\b.txt"), "/dest/a/b.txt");
+
+        // Rooted, drive-qualified and UNC names only mean anything at the start
+        // of a path, so landing their components under the destination defuses
+        // them. The colon goes because Windows rejects it in a file name.
+        assert_eq!(join_destination("/dest", "/etc/passwd"), "/dest/etc/passwd");
+        assert_eq!(
+            join_destination("/dest", "\\Windows\\system32\\x.dll"),
+            "/dest/Windows/system32/x.dll"
+        );
+        assert_eq!(join_destination("/dest", "C:\\evil.txt"), "/dest/C/evil.txt");
+        assert_eq!(
+            join_destination("/dest", "\\\\server\\share\\evil.txt"),
+            "/dest/server/share/evil.txt"
+        );
+
+        // Every result stays under the destination, which is the property that
+        // matters and the one a future edit must not lose.
+        for name in [
+            "..\\..\\outside.txt",
+            "../../outside.txt",
+            "C:\\evil.txt",
+            "\\\\server\\share\\evil.txt",
+            "a\\..\\..\\b.txt",
+        ] {
+            let joined = join_destination("/dest", name);
+            assert!(
+                joined.starts_with("/dest/") && !joined.contains(".."),
+                "{name:?} produced {joined:?}, which is not under the destination"
+            );
+        }
+
+        // And an ordinary member still lands where it should.
+        assert_eq!(join_destination("/dest", "a/b.txt"), "/dest/a/b.txt");
+        assert_eq!(join_destination("/dest", "a\\b.txt"), "/dest/a/b.txt");
+        assert_eq!(join_destination("/dest/", "a/./b.txt"), "/dest/a/b.txt");
+    }
+
+    /// `flat` naming takes the last path component, and it read `/` only - so
+    /// for `..\..\outside.txt` the whole string was the "leaf" and flat mode
+    /// escaped too, which the report confirmed.
+    #[test]
+    fn flat_naming_takes_the_leaf_of_either_separator() {
+        assert_eq!(member_leaf("a/b/c.txt"), "c.txt");
+        assert_eq!(member_leaf("a\\b\\c.txt"), "c.txt");
+        assert_eq!(member_leaf("..\\..\\outside.txt"), "outside.txt");
+        assert_eq!(member_leaf("plain.txt"), "plain.txt");
+    }
+}
+
 #[cfg(test)]
 mod git_revision_args_tests {
     use super::*;
