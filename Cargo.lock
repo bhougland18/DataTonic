@@ -4486,6 +4486,7 @@ dependencies = [
  "filetime",
  "getrandom 0.4.3",
  "jsonwebtoken",
+ "libc",
  "regex",
  "rusqlite",
  "serde",

@@ -84,3 +84,9 @@ filetime = "0.2"
 # drives the real Router. Already in the tree via axum, so no new dependency.
 tower = { version = "0.5", features = ["util"] }
 
+
+# GHSA-58g9-237h-ch2g: geteuid, to tell an artifact cache directory this user
+# made from one somebody else planted. Windows has no uid to compare, so this is
+# unix-only. Already in the tree, and declared the same way by duckdb-engine.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
