@@ -11,7 +11,10 @@
     "export-catalog": "node scripts/build-catalog.mjs",
     "check-visible-when": "node scripts/check-visible-when.mjs",
     "check-secret-fields": "node scripts/check-secret-fields.mjs",
-    "gen-icons": "node scripts/gen-brand-icons.mjs"
+    "gen-icons": "node scripts/gen-brand-icons.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@codemirror/lang-sql": "^6.10.0",
@@ -46,12 +49,15 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
+    "@vitest/coverage-v8": "^5.0.0",
     "esbuild": "^0.28.2",
+    "fast-check": "^4.9.0",
     "puppeteer-core": "^25.10.0",
     "si-legacy": "npm:simple-icons@^9.21.0",
     "simple-icons": "^16.29.0",
     "typescript": "^7.0.2",
-    "vite": "^8.2.2"
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0"
   },
   "engines": {
     "node": "^20.19.0 || >=22.12.0"

@@ -1,0 +1,30 @@
+# Fork-only test workflow (DataTonic). Deliberately a SEPARATE file from the
+# upstream-owned ci.yml so it never rebase-conflicts: upstream has no
+# fork-tests.yml, and our added tests gate here alongside upstream's CI.
+#
+# Today it runs the frontend Vitest suite (pure-helper unit + property tests).
+# Grow it as the strategy lands: a rust-fork job (`cargo test --test 'fork_*'`),
+# and a Playwright job against the DUCKLE_WEB build. See
+# ../../docs/plans/testing-strategy.md (parent repo) §5.
+name: Fork tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  frontend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        run: npm --prefix frontend ci
+      - name: Vitest
+        run: npm --prefix frontend run test

@@ -5988,18 +5988,6 @@ fn build_stage(
         // (inforApiBase/inforTenant, from duckle-secrets) + the node's data
         // area, mint via the password grant (authMode=inforPassword), and let
         // the runner unwrap the response (infor_generic).
-        fn infor_qenc(s: &str) -> String {
-            let mut out = String::with_capacity(s.len());
-            for b in s.bytes() {
-                match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                        out.push(b as char)
-                    }
-                    _ => out.push_str(&format!("%{:02X}", b)),
-                }
-            }
-            out
-        }
         let api_base = string_prop(&props, "inforApiBase")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
@@ -6022,28 +6010,11 @@ fn build_stage(
             Some("HCM") => ("LAWSONGHR", "hcm"),
             _ => ("FSM", "fsm"),
         };
-        let base = format!(
-            "{}/{}/{}/{}/soap",
-            api_base.trim_end_matches('/'),
-            tenant,
-            app,
-            module
-        );
         let business_class = string_prop(&props, "businessClass")
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
                 EngineError::Config(format!("{}: businessClass required", component_id))
             })?;
-        let mut query: Vec<String> = Vec::new();
-        if let Some(f) = string_prop(&props, "fields").filter(|s| !s.trim().is_empty()) {
-            query.push(format!("_fields={}", infor_qenc(f.trim())));
-        }
-        if let Some(f) = string_prop(&props, "filter").filter(|s| !s.trim().is_empty()) {
-            query.push(format!("_filter={}", infor_qenc(f.trim())));
-        }
-        if let Some(f) = string_prop(&props, "lplFilter").filter(|s| !s.trim().is_empty()) {
-            query.push(format!("_lplFilter={}", infor_qenc(f.trim())));
-        }
         // `limit` may arrive as a number or a string; omit when blank/zero so
         // the server default applies.
         let limit = props
@@ -6054,19 +6025,21 @@ fn build_stage(
                     .or_else(|| v.as_str().map(|s| s.trim().to_string()))
             })
             .filter(|s| !s.is_empty() && s != "0");
-        if let Some(l) = limit {
-            query.push(format!("_limit={}", infor_qenc(&l)));
-        }
-        let qs = if query.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", query.join("&"))
-        };
-        let url = format!(
-            "{}/classes/{}/lists/_generic{}",
-            base.trim_end_matches('/'),
-            infor_qenc(business_class.trim()),
-            qs
+        // URL/query-string assembly extracted to infor_generic_url (module
+        // scope) so it and infor_qenc are unit-testable; behavior unchanged.
+        let fields = string_prop(&props, "fields");
+        let filter = string_prop(&props, "filter");
+        let lpl_filter = string_prop(&props, "lplFilter");
+        let url = infor_generic_url(
+            &api_base,
+            &tenant,
+            app,
+            module,
+            &business_class,
+            fields.as_deref(),
+            filter.as_deref(),
+            lpl_filter.as_deref(),
+            limit.as_deref(),
         );
         let oauth = rest_oauth_from_props(&props, false)?;
         rest_source = Some(RestSourceSpec {
@@ -7428,6 +7401,77 @@ fn build_stage(
     })
 }
 
+// Infor `_generic` URL assembly (DataTonic). Extracted from the `src.infor` arm
+// so the query encoding and URL/query-string construction are unit-testable —
+// previously both lived as inline/nested code inside the builder, unreachable
+// from any test (the coverage gap called out in the testing-state handoff).
+
+/// Percent-encode a value for an Infor `lists/_generic` query segment. Only the
+/// RFC 3986 unreserved set passes through literally; every other byte (quotes,
+/// `&`, `=`, spaces, non-ASCII) becomes `%XX`, so a filter value cannot break
+/// out of its query parameter.
+pub(crate) fn infor_qenc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Build the Infor FSM/Landmark `lists/_generic` URL from a resolved connection
+/// (`api_base`/`tenant`), the data-area path (`app`/`module`), the business
+/// class, and the optional query parts. Each part is trimmed and skipped when
+/// blank; `_limit` is additionally skipped when `"0"`. Query params are emitted
+/// in a fixed order: `_fields`, `_filter`, `_lplFilter`, `_limit`.
+pub(crate) fn infor_generic_url(
+    api_base: &str,
+    tenant: &str,
+    app: &str,
+    module: &str,
+    business_class: &str,
+    fields: Option<&str>,
+    filter: Option<&str>,
+    lpl_filter: Option<&str>,
+    limit: Option<&str>,
+) -> String {
+    let base = format!(
+        "{}/{}/{}/{}/soap",
+        api_base.trim_end_matches('/'),
+        tenant,
+        app,
+        module
+    );
+    let mut query: Vec<String> = Vec::new();
+    if let Some(f) = fields.map(str::trim).filter(|s| !s.is_empty()) {
+        query.push(format!("_fields={}", infor_qenc(f)));
+    }
+    if let Some(f) = filter.map(str::trim).filter(|s| !s.is_empty()) {
+        query.push(format!("_filter={}", infor_qenc(f)));
+    }
+    if let Some(f) = lpl_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        query.push(format!("_lplFilter={}", infor_qenc(f)));
+    }
+    if let Some(l) = limit.map(str::trim).filter(|s| !s.is_empty() && *s != "0") {
+        query.push(format!("_limit={}", infor_qenc(l)));
+    }
+    let qs = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query.join("&"))
+    };
+    format!(
+        "{}/classes/{}/lists/_generic{}",
+        base.trim_end_matches('/'),
+        infor_qenc(business_class.trim()),
+        qs
+    )
+}
+
 mod builders;
 // #306: the chunk layer constrains a source by rewriting its read, and it must
 // use the SAME two functions the compiler does. A second opinion about what a
@@ -7442,3 +7486,10 @@ pub(crate) use builders::*;
 
 #[cfg(test)]
 mod tests;
+
+// Fork-owned tests (DataTonic), wired via a single #[path] include so they never
+// interleave with upstream's src/plan/tests.rs — the whole rebase surface is
+// this one line. See docs/plans/testing-strategy.md §2.1.
+#[cfg(test)]
+#[path = "fork_tests.rs"]
+mod fork_tests;
