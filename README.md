@@ -4382,7 +4382,9 @@ gh release edit vX.Y.Z --draft=false --latest
   successful publication, a pipeline that runs when the data it reads is
   published, a failed delivery that is visible and retryable, and a
   subscription that refuses to close a trigger loop. An ordered delta chain
-  blocks a slice whose predecessor has not landed.
+  blocks a slice whose predecessor has not landed, and a feed that republishes a
+  full snapshot recovers from a permanently broken delta by opening a new epoch
+  on it rather than needing state edited by hand.
 - **One capability registry, and the engine answers it.** Which components run
   a process, which advance durable state, which do incremental reads - reported
   from the registry rather than asserted in a document, reachable over MCP, and

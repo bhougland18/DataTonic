@@ -149,8 +149,26 @@ pub struct SequenceDef {
     /// epoch's slices stay for provenance and stop blocking, which is the
     /// difference between an operator-recoverable system and one that needs a
     /// state file edited by hand after every permanently missed delta.
+    ///
+    /// Authored, or derived by [`active_epoch`] from a snapshot that has been
+    /// applied. Where `snapshotPattern` is declared this is the STARTING
+    /// generation rather than the current one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<String>,
+    /// AC5: how a full snapshot's leaf name spells its key, when the feed
+    /// publishes them - `F{date:YYYYMMDD}.KBO.zip` beside the deltas.
+    ///
+    /// A registry that issues a periodic full snapshot and daily deltas from it
+    /// is the common shape, and the snapshot is what makes the feed recoverable:
+    /// a permanently broken delta blocks every delta after it forever, and the
+    /// next authoritative full state is the way out. Without this, the way out
+    /// is an operator editing `baseline` and `epoch` by hand, which is exactly
+    /// what those fields exist to avoid.
+    ///
+    /// Read against the same `order` as the deltas, so both live on one
+    /// timeline and a snapshot can be said to supersede the deltas below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_pattern: Option<String>,
 }
 
 /// An object that produced a key.
@@ -210,6 +228,13 @@ pub struct Reading {
     /// Ascending by key.
     pub items: Vec<Observed>,
     pub refusals: Vec<Refusal>,
+    /// AC5: the full snapshots in the same listing, ascending by key.
+    ///
+    /// Kept apart from `items` rather than mixed in, because a snapshot is a
+    /// different kind of object: it depends on nothing, it supersedes what came
+    /// before it, and treating it as one more link would put it in a chain it
+    /// is meant to restart.
+    pub snapshots: Vec<Observed>,
 }
 
 /// One link of the chain: a key, and what must come before it.
@@ -443,11 +468,45 @@ fn read_int(text: &str) -> Result<String, String> {
 /// name that then does not parse is a real problem rather than a neighbour.
 pub fn read(def: &SequenceDef, uris: &[String]) -> Result<Reading, String> {
     let c = compile(&def.pattern)?;
+    // AC5: a full snapshot is measured against its OWN pattern, and first. It is
+    // a different kind of object, so letting the delta pattern have it would
+    // report the feed's recovery point as a malformed delta.
+    let snap = def.snapshot_pattern.as_deref().map(compile).transpose()?;
     let mut out = Reading::default();
     // key -> the uri that claimed it, to catch two objects claiming one delta.
     let mut claimed: std::collections::BTreeMap<String, String> = Default::default();
+    // Snapshots claim their own keys: a snapshot and a delta for the same key
+    // are two different statements about that key, not a duplicate.
+    let mut snap_claimed: std::collections::BTreeMap<String, String> = Default::default();
     for uri in uris {
         let name = leaf(uri);
+        if let Some(sc) = &snap {
+            if let Some(text) = capture(sc, name) {
+                let pattern = def.snapshot_pattern.clone().unwrap_or_default();
+                match read_slot(&sc.slot, def.order, text) {
+                    Ok(key) => match snap_claimed.get(&key) {
+                        Some(first) if first == uri => {}
+                        Some(first) => out.refusals.push(Refusal {
+                            code: RefusalCode::DuplicateSequenceKey,
+                            uri: uri.clone(),
+                            expected_pattern: pattern,
+                            detail: format!("{key} is already claimed by {first}"),
+                        }),
+                        None => {
+                            snap_claimed.insert(key.clone(), uri.clone());
+                            out.snapshots.push(Observed { key, uri: uri.clone() });
+                        }
+                    },
+                    Err(detail) => out.refusals.push(Refusal {
+                        code: slot_refusal(&sc.slot, def.order),
+                        uri: uri.clone(),
+                        expected_pattern: pattern,
+                        detail,
+                    }),
+                }
+                continue;
+            }
+        }
         let Some(text) = capture(&c, name) else {
             out.refusals.push(Refusal {
                 code: RefusalCode::PatternMismatch,
@@ -457,32 +516,11 @@ pub fn read(def: &SequenceDef, uris: &[String]) -> Result<Reading, String> {
             });
             continue;
         };
-        let parsed = match (&c.slot, def.order) {
-            (Slot::Date(fmt), Order::Date { cadence }) => read_date(text, fmt, cadence),
-            (Slot::Seq, Order::Integer) => read_int(text),
-            (Slot::Date(_), Order::Integer) => Err(
-                "the pattern reads a date and the sequence is ordered by integer. Use {seq}, or \
-                 order the sequence by date."
-                    .to_string(),
-            ),
-            (Slot::Seq, Order::Date { .. }) => Err(
-                "the pattern reads an integer and the sequence is ordered by date. Use \
-                 {date:YYYYMMDD}, or order the sequence by integer."
-                    .to_string(),
-            ),
-        };
-        let key = match parsed {
+        let key = match read_slot(&c.slot, def.order, text) {
             Ok(k) => k,
             Err(detail) => {
                 out.refusals.push(Refusal {
-                    code: match (&c.slot, def.order) {
-                        (Slot::Date(_), Order::Date { .. }) => RefusalCode::InvalidDate,
-                        (Slot::Seq, Order::Integer) => RefusalCode::InvalidInteger,
-                        // A pattern that cannot produce the declared order is a
-                        // definition error, not a bad object; it is reported
-                        // per object because that is where it is noticed.
-                        _ => RefusalCode::PatternMismatch,
-                    },
+                    code: slot_refusal(&c.slot, def.order),
                     uri: uri.clone(),
                     expected_pattern: def.pattern.clone(),
                     detail,
@@ -519,7 +557,140 @@ pub fn read(def: &SequenceDef, uris: &[String]) -> Result<Reading, String> {
     }
     ranked.sort_by(|a, b| a.0.cmp(&b.0));
     out.items = ranked.into_iter().map(|(_, i)| i).collect();
+    // Snapshots share the timeline, so they are ranked the same way: "the
+    // newest applied snapshot" has to mean newest by VALUE.
+    let mut ranked_snaps: Vec<(Rank, Observed)> = Vec::with_capacity(out.snapshots.len());
+    for item in std::mem::take(&mut out.snapshots) {
+        let rank = def.order.rank(&item.key).ok_or_else(|| {
+            format!("{} is not orderable, which should be impossible", item.key)
+        })?;
+        ranked_snaps.push((rank, item));
+    }
+    ranked_snaps.sort_by(|a, b| a.0.cmp(&b.0));
+    out.snapshots = ranked_snaps.into_iter().map(|(_, i)| i).collect();
     Ok(out)
+}
+
+/// AC5: the generation the chain is actually in, given what has been applied.
+///
+/// A full snapshot is a complete state, so once one has been APPLIED the deltas
+/// below it are superseded: they cannot block, and re-running them would undo
+/// work. This returns the definition rebased on the newest such snapshot, which
+/// is the whole reset - `chain` already drops keys below the baseline and
+/// `slices` already drops the requirement that names it.
+///
+/// **Applied, not published.** A snapshot sitting in the listing has proved
+/// nothing. Rebasing on it would skip every delta between the old baseline and
+/// the snapshot while nobody had loaded the snapshot itself, which is silent
+/// data loss dressed as a recovery.
+///
+/// The old epoch is not touched. Its slices keep their own epoch id and stay as
+/// provenance, which is why this returns a new definition rather than editing
+/// anything: there is no plan to reinterpret.
+pub fn active_epoch(
+    def: &SequenceDef,
+    reading: &Reading,
+    state_of: impl Fn(&str) -> Option<crate::backfill::State>,
+) -> SequenceDef {
+    let applied = reading
+        .snapshots
+        .iter()
+        .rev()
+        .find(|s| state_of(&s.key) == Some(crate::backfill::State::Succeeded));
+    match applied {
+        Some(s) => SequenceDef {
+            baseline: Some(s.key.clone()),
+            epoch: Some(s.key.clone()),
+            ..def.clone()
+        },
+        None => def.clone(),
+    }
+}
+
+/// AC5: one slice per published full snapshot, so it can be run.
+///
+/// A snapshot **requires nothing**. That is the point: the chain it replaces is
+/// blocked precisely when a delta has failed permanently, and a recovery point
+/// that inherited that block would be no recovery at all.
+///
+/// Each snapshot is recorded in the epoch it ANCHORS - its own key - rather than
+/// in the epoch that was current when it was planned. That keeps the question
+/// "has the snapshot that opens epoch F2 been applied" answerable by looking in
+/// epoch F2, instead of having to know which generation happened to plan it.
+pub fn snapshot_slices(
+    def: &SequenceDef,
+    pipeline: &str,
+    release: Option<&str>,
+    reading: &Reading,
+) -> Vec<crate::backfill::PartitionRun> {
+    use crate::backfill::{occurrence_id, PartitionRun, State};
+    let _ = def;
+    reading
+        .snapshots
+        .iter()
+        .map(|s| {
+            let mut params = std::collections::BTreeMap::new();
+            params.insert("sequence_key".to_string(), s.key.clone());
+            params.insert("sequence_object".to_string(), s.uri.clone());
+            params.insert("sequence_epoch".to_string(), s.key.clone());
+            // Provenance: which of the two kinds of object this run applied.
+            // A consumer that treats a full snapshot as a delta would append a
+            // complete state onto the state it replaces.
+            params.insert("sequence_kind".to_string(), "snapshot".to_string());
+            PartitionRun {
+                occurrence: Some(occurrence_id(
+                    pipeline,
+                    &format!("sequence:{}:{}", s.key, s.key),
+                    release,
+                    None,
+                )),
+                key: s.key.clone(),
+                state: State::Requested,
+                run_id: None,
+                attempts: 0,
+                error: None,
+                finished_at: None,
+                params,
+                predicate: None,
+                artifact: None,
+                requires: None,
+                source_uri: Some(s.uri.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Turn a captured slot into a key, or say why it is not one.
+///
+/// Shared by the delta pattern and the snapshot pattern so the two cannot come
+/// to disagree about what `{date:YYYYMMDD}` means in the same feed.
+fn read_slot(slot: &Slot, order: Order, text: &str) -> Result<String, String> {
+    match (slot, order) {
+        (Slot::Date(fmt), Order::Date { cadence }) => read_date(text, fmt, cadence),
+        (Slot::Seq, Order::Integer) => read_int(text),
+        (Slot::Date(_), Order::Integer) => Err(
+            "the pattern reads a date and the sequence is ordered by integer. Use {seq}, or \
+             order the sequence by date."
+                .to_string(),
+        ),
+        (Slot::Seq, Order::Date { .. }) => Err(
+            "the pattern reads an integer and the sequence is ordered by date. Use \
+             {date:YYYYMMDD}, or order the sequence by integer."
+                .to_string(),
+        ),
+    }
+}
+
+/// Which refusal a failed [`read_slot`] is.
+fn slot_refusal(slot: &Slot, order: Order) -> RefusalCode {
+    match (slot, order) {
+        (Slot::Date(_), Order::Date { .. }) => RefusalCode::InvalidDate,
+        (Slot::Seq, Order::Integer) => RefusalCode::InvalidInteger,
+        // A pattern that cannot produce the declared order is a definition
+        // error, not a bad object; it is reported per object because that is
+        // where it is noticed.
+        _ => RefusalCode::PatternMismatch,
+    }
 }
 
 /// How far a chain may be expanded before it is called a definition error.
@@ -830,6 +1001,10 @@ pub struct Report {
     /// Objects that could not produce a key. Never empty-by-omission: an empty
     /// list means every selected object parsed, not that nothing was checked.
     pub refusals: Vec<Refusal>,
+    /// AC5: the full snapshots this feed publishes, ascending. Each one is a
+    /// recovery point - the epoch it would anchor is its own key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<Observed>,
 }
 
 /// Read a pipeline's chain and say where it stands.
@@ -843,11 +1018,30 @@ pub fn report(
     props: &serde_json::Value,
     state_of: impl Fn(&str) -> Option<crate::backfill::State>,
 ) -> Result<Report, String> {
+    let reading = survey(def, props)?;
+    report_from(def, reading, state_of)
+}
+
+/// List the collection and read it, without judging it.
+///
+/// Split from [`report`] because AC5 needs the snapshots BEFORE it can say which
+/// epoch the chain is in, and the epoch decides which ledger the verdict must be
+/// read against. Listing twice to answer that would be two listings that can
+/// disagree.
+pub fn survey(def: &SequenceDef, props: &serde_json::Value) -> Result<Reading, String> {
     let uri = def
         .uri
         .as_deref()
         .ok_or("the sequence declares no `uri`, so there is no collection to list")?;
-    let reading = read(def, &collect(uri, props)?)?;
+    read(def, &collect(uri, props)?)
+}
+
+/// Where a chain stands, given a listing already read.
+pub fn report_from(
+    def: &SequenceDef,
+    reading: Reading,
+    state_of: impl Fn(&str) -> Option<crate::backfill::State>,
+) -> Result<Report, String> {
     let links = chain(def, &reading.items)?;
     Ok(Report {
         verdict: verdict(&links, state_of),
@@ -856,6 +1050,33 @@ pub fn report(
         baseline: def.baseline.clone(),
         links,
         refusals: reading.refusals,
+        snapshots: reading.snapshots,
+    })
+}
+
+/// AC5: the next full snapshot to apply, if one supersedes the active epoch.
+///
+/// A published snapshot newer than the baseline makes every delta below it
+/// redundant, so it is the next unit of work rather than something to get to
+/// after the chain it replaces - and when that chain is blocked by a permanently
+/// failed delta, it is the only unit of work left.
+///
+/// The OLDEST such snapshot, not the newest: applying them in order is what
+/// makes each one's epoch a state the workspace was actually in.
+///
+/// `snapshot_state` answers for a snapshot's own epoch, the one it anchors.
+pub fn pending_snapshot<'a>(
+    active: &SequenceDef,
+    reading: &'a Reading,
+    snapshot_state: impl Fn(&str) -> Option<crate::backfill::State>,
+) -> Option<&'a Observed> {
+    let floor = active.baseline.as_deref();
+    reading.snapshots.iter().find(|s| {
+        let newer = match floor {
+            Some(b) => active.order.rank(&s.key) > active.order.rank(b),
+            None => true,
+        };
+        newer && snapshot_state(&s.key) != Some(crate::backfill::State::Succeeded)
     })
 }
 
@@ -871,6 +1092,7 @@ mod tests {
             require_continuity: true,
             baseline: None,
             epoch: None,
+            snapshot_pattern: None,
         }
     }
 
@@ -1376,5 +1598,164 @@ mod tests {
         assert_eq!(def.baseline.as_deref(), Some("2026-08-31"));
         assert_eq!(def.order, Order::Date { cadence: Cadence::Day });
         assert!(of(&serde_json::json!({ "nodes": [] })).is_none());
+    }
+
+    /// #326 AC5, exactly the scenario asked for: a newly accepted full snapshot
+    /// resets the chain.
+    ///
+    /// ```text
+    /// epoch 2026-08-31   D01 ok, D02 FAILED, D03 blocked behind it
+    /// F 2026-09-04 succeeds
+    /// epoch 2026-09-04   the snapshot is the baseline, D05 is the new chain,
+    ///                    D02 is still in the ledger and blocks nothing
+    /// ```
+    ///
+    /// The old plan is not mutated or reinterpreted. A new epoch is derived, and
+    /// the old one keeps its slices as provenance.
+    fn feed() -> SequenceDef {
+        SequenceDef {
+            snapshot_pattern: Some("F{date:YYYYMMDD}.zip".into()),
+            baseline: Some("2026-08-31".into()),
+            epoch: Some("2026-08-31".into()),
+            ..dated("D{date:YYYYMMDD}.zip")
+        }
+    }
+
+    fn listing() -> Vec<String> {
+        uris(&[
+            "D20260901.zip",
+            "D20260902.zip",
+            "D20260903.zip",
+            "F20260904.zip",
+            "D20260905.zip",
+        ])
+    }
+
+    #[test]
+    fn a_full_snapshot_is_read_as_a_snapshot_and_not_as_a_delta() {
+        let r = read(&feed(), &listing()).expect("a reading");
+        assert_eq!(keys(&r), ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-05"]);
+        assert_eq!(
+            r.snapshots.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            ["2026-09-04"],
+            "the full snapshot belongs to its own list, not the delta chain",
+        );
+        assert!(r.refusals.is_empty(), "a snapshot is not a malformed delta: {:?}", r.refusals);
+    }
+
+    #[test]
+    fn an_unapplied_snapshot_leaves_the_current_epoch_alone() {
+        let r = read(&feed(), &listing()).unwrap();
+        // D01 done, D02 failed, and the snapshot has not been run.
+        let active = active_epoch(&feed(), &r, done_and_failed(&["2026-09-01"], "2026-09-02"));
+        assert_eq!(
+            active.epoch.as_deref(),
+            Some("2026-08-31"),
+            "a snapshot that has merely been PUBLISHED resets nothing; it has to be applied",
+        );
+        assert_eq!(active.baseline.as_deref(), Some("2026-08-31"));
+    }
+
+    #[test]
+    fn a_snapshot_can_be_applied_while_the_chain_it_replaces_is_blocked() {
+        // The whole point of a recovery point: D02 failed permanently, so every
+        // delta after it is blocked. The snapshot must not be blocked too, or
+        // there is no way out without editing state by hand.
+        let r = read(&feed(), &listing()).unwrap();
+        let slices = snapshot_slices(&feed(), "p", None, &r);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].key, "2026-09-04");
+        assert!(
+            slices[0].requires.is_none(),
+            "a full snapshot depends on nothing - it is a complete state, not a delta",
+        );
+        assert_eq!(
+            slices[0].params.get("sequence_epoch").map(String::as_str),
+            Some("2026-09-04"),
+            "a snapshot anchors the epoch it opens, so it is recorded in that epoch",
+        );
+    }
+
+    #[test]
+    fn an_applied_snapshot_opens_its_epoch_and_rebases_the_chain() {
+        let r = read(&feed(), &listing()).unwrap();
+        // D01 ok, D02 still failed, and now the snapshot has been applied.
+        let active =
+            active_epoch(&feed(), &r, done_and_failed(&["2026-09-01", "2026-09-04"], "2026-09-02"));
+        assert_eq!(active.epoch.as_deref(), Some("2026-09-04"));
+        assert_eq!(active.baseline.as_deref(), Some("2026-09-04"));
+
+        let links = chain(&active, &r.items).expect("a chain");
+        assert_eq!(
+            links.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(),
+            ["2026-09-05"],
+            "the superseded deltas are gone from the chain, D02 included",
+        );
+
+        let slices = slices(&active, "p", None, &links);
+        assert_eq!(slices.len(), 1);
+        assert!(
+            slices[0].requires.is_none(),
+            "the first delta after a snapshot is anchored by it and waits for nothing",
+        );
+    }
+
+    /// The other half: the old epoch is evidence, not something that was
+    /// deleted. Its slices are still addressed under the old epoch id.
+    #[test]
+    fn the_superseded_epoch_keeps_its_own_slices() {
+        let r = read(&feed(), &listing()).unwrap();
+        let old = chain(&feed(), &r.items).unwrap();
+        let old_slices = slices(&feed(), "p", None, &old);
+        let old_keys: Vec<&str> = old_slices.iter().map(|s| s.key.as_str()).collect();
+        assert!(
+            old_keys.contains(&"2026-09-02"),
+            "the failed delta still has its slice in the epoch it belonged to: {old_keys:?}",
+        );
+        assert!(
+            old_slices
+                .iter()
+                .all(|s| s.params.get("sequence_epoch").map(String::as_str) == Some("2026-08-31")),
+            "and they stay addressed under the epoch that planned them",
+        );
+    }
+
+    /// A feed with no snapshot pattern behaves exactly as it did before: this
+    /// is an added capability, not a change to what a plain chain means.
+    #[test]
+    fn a_feed_that_declares_no_snapshots_is_unaffected() {
+        let def = SequenceDef { baseline: Some("2026-08-31".into()), ..dated("D{date:YYYYMMDD}.zip") };
+        let r = read(&def, &uris(&["D20260901.zip", "F20260904.zip", "D20260905.zip"])).unwrap();
+        assert!(r.snapshots.is_empty());
+        assert_eq!(
+            r.refusals.len(),
+            1,
+            "without a snapshot pattern F20260904 is just a name that does not match",
+        );
+        let active = active_epoch(&def, &r, done(&["2026-09-01"]));
+        assert_eq!(active.epoch, def.epoch);
+        assert_eq!(active.baseline, def.baseline);
+    }
+
+    /// Several snapshots: the newest APPLIED one wins, not the newest published.
+    #[test]
+    fn the_newest_applied_snapshot_is_the_one_that_anchors() {
+        let def = feed();
+        let r = read(
+            &def,
+            &uris(&["F20260904.zip", "D20260905.zip", "F20260906.zip", "D20260907.zip"]),
+        )
+        .unwrap();
+        assert_eq!(
+            r.snapshots.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            ["2026-09-04", "2026-09-06"],
+        );
+        // The later snapshot exists but has not been applied.
+        let active = active_epoch(&def, &r, done(&["2026-09-04"]));
+        assert_eq!(
+            active.epoch.as_deref(),
+            Some("2026-09-04"),
+            "an unapplied later snapshot must not rebase the chain past data nobody has loaded",
+        );
     }
 }

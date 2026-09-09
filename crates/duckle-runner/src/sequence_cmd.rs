@@ -24,7 +24,8 @@ fn usage() -> ExitCode {
          \x20   \"pattern\": \"D{{date:YYYYMMDD}}.KBO.zip\",\n\
          \x20   \"order\": {{ \"type\": \"date\", \"cadence\": \"day\" }},\n\
          \x20   \"requireContinuity\": true,\n\
-         \x20   \"baseline\": \"2026-08-31\"\n\
+         \x20   \"baseline\": \"2026-08-31\",\n\
+         \x20   \"snapshotPattern\": \"F{{date:YYYYMMDD}}.KBO.zip\"\n\
          \x20 }}\n\
          \n\
          status  where the chain is, and which link is missing. Changes nothing.\n\
@@ -33,7 +34,13 @@ fn usage() -> ExitCode {
          \n\
          A link is only claimable once its predecessor has SUCCEEDED, so a hole\n\
          stops the chain instead of being stepped over. Exit 1 when the chain is\n\
-         blocked, so a scheduled check can gate on it."
+         blocked, so a scheduled check can gate on it.\n\
+         \n\
+         `snapshotPattern` is optional and names the feed's FULL snapshots. One\n\
+         that has been applied becomes the baseline of a new epoch: the deltas it\n\
+         supersedes stop blocking and stay as provenance, so a permanently broken\n\
+         delta is recoverable without editing state by hand. A published snapshot\n\
+         is planned ahead of the deltas it replaces."
     );
     ExitCode::from(2)
 }
@@ -96,10 +103,29 @@ pub fn run() -> ExitCode {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "pipeline".into());
 
+    let props = doc.get("sequence").cloned().unwrap_or(serde_json::Value::Null);
+    // AC5: list once, then decide which generation the chain is in before
+    // reading progression - the epoch decides which ledger the verdict is read
+    // against, so doing it the other way round judges the new chain by the old
+    // chain's successes.
+    let reading = match sequence::survey(&def, &props) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("duckle-runner sequence: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // A snapshot is recorded in the epoch it anchors, which is its own key, so
+    // "has this snapshot been applied" is asked of that epoch's ledger.
+    let snapshot_state = |k: &str| {
+        sequence::ledger_states(&args.workspace, &pipeline, Some(k)).get(k).copied()
+    };
+    let def = sequence::active_epoch(&def, &reading, snapshot_state);
+    let pending = sequence::pending_snapshot(&def, &reading, snapshot_state).cloned();
+
     // Progression comes from the ledger, which is the only record of it.
     let states = sequence::ledger_states(&args.workspace, &pipeline, def.epoch.as_deref());
-    let props = doc.get("sequence").cloned().unwrap_or(serde_json::Value::Null);
-    let report = match sequence::report(&def, &props, |k| states.get(k).copied()) {
+    let report = match sequence::report_from(&def, reading.clone(), |k| states.get(k).copied()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("duckle-runner sequence: {e}");
@@ -138,7 +164,30 @@ pub fn run() -> ExitCode {
         &args.workspace,
         &std::env::var("DUCKLE_ENVIRONMENT").unwrap_or_else(|_| "default".into()),
     );
-    let slices = sequence::slices(&def, &pipeline, release.as_deref(), &report.links);
+    // AC5: a published snapshot the workspace has not applied supersedes every
+    // delta below it, so it is the next unit of work rather than something to
+    // reach after the chain it replaces - and when that chain is blocked behind
+    // a permanently failed delta, it is the only work left. Planned as its own
+    // epoch, because that is the generation it opens.
+    let (slices, epoch) = match &pending {
+        Some(snap) => {
+            println!(
+                "\nfull snapshot {} supersedes the chain from {}: planning it instead of the \
+                 deltas it replaces",
+                snap.key,
+                def.baseline.as_deref().unwrap_or("the start"),
+            );
+            let one = sequence::Reading { snapshots: vec![snap.clone()], ..Default::default() };
+            (
+                sequence::snapshot_slices(&def, &pipeline, release.as_deref(), &one),
+                Some(snap.key.clone()),
+            )
+        }
+        None => (
+            sequence::slices(&def, &pipeline, release.as_deref(), &report.links),
+            def.epoch.clone(),
+        ),
+    };
     if slices.is_empty() {
         println!("nothing published yet: no links to plan");
         return ExitCode::from(0);
@@ -156,7 +205,7 @@ pub fn run() -> ExitCode {
         kind: Kind::Sequence,
         chunk_node: None,
         staging: None,
-        epoch: def.epoch.clone(),
+        epoch,
         partitions: slices,
     };
     if let Err(e) = backfill::save(&args.workspace, &plan) {
