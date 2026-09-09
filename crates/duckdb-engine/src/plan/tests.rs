@@ -2500,6 +2500,71 @@
         }
     }
 
+    /// #238 follow-up. The JSON SOURCE can already flatten recursively and keep
+    /// parent names; the transforms could not, so a pipeline that exploded an
+    /// array and then flattened it met `Id`, `Id_1`, `Id_2` again downstream -
+    /// the very thing the source option exists to avoid.
+    ///
+    /// Measured on DuckDB 1.5.4: `unnest(s, recursive := true)` alone produces
+    /// several columns all named `Id`, and only `keep_parent_names := true`
+    /// turns them into `Id`, `owner.Id`, `account.Id`.
+    #[test]
+    fn flatten_and_explode_can_recurse_and_keep_parent_names() {
+        use crate::plan::builders::{build_array, build_json_flatten};
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["up".into()]);
+
+        // Flatten, recursive, with parent names.
+        let sql = build_json_flatten(
+            &ni,
+            &serde_json::json!({ "column": "s", "recursive": true, "keepParentNames": true }),
+        )
+        .expect("builds");
+        assert!(sql.contains("unnest(\"s\", recursive := true, keep_parent_names := true)"), "{sql}");
+        assert!(sql.contains("* EXCLUDE (\"s\")"), "the other columns must survive: {sql}");
+
+        // Recursive without parent names is a different, and legal, choice.
+        let plain = build_json_flatten(
+            &ni,
+            &serde_json::json!({ "column": "s", "recursive": true }),
+        )
+        .expect("builds");
+        assert!(plain.contains("recursive := true"), "{plain}");
+        assert!(!plain.contains("keep_parent_names"), "{plain}");
+
+        // Explode, recursive: no `AS` alias, because unnest then yields several
+        // columns rather than one. The NULL/empty guard stays - a sparse array
+        // must still keep its row.
+        let ex = build_array(
+            &ni,
+            &serde_json::json!({ "column": "items", "recursive": true, "keepParentNames": true }),
+            "xf.arr.explode",
+        )
+        .expect("builds");
+        assert!(ex.contains("recursive := true, keep_parent_names := true"), "{ex}");
+        assert!(ex.contains("CASE WHEN \"items\" IS NULL"), "the guard must survive: {ex}");
+        assert!(!ex.contains("END) AS \"items\""), "an aliased multi-column unnest is invalid: {ex}");
+    }
+
+    /// Both transforms are byte-for-byte what they were unless asked otherwise,
+    /// so nothing already saved changes.
+    #[test]
+    fn flatten_and_explode_are_unchanged_by_default() {
+        use crate::plan::builders::{build_array, build_json_flatten};
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["up".into()]);
+
+        assert_eq!(
+            build_json_flatten(&ni, &serde_json::json!({ "column": "s" })).unwrap(),
+            "SELECT * EXCLUDE (\"s\"), \"s\".* FROM \"up\""
+        );
+        assert_eq!(
+            build_array(&ni, &serde_json::json!({ "column": "items" }), "xf.arr.explode").unwrap(),
+            "SELECT unnest(CASE WHEN \"items\" IS NULL OR length(\"items\") = 0 THEN [NULL] \
+             ELSE \"items\" END) AS \"items\", * EXCLUDE (\"items\") FROM \"up\""
+        );
+    }
+
     #[test]
     fn json_flatten_is_a_setting_and_repeated_keys_can_keep_their_parent() {
         // #238. Two things, reported together.

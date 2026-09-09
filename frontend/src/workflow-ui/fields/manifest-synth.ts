@@ -6593,6 +6593,7 @@ function synthJsonTransform(comp: ComponentDef): ComponentManifest {
             // a STRUCT lands here, so say so from this side too.
             { key: 'column', label: 'Struct column to flatten', kind: 'column', required: true,
               description: "Expands the struct's fields into top-level columns, keeping one row. For a LIST or ARRAY column use Explode / Unnest instead, which produces one row per element." },
+            ...unnestDepthFields('Nested structs are expanded all the way down, instead of one level.'),
         ] }], 'declared');
     }
     if (id === 'xf.json.merge') {
@@ -6686,6 +6687,7 @@ function synthArrayTransform(comp: ComponentDef): ComponentManifest {
             // rather than the choice the author actually got wrong.
             { key: 'column', label: 'Array column', kind: 'column', required: true,
               description: 'A LIST or ARRAY column: one output row per element, other columns repeated. A NULL or empty array still yields one row, so the row is not lost. For a STRUCT column use Flatten instead, which expands its fields into columns and keeps one row.' },
+            ...unnestDepthFields('Elements that are themselves objects are expanded into columns as well, instead of arriving as a single struct column.'),
         ] }], 'declared');
     }
     if (id === 'xf.zip') {
@@ -7984,6 +7986,36 @@ function synthCustomCode(comp: ComponentDef): ComponentManifest {
         ...outputCacheSection(comp),
     ], 'declared');
 }
+
+// #238: the JSON source has carried `recursive` / `keep_parent_names` since the
+// flatten fix; the transforms had not, so a pipeline that exploded an array and
+// then flattened it met `Id`, `Id_1`, `Id_2` again downstream - the naming the
+// source option exists to avoid. Shared so the two nodes cannot describe the
+// same DuckDB arguments differently.
+//
+// `Keep parent names` is gated on `recursive` because it does nothing without
+// it: at a single level DuckDB produces the same columns either way (measured
+// on 1.5.4), and a control that changes nothing is worse than an absent one.
+const unnestDepthFields = (recursiveHelp: string): Field[] => [
+    {
+        key: 'recursive',
+        label: 'Expand nested objects',
+        kind: 'bool',
+        defaultValue: false,
+        description: recursiveHelp,
+    },
+    {
+        key: 'keepParentNames',
+        label: 'Keep parent names',
+        kind: 'bool',
+        defaultValue: false,
+        // The condition compares String(value), and recursive defaults to
+        // false, so an untouched node evaluates this as 'false' and hides it.
+        visibleWhen: [{ key: 'recursive', equals: ['true'] }],
+        description:
+            'Name each expanded column after the object it came from - owner.Id and account.Id rather than Id, Id_1 and Id_2. Without this, several objects carrying the same field produce columns whose names say nothing about where they came from.',
+    },
+];
 
 // AI / Vector ----------------------------------------------------------
 

@@ -1050,10 +1050,44 @@ pub(crate) fn build_date_diff(inputs: &NodeInputs, props: &JsonValue) -> Result<
     ))
 }
 
+/// The `recursive` / `keep_parent_names` arguments an unnest was asked for.
+///
+/// #238: the JSON source has carried these since 1639cd3, and the transforms had
+/// not - so a pipeline that exploded an array and then flattened it met `Id`,
+/// `Id_1`, `Id_2` again downstream, which is the naming the source option exists
+/// to avoid. Measured on DuckDB 1.5.4: `recursive := true` on its own produces
+/// several columns all called `Id`, and only `keep_parent_names := true` turns
+/// them into `Id`, `owner.Id`, `account.Id`.
+///
+/// Empty unless `recursive` is asked for. `keep_parent_names` alone changes
+/// nothing at a single level - measured - so it is not offered on its own.
+fn unnest_args(props: &JsonValue) -> String {
+    if props.get("recursive").and_then(JsonValue::as_bool) != Some(true) {
+        return String::new();
+    }
+    match props.get("keepParentNames").and_then(JsonValue::as_bool) {
+        Some(true) => ", recursive := true, keep_parent_names := true".to_string(),
+        _ => ", recursive := true".to_string(),
+    }
+}
+
 pub(crate) fn build_json_flatten(inputs: &NodeInputs, props: &JsonValue) -> Result<String, String> {
     let upstream = inputs.main().ok_or_else(|| missing_input_msg("xf.json.flatten"))?;
     let column = require_column(props)?;
     let col = quote_ident(&column);
+    let args = unnest_args(props);
+    if !args.is_empty() {
+        // `col.*` expands one level only. unnest() is what takes the arguments,
+        // so a recursive flatten is a different statement rather than a longer
+        // one.
+        return Ok(format!(
+            "SELECT unnest({}{}), * EXCLUDE ({}) FROM {}",
+            col,
+            args,
+            col,
+            quote_ident(upstream)
+        ));
+    }
     // Expand a STRUCT column's fields to top-level columns.
     Ok(format!(
         "SELECT * EXCLUDE ({}), {}.* FROM {}",
@@ -1664,9 +1698,17 @@ pub(crate) fn build_array(inputs: &NodeInputs, props: &JsonValue, component_id: 
         // data loss for sparse arrays. The CASE injects a single NULL
         // element so the row survives; untyped [NULL] unifies with any
         // array element type.
+        // #238: a recursive unnest yields SEVERAL columns, so it cannot carry
+        // the `AS {c}` alias a single-column one does. The NULL/empty guard is
+        // unaffected either way - measured - so a sparse array still keeps its
+        // row.
+        let args = unnest_args(props);
+        let alias = if args.is_empty() { format!(" AS {col}") } else { String::new() };
         return Ok(format!(
-            "SELECT unnest(CASE WHEN {c} IS NULL OR length({c}) = 0 THEN [NULL] ELSE {c} END) AS {c}, * EXCLUDE ({c}) FROM {up}",
+            "SELECT unnest(CASE WHEN {c} IS NULL OR length({c}) = 0 THEN [NULL] ELSE {c} END{a}){al}, * EXCLUDE ({c}) FROM {up}",
             c = col,
+            a = args,
+            al = alias,
             up = quote_ident(upstream)
         ));
     }

@@ -25753,6 +25753,28 @@
                 "kind": "column",
                 "required": true,
                 "description": "Expands the struct's fields into top-level columns, keeping one row. For a LIST or ARRAY column use Explode / Unnest instead, which produces one row per element."
+              },
+              {
+                "key": "recursive",
+                "label": "Expand nested objects",
+                "kind": "bool",
+                "defaultValue": false,
+                "description": "Nested structs are expanded all the way down, instead of one level."
+              },
+              {
+                "key": "keepParentNames",
+                "label": "Keep parent names",
+                "kind": "bool",
+                "defaultValue": false,
+                "visibleWhen": [
+                  {
+                    "key": "recursive",
+                    "equals": [
+                      "true"
+                    ]
+                  }
+                ],
+                "description": "Name each expanded column after the object it came from - owner.Id and account.Id rather than Id, Id_1 and Id_2. Without this, several objects carrying the same field produce columns whose names say nothing about where they came from."
               }
             ]
           }
@@ -26117,6 +26139,28 @@
                 "kind": "column",
                 "required": true,
                 "description": "A LIST or ARRAY column: one output row per element, other columns repeated. A NULL or empty array still yields one row, so the row is not lost. For a STRUCT column use Flatten instead, which expands its fields into columns and keeps one row."
+              },
+              {
+                "key": "recursive",
+                "label": "Expand nested objects",
+                "kind": "bool",
+                "defaultValue": false,
+                "description": "Elements that are themselves objects are expanded into columns as well, instead of arriving as a single struct column."
+              },
+              {
+                "key": "keepParentNames",
+                "label": "Keep parent names",
+                "kind": "bool",
+                "defaultValue": false,
+                "visibleWhen": [
+                  {
+                    "key": "recursive",
+                    "equals": [
+                      "true"
+                    ]
+                  }
+                ],
+                "description": "Name each expanded column after the object it came from - owner.Id and account.Id rather than Id, Id_1 and Id_2. Without this, several objects carrying the same field produce columns whose names say nothing about where they came from."
               }
             ]
           }
