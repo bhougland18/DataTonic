@@ -22116,3 +22116,361 @@ fn every_on_fail_gate_honours_all_three_values() {
         assert_eq!(n, "3", "{component}: reject drops the failing row, so 3 must remain");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Manticore Search (#340). HTTP JSON API on port 9308: POST /search to read,
+// POST /bulk to write. Two shapes differ from Elasticsearch and both are
+// pinned here: the key is `table` (renamed from `index` in Manticore 6.0),
+// and /bulk carries the document INSIDE the action line rather than on a
+// second line.
+// ---------------------------------------------------------------------------
+
+/// Serve `bodies` in order on 127.0.0.1, one connection each, forwarding the
+/// raw request bytes down a channel. Returns (port, receiver).
+fn manticore_stub(bodies: Vec<String>) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind manticore stub");
+    let port = listener.local_addr().unwrap().port();
+    let count = bodies.len();
+    std::thread::spawn(move || {
+        for (i, stream) in listener.incoming().take(count).enumerate() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(Duration::from_millis(250))).ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(8192);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..16 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(buf);
+            let body = &bodies[i];
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    (port, rx)
+}
+
+/// A Manticore /search response carrying `rows` as `_source` documents.
+fn manticore_hits(rows: &[&str]) -> String {
+    let inner = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!(r#"{{"_id":{},"_score":1,"_source":{}}}"#, i + 1, r))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"took":1,"timed_out":false,"hits":{{"total":9,"hits":[{}]}}}}"#,
+        inner
+    )
+}
+
+#[test]
+fn src_manticore_pages_by_offset_and_names_the_table() {
+    // Page size 2: the first page fills (2 hits) so a second request goes out
+    // at offset 2; that page returns 1 hit, short of the limit, which ends it.
+    // 3 rows land. Also pins the two things that are NOT Elasticsearch: the
+    // body says "table", and credentials go out as HTTP Basic.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (port, rx) = manticore_stub(vec![
+        manticore_hits(&[r#"{"id":1,"name":"alice"}"#, r#"{"id":2,"name":"bob"}"#]),
+        manticore_hits(&[r#"{"id":3,"name":"carol"}"#]),
+    ]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node(
+                "m",
+                "src.manticore",
+                json!({
+                    "endpoint": endpoint,
+                    "table": "products",
+                    "limit": 2,
+                    "username": "reader",
+                    "password": "s3cret",
+                })
+            ),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "m", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore source failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3);
+
+    let first = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("1st search request"),
+    )
+    .to_string();
+    let second = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("2nd search request"),
+    )
+    .to_string();
+
+    assert!(
+        first.contains("POST /search"),
+        "expected POST /search: {}",
+        first
+    );
+    assert!(
+        first.contains(r#""table":"products""#),
+        "Manticore 6.0+ names it `table`, not `index`: {}",
+        first
+    );
+    // base64("reader:s3cret")
+    assert!(
+        first.contains("Authorization: Basic cmVhZGVyOnMzY3JldA=="),
+        "expected HTTP Basic credentials: {}",
+        first
+    );
+    assert!(
+        first.contains(r#""offset":0"#),
+        "1st page starts at 0: {}",
+        first
+    );
+    assert!(
+        second.contains(r#""offset":2"#),
+        "2nd page starts at 2: {}",
+        second
+    );
+}
+
+#[test]
+fn src_manticore_lifts_max_matches_when_paging_past_the_default() {
+    // Manticore only keeps the 1000 best-ranked matches unless the request
+    // raises max_matches, so a window reaching past 1000 must ask for it or
+    // the server refuses the page.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    // One hit is short of the 1200 limit, so this is also the last page.
+    let (port, rx) = manticore_stub(vec![manticore_hits(&[r#"{"id":1,"name":"alice"}"#])]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node(
+                "m",
+                "src.manticore",
+                json!({ "endpoint": endpoint, "table": "products", "limit": 1200 })
+            ),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "m", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore source failed: {:?}", r.error);
+
+    let req = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("search request"),
+    )
+    .to_string();
+    assert!(
+        req.contains(r#""max_matches":1200"#),
+        "a 1200-row window must raise max_matches: {}",
+        req
+    );
+}
+
+#[test]
+fn snk_manticore_puts_the_document_inside_the_action_line() {
+    // Manticore's /bulk is NDJSON like Elasticsearch's, but one line per row:
+    //   {"insert":{"table":"products","doc":{...}}}
+    // Sending Elasticsearch's action/doc PAIR would index nothing.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (port, rx) = manticore_stub(vec![r#"{"items":[],"errors":false,"took":1}"#.into()]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n2,bob\n");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "m",
+                "snk.manticore",
+                json!({ "endpoint": endpoint, "table": "products" })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore sink failed: {:?}", r.error);
+
+    let body = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("bulk request"),
+    )
+    .to_string();
+    assert!(body.contains("POST /bulk"), "expected POST /bulk: {}", body);
+    assert!(
+        body.to_lowercase().contains("application/x-ndjson"),
+        "bulk is NDJSON: {}",
+        body
+    );
+    assert!(
+        body.contains(r#"{"insert":{"table":"products","doc":{"id":1,"name":"alice"}}}"#),
+        "expected the doc nested in the action line: {}",
+        body
+    );
+    assert_eq!(
+        body.matches(r#""insert":{"table":"products""#).count(),
+        2,
+        "one line per row: {}",
+        body
+    );
+}
+
+#[test]
+fn snk_manticore_fails_a_bulk_the_server_rejected() {
+    // Manticore answers a partly-rejected bulk with HTTP 200 and errors:true.
+    // Trusting the status code alone would report a green run that wrote
+    // nothing.
+    let engine = engine_or_skip!();
+    let (port, _rx) = manticore_stub(vec![
+        r#"{"items":[{"insert":{"status":409,"error":"duplicate id"}}],"errors":true,"took":1}"#
+            .into(),
+    ]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "m",
+                "snk.manticore",
+                json!({ "endpoint": endpoint, "table": "products" })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "error", "a rejected bulk must fail the run: {:?}", r);
+    let msg = r.error.unwrap_or_default();
+    assert!(
+        msg.contains("duplicate id"),
+        "the server's reason must reach the user: {}",
+        msg
+    );
+}
+
+#[test]
+fn snk_manticore_replace_writes_a_replace_action() {
+    // "Replace" is upsert-by-id in Manticore. The dropdown has to change the
+    // action name, not just the label.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (port, rx) = manticore_stub(vec![r#"{"items":[],"errors":false}"#.into()]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "m",
+                "snk.manticore",
+                json!({ "endpoint": endpoint, "table": "products", "writeMode": "replace" })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore sink failed: {:?}", r.error);
+
+    let body = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("bulk request"),
+    )
+    .to_string();
+    assert!(
+        body.contains(r#""replace":{"table":"products""#),
+        "expected a replace action: {}",
+        body
+    );
+    assert!(
+        !body.contains(r#""insert""#),
+        "replace must not also insert: {}",
+        body
+    );
+}
+
+#[test]
+fn snk_manticore_splits_rows_into_batches() {
+    // 3 rows at batchSize 2 is two requests, not one body holding everything.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (port, rx) = manticore_stub(vec![
+        r#"{"items":[],"errors":false}"#.into(),
+        r#"{"items":[],"errors":false}"#.into(),
+    ]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n2,bob\n3,carol\n");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "m",
+                "snk.manticore",
+                json!({ "endpoint": endpoint, "table": "products", "batchSize": 2 })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore sink failed: {:?}", r.error);
+
+    let first = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("1st bulk request"),
+    )
+    .to_string();
+    let second = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("2nd bulk request"),
+    )
+    .to_string();
+    assert_eq!(
+        first.matches(r#""insert""#).count(),
+        2,
+        "1st batch holds 2: {}",
+        first
+    );
+    assert_eq!(
+        second.matches(r#""insert""#).count(),
+        1,
+        "2nd batch holds 1: {}",
+        second
+    );
+}

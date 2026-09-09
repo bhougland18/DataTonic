@@ -1729,6 +1729,46 @@ pub struct ElasticSourceSpec {
     pub pagination: ElasticPagination,
 }
 
+/// Manticore Search `/search` source (#340).
+///
+/// Manticore's HTTP JSON API answers in Elasticsearch's response shape
+/// (`hits.hits[]._source`) but takes a different request: the table is named
+/// in the BODY under `table` (`index` was renamed in Manticore 6.0) rather
+/// than in the path, and the window is `limit`/`offset` rather than
+/// `size`/`from`.
+#[derive(Debug, Clone)]
+pub struct ManticoreSourceSpec {
+    pub node_id: String,
+    /// HTTP API endpoint, e.g. "http://localhost:9308".
+    pub endpoint: String,
+    /// Table to search.
+    pub table: String,
+    /// Raw Manticore JSON query. None = `{"match_all": {}}`.
+    pub query: Option<String>,
+    /// Page size (default 1000).
+    pub limit: u64,
+    pub max_pages: u64,
+    /// Optional HTTP Basic credentials.
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+/// Manticore Search `/bulk` sink (#340).
+#[derive(Debug, Clone)]
+pub struct ManticoreSinkSpec {
+    pub from_view: String,
+    pub endpoint: String,
+    pub table: String,
+    /// Bulk action: "insert" (fails on a duplicate id) or "replace"
+    /// (upsert by id). Manticore also has update/delete, which need a
+    /// document id or a filter and so are not write shapes for a sink.
+    pub action: String,
+    /// Rows per `/bulk` request.
+    pub batch_size: usize,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
 /// Pagination style for src.rest.
 #[derive(Debug, Clone)]
 pub enum RestPagination {

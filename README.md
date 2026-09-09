@@ -3364,7 +3364,7 @@ Duckle is not a CSV tool with extras. It reads a broad set of formats and source
 
 ### Sources
 
-**120 sources available today.**
+**121 sources available today.**
 
 | Group | Connectors | Status |
 |---|---|---|
@@ -3385,7 +3385,7 @@ Duckle is not a CSV tool with extras. It reads a broad set of formats and source
 | **APIs and SaaS (REST)** | Salesforce, HubSpot, Pipedrive, Zendesk, Intercom, Stripe, QuickBooks, Xero, Shopify, Notion, Airtable, Asana, Trello, ClickUp, Monday.com, GitHub, GitLab, Linear, Jira, Slack, Discord, Telegram, Twilio, Mailchimp, SendGrid, Segment - thin pre-configured wrappers over `src.rest` / `src.graphql`. `src.rest` takes a configurable API-key auth header name and offset pagination that stops on a body `total_count`. **Salesforce Bulk** (`src.salesforce.bulk`) - Bulk API 2.0 query source for migration-scale reads: SOQL as an async query job (query / queryAll), paged CSV result sets streamed to disk via `Sforce-Locator`, typed empty relations on 0 records | Available |
 | **APIs (protocols)** | OData v4 (follows `@odata.nextLink`), SOAP / generic XML APIs (XML response parsing with namespace local-name match) | Available |
 | **Health data (DHIS2)** | `src.dhis2` reads the DHIS2 Web API: aggregate `dataValueSets`, paged metadata lists, tracker exports, and `analytics/dataValueSet.json`. `snk.dhis2` imports back: chunked requests, `importStrategy` (CREATE_AND_UPDATE is DHIS2's upsert), `dryRun`, and real import-summary parsing, so conflicts and a non-zero `ignored` count fail the run instead of passing as a green HTTP 200. Auth via personal access token or HTTP Basic. Raw `/api/analytics` (columnar `headers[]` + `rows[][]`) is not supported | Available |
-| **NoSQL and search** | **Neo4j** (Cypher over the HTTP Query API - self-hosted or Aura, no Bolt driver; optional `$parameters`), MongoDB (official driver), Cassandra / ScyllaDB (CQL), Elasticsearch / OpenSearch (from+size + search_after), Redis (SCAN + GET), CouchDB (`_all_docs`), DynamoDB (HTTP + SigV4 - no AWS SDK; auto-unwraps typed attributes) | Available |
+| **NoSQL and search** | **Neo4j** (Cypher over the HTTP Query API - self-hosted or Aura, no Bolt driver; optional `$parameters`), MongoDB (official driver), Cassandra / ScyllaDB (CQL), Elasticsearch / OpenSearch (from+size + search_after), **Manticore Search** (HTTP JSON `/search`; `table` + limit/offset, and a window past the default 1000 best-ranked matches raises `max_matches` to suit), Redis (SCAN + GET), CouchDB (`_all_docs`), DynamoDB (HTTP + SigV4 - no AWS SDK; auto-unwraps typed attributes) | Available |
 | **Vector / AI databases** | pgvector (postgres ATTACH), Qdrant (`/points/scroll`), Weaviate (`/v1/objects`), Milvus (`/v1/vector/query`) | Available |
 | **Vector / AI databases** | Pinecone (no list-all-vectors API), Chroma, LanceDB | Preview |
 | **File transfer** | FTP / FTPS (pure-Rust `suppaftp`) and SFTP (SSH, pure-Rust `russh` + `russh-sftp` on the ring backend; password or private-key auth) - one File Transfer component, pick the protocol. Glob filter, base64 content per file. **Host keys are verified**: pin a SHA256 fingerprint to accept only that key, or leave it empty and the first key seen for a host is recorded in `<workspace>/.duckle/known_hosts`, after which a different key is refused. A host that presents an OpenSSH certificate is accepted only when it certifies the key you pinned. `DUCKLE_SFTP_HOST_KEY_POLICY=accept-any` opts out for a host whose key changes per connection | Available |
@@ -3478,7 +3478,7 @@ Validators split their input: passing rows continue on the main port, failures r
 
 ### Sinks
 
-**72 sinks available today.**
+**73 sinks available today.**
 
 | Group | Connectors | Status |
 |---|---|---|
@@ -3495,7 +3495,7 @@ Validators split their input: passing rows continue on the main port, failures r
 | **HTTP APIs** | REST (POST/PUT/PATCH batched JSON-array; configurable API-key auth header name), Webhook (one POST per row), GraphQL mutations | Available |
 | **SaaS / CRM** | Salesforce (`snk.salesforce`) - sObject Collections API: **insert / update / upsert (by external Id) / delete**, ≤200 records/request, Bearer token or OAuth 2.0 client-credentials (fresh token minted per run, same auth as `src.salesforce`). **Salesforce Bulk** (`snk.salesforce.bulk`) - Bulk API 2.0 for migration-scale loads: **insert / update / upsert / delete / hardDelete**, DuckDB streams to CSV and each ≤90 MB part runs as an async job | Available |
 | **Email (SMTP)** | Per-row SMTP send via pure-Rust `lettre` + rustls. Plain text v1; HTML + attachments follow. | Available |
-| **NoSQL** | **Neo4j** (rows as nodes over the HTTP Query API; one `UNWIND $rows` round trip per batch, `mergeKeys` switches CREATE to MERGE so re-runs update rather than duplicate), MongoDB (insert_many batched; **upsert** via replace_one on a key, plus delete propagation via delete_one), Cassandra / ScyllaDB (CQL), Elasticsearch / OpenSearch (`_bulk` NDJSON), Redis (pipelined SET) | Available |
+| **NoSQL** | **Neo4j** (rows as nodes over the HTTP Query API; one `UNWIND $rows` round trip per batch, `mergeKeys` switches CREATE to MERGE so re-runs update rather than duplicate), MongoDB (insert_many batched; **upsert** via replace_one on a key, plus delete propagation via delete_one), Cassandra / ScyllaDB (CQL), Elasticsearch / OpenSearch (`_bulk` NDJSON), **Manticore Search** (HTTP JSON `/bulk`; the doc rides inside the action line, insert or replace, and a batch the server rejects at HTTP 200 fails the run), Redis (pipelined SET) | Available |
 | **NoSQL** | DynamoDB | Planned |
 | **Streaming** | Kafka / Redpanda (`rskafka`), NATS JetStream, GCP Pub/Sub (REST + OAuth2), RabbitMQ (`lapin`), WebSocket (`ws://` / `wss://`) | Available |
 | **Streaming** | Pulsar, Kinesis | Planned |

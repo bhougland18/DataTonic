@@ -223,6 +223,7 @@ export const PALETTE: Category[] = [
                     src('neo4j', 'Neo4j', 'available', 'Run Cypher against Neo4j over the HTTP Query API (/db/{database}/query/v2) - works with a self-hosted server and with Aura, and needs no Bolt driver. Basic auth; optional Cypher $parameters. Node and relationship values keep their properties as structs.'),
                     src('elastic', 'Elasticsearch', 'available', 'Read docs from an Elasticsearch index via the _search API. from+size pagination (up to 10000 rows by default); ApiKey auth.'),
                     src('opensearch', 'OpenSearch', 'available', 'Read docs from an OpenSearch index via the _search API. Same wire as Elasticsearch; same ApiKey auth.'),
+                    src('manticore', 'Manticore Search', 'available', 'Read rows from a Manticore table via the HTTP JSON /search API (port 9308). Manticore answers in the Elasticsearch response shape but takes its own request: the table is named in the body as `table` (renamed from `index` in 6.0) and paging is limit/offset. A window past the default 1000 best-ranked matches raises max_matches to suit. Optional raw JSON query; optional HTTP Basic auth.'),
                     src('couchdb', 'CouchDB', 'available', 'Read CouchDB documents via the _all_docs endpoint (include_docs=true). Rides src.rest - Basic auth, responsePath /rows, cursor pagination via `next_key` if configured.'),
                 ],
             },
@@ -627,6 +628,7 @@ export const PALETTE: Category[] = [
                     snk('neo4j', 'Neo4j', 'available', 'Write rows as Neo4j nodes over the HTTP Query API. Rows ride up as one $rows parameter expanded with UNWIND, so a batch is one round trip. Set mergeKeys to MERGE on those properties (re-running updates the matched nodes) instead of CREATE; or supply your own Cypher that consumes $rows.'),
                     snk('elastic', 'Elasticsearch', 'available', 'Bulk-index docs via the _bulk NDJSON API (configurable host, index, ApiKey auth)'),
                     snk('opensearch', 'OpenSearch', 'available', 'Bulk-index docs via the OpenSearch _bulk NDJSON API (same shape as Elasticsearch)'),
+                    snk('manticore', 'Manticore Search', 'available', 'Index rows into a Manticore table via the HTTP JSON /bulk API (port 9308). NDJSON, one line per row, with the document nested inside the action ({"insert":{"table":"t","doc":{...}}}) - not Elasticsearch\'s action/doc pair. Insert or replace (upsert by id), batched at 1000 rows. A batch Manticore rejects comes back as HTTP 200 with errors:true, and fails the run rather than reporting a write that did not happen.'),
                 ],
             },
             {

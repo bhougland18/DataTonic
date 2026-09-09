@@ -15212,6 +15212,190 @@ impl DuckdbEngine {
         ))
     }
 
+    /// Manticore Search source (#340): POST /search, walk `hits.hits[]`,
+    /// materialize each `_source` as a row.
+    ///
+    /// Manticore answers in Elasticsearch's response shape but takes its own
+    /// request: the table is named in the BODY (`index` became `table` in
+    /// Manticore 6.0) and the window is `limit`/`offset`.
+    pub(crate) fn run_manticore_source(
+        &self,
+        db: &Path,
+        spec: &ManticoreSourceSpec,
+    ) -> Result<String, EngineError> {
+        let url = format!("{}/search", spec.endpoint.trim_end_matches('/'));
+        let query_dsl: JsonValue = match &spec.query {
+            Some(q) => serde_json::from_str(q).map_err(|e| {
+                EngineError::Config(format!("manticore: invalid query JSON: {}", e))
+            })?,
+            None => serde_json::json!({ "match_all": {} }),
+        };
+        let mut all_rows: Vec<JsonValue> = Vec::new();
+        let mut pages = 0_u64;
+        let mut truncated = false;
+        let mut offset = 0_u64;
+        loop {
+            self.check_cancelled()?;
+            let window = offset.saturating_add(spec.limit);
+            let mut body = serde_json::json!({
+                "table": spec.table,
+                "query": query_dsl,
+                "limit": spec.limit,
+                "offset": offset,
+            });
+            // Manticore keeps only the 1000 best-ranked matches per query
+            // unless the request raises max_matches, so a window reaching
+            // past that default has to ask for the room it needs or the
+            // server refuses the page.
+            if window > 1000 {
+                body["max_matches"] = serde_json::json!(window);
+            }
+            let body_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
+            let req = manticore_request(spec.username.as_deref(), spec.password.as_deref(), &url)
+                .set("Content-Type", "application/json");
+            let mut response: JsonValue = match req.send_string(&body_str) {
+                Ok(r) => r.into_json().map_err(|e| {
+                    EngineError::Query(format!("Manticore response not JSON: {}", e))
+                })?,
+                Err(ureq::Error::Status(code, r)) => {
+                    let body = r.into_string().unwrap_or_default();
+                    return Err(EngineError::Query(format!(
+                        "Manticore HTTP {} from {}: {}",
+                        code,
+                        url,
+                        body.chars().take(300).collect::<String>()
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!(
+                        "Manticore HTTP transport to {}: {}",
+                        url, e
+                    )))
+                }
+            };
+            // A failed search answers 200 with an `error` string and no hits,
+            // which would otherwise read as "zero rows".
+            if let Some(err) = response.get("error").and_then(|e| match e {
+                JsonValue::String(s) if !s.is_empty() => Some(s.clone()),
+                JsonValue::Object(_) => Some(e.to_string()),
+                _ => None,
+            }) {
+                return Err(EngineError::Query(format!("Manticore search failed: {}", err)));
+            }
+            let hits = response
+                .pointer_mut("/hits/hits")
+                .and_then(|v| v.as_array_mut())
+                .map(std::mem::take)
+                .unwrap_or_default();
+            let hit_count = hits.len();
+            for mut h in hits {
+                let source = h
+                    .get_mut("_source")
+                    .map(JsonValue::take)
+                    .unwrap_or_else(|| JsonValue::Object(Default::default()));
+                all_rows.push(source);
+            }
+            pages += 1;
+            if (hit_count as u64) < spec.limit {
+                break;
+            }
+            if pages >= spec.max_pages {
+                truncated = true;
+                break;
+            }
+            offset = window;
+        }
+        if truncated {
+            return Err(pagination_capped_err(
+                "manticore",
+                all_rows.len(),
+                spec.max_pages,
+            ));
+        }
+        materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &all_rows)?;
+        Ok(format!(
+            "manticore: materialized {} rows ({} page(s)) into {}",
+            all_rows.len(),
+            pages,
+            spec.node_id
+        ))
+    }
+
+    /// Manticore Search sink (#340): POST /bulk as NDJSON, one line per row.
+    ///
+    /// Manticore nests the document inside the action line
+    /// (`{"insert":{"table":"t","doc":{...}}}`) rather than putting it on a
+    /// second line the way Elasticsearch does, and it reports a rejected
+    /// batch as HTTP 200 with `errors: true` - so the response body, not the
+    /// status code, decides whether the write happened.
+    pub(crate) fn run_manticore_sink(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        spec: &ManticoreSinkSpec,
+    ) -> Result<String, EngineError> {
+        let select = format!(
+            "{}SELECT * FROM {}",
+            secret_prefix,
+            plan::quote_ident(&spec.from_view)
+        );
+        let rows = self.run_rows(Some(db), &select)?;
+        let url = format!("{}/bulk", spec.endpoint.trim_end_matches('/'));
+        let batch = spec.batch_size.max(1);
+        let mut batches = 0_usize;
+        for chunk in rows.chunks(batch) {
+            self.check_cancelled()?;
+            let mut body = String::with_capacity(chunk.len() * 128);
+            for row in chunk {
+                let mut inner = serde_json::Map::new();
+                inner.insert("table".into(), JsonValue::String(spec.table.clone()));
+                inner.insert("doc".into(), row.clone());
+                let mut line = serde_json::Map::new();
+                line.insert(spec.action.clone(), JsonValue::Object(inner));
+                body.push_str(
+                    &serde_json::to_string(&JsonValue::Object(line)).unwrap_or_else(|_| "{}".into()),
+                );
+                body.push('\n');
+            }
+            let req = manticore_request(spec.username.as_deref(), spec.password.as_deref(), &url)
+                .set("Content-Type", "application/x-ndjson");
+            let response: JsonValue = match req.send_string(&body) {
+                Ok(r) => r.into_json().unwrap_or(JsonValue::Null),
+                Err(ureq::Error::Status(code, r)) => {
+                    let body = r.into_string().unwrap_or_default();
+                    return Err(EngineError::Query(format!(
+                        "Manticore HTTP {} from {}: {}",
+                        code,
+                        url,
+                        body.chars().take(300).collect::<String>()
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!(
+                        "Manticore HTTP transport to {}: {}",
+                        url, e
+                    )))
+                }
+            };
+            if response.get("errors").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Err(EngineError::Query(format!(
+                    "Manticore rejected part of a /bulk batch ({} row(s) sent so far, none of \
+                     this batch is guaranteed written): {}",
+                    batches * batch,
+                    manticore_bulk_reason(&response)
+                )));
+            }
+            batches += 1;
+        }
+        Ok(format!(
+            "manticore: {}ed {} rows into {} ({} request(s))",
+            spec.action,
+            rows.len(),
+            spec.table,
+            batches
+        ))
+    }
+
     /// Generic HTTP REST source. Fetches the URL (optionally with a
     /// JSON body for POST APIs), parses the response, walks the
     /// configured JSON pointer to find the row array, and follows
@@ -17920,6 +18104,58 @@ fn tail_chars(s: &str, max: usize) -> &str {
 /// only thing standing between a label like `` a`b `` and a broken query.
 fn cypher_ident(s: &str) -> String {
     format!("`{}`", s.replace('`', "``"))
+}
+
+/// A Manticore HTTP JSON request with optional Basic credentials. Manticore
+/// runs unauthenticated by default; both its own `auth = 1` mode and a
+/// reverse proxy in front of it accept HTTP Basic.
+fn manticore_request(user: Option<&str>, password: Option<&str>, url: &str) -> ureq::Request {
+    let mut req = crate::tls::http_agent()
+        .post(url)
+        .set("Accept", "application/json");
+    if let Some(u) = user {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let creds = B64.encode(format!("{}:{}", u, password.unwrap_or("")));
+        req = req.set("Authorization", &format!("Basic {}", creds));
+    }
+    req
+}
+
+/// Pull the readable reason out of a /bulk response. Manticore puts a
+/// top-level `error` on some failures and a per-item `error` on others, so
+/// take whichever is there rather than echoing the whole envelope.
+fn manticore_bulk_reason(response: &JsonValue) -> String {
+    if let Some(e) = response.get("error").and_then(|v| v.as_str()) {
+        if !e.is_empty() {
+            return e.to_string();
+        }
+    }
+    let per_item = response
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| {
+                    it.as_object()
+                        .and_then(|o| o.values().next())
+                        .and_then(|v| v.get("error"))
+                        .map(|e| match e.as_str() {
+                            Some(s) => s.to_string(),
+                            None => e.to_string(),
+                        })
+                })
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    if per_item.is_empty() {
+        response.to_string().chars().take(300).collect()
+    } else {
+        per_item
+    }
 }
 
 /// A Query API request with optional Basic auth. Neo4j accepts the same

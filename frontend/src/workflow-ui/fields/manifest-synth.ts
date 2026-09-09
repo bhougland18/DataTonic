@@ -2615,6 +2615,86 @@ function synthWrongFamilyForm(comp: ComponentDef): ComponentManifest | null {
 }
 
 function synthNewConnector(comp: ComponentDef): ComponentManifest | null {
+    // Manticore Search (#340). Routed by id so the search-engine group's
+    // generic form cannot claim it: Manticore names the table `table` (it
+    // was renamed from `index` in 6.0) and pages with limit/offset, so an
+    // Elasticsearch-shaped form would set keys the arm never reads.
+    if (comp.id === 'src.manticore' || comp.id === 'snk.manticore') {
+        const isSource = comp.id === 'src.manticore';
+        const connection: FormSection = {
+            label: 'Manticore',
+            fields: [
+                {
+                    key: 'endpoint',
+                    label: 'HTTP endpoint',
+                    kind: 'text',
+                    required: true,
+                    placeholder: 'http://localhost:9308',
+                    description: 'The HTTP JSON API, port 9308 by default - not the MySQL port 9306.',
+                },
+                { key: 'table', label: 'Table', kind: 'text', required: true, placeholder: 'products' },
+                {
+                    key: 'username',
+                    label: 'Username',
+                    kind: 'text',
+                    description: 'Only for a server started with auth = 1, or one behind a proxy that asks for HTTP Basic. Leave blank otherwise.',
+                },
+                { key: 'password', label: 'Password', kind: 'text', placeholder: '••••••••' },
+            ],
+        };
+        if (isSource) {
+            return base(comp, [
+                connection,
+                {
+                    label: 'Query',
+                    fields: [
+                        {
+                            key: 'query',
+                            label: 'Query (raw JSON)',
+                            kind: 'textarea',
+                            rows: 4,
+                            placeholder: '{"match": {"title": "bag"}}',
+                            description: 'Body of the `query` field in the /search request. Empty = {"match_all": {}}.',
+                        },
+                        {
+                            key: 'limit',
+                            label: 'Page size',
+                            kind: 'integer',
+                            defaultValue: 1000,
+                            description: 'Rows per request. A window reaching past 1000 raises max_matches to match, so paging deeper than the default result set works without changing the server.',
+                        },
+                        { key: 'maxPages', label: 'Max pages (safety cap)', kind: 'integer', defaultValue: 100 },
+                    ],
+                },
+            ]);
+        }
+        return base(comp, [
+            connection,
+            {
+                label: 'Write',
+                fields: [
+                    {
+                        key: 'writeMode',
+                        label: 'Write mode',
+                        kind: 'select',
+                        defaultValue: 'insert',
+                        options: [
+                            { label: 'Insert (fails on a duplicate id)', value: 'insert' },
+                            { label: 'Replace (upsert by id)', value: 'replace' },
+                        ],
+                        description: 'Manticore rejects an insert whose id already exists. Replace overwrites that document instead.',
+                    },
+                    {
+                        key: 'batchSize',
+                        label: 'Rows per request',
+                        kind: 'integer',
+                        defaultValue: 1000,
+                        description: 'Rows per /bulk call. Manticore reports a rejected batch as HTTP 200 with errors:true; the run fails on that, so a smaller batch narrows what a rejection covers.',
+                    },
+                ],
+            },
+        ], 'upstream');
+    }
     if (comp.id === 'xf.tumble') {
         return base(comp, [
             {

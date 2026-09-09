@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "componentCount": 409,
+  "componentCount": 411,
   "components": [
     {
       "id": "src.csv",
@@ -14639,6 +14639,101 @@
                     "equals": "search_after"
                   }
                 ]
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [],
+          "outputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "src.manticore",
+      "label": "Manticore Search",
+      "kind": "source",
+      "availability": "available",
+      "summary": "Read rows from a Manticore table via the HTTP JSON /search API (port 9308). Manticore answers in the Elasticsearch response shape but takes its own request: the table is named in the body as `table` (renamed from `index` in 6.0) and paging is limit/offset. A window past the default 1000 best-ranked matches raises max_matches to suit. Optional raw JSON query; optional HTTP Basic auth.",
+      "ports": {
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ]
+      },
+      "manifest": {
+        "id": "src.manticore",
+        "kind": "source",
+        "label": "Manticore Search",
+        "description": "Read rows from a Manticore table via the HTTP JSON /search API (port 9308). Manticore answers in the Elasticsearch response shape but takes its own request: the table is named in the body as `table` (renamed from `index` in 6.0) and paging is limit/offset. A window past the default 1000 best-ranked matches raises max_matches to suit. Optional raw JSON query; optional HTTP Basic auth.",
+        "schemaSource": "autodetect",
+        "sections": [
+          {
+            "label": "Manticore",
+            "fields": [
+              {
+                "key": "endpoint",
+                "label": "HTTP endpoint",
+                "kind": "text",
+                "required": true,
+                "placeholder": "http://localhost:9308",
+                "description": "The HTTP JSON API, port 9308 by default - not the MySQL port 9306."
+              },
+              {
+                "key": "table",
+                "label": "Table",
+                "kind": "text",
+                "required": true,
+                "placeholder": "products"
+              },
+              {
+                "key": "username",
+                "label": "Username",
+                "kind": "text",
+                "description": "Only for a server started with auth = 1, or one behind a proxy that asks for HTTP Basic. Leave blank otherwise."
+              },
+              {
+                "key": "password",
+                "label": "Password",
+                "kind": "text",
+                "placeholder": "••••••••",
+                "secret": true
+              }
+            ]
+          },
+          {
+            "label": "Query",
+            "fields": [
+              {
+                "key": "query",
+                "label": "Query (raw JSON)",
+                "kind": "textarea",
+                "rows": 4,
+                "placeholder": "{\"match\": {\"title\": \"bag\"}}",
+                "description": "Body of the `query` field in the /search request. Empty = {\"match_all\": {}}."
+              },
+              {
+                "key": "limit",
+                "label": "Page size",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "Rows per request. A window reaching past 1000 raises max_matches to match, so paging deeper than the default result set works without changing the server."
+              },
+              {
+                "key": "maxPages",
+                "label": "Max pages (safety cap)",
+                "kind": "integer",
+                "defaultValue": 100
               }
             ]
           }
@@ -39086,6 +39181,104 @@
                 "label": "Row shape",
                 "kind": "note",
                 "description": "Each upstream row is sent as a doc, preceded by a {\"index\":{\"_index\":\"<index>\"}} action line. Content-Type is application/x-ndjson."
+              }
+            ]
+          }
+        ],
+        "ports": {
+          "inputs": [
+            {
+              "id": "main",
+              "label": "main",
+              "type": "main"
+            }
+          ],
+          "outputs": []
+        }
+      }
+    },
+    {
+      "id": "snk.manticore",
+      "label": "Manticore Search",
+      "kind": "sink",
+      "availability": "available",
+      "summary": "Index rows into a Manticore table via the HTTP JSON /bulk API (port 9308). NDJSON, one line per row, with the document nested inside the action ({\"insert\":{\"table\":\"t\",\"doc\":{...}}}) - not Elasticsearch's action/doc pair. Insert or replace (upsert by id), batched at 1000 rows. A batch Manticore rejects comes back as HTTP 200 with errors:true, and fails the run rather than reporting a write that did not happen.",
+      "ports": {
+        "inputs": [
+          {
+            "id": "main",
+            "label": "main",
+            "type": "main"
+          }
+        ],
+        "outputs": []
+      },
+      "manifest": {
+        "id": "snk.manticore",
+        "kind": "sink",
+        "label": "Manticore Search",
+        "description": "Index rows into a Manticore table via the HTTP JSON /bulk API (port 9308). NDJSON, one line per row, with the document nested inside the action ({\"insert\":{\"table\":\"t\",\"doc\":{...}}}) - not Elasticsearch's action/doc pair. Insert or replace (upsert by id), batched at 1000 rows. A batch Manticore rejects comes back as HTTP 200 with errors:true, and fails the run rather than reporting a write that did not happen.",
+        "schemaSource": "upstream",
+        "sections": [
+          {
+            "label": "Manticore",
+            "fields": [
+              {
+                "key": "endpoint",
+                "label": "HTTP endpoint",
+                "kind": "text",
+                "required": true,
+                "placeholder": "http://localhost:9308",
+                "description": "The HTTP JSON API, port 9308 by default - not the MySQL port 9306."
+              },
+              {
+                "key": "table",
+                "label": "Table",
+                "kind": "text",
+                "required": true,
+                "placeholder": "products"
+              },
+              {
+                "key": "username",
+                "label": "Username",
+                "kind": "text",
+                "description": "Only for a server started with auth = 1, or one behind a proxy that asks for HTTP Basic. Leave blank otherwise."
+              },
+              {
+                "key": "password",
+                "label": "Password",
+                "kind": "text",
+                "placeholder": "••••••••",
+                "secret": true
+              }
+            ]
+          },
+          {
+            "label": "Write",
+            "fields": [
+              {
+                "key": "writeMode",
+                "label": "Write mode",
+                "kind": "select",
+                "defaultValue": "insert",
+                "options": [
+                  {
+                    "label": "Insert (fails on a duplicate id)",
+                    "value": "insert"
+                  },
+                  {
+                    "label": "Replace (upsert by id)",
+                    "value": "replace"
+                  }
+                ],
+                "description": "Manticore rejects an insert whose id already exists. Replace overwrites that document instead."
+              },
+              {
+                "key": "batchSize",
+                "label": "Rows per request",
+                "kind": "integer",
+                "defaultValue": 1000,
+                "description": "Rows per /bulk call. Manticore reports a rejected batch as HTTP 200 with errors:true; the run fails on that, so a smaller batch narrows what a rejection covers."
               }
             ]
           }

@@ -13,8 +13,8 @@ catalog the application itself reads, so the names and counts here are exact.
 - Free and open source, dual-licensed MIT OR Apache-2.0. No per-row, per-connector, or per-seat billing.
 - Local-first desktop app: runs fully offline, no account and no telemetry, suitable for air-gapped and compliance-sensitive work.
 - Engine: pipelines compile to SQL and execute on DuckDB, an in-process analytical database, at native speed.
-- 409 components, 392 available today: sources, transforms, destinations, data-quality checks, control-flow nodes, and code runners.
-- 192 connectors (120 sources / 72 destinations): databases, warehouses, lakehouses, object stores, streaming brokers, NoSQL, vector databases, geospatial formats, and SaaS APIs.
+- 411 components, 394 available today: sources, transforms, destinations, data-quality checks, control-flow nodes, and code runners.
+- 194 connectors (121 sources / 73 destinations): databases, warehouses, lakehouses, object stores, streaming brokers, NoSQL, vector databases, geospatial formats, and SaaS APIs.
 - Transformation: 144 transforms including joins, window functions, aggregates, CDC/SCD, incremental loads, upsert with delete propagation, and a visual Map (tMap-style) editor.
 - Data quality: 29 checks, plus 21 control-flow nodes for branching, iteration, parallel branches, and calling child pipelines.
 - Three ways to author the same pipeline: the visual canvas, the Python API (`pip install duckle`), or plain English via the built-in assistant. All three produce the same pipeline JSON and the same SQL.
@@ -81,7 +81,7 @@ Every component, by id. `src.*` reads, `snk.*` writes, `xf.*` transforms,
 `qa.*` checks, `ctl.*` controls flow, `code.*` runs your own code. Entries
 marked [planned] or [preview] are not usable yet.
 
-### Sources (read) (129)
+### Sources (read) (130)
 
 - `src.adbc` ADBC (Arrow): Read any database that ships an ADBC (Arrow Database Connectivity) driver. Point at a prebuilt driver shared library (.dll / .so / .dylib) plus a connection URI and SQL; rows stream back as Arrow for fast loads. Friendly wrappers can map their own fields onto driver / options
 - `src.airtable` Airtable: Airtable REST. Bearer Personal Access Token. Cursor pagination on `offset` (cursorNextPath /offset, cursorParam `offset`). responsePath /records
@@ -144,6 +144,7 @@ marked [planned] or [preview] are not usable yet.
 - `src.lancedb` LanceDB: Read a Lance table (local dir, LanceDB Cloud db://, or s3:// / gs:// / az:// object store) via the bundled duckle-lance sidecar
 - `src.linear` Linear: Linear GraphQL. Rides src.graphql; auth via API key in Authorization header. responsePath walks /data.<query>.<edges> or similar
 - `src.mailchimp` Mailchimp: Mailchimp REST. Bearer API key (the key has a region suffix - the URL is https://{region}.api.mailchimp.com/3.0). Offset pagination via `offset` + `count`. responsePath /lists (or /campaigns / etc)
+- `src.manticore` Manticore Search: Read rows from a Manticore table via the HTTP JSON /search API (port 9308). Manticore answers in the Elasticsearch response shape but takes its own request: the table is named in the body as `table` (renamed from `index` in 6.0) and paging is limit/offset. A window past the default 1000 best-ranked matches raises max_matches to suit. Optional raw JSON query; optional HTTP Basic auth
 - `src.mariadb` MariaDB: Read from MariaDB via the DuckDB mysql extension
 - `src.milvus` Milvus: Query Milvus via POST /v1/vector/query. Offset pagination on `offset` + `limit`; emits each `data[]` element as a row. Provide a filter expression (default `id > 0`) and optional outputFields. apiKey via Bearer
 - `src.minio` MinIO: Read via S3-compatible endpoint
@@ -213,7 +214,7 @@ marked [planned] or [preview] are not usable yet.
 - `src.yaml` YAML: Read a YAML file as a table. Top-level YAML arrays become one row per element; non-array docs become a single row. Suits config-data ETL (Helm values, GitHub Actions matrices) not bulk logs
 - `src.zendesk` Zendesk: Zendesk Support REST. Basic auth (email/token + API token). Cursor pagination via `meta.after_cursor` + `page[after]` param. responsePath /tickets (or whatever resource)
 
-### Destinations (write) (77)
+### Destinations (write) (78)
 
 - `snk.avro` Avro: Write rows as an Apache Avro container file via the pure-Rust `apache-avro` crate. Schema is inferred from the first row's column types (long / double / string / boolean) - or supply a JSON Avro schema via the schemaJson field to override. recordName names the inferred record (default `Row`)
 - `snk.azureblob` Azure Blob Storage: Write via the azure extension
@@ -245,6 +246,7 @@ marked [planned] or [preview] are not usable yet.
 - `snk.kafka` Apache Kafka: Produce one Kafka record per upstream row via the pure-Rust `rskafka` driver. Record key = optional keyColumn value; record value = JSON-stringified row. Records go to a single partition (partitionId, default 0); pipelined batching (default 500 records per produce call). Every write is acknowledged by the full in-sync replica set (acks=all) - the driver does not offer a weaker setting
 - `snk.kinesis` AWS Kinesis [planned]: Writes data to AWS Kinesis
 - `snk.lancedb` LanceDB: Write rows to a Lance table (create/overwrite or append) via the bundled duckle-lance sidecar
+- `snk.manticore` Manticore Search: Index rows into a Manticore table via the HTTP JSON /bulk API (port 9308). NDJSON, one line per row, with the document nested inside the action ({"insert":{"table":"t","doc":{...}}}) - not Elasticsearch's action/doc pair. Insert or replace (upsert by id), batched at 1000 rows. A batch Manticore rejects comes back as HTTP 200 with errors:true, and fails the run rather than reporting a write that did not happen
 - `snk.mariadb` MariaDB: Write to MariaDB via the DuckDB mysql extension (MariaDB speaks the MySQL wire protocol)
 - `snk.milvus` Milvus: Insert rows to a Milvus collection via /v1/vector/insert
 - `snk.minio` MinIO: Write via S3-compatible endpoint

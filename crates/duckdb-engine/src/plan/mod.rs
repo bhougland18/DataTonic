@@ -378,6 +378,8 @@ pub enum RuntimeSpec {
     DatabricksSource(DatabricksSourceSpec),
     RestSource(RestSourceSpec),
     ElasticSource(ElasticSourceSpec),
+    ManticoreSource(ManticoreSourceSpec),
+    ManticoreSink(ManticoreSinkSpec),
     MongoSink(MongoSinkSpec),
     HuggingFaceSink(HuggingFaceSinkSpec),
     MongoSource(MongoSourceSpec),
@@ -1917,6 +1919,8 @@ fn build_stage(
     let mut databricks_source: Option<DatabricksSourceSpec> = None;
     let mut rest_source: Option<RestSourceSpec> = None;
     let mut elastic_source: Option<ElasticSourceSpec> = None;
+    let mut manticore_source: Option<ManticoreSourceSpec> = None;
+    let mut manticore_sink: Option<ManticoreSinkSpec> = None;
     let mut mongo_sink: Option<MongoSinkSpec> = None;
     let mut huggingface_sink: Option<HuggingFaceSinkSpec> = None;
     let mut mongo_source: Option<MongoSourceSpec> = None;
@@ -3010,6 +3014,38 @@ fn build_stage(
             declared_schema: node.data.schema.clone(),
         });
         (String::new(), StageKind::View, None)
+    } else if component_id == "snk.manticore" {
+        // Manticore Search /bulk. NDJSON like Elasticsearch's, but the
+        // document rides INSIDE the action line, so it cannot reuse the
+        // webhook sink's ndjson_bulk shape - and Manticore reports a
+        // rejected batch as HTTP 200 with errors:true, which that shape
+        // would read as success. MUST come before the starts_with("snk.")
+        // catch-all below.
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let endpoint = string_prop(&props, "endpoint")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: endpoint required", component_id)))?;
+        let table = string_prop(&props, "table")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: table required", component_id)))?;
+        let action = match string_prop(&props, "writeMode").as_deref() {
+            Some("replace") => "replace",
+            _ => "insert",
+        };
+        manticore_sink = Some(ManticoreSinkSpec {
+            from_view: from_view.to_string(),
+            endpoint,
+            table,
+            action: action.to_string(),
+            batch_size: props
+                .get("batchSize")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1000) as usize,
+            username: string_prop(&props, "username").filter(|s| !s.is_empty()),
+            password: string_prop(&props, "password").filter(|s| !s.is_empty()),
+        });
+        (String::new(), StageKind::Sink, Some(from_view.to_string()))
     } else if component_id == "snk.elastic" || component_id == "snk.opensearch" {
         // Elasticsearch / OpenSearch bulk API:
         //   POST {host}/{index}/_bulk
@@ -4081,6 +4117,36 @@ fn build_stage(
             ),
         };
         (copy, StageKind::Sink, Some(from_view.to_string()))
+    } else if component_id == "src.manticore" {
+        // Manticore Search /search. Elasticsearch's response shape, its own
+        // request shape: `table` in the body (not `index` in the path) and
+        // limit/offset (not size/from). Form: endpoint, table, query,
+        // limit, maxPages, username, password.
+        let endpoint = string_prop(&props, "endpoint")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: endpoint required", component_id)))?;
+        let table = string_prop(&props, "table")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: table required", component_id)))?;
+        manticore_source = Some(ManticoreSourceSpec {
+            node_id: node.id.clone(),
+            endpoint,
+            table,
+            query: string_prop(&props, "query").filter(|s| !s.trim().is_empty()),
+            limit: props
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1000),
+            max_pages: props
+                .get("maxPages")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(100),
+            username: string_prop(&props, "username").filter(|s| !s.is_empty()),
+            password: string_prop(&props, "password").filter(|s| !s.is_empty()),
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id == "src.elastic" || component_id == "src.opensearch" {
         // Elasticsearch / OpenSearch _search source. Form: endpoint,
         // index, apiKey, query (raw JSON DSL), size.
@@ -6812,6 +6878,8 @@ fn build_stage(
         .or_else(|| databricks_source.map(RuntimeSpec::DatabricksSource))
         .or_else(|| rest_source.map(RuntimeSpec::RestSource))
         .or_else(|| elastic_source.map(RuntimeSpec::ElasticSource))
+        .or_else(|| manticore_source.map(RuntimeSpec::ManticoreSource))
+        .or_else(|| manticore_sink.map(RuntimeSpec::ManticoreSink))
         .or_else(|| mongo_sink.map(RuntimeSpec::MongoSink))
         .or_else(|| huggingface_sink.map(RuntimeSpec::HuggingFaceSink))
         .or_else(|| mongo_source.map(RuntimeSpec::MongoSource))
