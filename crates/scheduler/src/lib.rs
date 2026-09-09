@@ -478,7 +478,56 @@ impl Scheduler {
     /// Updates last-run bookkeeping on completion.
     ///
     /// That is one pipeline for most schedules and a whole plan for one that names one.
+    /// Run a schedule now, taking the run lock first.
+    ///
+    /// The public entry point, which is what "Run now" in the desktop app calls.
+    /// It claims because a manual fire is a run of the pipeline like any other:
+    /// pressing the button while this scheduler's own tick, `duckle-runner
+    /// serve`'s scheduler, or a follower is running the same pipeline used to
+    /// start a second one beside it, and two runs of one pipeline write the same
+    /// sink and advance the same `xf.incremental` watermark.
+    ///
+    /// The claim lives HERE rather than inside the body because the scheduled
+    /// paths take it before they call through and hold it for the duration - the
+    /// lock is the operating system's and is not reentrant, so claiming it again
+    /// underneath them would refuse every scheduled run. Which way round it goes
+    /// is therefore load-bearing: the unlocked body is private, so a new caller
+    /// gets the safe one by default.
     pub async fn run_now(&self, id: &str) -> Result<RunResult, String> {
+        let (workspace, key) = {
+            let g = self.inner.lock().expect("scheduler poisoned");
+            let s = g
+                .schedules
+                .iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| "Schedule not found".to_string())?;
+            (g.workspace_path.clone(), lock_key(s).map(str::to_string))
+        };
+        // No key means a plan, which locks each of its pipelines itself as it
+        // reaches them. See `lock_key`.
+        let _claim = match &key {
+            None => None,
+            Some(pipeline_id) => match claim_run(workspace.as_deref(), pipeline_id) {
+                Claim::Ours(lock) => lock,
+                Claim::Taken => {
+                    return Err(format!(
+                        "{pipeline_id} is already running in this workspace, so this run was \
+                         refused rather than started beside it. Two runs of one pipeline write \
+                         the same sink and advance the same saved state. Wait for it to finish, \
+                         or run it somewhere else."
+                    ))
+                }
+                Claim::Unusable(why) => {
+                    return Err(format!("cannot take a run lock for {pipeline_id}: {why}"))
+                }
+            },
+        };
+        self.run_now_claimed(id).await
+    }
+
+    /// The body of [`run_now`](Self::run_now), for a caller that already holds
+    /// the run lock. Private: see the note there on why the order matters.
+    async fn run_now_claimed(&self, id: &str) -> Result<RunResult, String> {
         let (workspace, sched) = {
             let g = self.inner.lock().expect("scheduler poisoned");
             let s = g
@@ -709,7 +758,10 @@ impl Scheduler {
     /// where someone would go looking for the reason.
     async fn fire_and_record(&self, id: &str, why: &str) {
         let started = Utc::now();
-        let Err(e) = self.run_now(id).await else {
+        // The caller already holds the run lock for this pipeline and the
+        // lock is not reentrant, so this takes the body rather than the public
+        // entry point.
+        let Err(e) = self.run_now_claimed(id).await else {
             return;
         };
         warn!("{} run {} failed: {}", why, id, e);

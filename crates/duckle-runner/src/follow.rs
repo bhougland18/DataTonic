@@ -176,6 +176,28 @@ pub fn run(opts: FollowOptions) -> Result<u64, String> {
         .or_else(|| opts.pipeline.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
 
+    let name = opts.name.clone().unwrap_or_else(|| {
+        opts.pipeline
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pipeline".into())
+    });
+
+    // A follower IS a run of this pipeline, so it takes the lock a run takes.
+    // Every pass advances the same saved state a scheduled run would - Kafka
+    // offsets, `xf.incremental` watermarks - and two things advancing one
+    // watermark is how a load silently skips rows. The realistic clash is a
+    // follower started for latency in a workspace that still has a schedule for
+    // the same pipeline: the scheduler claims the lock and, until now, the
+    // follower did not.
+    //
+    // Claimed before the document is even read, so a clash is reported as a
+    // clash rather than behind whatever else the file might be wrong about, and
+    // held for the follower's whole life: it is one continuous run, and the
+    // scheduler's response to a clash - skip this tick - is the right one for
+    // every tick a follower is up.
+    let _run_lock = duckle_duckdb_engine::runlock::claim_for_run(&workspace, &name)?;
+
     // Everything below happens ONCE. That is the whole point of the mode: a
     // scheduled run pays all of it per batch.
     let base_doc = load_base_doc(&opts.pipeline, &workspace)?;
@@ -184,12 +206,6 @@ pub fn run(opts: FollowOptions) -> Result<u64, String> {
     std::env::set_var("DUCKLE_LOG_DIR", &log_dir);
 
     let duckdb = crate::resolve_duckdb(opts.duckdb.clone())?;
-    let name = opts.name.clone().unwrap_or_else(|| {
-        opts.pipeline
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "pipeline".into())
-    });
     let engine = DuckdbEngine::new(duckdb).without_previews();
 
     // Ctrl-C is checked between passes, never during one. Stopping mid-batch
@@ -456,6 +472,53 @@ mod tests {
             rows_of(&r),
             0,
             "a source that re-read 12 rows an incremental filter then dropped is an IDLE pass - counting the graph total would spin the follower at full speed"
+        );
+    }
+
+    /// A follower is a run of the pipeline, so it takes the same lock a run
+    /// takes. It advances `xf.incremental` watermarks and Kafka offsets pass
+    /// after pass, which is precisely the state `runlock` exists to keep two
+    /// runs from advancing at once - "two runs writing the same sink, and two
+    /// runs advancing the same watermark, which is how a load silently skips
+    /// rows".
+    ///
+    /// The realistic collision is a follower started for latency in a workspace
+    /// that still has a schedule for the same pipeline: the scheduler claims the
+    /// lock and the follower did not, so both ran.
+    ///
+    /// Refused BEFORE the document is read, so the message is about the clash
+    /// rather than about whatever else might be wrong with the file.
+    #[test]
+    fn a_follower_will_not_start_beside_a_run_of_the_same_pipeline() {
+        let ws = tempfile::tempdir().unwrap();
+        let pipeline = ws.path().join("orders.json");
+        std::fs::write(&pipeline, "not even json, and it must not get that far").unwrap();
+
+        let held = duckle_duckdb_engine::runlock::try_acquire(ws.path(), "orders")
+            .expect("something else is running orders");
+
+        let err = run(FollowOptions {
+            pipeline: pipeline.clone(),
+            workspace: Some(ws.path().to_path_buf()),
+            max_batches: Some(1),
+            ..Default::default()
+        })
+        .expect_err("a follower must not start beside a run of the same pipeline");
+        assert!(err.contains("already running"), "the refusal has to say what is wrong: {err}");
+
+        // And once the other run is over the follower is free to start: the lock
+        // is a clash, not a permanent claim on the pipeline.
+        drop(held);
+        let err = run(FollowOptions {
+            pipeline,
+            workspace: Some(ws.path().to_path_buf()),
+            max_batches: Some(1),
+            ..Default::default()
+        })
+        .expect_err("the file is still nonsense");
+        assert!(
+            !err.contains("already running"),
+            "with the lock free it must get past the claim and fail on the document: {err}"
         );
     }
 }
