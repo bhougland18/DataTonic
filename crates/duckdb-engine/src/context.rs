@@ -413,6 +413,64 @@ const SHELL_METACHARACTERS: [char; 13] = [
     ';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r', '{', '}',
 ];
 
+/// Sequences that end one SQL token and begin something else.
+///
+/// The same judgement [`SHELL_METACHARACTERS`] makes, for the same reason: a
+/// parameter is meant to be a VALUE, and escaping correctly needs the quoting
+/// context, which text substitution into an arbitrary property does not have.
+/// A quote closes a literal, a double quote closes an identifier, a semicolon
+/// ends the statement, and `--` or `/*` comment out whatever was going to
+/// follow the value.
+const SQL_METACHARACTERS: [&str; 5] = ["'", "\"", ";", "--", "/*"];
+
+/// May this parameter's value carry that syntax?
+///
+/// Only when the pipeline's AUTHOR said so, and that is the whole design.
+/// Supplying run parameters needs Operator; authoring a pipeline needs Admin.
+/// So the permission lives in the declaration - an `enum` of the author's own
+/// literals, or a `pattern` they wrote - and an operator cannot grant it to
+/// themselves by choosing a different value.
+///
+/// A non-string type needs no exception: validation has already established the
+/// value IS a number or a date, which cannot express this.
+///
+/// A bare `{"type": "string"}` is not an opt-in. Declaring a parameter says it
+/// exists, not that anything may go in it. Nor is `secret`: it is still a value
+/// an operator supplies, and a connection string is built into an `ATTACH` like
+/// any other text.
+fn author_permitted_syntax(spec: Option<&crate::params::ParamSpec>) -> bool {
+    use crate::params::ParamType;
+    match spec {
+        None => false,
+        Some(s) => match s.kind {
+            ParamType::String | ParamType::Secret => !s.allowed.is_empty() || s.pattern.is_some(),
+            _ => true,
+        },
+    }
+}
+
+/// Does `${name}` appear in a property that is EXECUTED rather than read?
+///
+/// Only used to decide which of two overlapping refusals gives the better
+/// message; both refuse, so a miss here costs wording rather than safety.
+fn used_in_executed_prop(doc: &PipelineDoc, name: &str) -> bool {
+    let needle = format!("${{{name}}}");
+    fn walk(v: &JsonValue, key: Option<&str>, needle: &str) -> bool {
+        match v {
+            JsonValue::String(s) => {
+                key.is_some_and(|k| EXECUTED_PROPS.contains(&k)) && s.contains(needle)
+            }
+            JsonValue::Array(a) => a.iter().any(|x| walk(x, key, needle)),
+            JsonValue::Object(m) => m.iter().any(|(k, x)| walk(x, Some(k.as_str()), needle)),
+            _ => false,
+        }
+    }
+    doc.nodes
+        .iter()
+        .filter_map(|n| n.data.properties.as_ref())
+        .any(|p| walk(p, None, &needle))
+}
+
 fn is_reserved_param(name: &str) -> bool {
     // Exactly what discover_parameters refuses to offer. A caller supplying one of
     // these is not filling in a parameter, it is redefining a builtin: overriding
@@ -553,6 +611,43 @@ pub fn apply_params_from(
     if params.is_empty() {
         return Ok((recorded, effective));
     }
+    // GHSA-6756-rxf2-f9xr: a run parameter is a value, not statement text.
+    //
+    // Substitution is a plain textual replacement into every node property, and
+    // the SQL properties are handed to DuckDB as written - so a value carrying a
+    // quote closed the literal around it and appended a statement of its own.
+    // `POST /api/run` needs Operator and authoring a pipeline needs Admin, so
+    // that let an operator run SQL of their own choosing: exactly what the rule
+    // above this function already forbids for shell, and it did not hold here.
+    //
+    // Checked BEFORE anything is substituted, so a refusal leaves the document
+    // as it was rather than half-rewritten. Checked per PARAMETER rather than
+    // per property, because which properties reach SQL is a list of about a
+    // hundred field names that grows with every component, and a list like that
+    // is wrong the first time somebody adds one.
+    for (name, value) in params.iter() {
+        if author_permitted_syntax(doc.parameters.get(name)) {
+            continue;
+        }
+        // The two rules overlap on `;`. Where the shell rule also applies it is
+        // the more useful refusal - it can name the executed property that made
+        // the value dangerous - so leave that case to it rather than answering
+        // first with a message about SQL. A value with no shell syntax, or one
+        // that never reaches an executed property, is this rule's alone.
+        if value.contains(SHELL_METACHARACTERS) && used_in_executed_prop(doc, name) {
+            continue;
+        }
+        if let Some(found) = SQL_METACHARACTERS.iter().find(|m| value.contains(**m)) {
+            return Err(format!(
+                "parameter '{name}' contains {found:?}, which can end one SQL token and begin \
+                 another, so it is refused. A run parameter is a value. If this parameter really \
+                 does carry that character, declare it in the pipeline's `parameters` with an \
+                 `enum` or a `pattern` that says so - that is a decision for whoever authors the \
+                 pipeline."
+            ));
+        }
+    }
+
     let re = match regex::Regex::new(r"\$\{([^}]+)\}") {
         Ok(re) => re,
         Err(_) => return Ok((recorded, effective)),
@@ -1638,5 +1733,147 @@ mod tests {
             format!("{}/exports/${{date}}/orders.parquet", root),
             "${{workspace}} resolves but ${{date}} must remain for the run-time pass"
         );
+    }
+}
+
+#[cfg(test)]
+mod run_parameters_are_values {
+    use super::*;
+
+    fn doc_with(sql: &str, parameters: serde_json::Value) -> PipelineDoc {
+        serde_json::from_value(serde_json::json!({
+            "parameters": parameters,
+            "nodes": [{
+                "id": "q",
+                "position": {"x": 0, "y": 0},
+                "data": {
+                    "label": "Q",
+                    "componentId": "code.sql",
+                    "properties": { "sql": sql }
+                }
+            }],
+            "edges": []
+        }))
+        .expect("a document")
+    }
+
+    fn run(doc: &mut PipelineDoc, name: &str, value: &str) -> Result<(), String> {
+        let mut params = HashMap::new();
+        params.insert(name.to_string(), value.to_string());
+        apply_params(doc, &params).map(|_| ())
+    }
+
+    fn sql_of(doc: &PipelineDoc) -> String {
+        doc.nodes[0]
+            .data
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("sql"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// GHSA-6756-rxf2-f9xr: run parameters were spliced into node properties as
+    /// text, so a value could close the quote around it and append a statement
+    /// of its own.
+    ///
+    /// `POST /api/run` needs Operator; authoring a pipeline needs Admin. An
+    /// Operator who can write the SQL a run executes has the privilege the
+    /// authorization table reserves for an administrator - which is the rule
+    /// `apply_params` already states for shell, and did not hold for SQL.
+    #[test]
+    fn an_undeclared_parameter_cannot_carry_sql_syntax() {
+        let mut doc = doc_with(
+            "SELECT order_id FROM sales WHERE dt = '${day}'",
+            serde_json::json!({}),
+        );
+        let err = run(
+            &mut doc,
+            "day",
+            "' UNION ALL SELECT 1, content FROM read_text('/etc/passwd')-- ",
+        )
+        .expect_err("a value that restructures the statement must be refused");
+        assert!(err.contains("day"), "the refusal has to name the parameter: {err}");
+        assert_eq!(
+            sql_of(&doc),
+            "SELECT order_id FROM sales WHERE dt = '${day}'",
+            "the document must be left as it was when a parameter is refused",
+        );
+    }
+
+    /// The integrity half of the same advisory: no quote needed, just enough
+    /// syntax to neutralise a predicate.
+    #[test]
+    fn a_comment_marker_is_refused_too() {
+        let mut doc = doc_with("SELECT * FROM t WHERE dt > '${since}'", serde_json::json!({}));
+        assert!(run(&mut doc, "since", "1970-01-01' OR 1=1 -- ").is_err());
+    }
+
+    /// An ordinary value still substitutes. The point is that a parameter is a
+    /// VALUE, not that parameters stop working.
+    #[test]
+    fn a_plain_value_still_substitutes() {
+        let mut doc = doc_with("SELECT * FROM t WHERE dt = '${day}'", serde_json::json!({}));
+        run(&mut doc, "day", "2026-09-09").expect("a date is a value");
+        assert_eq!(sql_of(&doc), "SELECT * FROM t WHERE dt = '2026-09-09'");
+    }
+
+    /// The opt-in, and where it sits is the whole design: a `pattern` is written
+    /// by whoever authored the pipeline, and authoring needs Admin. So an
+    /// administrator can say "this parameter may contain quotes" and an operator
+    /// cannot decide it for themselves.
+    #[test]
+    fn an_author_can_permit_syntax_by_declaring_a_pattern() {
+        let mut doc = doc_with(
+            "SELECT * FROM t WHERE name = '${who}'",
+            serde_json::json!({ "who": { "type": "string", "pattern": "^[A-Za-z' ]+$" } }),
+        );
+        run(&mut doc, "who", "O'Brien").expect("the author allowed this shape");
+        assert_eq!(sql_of(&doc), "SELECT * FROM t WHERE name = 'O'Brien'");
+    }
+
+    /// An `enum` is the same statement in a stronger form: the value can only be
+    /// one of the author's own literals.
+    #[test]
+    fn an_enum_is_the_authors_own_list_and_is_allowed() {
+        let mut doc = doc_with(
+            "SELECT * FROM t WHERE region = '${r}'",
+            serde_json::json!({ "r": { "type": "string", "enum": ["north", "o'south"] } }),
+        );
+        run(&mut doc, "r", "o'south").expect("one of the declared values");
+    }
+
+    /// A declared-but-unconstrained string is not an opt-in. Declaring a
+    /// parameter says it exists, not that anything may go in it.
+    #[test]
+    fn declaring_a_bare_string_permits_nothing_extra() {
+        let mut doc = doc_with(
+            "SELECT * FROM t WHERE dt = '${day}'",
+            serde_json::json!({ "day": { "type": "string" } }),
+        );
+        assert!(run(&mut doc, "day", "x' OR '1'='1").is_err());
+    }
+
+    /// A secret is not a free pass either. It is still a value an operator
+    /// supplies, and it still lands in text that becomes SQL - a connection
+    /// string is built into an ATTACH like anything else.
+    #[test]
+    fn a_secret_parameter_is_not_exempt() {
+        let mut doc = doc_with(
+            "ATTACH '${pw}' AS d",
+            serde_json::json!({ "pw": { "type": "secret" } }),
+        );
+        assert!(run(&mut doc, "pw", "x' ; DROP TABLE t; --").is_err());
+    }
+
+    /// A non-string type cannot express this at all - validation has already
+    /// established it is a number - so it needs no exception and gets none.
+    #[test]
+    fn a_typed_parameter_is_checked_by_its_type() {
+        let mut doc = doc_with("SELECT * FROM t LIMIT ${n}", serde_json::json!({ "n": { "type": "integer" } }));
+        assert!(run(&mut doc, "n", "5' OR '1").is_err(), "not an integer");
+        run(&mut doc, "n", "5").expect("an integer is fine");
+        assert_eq!(sql_of(&doc), "SELECT * FROM t LIMIT 5");
     }
 }
