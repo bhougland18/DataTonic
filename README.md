@@ -11,17 +11,15 @@
 <p><sub><i>Duckle is an independent open-source project by SlothFlowLabs. It builds on the DuckDB engine but is not part of, affiliated with, or endorsed by DuckDB Labs or MotherDuck.</i></sub></p>
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-beta-3b82f6"/>
-<img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"/>
-<img alt="platforms" src="https://img.shields.io/badge/platforms-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-2b6cb0"/>
-<img alt="rust" src="https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white"/>
-<img alt="tauri" src="https://img.shields.io/badge/Tauri%202-24C8DB?logo=tauri&logoColor=white"/>
-<img alt="react" src="https://img.shields.io/badge/React%2019-20232A?logo=react&logoColor=61DAFB"/>
-<img alt="typescript" src="https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white"/>
-<img alt="duckdb" src="https://img.shields.io/badge/DuckDB-FFF000?logo=duckdb&logoColor=black"/>
-<img alt="stars" src="https://img.shields.io/github/stars/slothflowlabs/duckle?style=social"/>
-<a href="https://discord.com/invite/rUeAStJbWb"><img alt="discord" src="https://img.shields.io/discord/1498599942246109265?logo=discord&amp;logoColor=white&amp;label=Discord&amp;color=5865F2"/></a>
-<a href="https://mcptoplist.com/server/glama%2Fslothflowlabs%2Fduckle"><img src="https://mcptoplist.com/badge/glama%2Fslothflowlabs%2Fduckle.svg" alt="MCP Toplist: Top 1% of 98,291" /></a>
+<img alt="status" src="https://img.shields.io/badge/status-beta-3b82f6?style=for-the-badge"/>
+<a href="https://github.com/slothflowlabs/duckle/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/slothflowlabs/duckle/total?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=DOWNLOADS&amp;color=2b6cb0"/></a>
+<img alt="clones" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fslothflowlabs%2Fduckle%2Fmain%2F.github%2Fbadges%2Fclones.json&amp;style=for-the-badge&amp;logo=github&amp;logoColor=white"/>
+<img alt="stars" src="https://img.shields.io/github/stars/slothflowlabs/duckle?style=for-the-badge&amp;logo=github&amp;logoColor=white&amp;label=STARS&amp;color=f59e0b"/>
+<a href="https://discord.com/invite/rUeAStJbWb"><img alt="discord" src="https://img.shields.io/discord/1498599942246109265?style=for-the-badge&amp;logo=discord&amp;logoColor=white&amp;label=DISCORD&amp;color=5865F2"/></a>
+<br/>
+<img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=for-the-badge"/>
+<img alt="platforms" src="https://img.shields.io/badge/platforms-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-2b6cb0?style=for-the-badge"/>
+<img alt="duckdb" src="https://img.shields.io/badge/DuckDB-FFF000?style=for-the-badge&amp;logo=duckdb&amp;logoColor=black"/>
 </p>
 
 </div>
@@ -48,6 +46,8 @@
 
 - [Where Duckle runs](#where-duckle-runs)
 - [What is Duckle?](#what-is-duckle)
+- [What's new in v0.7.2](#whats-new-in-v072)
+- [What's new in v0.7.1](#whats-new-in-v071)
 - [What's new in v0.7.0](#whats-new-in-v070)
 - [What's new in v0.6.1](#whats-new-in-v061)
 - [What's new in v0.6.0](#whats-new-in-v060)
@@ -128,8 +128,8 @@ In short: a free, open-source, single-engine alternative to hosted, per-row-pric
 
 Three things set it apart:
 
-1. **An AI assistant that ships in the box.** Describe the pipeline you want in English; Duckie writes the JSON and drops it onto the canvas. The model runs locally - no API key, no telemetry, no cloud round-trip.
-2. **360+ components ready at install time.** Files, lakehouses, SQL databases, warehouses, NoSQL, vector DBs, streaming brokers, SaaS REST/GraphQL APIs, even FTP and IMAP - working today, not coming-soon.
+1. **An AI assistant that ships in the box.** Describe the pipeline you want in English; Duckie writes the JSON and drops it onto the canvas. The model runs wherever Duckle does - no API key, no telemetry, no vendor round-trip. Point it at your own OpenAI-compatible endpoint instead if you would rather it did not run in-process.
+2. **400+ components ready at install time.** Files, lakehouses, SQL databases, warehouses, NoSQL, vector DBs, streaming brokers, SaaS REST/GraphQL APIs, even FTP and IMAP - working today, not coming-soon.
 3. **A self-contained binary you can audit.** 73 to 110 MB depending on your platform. Engines install on first launch. Workspaces are plain files in a folder you choose. Diff them, branch them, ship them.
 
 <div align="center">
@@ -143,11 +143,11 @@ Three things set it apart:
 | | |
 |---|---|
 | **Visual, never opaque** | The canvas compiles to SQL you can read, and every node has a live preview tab. No black box. |
-| **Local-first AI** | An assistant that runs on your laptop without an API key. Your prompts, your data, your machine. |
+| **An assistant with no API key** | Runs in-process by default, or against your own OpenAI-compatible endpoint. Your prompts and your data stay inside your infrastructure either way. |
 | **Single-file binary, no bundled DB** | 73 to 110 MB depending on platform (it embeds the headless runner + MCP server). DuckDB downloads on first launch with a guided step. AI engine is opt-in. |
 | **Native speed** | Execution runs through DuckDB: vectorized, columnar, local. A clean-and-export job that crawls in a spreadsheet finishes in milliseconds. |
 | **Git-friendly by design** | Pipelines, connections, contexts, and routines persist as plain files in a folder you pick. Diff them, branch them, review them. |
-| **360+ components ready today** | Files, databases, warehouses, lakehouses, object stores, SaaS APIs, NoSQL, streaming brokers, vector DBs, FTP, IMAP, SMTP. Each is covered by tests. |
+| **400+ components ready today** | Files, databases, warehouses, lakehouses, object stores, SaaS APIs, NoSQL, streaming brokers, vector DBs, FTP, IMAP, SMTP. Each is covered by tests. |
 | **Honest about scope** | Single-machine and embedded by design. Built to make local and small-team data work fast, not to replace a distributed warehouse. |
 | **60 UI languages** | Topbar, palette, chat assistant, properties panel, and common dialogs ship localized. English, Spanish, Chinese (Simplified + Traditional), Hindi, Arabic, Portuguese (Brazil), Bengali, Russian, Japanese, Punjabi, German, Korean, French, Vietnamese, Telugu, Marathi, Turkish, Tamil, Urdu, Persian, Polish, Italian, Ukrainian, Indonesian, Thai, Dutch, Hebrew, Swedish, Greek, Czech, Hungarian, Romanian, Filipino, Malay, Norwegian, Danish, Finnish, Catalan, Bulgarian, Slovak, Croatian, Serbian, Slovenian, Lithuanian, Latvian, Estonian, Khmer, Burmese, Sinhala, Nepali, Swahili, Afrikaans, Welsh, Irish, Icelandic, Albanian, Azerbaijani, Mongolian, Kazakh. RTL (Arabic, Hebrew, Persian, Urdu) supported. Switch languages from the topbar globe. |
 | **Open source** | Dual-licensed MIT OR Apache-2.0. Yours to use, fork, and extend. |
@@ -206,7 +206,7 @@ That's a real, native ETL pipeline built and run in under a minute. CSV is just 
 
 ## Download / Install
 
-Pick the binary for your OS from the [latest release](https://github.com/slothflowlabs/duckle/releases/tag/v0.7.0):
+Pick the binary for your OS from the [latest release](https://github.com/slothflowlabs/duckle/releases/tag/v0.7.2):
 
 | OS | Asset | How to run |
 |---|---|---|
@@ -362,7 +362,7 @@ Nothing here depends on a person's machine being switched on:
 
 Working recipes for **AWS (EC2, ECS, EKS)**, **Azure (VM, Container Apps, AKS)** and **Google Cloud (Compute Engine, GKE)**, with manifests and the mistakes worth avoiding, are at **[duckle.org/deploy](https://duckle.org/deploy.html)**. Three things worth knowing before you start:
 
-- On a non-loopback bind with no credential the console starts **unclaimed**, and for 15 minutes anyone who can reach it can claim it and become its administrator. Pass `--token`, set `DUCKLE_CONSOLE_TOKEN`, or create accounts with `duckle-runner console add-user` before exposing it. An empty value is refused rather than treated as absent, so an unresolved secret fails loudly instead of opening that window. Who can do what, and [how one request is decided](#how-a-request-is-decided), is set out under [Sign-in and roles](#sign-in-and-roles).
+- On a non-loopback bind with no credential the console starts **unclaimed**, and for 15 minutes it can be claimed by someone holding the **setup code it prints to its own output** when it starts. Reading that output - the terminal, or `docker logs` - is what distinguishes the operator from anyone who can reach the port; the code is 128 bits, new on every restart, and never written to disk. A refused claim is recorded in the audit log, so guessing is visible rather than silent. Pass `--token`, set `DUCKLE_CONSOLE_TOKEN`, or create accounts with `duckle-runner console add-user` to skip the window entirely. An empty value is refused rather than treated as absent, so an unresolved secret fails loudly instead of opening that window. Who can do what, and [how one request is decided](#how-a-request-is-decided), is set out under [Sign-in and roles](#sign-in-and-roles).
 - The **scheduler runs in `serve`**, not in the editor. Start the editor with schedules armed and it now says so rather than leaving you to wonder why nothing fired.
 - **`GET /healthz`** needs no credential and answers `ok`, so a Kubernetes probe or a load balancer can check liveness without holding a token. Every other route is authenticated, so pointing a probe anywhere else reports the pod unhealthy forever.
 
@@ -467,6 +467,2497 @@ On Windows use **Task Scheduler**; on macOS a **launchd** plist; on Linux a **sy
 duckle-runner --pipeline /path/to/pipeline.json [--workspace /path/to/workspace] [--duckdb /path/to/duckdb]
 ```
 
+### Continuous mode (`follow`)
+
+A scheduled pipeline already consumes a stream without gaps: a source that
+tracks its position (`src.kafka` with `trackOffset`, `xf.incremental`) resumes
+where the last **successful** run stopped. What a schedule cannot give is
+latency - the scheduler wakes every 15 seconds, and every run pays process
+start, DuckDB resolution and document parsing again.
+
+`follow` keeps the same execution model and removes that per-batch overhead.
+The document is read and resolved once, the engine is built once, and the
+pipeline then runs in a loop. Each pass is one micro-batch:
+
+```bash
+duckle-runner follow /path/to/pipeline.json --idle-ms 500
+```
+
+| Flag | Meaning |
+|---|---|
+| `--idle-ms N` | wait N ms after a pass whose sinks wrote nothing (default 1000) |
+| `--max-batches N` | stop after N passes (default: until stopped) |
+| `--on-error stop\|continue` | stop on a failed batch (default), or keep going |
+
+**A failed batch never advances the source position.** The position is queued
+during the run and written only when the run reaches `ok`, which is after every
+sink has written - so a failure anywhere, transform, quality gate or sink,
+leaves the position where it was and the next pass re-reads exactly the records
+that did not land. Killing the process is safe for the same reason; `Ctrl-C`
+finishes the batch in hand first, which only saves you a truncated output file.
+
+That ordering is the difference between a correct micro-batch loop and a lossy
+one, so it is covered by a regression test that fails if the position ever
+advances past a batch that did not land.
+
+### Masking what you look at, not what you write
+
+A pipeline's sinks can be perfectly governed and its data still be read off a
+screen. Previews, profiles, reject rows, error bodies, API responses and the
+rows an MCP tool hands an agent are all places production person-data appears
+without anyone's permissions being wrong.
+
+Tag the column in the schema:
+
+```json
+{ "name": "email",      "type": "string", "tags": ["pii"] }
+{ "name": "api_secret", "type": "string", "tags": ["secret"] }
+```
+
+| tag | what an inspection surface shows |
+|---|---|
+| `secret` | `***`, always, whatever else the column is tagged |
+| `pii` | a short stable digest, so rows stay distinguishable without the value appearing |
+| `mask:null` / `mask:last4` / `mask:redact` / `mask:hash` | picked explicitly |
+
+**It never changes what the pipeline writes.** The sink still receives the real
+value, because the sink is governed by policy and the screen is not. Changing
+written data is what `qa.mask` is for.
+
+Masking happens as the previews are assembled, so the desktop panel, the CLI,
+the console API and MCP are consistent by construction rather than by four
+callers remembering. Both execution paths are covered, and there is a test for
+each - a masking point wired into only one of them would leak on the other.
+
+Nothing is inferred from a column name. A heuristic that masked `company_name`
+because it contains "name" would teach people to distrust the masking, and one
+that quietly failed to mask something would be worse.
+
+### Schedules in a named time zone
+
+A cron expression is civil time: `0 3 * * *` means three in the morning as a
+person reads a clock. With no zone set that is the machine's clock, which is
+what every existing schedule already means. Set one and it stops depending on
+where the runner is deployed:
+
+```yaml
+timezone: Europe/Brussels
+```
+
+A Brussels registry pipeline stays at 03:00 Brussels whether the container runs
+on UTC or the operator is watching from another continent. An unknown zone is
+**refused when you save it**, not at fire time, so `Europe/Brussel` is a typo
+you see rather than a job quietly running on UTC for a quarter.
+
+**Daylight saving is decided, not discovered.** Twice a year a civil time is not
+a single instant, so both cases are pinned and tested:
+
+| case | what happens |
+|---|---|
+| the clock skips it (spring) | the occurrence is **skipped**, and the skip is reported. A job asked to run at 02:30 on a day with no 02:30 has not been missed by the scheduler; the day was short. It is not nudged to 03:30. |
+| the clock repeats it (autumn) | it fires **once, at the earlier** of the two instants |
+
+**Intervals are untouched.** `every 24 hours` is an elapsed duration, not "the
+same clock time tomorrow", and a zone must not quietly turn one into the other.
+
+Both schedulers - the desktop one and the web console's - now evaluate through
+the same code. They disagreed once before, and the way it showed up was one
+expression firing at two different times depending on which surface owned it.
+
+**Days a schedule must not fire on** are a small calendar rather than a holiday
+provider:
+
+```yaml
+exclude:
+  weekdays: [sunday]
+  dates: [2026-12-25]
+```
+
+The dates are civil dates **in the schedule's own zone**, which is why this
+belongs with time zones rather than beside them: a schedule at 00:30 Brussels on
+the 25th is 23:30 UTC on the 24th, so a UTC-based check would exclude the wrong
+day. A skipped occurrence is reported rather than merely not happening, and a
+misspelled weekday or date is refused when you save it - "sundy" excludes
+nothing, which looks exactly like no exclusion at all until the day arrives.
+
+Real holiday calendars vary by country, region and year; a first version that
+tried to know them would be wrong somewhere and confidently so. A date list is
+something an operator can check by reading it.
+
+### Typed pipeline parameters
+
+A pipeline can declare what it takes, and the contract is checked once for every
+surface rather than separately by each:
+
+```json
+"parameters": {
+  "jurisdiction":   { "type": "string",  "enum": ["BE","NL","GB"], "required": true },
+  "effective_date": { "type": "date",    "required": true },
+  "full_refresh":   { "type": "boolean", "default": "false" },
+  "max_companies":  { "type": "integer", "minimum": 1 },
+  "api_token":      { "type": "secret",  "required": true }
+}
+```
+
+Types: `string`, `integer`, `number`, `boolean`, `date`, `datetime`, `secret`.
+Constraints: `required`, `default`, `enum`, `minimum`, `maximum`, `pattern`,
+`description`.
+
+**Where a value came from is kept.** When two surfaces bind the same parameter -
+a schedule and the run that starts, say - the later one wins, which is a
+documented rule and not a clever one. What is not thrown away is that something
+was displaced:
+
+```json
+{ "name": "jurisdiction", "value": "NL", "source": "run input", "overrode": ["schedule"] }
+```
+
+Only a *differing* value counts as an override. Two places binding a parameter
+to the same value is a duplicate and harmless; recording both alike would bury
+the case that matters in the noise of the one that does not. The record lands on
+the run receipt, so "was this deliberately overridden, or bound twice by
+accident?" is answerable after the fact rather than only while it happens. A
+secret is `***` here for exactly the reason it is elsewhere - a provenance record
+must not become the one place a credential is written down.
+
+**Validated at one boundary.** Every surface - desktop, console, CLI, HTTP API,
+MCP, scheduler, Plans - reaches substitution through the same function, so the
+contract is enforced there. Validating per surface is how the desktop ends up
+accepting a value the scheduler refuses, and the bug is then in neither of them.
+
+**Every problem at once**, with a stable code (`param:unknown`, `param:missing`,
+`param:type`, `param:enum`, `param:range`, `param:pattern`) and what was wanted.
+A form filling in one mistake per round trip is not a contract, it is a
+guessing game. An undeclared name is refused rather than ignored, with the near
+names suggested - a typo is far more likely than a new parameter, and a silently
+ignored one means the run used the default and nobody noticed.
+
+**`secret` is a declared type, not a guess from the name.** A secret value never
+reaches run history, and a constraint failure on one never echoes the value into
+an error message. In history it is replaced rather than dropped, because a
+missing key reads as "never supplied" and "was this run given a token?" is worth
+being able to answer.
+
+A pipeline that declares nothing behaves exactly as before: any unresolved
+`${name}` is simply prompted for.
+
+### Is this SQL right? (`sql check`)
+
+```bash
+duckle-runner sql check pipeline.json [--node q] [--format json|junit|sarif]
+```
+
+```text
+skip  src                src.csv has no SQL to check
+skip  pg                 src.postgres sends its SQL to the remote system, so DuckDB cannot
+                         validate it. Checking it here would say nothing true about that dialect.
+hint  pg                 more than one statement: a source sends ONE query, wrapped as
+                         `SELECT * FROM (...)`, so anything after the first semicolon is a
+                         syntax error rather than a second step
+FAIL  q                  2:12: Referenced column "amountt" not found in FROM clause!  (did you mean amount?)
+skip  out                node "out" is a sink stage, which produces no relation to describe - and
+                         running it to find out would perform its writes
+
+4 node(s) checked, 2 problem(s)
+```
+
+Every SQL-bearing node is bound against the columns its upstreams actually
+produce, **before anything runs**, and the output schema each node infers is
+carried forward to the next. Nothing with effects is executed: a sink is refused
+rather than run to see what it returns, and only a plain derived view is bound.
+
+**The diagnostics were always there and were being thrown away.** DuckDB already
+says which column, where, and what it thinks you meant; all of it was collapsed
+into one error string, so the editor could report only that a node did not
+resolve. The candidate list is the most useful part and was the first thing lost.
+
+**A wrong position is worse than none.** The position DuckDB reports is an offset
+into the SQL Duckle *compiled*, not the SQL you wrote - and DuckDB truncates the
+line it echoes for any wide statement, which Duckle's always is. So the position
+is recovered by finding the named token in your own SQL, and only when it occurs
+exactly once. Twice, and there is no position at all rather than a confident
+guess at the first one.
+
+**A source's query is not checked, and says so.** It runs on Postgres or
+BigQuery; binding it against DuckDB would either reject valid SQL or accept
+invalid SQL, and either way the answer would be about the wrong engine. "Not
+checked" and "checked and clean" never read the same.
+
+**But some things are wrong in every dialect.** An unclosed quote, an unbalanced
+parenthesis, a second statement where exactly one query is sent, a `DELETE` in a
+position that reads rows, a `${placeholder}` nothing substituted. Those are
+reported as `hint` on a node that still says it was not validated - the round
+trip to the remote system tells you the same thing, slower, in a message about a
+token far from the mistake. Nothing here guesses at a dialect: `ARRAY_AGG`,
+`QUALIFY`, `LISTAGG`, `toDateTime` and `GENERATE_UUID()` are left alone, because
+checking Postgres SQL with anything other than Postgres tells you about the
+checker rather than about your query. A test asserts exactly that.
+
+**The editor shows them.** Selecting a node runs the same bind and puts what
+DuckDB said above the form - the position in your own SQL, and the column it
+suggests instead:
+
+```text
+2:12  Referenced column "amountt" not found in FROM clause!  did you mean amount?
+```
+
+Cleared as soon as the node binds again, because a stale error under a line the
+author has already fixed is worse than no error at all.
+
+**And what could come next.** `complete_node_sql` suggests upstream columns with
+their types, the relations the node can read, the pipeline's declared parameters,
+DuckDB's functions and keywords - ranked for the position:
+
+```text
+SELECT reg          ->  column region (String)   ${region_filter}   regexp_escape(
+SELECT * FROM       ->  input   src              (relations only)
+WHERE x = ${re      ->  ${region_filter}         (nothing else can be meant)
+```
+
+A column beats a function where a column belongs, a prefix beats a substring, and
+the list is stable between identical edits - a list that reshuffles between
+keystrokes is one nobody builds muscle memory against.
+
+**It never runs your SQL.** The only thing read from DuckDB is its own function
+list, cached for the process; the columns come from the caller. That is what lets
+it answer on every keystroke when the bind cannot.
+
+**The editor uses it.** A SQL field suggests as you type, with arrow keys, Enter
+or Tab to accept, Escape to dismiss and Ctrl-Space to ask at a fresh position. It
+is still a plain textarea: swapping it for a code editor to add completion would
+change everything about typing in order to change one thing. Requests are
+debounced, and a reply for an earlier keystroke is discarded rather than shown -
+it describes text that is no longer there.
+
+Same analysis from `duckle-runner sql check`, the MCP tools `check_node_sql` and
+`complete_node_sql`, and both editors - one function, so they cannot come to
+disagree. SARIF carries a real
+`region`, so a code-scanning viewer jumps to the token.
+
+### OpenLineage export
+
+Drop an `openlineage.json` in the workspace and every run emits START and a
+terminal event. No file means no events, no local writes and no network.
+
+```json
+{ "namespace": "prod-eu", "endpoint": "http://marquez:5000/api/v1/lineage" }
+```
+
+```text
+START    | prod-eu/nightly | runId 79f0c574-56ee-5025-b0f4-addee7acb28a
+COMPLETE | prod-eu/nightly | runId 79f0c574-56ee-5025-b0f4-addee7acb28a
+   outputs: file  ${workspace}/data/curated.parquet  rowCount 3  unresolved
+```
+
+**Emitted from `retry::begin` and `retry::finish`**, which every execution
+surface already goes through - the desktop, the console, the CLI, MCP, the
+scheduler and Plans. A feed covering six of eight surfaces is one nobody can
+reason about, because the missing runs look like runs that never happened.
+
+**The run id is derived, not random.** OpenLineage requires a UUID and Duckle's
+ids are readable strings, so they are mapped by name: START and COMPLETE are
+emitted by different calls and must agree, or a collector shows two unrelated
+runs and no completed one. The original id travels in a facet.
+
+**`interrupted` is ABORT, not FAIL** - the run stopped being observed, it did
+not fail, and a consumer that treats those the same re-runs work that may have
+finished.
+
+**A run-time reference is marked, not asserted.** A dataset name still holding a
+`${...}` does not address a single dataset, and it is emitted with
+`unresolved: true` rather than silently joining to the wrong thing in someone's
+graph. Datasets come from the catalog joined to the receipt **by node id**, so a
+node the run never reached is not reported as touched: absent is not zero.
+
+**Telemetry cannot fail a run.** Events are appended to
+`logs/openlineage.ndjson` first and only then POSTed, so a collector that is
+down costs one short timeout and the events are already durable. Catalog asset
+ids are credential-free by construction; query strings are stripped on top of
+that, so a signed URL never carries its signature off the machine.
+`hashDatasetNames` replaces names with a digest and keeps the namespace, for an
+organisation that wants the shape of its graph in a shared tool without the
+table names.
+
+### Alerting without scraping the UI (`/metrics`, `/readyz`)
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://console:8080/metrics
+curl http://console:8080/readyz      # no credential; so does /healthz
+```
+
+```text
+duckle_run_last_status{pipeline="nightly"} 0
+duckle_run_last_duration_seconds{pipeline="nightly"} 12.4
+duckle_runs_window{pipeline="nightly",status="error"} 3
+duckle_run_permits_total 4
+duckle_run_permits_free 0
+duckle_runs_in_flight 4
+```
+
+The run-history half is rendered by the engine, the same function that writes
+`logs/duckle_metrics.prom` for a node_exporter textfile collector - so the
+endpoint and the file cannot come to disagree about what a series means. What
+the endpoint adds is what a file cannot carry: what this process is doing right
+now. `duckle_run_permits_free` at zero for any length of time is runs queueing.
+
+**Liveness and readiness are separate**, because they fail differently and an
+orchestrator acts differently on each: a process that is alive but not ready
+should stop receiving traffic, not be restarted. `/readyz` writes and deletes a
+probe file under `.duckle/`, so it catches a read-only mount or a full disk - the
+states that stop runs being recorded while every read still succeeds. It checks
+nothing external: a source being down is not this server being unready.
+
+**Both probes are unauthenticated; `/metrics` is not.** A probe says the process
+is up and tells an anonymous caller nothing else. Pipeline names are the shape of
+someone's business, so a scraper sends the same bearer token any other API client
+does.
+
+**Labels are bounded**, and when the budget bites it says so:
+`duckle_metrics_pipelines_omitted` above zero means those pipelines are not being
+monitored. Nothing prunes `runs/`, so a workspace that has ever run thousands of
+pipelines would otherwise emit thousands of label values forever.
+
+### External components
+
+An iXBRL parser, an OCR adapter, a country-specific registry reader - Duckle
+should not contain all of those, and they should not have to be escape hatches
+either. Drop one in `<workspace>/components/<name>/`:
+
+```json
+{ "id": "ext.upper", "version": "1.0.0", "label": "Uppercase (external)",
+  "inputs": [{"name": "main"}], "outputs": [{"name": "main"}],
+  "properties": { "sections": [ ... ] },
+  "runtime": { "command": ["python", "run.py"], "timeoutSecs": 60, "lock": "requirements.txt" } }
+```
+
+and use `ext.upper` like any other component. A component reads a JSON control
+message on stdin, reads and writes **Parquet**, and answers with JSON:
+
+```python
+req = json.load(sys.stdin)
+# req["inputs"]["main"], req["output"], req["properties"]
+print(json.dumps({"ok": True, "rows": n}))
+```
+
+**Bulk data is Arrow IPC or Parquet, never row JSON.** A component says what it
+can handle, best first, and the host picks:
+
+```json
+"runtime": { "command": ["python", "run.py"], "interchange": ["arrow", "parquet"] }
+```
+
+```python
+if req["format"] == "arrow":
+    with open(req["inputs"]["main"], "rb") as f:
+        table = ipc.open_stream(f).read_all()      # the STREAM format, .arrows
+```
+
+Arrow IPC needs DuckDB's `arrow` extension, which is a **community** one -
+`INSTALL arrow` from the core repository 404s - so it may be unavailable on a
+machine with no network. The host probes once and falls back to Parquet rather
+than failing a run over an interchange preference. A component that never
+mentions `interchange` gets Parquet, exactly as before.
+
+What DuckDB writes is the Arrow IPC **stream** format, so a component reaches for
+`open_stream`, not `open_file`; the files are named `.arrows` so the name does
+not promise the other one. Control messages stay JSON because they are small and
+structured.
+
+**Sources and sinks too, not only transforms.** The ports a component declares
+decide what it is: no inputs is a source, no outputs is a sink.
+
+```text
+  g   ok (5 rows) - ext.gen: 5 row(s) -> g
+  e   ok          - ext.emit: 5 row(s) delivered
+```
+
+A sink has delivered its rows somewhere Duckle does not model - an API, a queue,
+a file of its own - and has no relation to hand back, so it is not asked for one.
+Requiring one failed a sink that had already done its job.
+
+**Rows it cannot handle go to the reject port**, on the same `__reject` contract
+every built-in uses, so a downstream edge reads them identically whoever wrote
+the component:
+
+```python
+con.execute(f"COPY (SELECT * FROM read_parquet(?) WHERE name IS NULL) "
+            f"TO '{req['reject']}' (FORMAT PARQUET)", [src])
+```
+
+A component that writes no rejects still gets an empty reject relation with the
+right columns. Without it, wiring the port to a component that happens never to
+reject fails the run with `Table with name v__reject does not exist` - and
+"this component rejects nothing" is an ordinary thing for a component to be.
+
+**An external id must start with `ext.`**, so a component can never shadow a
+built-in one. A component called `xf.filter` that quietly replaced the real one
+would be the worst failure this could have.
+
+**Policy gates them like anything else.** `components.deny: ["ext.*"]` refuses
+the family; the existing denylist covers external components by construction
+rather than by remembering to.
+
+**Declared, not discovered by running.** Ports, properties and version come from
+the manifest, so "what components exist here" never means executing third-party
+code. `duckle-runner components external` lists them with their manifest and lock
+hashes.
+
+**They appear in the palette.** Opening a workspace loads its external
+components into an **External** category - their own, rather than mixed into
+Sources and Transforms, because a component Duckle did not write should be
+visibly not one Duckle wrote. The property form comes from the component's own
+manifest, so a tile you can drop is a tile you can configure. `kind` is derived
+from the declared ports: no inputs is a source, no outputs is a sink.
+
+Both editors get the same list from the same endpoint, and MCP's
+`list_components` includes them when given a `workspace` - so an agent asking
+what it can build with sees what the workspace installed, not only what was
+compiled in.
+
+**A component that hangs is killed** at its declared timeout, and a manifest that
+does not parse is reported rather than silently missing from the list.
+
+**Does your component behave?**
+
+```bash
+duckle-runner components conform ext.upper --workspace .
+```
+
+```text
+  pass         schema validation    id, version and runtime.command are declared; 1 input, 1 output
+  pass         initialize           answered without doing the work
+  pass         interchange          declares arrow, parquet; this host would use arrow
+  pass         empty typed input    zero rows in, zero rows out, with a readable schema
+  pass         large batch          200000 rows in, 200000 out, in 0.9s
+  pass         crash cleanup        reported the failure: IO Error: No files found ...
+  pass         secret redaction     the request carries property values and paths, no credentials
+  pass         cancellation         killed after 60s; the host enforces this bound
+  pass         reject output        wrote 2 rejected row(s) the host can read
+  pass         artifact lineage     1 artifact(s) exist and hash as declared (29 bytes)
+```
+
+Real invocations through the same code the engine uses, so "conforming" means
+what the engine will actually do. Against a deliberately broken component it
+reports what is wrong and exits 1:
+
+```text
+  FAIL  empty typed input   reported success but wrote no output; zero rows is still a table
+  FAIL  crash cleanup       reported success on an input that does not exist
+```
+
+**A case for something the host cannot do says `unsupported`**, not `pass`. A
+green tick for a feature nobody built is the most misleading result a
+conformance kit can produce - and it is not a failure either, or every component
+would look broken because the host is incomplete.
+
+**A lifecycle, not just a call.** A component may answer an `initialize` - a
+configuration check that must not do the work - and may report progress while it
+runs:
+
+```python
+if req.get("phase") == "initialize":
+    emit({"type": "result", "ok": True}); raise SystemExit(0)
+emit({"type": "progress", "rows": n, "fraction": 0.5, "message": "stage 2 of 4"})
+```
+
+```text
+  w ext.slow: 1 row(s), 50%, stage 2 of 4
+  w ext.slow: 2 row(s), 75%, stage 3 of 4
+```
+
+A component written before progress existed emits one `{"ok": true}` and keeps
+working unchanged - a bare object carrying `ok` is still a result. A stray log
+line is ignored rather than treated as a malformed one.
+
+**Cancelling stops the process.** A portable in-band cancel would require every
+component to read stdin as a live stream while working, which the simple case -
+`json.load(sys.stdin)` - cannot do; so the host terminates it and cleans up its
+own files. A component that outlives its declared timeout is killed the same way:
+
+```text
+error: ext.slow: did not finish within 1s
+```
+
+**Files are referenced, not streamed.** A document, a model or a report is a
+file: the component writes it into the directory the host provides and names it
+back, and the run's provenance records where it is and what it hashed to.
+
+```python
+open(os.path.join(req["artifactDir"], "summary.md"), "wb").write(body)
+print(json.dumps({"ok": True, "artifacts": [
+    {"uri": "summary.md", "hash": hashlib.sha256(body).hexdigest(),
+     "mediaType": "text/markdown", "role": "report"}]}))
+```
+
+```json
+"artifacts": [ { "nodeId": "r", "uri": ".../artifacts/<run>/r/summary.md",
+                 "hash": "2c678098…", "mediaType": "text/markdown",
+                 "role": "report", "bytes": 29 } ]
+```
+
+**A declared hash is verified, never trusted** - a hash a component asserts about
+its own output is worth nothing if nobody checks it, and being able to tell later
+that the file changed is the whole reason to record one. A component that
+declares a file it did not write, or one whose hash does not match, fails the
+run. Declare no hash and the host computes it.
+
+**Every run records what it ran against.** The receipt carries each external
+component the pipeline names with its manifest and lock hashes:
+
+```json
+"components": [ { "id": "ext.upper", "version": "1.0.0",
+                  "manifestHash": "56c3b085...", "lockHash": "984849a1..." } ]
+```
+
+The hash is the point, not the version: a component edited in place keeps its
+version, which is exactly the case worth being able to detect. A component the
+pipeline names and the workspace does not have is recorded as `missing` rather
+than omitted - an absent entry is indistinguishable from a run that used no
+external components at all.
+
+### Chunked, resumable extraction
+
+A single query over a billion-row table holds a snapshot for hours, fails near
+the end and restarts from zero. Declare how it should be split:
+
+```json
+{ "chunking": { "type": "range", "column": "company_id", "chunkSize": 1000000, "concurrency": 4 } }
+```
+
+```bash
+duckle-runner source plan    pipelines/big.json --node src
+duckle-runner source extract pipelines/big.json --node src
+```
+
+```text
+strategy    range on company_id
+chunks      5          concurrency 4
+snapshot    best effort - each chunk reads when it runs
+fallback    one query, as today, if chunking is removed
+
+note        chunks are separate queries: a row written while the extract runs is in
+            one chunk or none. This source cannot pin a snapshot across them.
+
+  1..1000000       company_id >= 1 AND company_id < 1000001
+  4000001..4200000 company_id >= 4000001 AND company_id <= 4200000
+```
+
+Range, time and hash strategies. **Refusing is the feature**: a connector that
+cannot give stable semantics is told so rather than emulated, a key with NULLs is
+refused with the row count it would silently lose, and a column name that is not
+a plain identifier is refused rather than escaped, because a pipeline file is not
+a trusted source of SQL fragments. Hash bucketing is spelled out per family -
+`hashtext`, `ORA_HASH`, `CHECKSUM`, `CRC32` - because getting it wrong does not
+error, it silently produces overlapping or empty buckets.
+
+**The extent of the key is asked of the source**, through the same engine the
+extract will use, so the probe reaches the source the way the extract does
+rather than by a second path that could succeed where the extract then fails.
+`--min` / `--max` / `--nulls` override it, and are what to reach for when this
+machine cannot see the database. Numbers typed in once are right once: a table
+grows, and nothing notices.
+
+**A chunk is a slice, so it is the same ledger.** `source extract` writes one
+entry per chunk into the ledger a partitioned backfill uses, and everything
+around it comes from there rather than from a second executor: claiming,
+bounded concurrency, resource-pool admission, reuse of an identical occurrence,
+restart reconciliation, run ids and receipts. `backfill status <id>` shows a
+chunked extract, and `backfill retry <id>` resumes one - neither of them knows
+it is an extract, which is the point. Only the generator differs: a partition
+binds a time window, a chunk binds a predicate.
+
+**"The query finished" is not "the chunk succeeded."**
+
+```text
+query completed -> part fsynced, hashed, renamed into place -> slice succeeds
+```
+
+A process that dies between the read and the commit would otherwise leave a
+chunk marked done whose part is not there, and the retry that exists to fix
+exactly that would skip it - silently, after an hour of database time. So the
+part is committed before the ledger moves, and the executor refuses to record a
+success without one. On a restart, a chunk whose part is gone or the wrong size
+goes back to `requested`; `--verify` re-hashes every part, which is the only
+thing that catches one edited in place and costs a full read to do.
+
+Assembly is free: the extract IS the parts read together, so a completed extract
+prints its `read_parquet([...])` and nothing is merged or copied. A partial one
+refuses to print a read at all, because a short extract that looks whole is the
+failure the design exists to prevent.
+
+**The predicate goes into the read, not after it.** A filter applied on Duckle's
+side would make every chunk fetch the whole table. With `pushdown` on and your
+own SQL, the predicate is placed inside the statement that runs on the server;
+otherwise the node's read is wrapped and pushdown is turned off, because the
+rewritten SQL names the local attach alias and a remote server has never heard
+of it.
+
+### Partitioned backfills
+
+Declare how a pipeline is sliced:
+
+```json
+{ "name": "accounts",
+  "partition": { "type": "time", "cadence": "day", "timezone": "Europe/Brussels" },
+  "nodes": [ { "...": "reads ${partition_key}, ${window_start}, ${window_end}" } ] }
+```
+
+```bash
+duckle-runner backfill create pipelines/accounts.json --from 2020-01-01 --to 2020-01-05                               --max-concurrent 2 [--dry-run]
+duckle-runner backfill status <backfill-id>
+duckle-runner backfill retry  <backfill-id> [--partition 2020-01-03]
+duckle-runner backfill cancel <backfill-id>
+```
+
+```text
+  2020-01-01   succeeded    run-backfill-accounts-...
+  2020-01-03   failed       run-backfill-accounts-...  IO Error: No files found ...
+bf-accounts-...: 1 failed, 4 succeeded
+
+# the missing file arrives
+retrying 1 partition(s)          -> 5 succeeded, and one new run, not five
+```
+
+**Addressable over the server and from MCP**, not only from a CLI:
+
+```bash
+GET  /api/backfills            # every plan, or ?id= for one
+POST /api/backfills            # {"action":"create"|"retry"|"cancel", ...}
+```
+
+Create and retry are accepted and run on a thread, returning the plan id at once
+rather than holding a connection open for hours. `dryRun` lists the partitions
+and queues nothing - "what would this queue" must not be a question that queues
+anything. Reading needs a viewer; creating, retrying or cancelling needs an
+operator.
+
+The MCP tool `backfill` takes the same five actions, through the same engine
+functions, so an agent and an operator cannot get different behaviour.
+
+**A slice knows what it is, so it is not done twice.** Its identity is
+pipeline + partition + release + the schedule occurrence that caused it, hashed
+deterministically - so a restart, or the same schedule firing again, finds the
+work already done:
+
+```text
+first firing    2020-01-01  ok
+same occurrence 2020-01-01  already done by bf-accounts-1788359538501
+                receipts: 3, not 6
+```
+
+The release is part of the identity because the same date against different code
+is different work. `--force` runs them anyway, and a retry is always explicit.
+
+**A backfill's own bound is an additional ceiling, not a way around the
+machine's.** Each slice still acquires the pool its pipeline asks for, so
+`--max-concurrent 4` over a pipeline in a pool of one runs one at a time:
+
+```text
+2020-01-01  pool=heavy  queuedMs=0
+2020-01-02  pool=heavy  queuedMs=215
+2020-01-04  pool=heavy  queuedMs=494
+```
+
+**Each slice is an ordinary durable run** - its own receipt, run id, release and
+log lines - with the backfill named as its parent, so "which slice produced this
+output" is answerable from the receipt alone.
+
+**Boundaries are computed in the partition's own zone.** A Brussels day is 23
+hours in March and 25 in October; generating UTC days would silently process an
+hour twice and skip another. Each window ends exactly where the next begins.
+
+**The plan is written before anything runs** and updated after every slice, so a
+kill halfway through leaves something resumable. Slices still marked `running` on
+the next start become `interrupted`, the same reconciliation a run receipt gets.
+
+**Retrying touches only the failures.** A thousand days failing on four costs
+four runs to finish, not a thousand.
+
+**Parameters go through the same boundary as everything else**, with `partition`
+as the source - so a value that came from the slice is distinguishable from one
+you passed.
+
+### Named execution pools
+
+One heavy join should not have to serialise eight cheap HTTP jobs. Name the kinds
+of work in `<workspace>/.duckle/pools.json`:
+
+```json
+{ "heavy":   { "maxConcurrentRuns": 1 },
+  "network": { "maxConcurrentRuns": 8 },
+  "ai":      { "maxConcurrentRuns": 16 } }
+```
+
+and a pipeline picks one:
+
+```json
+{ "name": "registry-parse", "resourcePool": "heavy", "nodes": [ ... ] }
+```
+
+**Admission only.** A pool answers *may this run start now*. What a run may then
+use - threads, memory, temp disk - is the existing `resources` block and is
+untouched; otherwise a pipeline could widen its own memory limit by choosing a
+different pool.
+
+**A pipeline may choose a pool, never widen one.** Point `DUCKLE_POOLS_FILE` at a
+server-authoritative file and a workspace can select among those pools and ask
+for *less*, never more; a name the server does not define falls back to `default`
+rather than becoming a new unbounded pool.
+
+**One definition, two gates.** The runner gates with a condvar and the scheduler
+with a tokio semaphore because one is sync and the other async - but both read
+the same numbers, because two limiters each parsing their own config is how the
+two schedulers came to disagree about time zones.
+
+**A run waiting for capacity already exists.** It is written as `queued` with a
+`queueReason` before the wait, so an API or MCP caller gets a durable id
+immediately instead of holding its request open, and can inspect or cancel it
+while it waits - nothing has started, so there is nothing to undo. When the
+permit arrives it becomes `running` with `startedAt` and `queueMs`. A queued run
+whose process died is reconciled to `interrupted` on the next start, so a restart
+does not leave stale capacity behind.
+
+**A Plan takes no workload slot.** It is a supervisor that spends its time
+waiting for children, each of which acquires the pool its own pipeline asks for.
+Holding a slot while waiting for a child that needs the same pool is a deadlock
+the size of the pool.
+
+Every run records `resourcePool` and, where it actually waited, `queueMs` - a
+pool that is never saturated and one that queues for ten minutes are otherwise
+indistinguishable. `/metrics` carries `duckle_pool_permits_free{pool="..."}`,
+because a network pool at 8/8 and an idle heavy pool sum to something that looks
+half busy.
+
+**A separate `duckle-runner` invocation is a separate process** and an in-process
+semaphore cannot bound it. That path records the pool it belongs to and no queue
+time, because it never queued.
+
+### Which tested version is running? (`release`)
+
+```bash
+duckle-runner release build                              # record the control plane
+duckle-runner release diff <from> [<to>]                 # what changed
+duckle-runner release activate <id> --environment production
+duckle-runner release rollback --environment production
+```
+
+```text
+release c2cc337f3dd609fb...  2 pipeline(s), format v1
+production is now running release 15963a9b750d6492...
+  changed   load
+production rolled back to release c2cc337f3dd609fb...
+```
+
+**A release holds the content, not only its hash.** Every pipeline, plan and
+schedule is stored immutably, content-addressed and shared between releases, and
+`activate` **materialises** it into the workspace. That is what makes
+`activate A` / `activate B` / `rollback` actually execute A, B, A - and what makes
+`releaseId: A` on a run mean the run executed A, rather than that A happened to
+be the pointer when it started.
+
+Two releases differing in one pipeline cost one extra object, not a second copy
+of the workspace. Rebuilding an unchanged workspace produces the same id, so
+"has anything changed?" stays a comparison rather than an investigation.
+
+**Activation refuses before it mutates.** Every check runs and every problem is
+reported: the release's stored content must be intact and still compile, every
+connection a pipeline names must exist, and policy must load. An operator fixing
+a production activation should not discover the second problem after fixing the
+first. It does *not* require the workspace to already match the release - that
+requirement is what would make rollback impossible, since rolling back to A is
+exactly the case where the workspace holds B.
+
+**Uncommitted work is named, not discarded.** Activating overwrites the
+control-plane files, so if the workspace differs it lists what would be
+overwritten or removed and refuses without `--force`.
+
+**The pointer swap is one rename.** Never remove-then-rename: `std::fs::rename`
+replaces the destination even while a reader holds it open, so unlinking first
+buys nothing and costs exactly the guarantee - a window where the environment
+points at nothing.
+
+**Rollback is deliberately not gated** on those checks. It is what an operator
+reaches for when the current release is broken, and one that refuses because the
+workspace is in a bad state is one that never works when it is needed.
+
+**Every run records the release it ran under**, read when the run starts - so a
+run already in flight when someone activates keeps naming the release it began
+with, because it did not silently change code halfway through.
+
+**The hashes are the ones already in use.** A pipeline's hash is
+`retry::pipeline_hash`, the same one its run receipt records; a second hash would
+eventually disagree with the first. Only hashes and declarations are stored -
+connection *references* so activation can check them, never their values.
+
+### Sign in through an identity provider (OIDC)
+
+Optional, and off unless `<workspace>/.duckle/oidc.json` exists:
+
+```json
+{
+  "issuer": "https://idp.example.com",
+  "clientId": "duckle-console",
+  "clientSecret": "...",
+  "redirectUri": "https://console.example.com/auth/oidc/callback",
+  "roleMappings": [
+    { "claim": "groups", "contains": "data-admins",    "role": "admin" },
+    { "claim": "groups", "contains": "data-operators", "role": "operator" }
+  ]
+}
+```
+
+Authorization-code flow with PKCE (S256), `state`, `nonce`, and RS256 ID-token
+verification against the provider's JWKS. It adds a protocol and nothing else -
+the flow ends by minting the same session a password login mints, and every
+request after that is authorised by the same code as before.
+
+**A subject no rule matches is refused**, unless `defaultRole` says otherwise.
+An identity provider saying who someone is does not say what they may do here,
+and absent means deny because that is the answer that cannot surprise anyone.
+
+**First matching rule wins**, in file order, so the result is a property of the
+config rather than of iteration order. A group name matches whole: `contains:
+"data-admins"` does not match a group called `not-data-admins-really`.
+
+**The callback is bound to the browser that started the login.** The redirect
+sets a short-lived HttpOnly cookie and the callback requires it back, compared in
+constant time. Single-use and a five-minute TTL stop a state being replayed; they
+do not stop an attacker starting a login, taking the callback URL for their own
+identity and getting a victim to visit it - which would sign the victim in as the
+attacker.
+
+**Audit names the provider's subject.** A display name is self-service at most
+providers, so a session labelled with one lets a user choose their own actor
+string - including the label the break-glass admin runs under - and every action
+they take afterwards is recorded against it. The actor is `sub (display name)`,
+and the part that identifies is the subject.
+
+**Break-glass is untouched.** The `--token` / `DUCKLE_CONSOLE_TOKEN` admin lives
+only in the process and never in the store, so it still works when the provider
+does not. Scoped API keys are unaffected.
+
+**No reverse-proxy identity headers**, by not implementing them: in any
+deployment where the proxy can be bypassed, an `X-Forwarded-User` header is an
+admin login. **No provider tokens are stored** - the ID token is verified and
+dropped, and only the subject, a display name and the mapped role reach the
+session. Audit records the provider's stable `sub`, not the display name, because
+a name or an email can be reassigned to a different person.
+
+### Reading GeoParquet
+
+The **Geospatial** source reads GeoParquet as well as GeoJSON, Shapefile,
+GeoPackage, KML, GPX and GML.
+
+`ST_Read` is GDAL-backed and the spatial extension DuckDB ships does not carry
+GDAL's Parquet driver, so a `.geoparquet` path failed with `Could not open GDAL
+dataset` - the file was perfectly readable, just not by that function. Parquet
+paths now go through `read_parquet`, which returns a real `GEOMETRY` with its CRS
+intact; everything else still goes through `ST_Read`.
+
+### Spatial sort on Parquet export
+
+Name a GEOMETRY column on a Parquet sink and rows are sorted along a Hilbert
+curve before writing, so geometries close on the ground land in the same row
+group and a spatial filter can skip more of the file.
+
+Measured on 2,000 scattered points written in 40 row groups of 50:
+
+| written            | mean row-group bbox area |
+|--------------------|-------------------------:|
+| as they arrive     |                  954,575 |
+| Hilbert            |                   19,549 |
+
+The curve is scaled to **this dataset's own extent**, which costs one extra pass
+to find it - that is the trade the option exists to make. Leave the field empty
+and nothing changes: the emitted SQL is byte-for-byte what it was.
+
+One field rather than a checkbox and a column, because a checkbox ticked with no
+column chosen is a state the engine would have to guess at, and guessing which
+column holds the geometry is how the wrong one gets sorted on.
+
+### A watcher is not a run
+
+`follow` polls continuously, and most polls find nothing. A source checked every
+ten seconds is unchanged thousands of times between real arrivals, so there are
+two identities rather than one:
+
+```text
+session   follow-orders-1788270909966   the watcher: is it up, when did it last look?
+run       run-follow-orders-1788270910157   one execution: what did it do, can I retry it?
+```
+
+A poll that finds nothing updates the session - `lastPollAt`, `pollCount`,
+`lastError` - and nothing else. A poll that actually moves rows, or fails, gets a
+normal run id from the same primitive every other surface uses, names the session
+as its parent, and lands in run history: retryable, comparable and addressable
+exactly like a scheduled or manual run.
+
+```json
+{ "sessionId": "follow-orders-...", "state": "stopped", "pollCount": 2043, "runCount": 7 }
+```
+
+`pollCount - runCount` is how much of the watching was quiet. `lastPollAt` and
+`lastEventAt` are separate because "healthy and idle" and "healthy and ingesting"
+are different states and one field cannot say which.
+
+**A killed watcher is `interrupted`, not `running` forever.** The session is
+written before the loop starts and reconciled on the next start, the same way a
+run receipt is - because "the box rebooted" and "it is quietly still polling"
+call for opposite responses.
+
+### One id, all the way through
+
+A run's **receipt**, its **history record** and its **log lines** all carry the
+same id, so `runs/receipts/<id>.json`, the Runs tab and
+`logs/<pipeline>/runtime.log` join up:
+
+```bash
+duckle-runner runs logs run-scheduled-nightly-1788203742570
+```
+
+The pipeline comes from the run's own receipt, so holding an id from an alert or
+an API response is enough - you do not also have to know which pipeline produced
+it. Lines are matched on the `run_id` field rather than anywhere in the text, so
+a run that merely *mentions* another one is not reported as its log.
+
+The engine used to mint its own `run-{pid}-{nanos}` for the log and persist it
+nowhere, so "show me the log for run X" had no answer for any X anyone could
+hold. That was the last of the three competing id schemes.
+
+### Why was this run different? (`runs diff`)
+
+```bash
+duckle-runner runs diff <run_a> <run_b>
+duckle-runner runs diff <run_a> <run_b> --json
+```
+
+```text
+execution:
+  node.out.rows                          3  ->  7
+  node.src.durationMs                    61  ->  103
+  durationMs                             172  ->  198
+output:
+  rows                                   3  ->  7
+
+* Identical code, engine and parameters, but the output differs - which points at
+  the sources rather than at Duckle.
+* A node produced a different number of rows, which is visible from the receipts alone.
+
+not compared:
+  source content hashes and data-quality results: not recorded per run yet.
+```
+
+**Grouped by kind, because the grouping is the answer.** Code, runtime,
+invocation, inputs, execution, output. "Seventeen things differ" helps nobody;
+"the code is identical, the engine is identical, one input has different rows"
+is a diagnosis.
+
+**Explanations are rules over recorded facts**, not generated prose. Every line
+can be traced back to a difference in the list above it, so a reader who
+disagrees can point at the rule. A plausible sentence that cannot be traced is
+worse than none, because it gets believed.
+
+**What could not be compared is stated.** A comparison that quietly omits what
+it could not see reads as "these are the same".
+
+**Absent is not zero.** A run that failed at its second node has counts for
+nothing after it, and calling those zero would report a collapse in volume that
+never happened.
+
+**Secrets are compared without being revealed.** A parameter the pipeline
+declared secret is recorded as `***`; a parameter in a pipeline that declared
+nothing is recorded as a digest of its value, so "this changed" stays answerable
+without a credential ever reaching a file. Nothing here reads data - row counts,
+hashes and durations only.
+
+### Which format is this file in? (`migrate`)
+
+A workspace outlives the build that wrote it. Every pipeline now carries the
+format it is in, and every build says which formats it will accept.
+
+```bash
+duckle-runner migrate            # what would change, and why. Writes nothing.
+duckle-runner migrate --json     # the same, for CI
+duckle-runner migrate --write    # apply, keeping each original as .json.bak
+```
+
+```text
+pipelines/region_summary.pipeline.json
+    k1: renamed snk.csv.hasHeader to writeHeader
+    stamped formatVersion 1 (was 0)
+
+nothing written. Pass --write to apply.
+```
+
+**A file from a newer build is refused, before anything else happens** -
+including before the check that the engine is installed, because "upgrade
+Duckle" is the useful answer and upgrading installs the engine too. A newer
+format may carry settings this build cannot see, and reading it anyway runs
+something other than what the file describes without failing anywhere.
+
+**A file with no marker is version 0, and version 0 runs.** Migration is how a
+file stops being ambiguous, not a toll for opening it.
+
+**Migration works on the raw document, never through the engine's struct.** That
+struct carries what the engine needs and not, for instance, `name`; round-tripping
+through it would silently delete every key the engine happens not to use. There
+is a test asserting it still would.
+
+**Stamping a version is a one-line diff.** Re-serializing expands every object
+an author wrote inline, which buries the real change under a reformat nobody
+asked for. The insertion is only used when re-parsing it yields exactly the
+document the migration produced - correctness first, then the diff.
+
+**Renames are deterministic and idempotent.** A property renamed between
+versions is still honoured under the old name and reported by `validate` as
+deprecated, naming the current one. When both names are present the old one is
+dropped rather than moved over the live value, because the builder already reads
+the current name and a migration must not change what runs.
+
+### A property nothing reads (`validate`)
+
+A property no builder reads used to change nothing and say nothing: the run took
+the default and the numbers looked fine. `validate` now refuses it.
+
+```text
+FAIL  typo.json  (3 stages, 2 dead properties)
+      unknown_component_property  src.csv does not read hasHeaders. Did you mean hasHeader?
+      unknown_component_property  xf.topn does not read limit, so setting it changes nothing
+```
+
+Machine-readable under `--format json`: `code`, `node`, `component`, `property`
+and a `suggestion` when one is close enough to be worth naming. A wrong guess
+sends the reader off to check a name that was never the point, so nothing close
+enough gets no suggestion at all.
+
+```bash
+duckle-runner components schema        # the accepted names, per component
+```
+
+That document is generated from the same map the checker enforces, so what it
+promises and what the engine accepts cannot drift apart.
+
+**Strict at `validate`, a warning at run time.** A lint that cannot fail is one
+people stop reading, and validate is where a typo should be caught. A pipeline
+that has quietly carried a dead property for a year should start telling its
+operator, not stop running the day they upgrade - set
+`DUCKLE_STRICT_PROPERTIES=1` to refuse there too.
+
+**`x-` keys round-trip untouched**, so a third-party tool can keep its own
+metadata in a pipeline file without it ever reaching a builder.
+
+**A component the exported catalog does not list is a catalog gap, not a
+pipeline error.** The engine accepts aliases the catalog has no entry for, so
+those are reported and never fail anything.
+
+### What does this change reach? (`affected`)
+
+A change to one pipeline is rarely contained to it. Ask which pipelines it
+reaches, and why:
+
+```bash
+duckle-runner affected --base main                 # against the working tree
+duckle-runner affected --base main --head HEAD --json
+duckle-runner validate --affected --base main      # validate only what it reaches
+```
+
+```text
+affected against main (head: working tree)
+
+  produce                      changed
+  middle                       produce -> lake/orders.parquet -> middle
+  serve                        produce -> lake/orders.parquet -> middle -> lake/canonical.parquet -> serve
+
+run order: produce, middle, serve
+```
+
+**Every pipeline carries the chain that reached it**, so a reviewer can point at
+the hop they disagree with. A selection with no explanation is not reviewable -
+it is trusted completely or ignored completely, and both are wrong.
+
+**Two kinds of edge.** The asset graph is one: a pipeline writes a table,
+another reads it. The other is `pipelineRef` - a parent invoking a child - and
+it runs the other way, because the child changing is what affects the parent.
+Following only the asset graph misses every sub-pipeline edit.
+
+**Deleting a producer is a change too.** It writes nothing now, so the current
+graph says it affects nobody; the pipelines that read what it used to write are
+listed, and the deleted one is named separately because it cannot be run.
+
+**Dragging a node is not a change.** Canvas geometry is dropped before
+comparing. A gate that fires on every drag is one people learn to skip.
+
+**Dynamic dependencies are a result, not a gap.** A path decided at run time
+(`${ARRIVAL_DIR}/*.parquet`) gets a confident-looking id from the catalog that
+is not what the run will read, so neither its edges nor their absence can be
+trusted. Those are always listed; `--include-uncertain` decides only whether
+they are also selected.
+
+**Contexts are compared key by key, by hash.** A context holds credentials, so
+"did this key change" is answered without the value reaching an output, a log or
+a return type - and only the pipelines referencing a changed key are selected.
+
+**Producers run before consumers, children before parents.** Pipelines that
+depend on each other are reported as a cycle rather than flushed into the order:
+an arbitrary order that looks topological is worse than an admitted one.
+
+Changed files that are neither pipelines nor a modelled shared input are listed
+under `unclassified` rather than silently assumed harmless. The JSON carries
+`schemaVersion` so CI fails loudly instead of half-parsing a newer document.
+
+### Will this change break something downstream? (`contracts check`)
+
+A pipeline can validate perfectly on its own and still break another one. This
+compares each produced asset's declared schema against a git revision, asks the
+catalog who reads that asset, and says what would break:
+
+```bash
+duckle-runner contracts check --base main --format sarif
+```
+
+```text
+BREAKING               /lake/orders.parquet removes amt, read by consumer
+possibly breaking      /lake/orders.parquet removes note, and nothing in this workspace reads it
+```
+
+**Severity depends on the reader, not just the change.** Removing a column is
+only breaking if something reads it - the same edit is additive in one workspace
+and an outage in another, and only the consumer graph can tell them apart.
+
+| change | verdict |
+|---|---|
+| add a column | compatible - nothing can bind a column that did not exist |
+| remove or rename a column something reads | **breaking** |
+| remove a column nothing here reads | possibly breaking, never "compatible" |
+| widen a type (`int32` to `int64`, anything to text) | compatible |
+| narrow a type something reads | **breaking** |
+| let a column be null | possibly breaking - it still binds, the answers just go wrong |
+
+**It compares against a git revision rather than a stored contract**, because
+the previous schema already exists in the commit you are proposing against. A
+separately stored contract is a second copy of the same fact, and the first time
+it drifts the check compares against something nobody shipped.
+
+**"Reads it" is deliberately over-broad**: a column counts as referenced if its
+name appears as a whole word in a consumer's declared schema or any of its node
+properties. A false "breaking" costs someone thirty seconds; a false
+"compatible" costs an incident. Uncertain answers are reported as *possibly
+breaking* rather than dressed up as either, and `--strict` fails the build on
+those too.
+
+**Three tiers, because two would need column lineage Duckle has not got.** A
+direct consumer that references the changed column is **breaking**; a direct
+consumer that does not is **possibly breaking**; everything further downstream is
+listed for **revalidation** and never called broken:
+
+```text
+BREAKING  lake/company.parquet removes vat, read by normalized;
+          revalidate search_index (downstream, no column lineage to prove it either way)
+```
+
+Proving a dropped column propagates through an intervening transform needs
+column lineage across it. Asserting it anyway would put a confident wrong claim
+in front of a reviewer; leaving the pipeline out entirely would hide it from the
+blast radius. Naming it at its own tier is the only honest option, and it does
+not fail the gate.
+
+### Run a pipeline when its input is published (`subscriptions.json`)
+
+A consumer that says "after the producer" through a clock is guessing: too early
+and it reads yesterday's data, too late and it wastes the gap, and when the
+producer is delayed it does both. Every successful publication is recorded, and
+a subscription runs a pipeline when one it cares about arrives:
+
+```json
+[{ "id": "gold-after-raw", "pipelineId": "build-gold",
+   "assets": ["/lake/raw/orders.parquet", "/lake/raw/customers.*"] }]
+```
+
+**One event per successful run, not per asset.** A run committing four tables is
+one publication, so a subscriber is triggered once rather than four times and
+there is no debounce window to tune. A failed run publishes nothing, and neither
+does one that stopped at a ceiling - its rows are correct and are not all of
+them.
+
+**Three states, not one silence.** The publication, the delivery and the
+consumer's run are recorded separately, so "the downstream never ran" and "it
+ran and failed" are different answers rather than the same absence. Each
+delivery names the run it started, so a failure is one hop away.
+
+**A publication delivered to a subscriber once stays delivered**, however often
+the pump looks - and because deliveries are derived rather than queued at
+publish time, a subscription added today receives the publications that already
+happened. A pipeline cannot subscribe to its own output, which would publish
+again and run forever.
+
+The run it creates is an ordinary run: same resource pool, same policy, same
+receipt, same logs. Only the trigger is new.
+
+### Freshness that does not wait for a failure (`freshness`)
+
+A dataset goes stale in ways that produce no failed run at all: a schedule
+switched off, a server down, a source that stopped publishing, a run that was
+never queued. Alerting on failures cannot see any of those, because nothing
+failed. So an asset declares how old it may get, on the same `owners.json` rule
+that already carries who owns it:
+
+```json
+{ "match": "/lake/raw/*", "owner": "data-eng", "maximumAge": "36h" }
+```
+
+```bash
+duckle-runner freshness --stale --json     # exit 1 when anything is stale
+```
+
+```text
+asset                                    state    age        limit      owner
+/lake/never                              stale    never      1h         ops
+/lake/orders                             stale    50h        36h        data-eng
+```
+
+**A partial publish does not count as a refresh.** A failed run never did, but an
+`incomplete` one used to - a run that stopped at a ceiling has correct rows and
+not all of them, and unlike a failure it looks healthy. That was a real bug, and
+there is a test that fails without the fix.
+
+**No declared limit means `unknown`, not `fresh`.** "We do not know" and "it is
+fine" are different answers and only one of them is reassuring. An asset a rule
+names but which has never been written is `stale` rather than missing: the SLA
+says it should have been there by now.
+
+**Every surface reads the same verdict.** The catalog carries it, so
+`/api/catalog` and the console's Catalog view show a **STALE** badge and the
+limit it was measured against; the MCP tool `asset_freshness` answers which
+assets are stale, why, and when each was last successfully materialized, in one
+record rather than three tools that could disagree. Asking is read-only: an
+agent's question must not move the stale/recovered state the alerting depends
+on.
+
+**The server checks it on a clock**, once a minute, on its own cadence rather
+than the scheduler's - an asset's age does not change between two scheduler
+ticks and evaluating reads run history for every asset. It runs off the
+scheduler's thread so a slow evaluation delays no schedule, and two evaluations
+can never overlap. An SLA that only holds while somebody remembers to run a
+command is not one.
+
+**Or relative to the schedule that produces it.** An absolute `maximumAge` has
+to be picked loose enough for the longest gap between runs, which makes it slow
+to notice a miss on a frequent schedule:
+
+```json
+{ "match": "/lake/raw/*", "owner": "data-eng", "expectedAfterSchedule": "4h" }
+```
+
+meaning "written within 4h of when it was due". A schedule that is **disabled or
+missing makes the asset stale**, because that is one of the failure modes this
+exists for and a deadline taken from a schedule nobody is running would excuse
+exactly the outage it should catch. An interval or file-watch schedule has no
+civil-time occurrence to be late against, so it falls back to `maximumAge`
+rather than inventing a deadline.
+
+**`fresh -> stale` alerts, and `stale -> fresh` sends the all-clear.** Both go
+through the same alert rules, cooldowns and channels a failing pipeline uses,
+with the asset path in the slot the pipeline name takes - so an `alerts.json`
+pattern matches an asset the same way. A rule can also route on **who owns** the
+asset and **which tags** it carries, because assets are named by path and owned
+by team and the two do not line up: one team's datasets live under three
+prefixes and one prefix holds two teams'. Tags match on ANY of those listed, a
+routing list being the set of things a channel cares about rather than a
+condition to satisfy; owner and tags together both apply. The all-clear is never held back by a
+cooldown, because suppressing it leaves people believing an outage is still
+running. `stale_since` is carried across evaluations, so "how long has this been
+broken" does not reset every minute, and `recovered` is reported once rather
+than on every evaluation after the recovery.
+
+### The connector matrix, generated (`capabilities`)
+
+A hand-maintained feature table drifts from the code the week after it is
+written, and a prose list of ~400 components cannot answer "which sources do
+incremental?". So it is derived from the same manifests the editor renders forms
+from:
+
+```bash
+duckle-runner capabilities --kind source
+duckle-runner capabilities --json | jq '.components[] | select(.incremental)'
+```
+
+```text
+component                  kind       sql   incr  push  rej   write modes
+src.postgres               source     yes   yes   yes   yes
+snk.csv                    sink       -     -     -     yes   overwrite/append
+```
+
+Each record carries the ports (reject output, lookup input, artifact I/O),
+whether it takes a saved connection or inline credentials, custom SQL,
+incremental, pushdown, the write modes its own field offers, whether its output
+can be cached, and every declared property key.
+
+**It reports what a component OFFERS, not what the engine does with it.** A
+capability is inferred from the declared surface, so where the two disagree the
+manifest is wrong - which is what the property-contract test exists to catch.
+This registry inherits that accuracy rather than adding to it.
+
+
+**An agent can ask it too.** The MCP tool `component_capabilities` answers the
+questions that were otherwise guesses from a component name - which sources do
+chunked extraction, which sinks offer which write modes, which components need a
+DuckDB extension - from the same records the command prints. Several
+capabilities narrow rather than widen, and a misspelled one matches nothing
+rather than returning the whole catalog, because a typo that reads as an answer
+is worse than an error.
+
+**Every release publishes `capabilities.json`**, stamped with its tag, so a tool
+can target a known Duckle version instead of interrogating a binary it may not
+have. It is covered by `SHA256SUMS.txt` like every other asset.
+
+**Execution side effects, from the code that enforces them.** The registry
+reports whether a component advances durable state and whether it runs a process
+outside DuckDB, read from the same functions the policy uses - so the table
+cannot say a component is inert in an environment whose policy refuses to run
+it. Two axes rather than seven: for network and filesystem access the engine's
+authority is per NODE, decided from a configured property value, so there is no
+honest per-component answer and none is invented. Under-reporting a safety
+characteristic is the dangerous direction, so a component whose side effect
+depends on how it is configured reports nothing rather than "no".
+
+**And the matrices are generated from it.** `--markdown` renders the source,
+sink, authentication and runtime-dependency matrices into
+[`docs/capability-matrix.md`](docs/capability-matrix.md), regenerated and diffed
+in CI. That is the whole of "do not maintain a second independent list": the
+document is a projection of the registry, so it cannot state something the
+registry does not know, and a component change that is not exported fails the
+build rather than quietly making the table wrong.
+
+**External components count.** Given a workspace, the registry includes what is
+installed there - a component the engine will run and the palette will show is a
+component, and a registry that only knew what was compiled in would answer the
+question wrongly for exactly the estates that installed something.
+### Bounding what a workspace accumulates (`retention`)
+
+A long-running server grows run history, run logs, receipts and a stage cache,
+and nothing the pipelines do bounds any of it:
+
+```bash
+duckle-runner retention status --json
+duckle-runner retention prune --cache-days 45 --logs-days 30 --receipts-keep 50 --dry-run
+duckle-runner retention prune --cache-days 45 --logs-days 30 --receipts-keep 50
+```
+
+```text
+category          files        bytes  oldest
+cache               412   1204338112  61d
+logs                 38      1102944  90d
+runs                  6        49122  12d
+receipts             57        27991  12d
+```
+
+**Retention is opt-in per category.** A bare `prune` with no limits removes
+nothing, because housekeeping that deletes by default is how a workspace loses
+something nobody meant to lose.
+
+**`.duckle/` is never touched, at all.** It holds the workspace encryption key,
+saved watermarks and resume positions, known host keys and the accepted XSD
+contracts. Losing a watermark does not lose history - it silently re-ingests or
+skips data, which is a correctness problem rather than a housekeeping one. The
+check runs when the plan is built **and again when it is applied**, so that
+"never touches state" is a property of the code rather than of the caller.
+
+The **audit log is never pruned by age**: it is the record of the prune's own
+deletions, and every prune appends to it.
+
+**The last publication of an asset with a freshness SLA is kept**, whatever
+`--materializations-days` says. Freshness reads the publication log as well as
+run history, and run history is a rolling window per pipeline - so for an asset
+published less often than that window, the log holds the only record that it was
+ever written. Aging that out does not retire a stale fact, it deletes the answer,
+and a declared SLA with no known write reads as **stale**. A 30-day horizon would
+otherwise report a 90-day SLA as breached 45 days early. Superseded publications
+of the same asset still age out, and an asset with no declared SLA is unaffected.
+
+`--dry-run` and a real prune call the same planning function and differ only in
+whether the deletion runs, so the two cannot disagree about what would go.
+
+### Reports CI already understands (`--format`)
+
+`validate` emits the shapes CI systems and agents actually consume, so nothing
+has to scrape console text:
+
+```bash
+duckle-runner validate --format json    # versioned envelope
+duckle-runner validate --format junit   # every CI renders this as a test report
+duckle-runner validate --format sarif   # GitHub Code Scanning, and most editors
+duckle-runner test     --format junit   # the same three, from the same module
+```
+
+`duckle test` names each case by its assertion and the node it asserts on, so a
+JUnit report is navigable rather than a list of file names:
+
+```xml
+<testcase classname="assert" name="tests/orders.test.json :: a row with no amount is dropped (keep)" />
+<testcase classname="assert" name="tests/orders.test.json :: totals match (rollup)">
+  <failure message="row 1, id: expected 9 (number), got 1 (number)">...</failure>
+</testcase>
+```
+
+SARIF puts each finding on the file it is about, with forward-slash URIs so Code
+Scanning can match them to repository paths. JUnit keeps the passing checks as
+well as the failures, because a report with two failures and no passes cannot be
+told from one where only two things ran.
+
+**The exit codes are part of the contract:**
+
+| code | meaning |
+|---|---|
+| `0` | everything checked passed |
+| `1` | a check failed - the thing being checked is wrong |
+| `2` | the tool could not run - bad flag, unreadable file, no input |
+
+`1` and `2` are deliberately different. A job usually wants to fail differently
+on `2`, because `2` means the gate never actually ran, and treating that as a
+pass is how a broken gate goes unnoticed for a month.
+
+`--json` is unchanged and is the same document as `--format json`: the versioned
+envelope carries the old `results` array alongside the new `findings`, so an
+existing consumer keeps working and a new one gets `schemaVersion`.
+
+### Retry a failed run (`retry`)
+
+Every run writes a small receipt under `<workspace>/runs/receipts/` and prints
+its id. `retry` takes that id and says what repeating the run would do, before
+doing any of it:
+
+```bash
+duckle-runner retry run-daily-1788171319319 --dry-run
+duckle-runner retry run-daily-1788171319319 --rerun-sinks
+duckle-runner retry run-daily-1788171319319 --json          # for CI and agents
+```
+
+```text
+  run    extract                  it failed last time
+  reuse  parse                    <ws>/cache/daily/parse/9f2c....parquet
+  WRITE  publish                  a sink writes outside the run
+```
+
+**It refuses more than it reuses, on purpose.** A retry stops before planning
+anything when the pipeline has changed since that run, when the engine version
+has, when the run being retried actually succeeded, or when it would write again
+to a sink. Nothing in the engine can tell a sink that is safe to repeat from one
+that is not, so that decision is not made for you: `--rerun-sinks` is how you
+say you have checked. `--allow-changed` retries a changed pipeline with reuse
+switched off, because the recorded outputs describe work that no longer exists.
+
+**Reuse is verified, not assumed.** A node is only reused when its recorded
+output is still on disk, checked by looking. A receipt saying a node succeeded
+is not evidence that its output survived, and a cache pruned since is the normal
+way it does not.
+
+**What it does not do yet.** There is no `--from <node>`: compiling a downstream
+subgraph does not exist, and a flag that always errors is worse than no flag.
+Reuse only ever covers nodes with `cacheOutput` set, which is opt-in and offered
+by six components, so a pipeline that never ticked the box reuses nothing and
+the plan says so on every line. And only runs started by `duckle-runner
+--pipeline` write a receipt today, so a run from the API, the scheduler or the
+desktop app answers `retry:no-receipt` rather than guessing.
+
+### Backfill without the desktop app (`backfill`)
+
+Production deployments are headless, so replaying from an earlier point should
+not mean getting at the server's workspace through a GUI:
+
+```bash
+duckle-runner backfill list  --pipeline ./pipelines/daily.json
+duckle-runner backfill set   --pipeline ./pipelines/daily.json --node inc --value 2026-01-01 --type TIMESTAMP
+duckle-runner backfill clear --pipeline ./pipelines/daily.json --node inc
+duckle-runner backfill list  --pipeline ./pipelines/daily.json --json      # for CI and agents
+```
+
+**Five node kinds keep state in that folder, and only two resume from a value a
+person can write down.** `xf.incremental` (a watermark) and
+`src.ducklake.changes` (a snapshot id) can be set; a `src.kafka` resume offset,
+a `src.spool` byte position and an `xf.tumble` buffer pointer are listed and can
+be cleared, but `set` on them is **refused**. Writing `{value,type}` over a
+tumbling window's state would drop the pointer to the rows it is holding and
+delete them on the next run, with nothing to report it.
+
+Clearing is not always a full reload, and the tool says so: a Kafka node with
+`startFrom: latest` skips whatever is already in the topic when it has no saved
+offset, so clearing it moves PAST that backlog rather than replaying it.
+
+The same three operations are on the console API and MCP, so a replay can be
+driven from CI or an agent as well as the CLI:
+
+```
+GET    /api/watermarks?file=pipelines/daily.json          viewer
+POST   /api/watermarks?file=pipelines/daily.json          operator
+DELETE /api/watermarks?file=pipelines/daily.json&node=ID  operator
+```
+
+Reading needs a viewer; changing what the next run processes needs an
+operator. All four surfaces - desktop panel, CLI, API, MCP - call the same
+engine functions, so the kind guard cannot be bypassed by picking a different
+one.
+
+### Push sources that do not lose what arrives (`listen` + `src.spool`)
+
+`src.webhook` and `src.websocket` collect INSIDE a pipeline run: they bind or
+connect, take N messages or time out, and stop. Right for a one-shot capture,
+wrong for anything continuous - between runs the port is closed and arriving
+requests are refused. Under `follow` that gap is every batch boundary.
+
+`listen` is the other half. It keeps the listener up and appends what arrives
+to an append-only NDJSON spool; a pipeline reads that spool with `src.spool`,
+from wherever the last **successful** run stopped:
+
+```bash
+duckle-runner listen --port 9000 --spool ./spool/hooks.ndjson --path-filter /hooks
+duckle-runner follow ./pipelines/hooks.json --idle-ms 500
+```
+
+Arrival is decoupled from processing, so a slow batch, a failed batch or a
+restart costs nothing that already arrived. Append-only plus a byte offset is
+the whole trick: the reader never deletes and the writer never rewrites, so
+there is no race between them.
+
+A record is `{received_at, method, path, headers, json|body}` - a JSON body is
+embedded under `json` so the pipeline can address its fields, and anything else
+is kept verbatim under `body` rather than dropped for not parsing. The spool is
+written and flushed BEFORE the 200 goes out, because a 200 tells the sender its
+delivery is safe and webhook senders do not retry those.
+
+### Resource budget (`--memory-limit`, `--threads`, `--max-temp-size`)
+
+Duckle targets one machine and will use it. On a dedicated box that is what
+you want; on a shared server one unexpectedly large job should not be able to
+take everything else down with it.
+
+```bash
+duckle-runner --pipeline ./daily.json   --memory-limit 24GB --threads 8   --temp-dir /data/duckle-tmp --max-temp-size 300GB
+```
+
+`--max-temp-size` is the one worth setting deliberately. **DuckDB's own
+default is 90% of available disk space**, so without it a single large join or
+sort can fill the volume the OS is on - which is an outage, not a slow
+pipeline. `--memory-limit` is a spill threshold rather than a hard ceiling:
+above it DuckDB writes to the temp directory and keeps going, so the limit
+buys predictability, not failure.
+
+Each run spills into its own subdirectory of `--temp-dir`. Pointing several
+concurrent runs at one shared directory is what a person does to move spill
+onto a bigger disk, and it used to make them unsafe: four concurrent spilling
+queries sharing a directory lost 3 of 12 to segfaults and delete failures.
+
+The flags set the same variables the engine reads (`DUCKLE_MEMORY_LIMIT`,
+`DUCKLE_THREADS`, `DUCKLE_TEMP_DIR`, `DUCKLE_MAX_TEMP_DIR_SIZE`), so a flag, a
+workspace-wide export and a per-stage setting all land in one place, with the
+most specific winning.
+
+### Poll a remote source without downloading it (`src.changed`)
+
+A pipeline that watches a bulk source should not pay for the object to find
+out whether it was needed. `src.changed` compares what a HEAD or an SFTP stat
+reports against the last fingerprint it **successfully processed**, and emits
+a row only for what moved. `https://`, `s3://` (including MinIO, Backblaze B2,
+Cloudflare R2 and other S3-compatible stores, through a saved connection or
+credentials on the node) and `sftp://`.
+
+Two shapes, because they are the same question asked of a different number of
+objects:
+
+- **object** - one URI replaced periodically. A row when its fingerprint
+  differs, nothing when it does not.
+- **listing** - an `sftp://` directory or an `s3://` prefix of immutable
+  files. Lists it, compares each entry, and emits the new and changed ones as
+  ordinary rows for a `ctl.foreach` or an artifact copy downstream. S3 listings
+  follow continuation tokens, so a prefix larger than one page is enumerated
+  fully rather than silently truncated at the first thousand.
+
+Rows carry `uri`, `name`, `size`, `modified_at`, `etag`, `fingerprint` and
+`status` (`new` / `changed`).
+
+**A quiet poll is not a plain success.** When nothing changed the node reports
+`unchanged`, so a working poll and a broken one are told apart - a healthy
+source can be unchanged hundreds of times between updates, and that has to
+stay countable.
+
+**Fingerprints are conservative on purpose.** None of the signals are
+guarantees: an ETag can be absent, can weaken under compression, and on S3 is
+a digest-of-digests for a multipart upload rather than the object's hash;
+Last-Modified has one-second resolution; SFTP offers mtime and size. A missing
+or unreadable signal therefore counts as **changed**. Re-reading something
+unnecessarily costs compute; skipping something that did change loses data and
+reports nothing.
+
+What was processed advances only when the whole run succeeds, and only for
+rows that were actually emitted - so a failure downstream re-offers the same
+files, and a run capped by `maxEntries` does not mark the remainder as done.
+
+### Maintain a DuckLake through the same pipelines (`src.ducklake.maintain`)
+
+A lakehouse that is written to continuously eventually needs maintaining as
+well as filling: frequent incremental writes leave many small files, snapshots
+accumulate, and files stay referenced longer than they need to be. Those
+operations used to live outside Duckle.
+
+Each operation is **one DuckLake function**, and its options are that
+function's options - compact, rewrite files heavy with deletes, expire
+snapshots, clean up files an expired snapshot released, delete orphaned files,
+flush inlined data, or read per-table storage statistics. Nothing here invents
+storage semantics, so what it does follows the installed DuckLake rather than
+anything Duckle decided.
+
+The result comes back as **ordinary rows**, which is what lets a quality check
+or an alert read a compaction the way it reads anything else, and the node
+reports what changed: `ducklake compact: 1 row(s) - files 4 -> 1, 1.1 KB ->
+513 B`.
+
+Three things about deleting, since that is where this gets dangerous:
+
+- The three destructive operations support **dry run**, which lists exactly
+  what would go and changes nothing.
+- Ticking dry run on an operation DuckLake cannot dry-run is **refused, not
+  ignored** - an ignored dry run deletes while the operator believes nothing
+  will happen.
+- **Snapshot expiry does nothing without an explicit retention boundary.**
+  That is DuckLake's own default and it is surfaced rather than replaced, so a
+  scheduled job that forgot its boundary does nothing instead of deleting
+  history.
+
+Two maintenance runs against one catalog serialise on a lock rather than
+racing, so a weekly compaction overlapping a monthly cleanup waits instead of
+failing a two-hour job at its commit.
+
+### Never buy the same row twice (item checkpointing)
+
+The failure this exists for:
+
+```
+399,999 successful paid calls
+request 400,000 fails permanently
+rerun repeats all 399,999 calls
+```
+
+Tick **Remember completed rows** on `xf.ai.llm`, `xf.ai.classify` or
+`xf.ai.embed` and each row's result is stored **as it arrives** - not when the
+stage finishes - so a failure on the next row keeps everything already bought. A
+rerun reuses them and calls the API only for what is missing.
+
+`xf.ai.embed` needs one extra step, because its billable unit is the **batch**
+rather than the row: the rows it already has are taken out first, only what is
+left is chunked and sent, and everything goes back in the input order. An
+embedding attached to the wrong row would be worse than paying for it twice.
+
+The **output** is stored, not just the fact of success. A success marker without
+the output leaves the item unable to run again and unable to be rebuilt, which
+is not resumable at all.
+
+Identity is the logical key **and** the whole input row **and** the stage's own
+configuration - the model and prompt for `llm`, the model and **category list**
+for `classify`, the model for `embed`. Asking a different question of the same
+text is different work. All three, because each alone is wrong:
+
+- a business key alone reuses the old answer for a row whose text changed
+- an input fingerprint alone misses that the prompt changed underneath it
+
+With no key named, the whole row is the key: a volatile column like a run id
+then costs reuse rather than causing a wrong answer, which is the safe
+direction.
+
+```bash
+duckle-runner checkpoint status                      # what each stage holds
+duckle-runner checkpoint prune --retain-days 30      # bound it
+```
+
+Pruning is explicit. These entries are results that were already paid for, so
+nothing is dropped on a default nobody chose.
+
+### The feed already published its schema (XSD)
+
+A national register hands you a 400-element XSD next to the data. Retyping it
+into the Schema tab is repetitive, and a typo in it is a silently mistyped
+column rather than an error.
+
+Point `src.xml` at the XSD instead:
+
+```
+XSD file : schemas/cbe.xsd
+Row path : Root/Enterprises/Enterprise
+```
+
+```
+@id       bigint      <- xs:long attribute, use="required" so NOT NULL
+Number    varchar     <- a named simple type, followed down to xs:string
+Employees integer     <- xs:int
+Turnover  decimal     <- xs:decimal stays exact; these feeds carry money
+StartDate date        <- xs:date
+Active    boolean     <- xs:boolean
+```
+
+Only read when the Schema tab is empty, so anything you declare by hand wins.
+
+**It is read for types, not as a gate.** Nothing is validated against the XSD at
+run time: full-document validation on every production load is expensive and is
+not what the schema is wanted for. It is wanted so the bounded Parquet path can
+skip per-batch inference and a daily run keeps the same column types.
+
+The derived schema describes what Duckle's reader **produces**, which is not
+quite what the XSD describes: attributes arrive as `@name`, a repeated child as
+an array and a nested child as an object, so those are declared as text.
+Deriving the abstract XSD shape instead would produce casts that fail on every
+row.
+
+The **exact schema bytes** are recorded in the signed run manifest, alongside
+every other input the run read:
+
+```json
+{"role":"input","name":"xsd","uri":"schemas/company.xsd",
+ "sha256":"eb1803ae...","sizeBytes":812}
+```
+
+A configured path can stay the same while the bytes behind it change, and the
+derived column types change with them. The path alone would say nothing about
+which schema a given run actually used.
+
+**An `xs:import`, `xs:include` or `xs:redefine` is followed**, under rules that
+keep a schema set from becoming a way to read the disk or the network:
+
+- Resolved relative to the document that **named** it, not to the root, so a
+  nested set loads the way its author laid it out.
+- Confined to the root schema's own directory. `..` is folded *before* the check,
+  because checking a path and then normalizing it is how a confinement is walked
+  past.
+- A **local** schema set may not fetch over the network. A remote one resolves
+  through the shared HTTP agent, which is where the workspace network policy
+  applies, so an import is subject to the same allowlist as anything else.
+- A cycle loads once and stops, and a document shared by two parents is read
+  once.
+- Ceilings: 64 documents, 16 levels deep, 8 MiB in total.
+- Every imported document is hashed into the run manifest alongside the root. A
+  change to any of them changes the derived columns just as much.
+
+**The whole set is one parser contract.** A publisher can replace the bytes
+behind a URL that never changed, and the next run then parses the feed into
+different columns and publishes the result as though nothing happened. The
+manifest records what was used, but only after the data is out. So the resolved
+set is fingerprinted, and the fingerprint is remembered the first time it is
+seen, in `.duckle/xsd_contracts`:
+
+| `xsdChangePolicy` | on a change |
+|---|---|
+| `warn` (default) | says so once, accepts the new set, run continues |
+| `fail` | refuses the run until you accept it by deleting the line |
+| `allow` | does not look |
+
+The fingerprint covers **every** document in the closure, not the root, because
+an `xs:include` three levels down decides a column's type just as much - a root
+whose bytes never moved is no evidence that anything held. It is canonical, so
+a schema that merely reorders its own imports is not a change.
+
+Two things are still refused, because the alternative is a column list that
+quietly stops early. An import naming a namespace with **no `schemaLocation`**
+has nothing to resolve. And two schemas declaring a *different* type under the
+same local name cannot both be honoured, so the run says which name clashed
+rather than picking one and changing a column's type silently.
+
+### A fan-out over two million parents
+
+`src.rest` with a **URL per upstream row** turns `/companies` into
+`/companies/{id}/officers` - one request per parent, one relation out. At
+registry scale three things about that mattered, and none of them were the
+requests themselves.
+
+**Memory.** The fan-out used to hold every child row in one list until the stage
+ended, so a 2M-parent walk was bounded by RAM rather than by the API. It now
+writes as each walk finishes. Memory is the parent list, the walks in flight and
+one write batch; the total number of children is no longer in that sum.
+
+**Concurrency.** **Requests in flight** puts N parents in the air at once.
+Workers pull the next parent rather than being handed a slice, so one slow
+endpoint does not leave the others idle at the end of their share.
+
+```
+c  ok (8 rows) - rest: materialized 8 rows (8 page(s)) into c (unordered: 4 requests in flight)
+```
+
+Above 1, **the output order is not the upstream order** - rows land as their
+requests finish. That is said in the field, in the node's message and here,
+rather than left to be discovered when a downstream `LIMIT 10` returns different
+rows on a rerun. **Carry upstream column** is what makes a child row traceable
+without order, which is why it exists.
+
+**One bad parent.** **When a row request fails** chooses:
+
+| | |
+|---|---|
+| `Stop the run` | the default, and what it did before |
+| `Skip that row` | drop it and carry on |
+| `Send it to the reject output` | carry on, and keep the failure as a row |
+
+```
+parent_key | url                                  | error         | failed_at
+2          | http://.../companies/2/officers      | REST HTTP 500 | 2026-08-28T...
+```
+
+One failure in a million requests should not discard the 999,999 that worked,
+and a run that half-failed is only operable if the failures are somewhere you
+can query rather than only in a log. The reject relation is built even when
+empty, so a node wired to it binds on a clean run too.
+
+`_page_number` is now per parent walk. A global counter said 4001 for the first
+page of the 4001st company.
+
+### A fan-out that died at row 900,001
+
+Tick **Remember completed rows** on `src.rest` and each upstream row is recorded
+as its requests finish. A rerun does not fetch it again:
+
+```
+c  ok (3 rows) - rest: materialized 3 rows (0 page(s)) into c,
+                 3 parent(s) reused from the checkpoint
+```
+
+It is the **same store the AI steps use**, on purpose. A fan-out with its own
+record of what succeeded would be a second answer to the same question, and two
+records of that kind drift apart. Resume falls out of the execution shape rather
+than sitting beside it.
+
+Identity is the carried parent key when there is one and the whole upstream row
+otherwise, plus everything that shapes the request - URL, template, method, body,
+response path, and the saved incremental cursor. Change any of them and the old
+answers are not reused, because they answered a different question.
+
+The destination may be **`s3://`**, using the object-storage connection on the
+node, so a raw zone can be the raw zone rather than a local staging step. It is
+written before the parse either way, so no parsed row can exist without its
+source being durable - which a later copy stage could not promise.
+
+`src.html` takes the same setting. It already fetched once, so the archived page
+and the parsed page are the same bytes rather than two requests that might
+differ, and its rows carry the same two columns.
+
+Each parsed row carries `_response_uri` naming the artifact it was parsed out
+of, so nothing downstream re-derives the destination template - which `{date}`
+would not reproduce on a run that crossed midnight anyway. The artifact is
+written **before** the parse, so a row can never name a file that does not exist.
+
+### Following pagination a server rendered
+
+Set a **Next-page link** selector on `src.html` and Duckle follows the link the
+page names, then the one that page names, until a page names none:
+
+```
+Next-page link : a.next
+Link attribute : href
+Max pages      : 100
+```
+
+Relative links resolve the way a browser resolves them - against the page URL,
+or a `<base href>` when the document sets one. A bare `?p=2` keeps the path and
+replaces the query; `../next` climbs one directory. Getting that wrong does not
+error, it silently fetches the wrong page, so each shape has its own test.
+
+A walk that stops EARLY - a page that failed, or the page cap reached with a
+link still to follow - reports the run as **incomplete** and stops anything
+downstream, the same as a budget stop. Skipping a document in a corpus loses
+that document; skipping a page in a chain loses every page after it, because
+the link to them was on the page that failed.
+
+Bounded three ways, because the link is written by someone else: a page cap, a
+stop when a page names no link, and a stop when a URL **repeats**. That last one
+matters most - a next link pointing back at page 1 is a cycle, not a long list.
+
+Every page goes through the same transport, capture and provenance as the first,
+so `_response_uri` and `_response_sha256` identify the page a row came from.
+
+Ignored when documents are wired in from upstream: that list already names every
+page it wants, and following links out of it would fetch pages nobody asked for.
+
+### Handing a scanned page to your own OCR
+
+Duckle does not do OCR, and will not: rasterising needs a native rendering
+engine plus per-language trained data, which would end the self-contained
+cross-OS build. What it owes instead is a page you can render **without
+guessing** - so a page with no text layer arrives carrying everything an
+external stage needs.
+
+```
+src.changed  ->  xf.artifact.copy  ->  src.pdf  ->  filter  ->  code.python
+                 (localise)            (pages)     (no text)   (your OCR)
+```
+
+```sql
+SELECT document_uri, page_number, source_sha256
+FROM pages
+WHERE has_text_layer = false
+```
+
+| column | what the OCR stage does with it |
+|---|---|
+| `document_uri` | opens it |
+| `page_number` | renders that page |
+| `source_sha256` | pins the bytes, so a re-render is reproducible |
+
+Then, in **your** locked environment - the one `uv.lock` pins, so the render is
+the same next month:
+
+```python
+import fitz  # PyMuPDF
+
+def process(row):
+    page = fitz.open(row["document_uri"])[int(row["page_number"]) - 1]
+    row["image_path"] = f"/work/{row['source_sha256']}-{row['page_number']}.png"
+    page.get_pixmap(dpi=300).save(row["image_path"])
+    return row
+```
+
+**Localise before OCR.** That is the one constraint. When `src.pdf` fetches a
+remote document it spools, parses and deletes - one document at a time, so the
+bound is a document rather than the corpus - and `document_uri` is then the
+remote URI, which a Python step cannot open. Re-fetching it would be neither
+stable nor reproducible: a URL is a name that can be rebound, so the second
+fetch may not be the bytes that were parsed. `xf.artifact.copy` first, and
+`document_uri` is a local path.
+
+PyMuPDF, Docling, PaddleOCR and Tesseract all work from that pair, and none of
+them become Duckle's problem.
+
+### A cursor that reaches the request
+
+Filtering after the fetch is not incremental for an API. You still pay for the
+whole dataset every run, so for a large API it is a full reload with extra
+steps. The cursor has to reach the request.
+
+Name an **Incremental field** on `src.rest` and put `{incremental}` wherever the
+API takes its cursor - the URL, a query parameter, the body or a header:
+
+```
+URL                  : https://api.example.com/changes?since={incremental}
+Incremental field    : updated_at
+Starting value       : 1970-01-01
+```
+
+```
+run 1  GET /changes?since=1970-01-01   -> records up to 2026-03-05
+run 2  GET /changes?since=2026-03-05   -> only what is new
+```
+
+The mark is the **highest value seen**, not the last one received - an API that
+returns a page out of order must not move the cursor backwards and re-fetch
+what was already taken. Numbers compare numerically and everything else
+lexically, which is why ISO-8601 works without a date parser.
+
+**It is saved only when the whole pipeline succeeds**, through the same deferred
+queue every other watermark uses. A run that fails after this stage does not
+advance the cursor past rows no sink ever received. Nothing REST-specific was
+added for that; it is the mechanism `xf.incremental` and the Kafka resume point
+already use.
+
+`{incremental}` is a reserved name. When the node is also fanning out over
+upstream rows, an upstream column called `incremental` is refused rather than
+silently shadowed by the mark.
+
+### A ceiling on the bill, not just on the rate
+
+Rate limiting controls how fast money leaves. It does not control how much. A
+prompt template that accidentally embeds a whole document, over a source that
+grew tenfold overnight, is a bill nobody approved.
+
+`xf.ai.llm`, `xf.ai.classify` and `xf.ai.embed` take a **Budget**:
+
+```
+Max requests                      : 1000000
+Max input tokens                  : 500000000
+Max output tokens                 : 30000000
+Max estimated cost (USD)          : 50
+Input price per million tokens    : 0.15
+Output price per million tokens   : 0.60
+```
+
+Reaching one stops the stage. What happens then is the part worth reading:
+
+```
+status     : ok
+incomplete : budget:maxRequests - the rows produced are correct and are not all
+             of them; nothing downstream ran
+  l   ok (5 rows) - ai.llm: stopped at the budget:maxRequests ceiling after
+                    2 request(s), 20 input + 10 output token(s)
+  k   skipped     - not run: an earlier stage stopped at its budget
+```
+
+- **Not a failure.** The rows already bought are correct and paid for. `status`
+  stays `ok`, and a Plan step does not fail.
+- **Not a plain success either.** `incomplete` sits beside `status` with a
+  machine-readable reason, because alerting has to tell "we hit the ceiling"
+  apart from "it broke", and a sentence cannot be matched on.
+- **Everything downstream is skipped.** This is the point. Stopping is only the
+  mechanism; the damage a budget stop prevents is a sink publishing two rows of
+  five as if they were the answer.
+- **No watermark advances.** An incomplete run read a window and processed part
+  of it. Recording the end of that window would make the next run skip
+  everything the budget stopped, permanently. This is the one place where "not
+  a failure" still has to behave like one.
+- **The checkpoint keeps what was bought.** Tick **Remember completed rows** and
+  a rerun after raising the ceiling calls the API only for what is missing.
+
+**How exact is it?** The request ceiling is exact: no request past the Nth is
+ever issued, and it holds under concurrency (the slot is claimed with a
+compare-and-swap, so eight workers cannot all take the same last one). Token and
+cost ceilings cannot be, because tokens are only knowable after a reply. The
+guarantee is precisely: **no request starts once the recorded totals have
+reached the limit**, so the last one may carry the total past it by at most one
+request's worth. Anything stronger would need a local tokenizer per model and
+would still be an estimate.
+
+A cost ceiling **with no prices does not compile**. It could never be reached,
+and a limit that cannot fire is worse than no limit: it is a limit somebody
+believes in. `duckle validate` catches it before a run rather than a run
+discovering it after the first stage has started spending. Request and token
+ceilings need no prices and work against a self-hosted endpoint.
+
+### Extraction should produce columns, not a paragraph containing the answer
+
+`xf.ai.llm` can ask for a shape instead of prose. Pick **A JSON Schema you
+define**, paste the schema, and the provider enforces it while it writes
+(`strict: true`). Tick **Turn the reply fields into columns** and each top-level
+field lands as its own column, ready for a join, rather than a JSON blob a
+downstream stage has to unpack.
+
+The reply is checked again locally, and that is the point. An
+OpenAI-**compatible** endpoint may accept `response_format` and ignore it, and a
+silently unstructured answer is exactly the failure this removes. What is
+checked: the reply parses, every `required` field is present, and each declared
+top-level field is the type the schema says. Nested schemas are enforced by the
+provider during decoding; re-implementing draft 2020-12 here to check them a
+second time would be a large dependency for a second opinion, and it is not
+claimed.
+
+Three things are refused before a single request is billed:
+
+- a schema that does not parse
+- a reply shape of JSON Schema with no schema given
+- a schema field with the same name as an incoming column, which expansion would
+  silently overwrite
+
+**When a reply does not match** defaults to stopping the run. An extraction that
+quietly produced nulls for a tenth of its rows is worse than one that stopped;
+the other setting is there for genuinely messy input.
+
+The schema is part of the checkpoint identity, so adding a field to it does not
+hand back yesterday's answers, which do not have it.
+
+### Two machines that both look correct (Python environments)
+
+```
+machine A    .venv with splink==4.0.0
+machine B    .venv with splink==3.9.1
+```
+
+Same pipeline, same `uv.lock`, different answers, and nothing anywhere says so.
+Duckle now reads the environment as it **is** - the distributions installed in
+it - rather than trusting a marker written by whoever created it. A stamp file
+records an intention; `*.dist-info` records the fact.
+
+Commit a `uv.lock` and the check turns on. A pipeline with a `code.python` node
+is refused before it runs when the workspace `.venv` contradicts the lock:
+
+```
+error : python: the workspace .venv is not the environment uv.lock describes,
+        so this run would not be the run the lock says it is:
+          splink: installed 3.9.1, locked 4.0.0
+```
+
+```bash
+duckle-runner python check      # exit 1 when it does not match, so CI can gate
+duckle-runner python prepare    # rebuild .venv from the lock (uv sync --frozen)
+```
+
+**Nothing is installed during a pipeline run.** Resolving dependencies mid-run
+would turn a missing package into a download, which an air-gapped box and a
+scheduled job cannot have. `prepare` is a provisioning step: run it once, in CI
+or at deploy time.
+
+A package the lock names but that is not installed is **reported and does not
+fail**. A lock resolves for every platform, so something absent here may simply
+not apply here; a package that really is needed and really is missing raises
+`ImportError` on the first row, which is already unambiguous. What does fail is
+a version that contradicts the lock, or a package the lock never mentions -
+those are the two shapes of "someone changed this environment".
+
+**A deployed pipeline cannot silently run against an unprepared target.** A
+bundle built from a workspace with a `code.python` step carries `uv.lock` and
+`pyproject.toml`, so the target has something to verify against. On that target,
+a lock with nothing installed in `.venv` is refused before the run starts:
+
+```
+error : config: python: /srv/app declares a locked environment (uv.lock) but
+        nothing is installed in .venv, so this target is not prepared. Run
+        `duckle-runner python prepare` on this machine before the pipeline runs,
+        or point DUCKLE_PYTHON_BIN at the interpreter you mean.
+```
+
+That gap mattered: "missing packages" alone is deliberately not a failure, so an
+absent or never-synced `.venv` produced only Missing entries and the run went
+ahead against whatever Python the machine had. The lock is shipped, **not** the
+environment - preparing the target stays an explicit step, because resolving
+dependencies at run time is what an air-gapped box cannot have. Naming an
+interpreter with `DUCKLE_PYTHON_BIN` is a decision, so it is exempt.
+
+`DUCKLE_PYTHON_ALLOW_DRIFT=1` downgrades the refusal to a warning. There is
+always a machine where the rule is wrong, and a check with no way past it gets
+deleted rather than fixed.
+
+With no `uv.lock`, none of this applies and `code.python` behaves exactly as it
+did: `DUCKLE_PYTHON_BIN`, then the workspace `.venv`, then the system Python.
+
+The signed run manifest records the Python version, the platform, the `uv.lock`
+SHA-256 and the environment hash - but only for a pipeline that actually has a
+Python stage, so an unused interpreter does not become noise in every manifest.
+
+### Do not parse the same 40,000 PDFs twice (output caching)
+
+The checkpoint above remembers each **item** as it is bought. This remembers the
+**whole relation a stage produced**, so a stage whose inputs and settings have
+not changed does not run at all - the parse, the script, the extraction, none of
+it.
+
+Tick **Skip this step when its inputs have not changed** on `src.pdf`,
+`src.xml`, `src.html`, `code.python`, `code.javascript` or `code.wasm`. On the
+next run the stage's output is served from the workspace cache instead of being
+recomputed, and the node says so:
+
+```
+j  code.javascript  ok  reused cached output 3f9a1c22b4d0
+```
+
+It is off unless you ask for it, and it is deliberately hard to fool:
+
+- The key is the component, the node's settings **and** a checksum of the rows
+  arriving from upstream. Change any of them and the stage really runs.
+- Secrets are stripped out of the key. A rotated password is not new work.
+- **No upstream connection means no caching.** A stage reading the outside world
+  has no input this pipeline can checksum, so keying on settings alone would
+  hand back last week's parse of a file that has since changed. It is refused
+  instead of guessed at.
+- **A Python stage is keyed on its environment too**, and refused without one.
+  The same script under a different pyarrow is different work; a stage running
+  against whatever interpreter the machine happens to have has no identity to
+  pin, so it is not cached at all.
+- **An engine upgrade invalidates everything.** A stage is deterministic given
+  a build: a parser fix makes the same input produce a different, better answer,
+  and a cache that survived the upgrade would quietly keep serving the one the
+  fix was meant to correct. That costs one slow run, which is the right side to
+  err on.
+- The list of components is an allowlist, not a denylist. Anything that writes
+  somewhere, reads a clock or talks to a queue gives a different answer the
+  second time, and reusing the first one would be wrong rather than fast.
+- A cache that cannot be read or written is a slower run, never a failed one.
+
+```bash
+duckle-runner cache list                    # what is cached, by pipeline and node
+duckle-runner cache clear --pipeline daily  # drop it
+duckle-runner --pipeline p.json --no-cache  # distrust it for one run
+```
+
+`--no-cache` neither reads nor writes, so a run taken to settle whether the
+cache is lying does not then overwrite the evidence.
+
+Cached output lives under `<workspace>/cache/<pipeline>/<node>/` and can be
+deleted at any time. Unlike the checkpoint above, nothing here was paid for -
+it can all be recomputed, which is why clearing it needs no ceremony.
+
+### A JSON column that appears late is not a column you lose
+
+DuckDB decides what a JSON document's columns ARE from the first `sample_size`
+records - 20480 by default. On records that do not all carry the same keys, that
+**silently drops** every column first appearing later: the read succeeds, the
+rows look right, and a field is simply gone. No error, nothing to notice.
+
+`src.json` now scans everything by default (`sampleSize: -1`). That costs an
+extra pass over the file, which is the honest price of not losing columns. Set a
+number if you know your records are uniform and would rather have the speed.
+
+### Make forbidden things impossible, not discouraged (workspace policy)
+
+Roles answer *which control-plane actions may this key invoke*. A different
+question matters once an AI agent or a CI job can write pipelines: **which
+capabilities may a pipeline in this environment contain at all**. An agent with
+legitimate write access to the repository defeats the first entirely.
+
+"Do not modify production data" in a prompt is guidance. A policy file is a
+boundary.
+
+```yaml
+mode: enforce
+components:
+  deny: [code.shell]
+network:
+  allowedDomains: [api.registry.example]
+sinks:
+  allowedConnections: [dev_lake]
+  allowedS3Prefixes: ["s3://company-development/"]
+  deniedSchemas: [production]
+filesystem:
+  allowedPaths: [/var/lake/dev]
+state:
+  allowMutation: false
+```
+
+`DUCKLE_POLICY_FILE` points at the authoritative one, from outside the
+workspace. `.duckle/policy.yaml` may then add restrictions.
+
+Four things make it a boundary rather than a check:
+
+**Enforcement is at plan time, and again at the point of the act.** An agent
+that can write the pipeline can also invoke a path that skips a validation step,
+so the check sits where a pipeline becomes executable - a denied capability has
+nowhere to run, rather than having failed a check somebody can route around.
+Nothing is written before the refusal.
+
+Plan time alone is not enough, because a plan-time check reads a URL out of a
+node's properties and the request happens somewhere else entirely. So each rule
+also holds where it is actually exercised:
+
+| rule | also enforced at |
+|---|---|
+| `network.allowedDomains` | every connection, every redirect hop, and DuckDB itself |
+| `state.allowMutation` | every component that advances saved state - incremental watermarks, DuckLake CDC snapshots, Kafka offsets, the `src.changed` seen-map, spool and REST positions, tumble windows and stored baselines - so `duckle-runner backfill`, the API, MCP and the panel all meet the same refusal |
+| `extensions.allowUnsigned` | the DuckDB launch, which can withhold `-unsigned` but never grant it |
+
+DuckDB is the reason that last one names two enforcers. Duckle's own HTTP
+client checks every host it dials, but SQL that DuckDB runs never passes
+through that client: `read_parquet` over https, a remote `ATTACH`, a `COPY` to
+a remote URI, an extension that fetches on its own. Scanning the SQL for those
+is not a boundary, because the SQL is generated by dbt, Python, templates and
+MCP, and a path can be built at run time from a row. So under a restricted
+network the run starts with DuckDB's remote filesystems disabled and community
+extensions refused, both of which DuckDB will not let a later statement undo.
+Local file access is untouched. Where an operator genuinely needs DuckDB-native
+remote reads, `network.allowDuckdbExternalIo: true` in the server policy returns
+them, along with the boundary they cost.
+
+**Prefixes match at a boundary, not as strings.** An allowed path of
+`/var/lake/dev` does not admit `/var/lake/development`, and an allowed
+`s3://co-development` does not admit `s3://co-development-prod`.
+
+**Narrowing is the only operation the format has.** Denies union, allowlists
+intersect, permissions AND. There is no expressible way to remove a deny or
+extend an allowlist, so "a workspace may never widen a server policy" is
+structural rather than a merge rule somebody has to keep getting right.
+
+**`mode` comes from the server policy alone.** The workspace file is writable by
+whatever writes the pipelines, so a workspace that could set `mode: report`
+could switch the boundary off from inside the thing being bounded.
+
+A policy file that is named and cannot be read **refuses the run**. Falling back
+to "no policy" would mean a typo in the environment silently removes the
+boundary. With no policy configured at all, nothing changes.
+
+### Catch the run that looks fine and is not (`qa.baseline`)
+
+Absolute rules catch a NULL where one is not allowed. They cannot catch this:
+
+```
+Monday       5,120,310 rows
+Tuesday      5,131,244 rows
+Wednesday    5,129,991 rows
+Thursday       842,114 rows
+```
+
+Every one of those 842,114 rows can satisfy the schema and every row-level
+rule. The pipeline stays green and publishes, which is more dangerous than a
+crash - a crash is noticed.
+
+`qa.baseline` profiles the current input, compares it against the **median** of
+the last N accepted profiles, and either reports the comparison as rows or
+fails the run. Median rather than mean, so one odd day does not drag the
+baseline towards itself.
+
+Row count, and per column the null count, null rate, distinct count, min, max
+and mean. Rules take limits in either direction, as a percentage or as an
+absolute: a null rate going from 0% to 5% is an infinite percentage increase,
+so a percentage says nothing about it.
+
+`groupBy` with `requireExistingGroups` catches a partition that stopped
+arriving - a country missing from a feed - **even when the total row count is
+unchanged**, because the other partitions grew to cover it. A dataset-level
+rule cannot see that at all.
+
+Deterministic throughout: rolling summary statistics and explicit thresholds,
+no model. Only compact numbers are stored, never copies of the data. And the
+new profile is accepted **only if the whole run succeeds**, so a bad day never
+teaches the gate that bad is normal.
+
+**Re-basing it when the source really did change.** A retired product line, a
+migrated system, a rate that genuinely moved - the accepted history now
+describes a world that is gone, and every run fails against it. A gate with no
+way to say "this is the new normal" gets deleted, or has its thresholds widened
+until it means nothing, which is worse because it still looks like a check.
+
+```bash
+duckle-runner baseline list                                    # what has a baseline
+duckle-runner baseline inspect --pipeline orders --node qa     # accepted vs last run
+duckle-runner baseline accept  --pipeline orders --node qa     # this is the new normal
+duckle-runner baseline clear   --pipeline orders --node qa     # start the history over
+```
+
+`accept` promotes what the **last run measured**; it never invents a number, so
+a node no run has measured has nothing to accept. That works because a refused
+run still records its profile - the run an operator most needs to look at is
+exactly the one the gate rejected, so that observation is written whatever the
+outcome, unlike the accepted history.
+
+Both `accept` and `clear` go through `state.allowMutation` and are written to
+the audit log with the value they replaced, because "somebody cleared it" is not
+reviewable and the number it held is. The same four operations exist over the
+HTTP API and MCP.
+
+### A corpus, not one file (`src.xml` on the artifact contract)
+
+Wire an artifact relation into `src.xml` and it reads every document that
+relation names, instead of one configured path - so change detection, an
+immutable landing copy and the parser compose instead of each needing its own
+notion of "where the file is":
+
+```
+src.changed  ->  xf.artifact.copy  ->  src.xml  ->  DuckLake
+```
+
+Each document is **streamed straight out of the artifact reader**. The pull
+parser never seeks, so spooling every file to disk first would buy nothing and
+cost a full local copy of the corpus. Object storage works on this route (it
+goes through the signed S3 read), which the configured-path route still cannot
+do. A zip is refused with a pointer to `xf.archive.extract`, because a zip
+directory is at the END of the file and cannot be streamed.
+
+`carryColumns` copies the business keys - `company_id`, `filing_id` - onto every
+row the parser emits, so a row can be joined back to the document it came from
+without a second lookup, and `source_sha256` is carried rather than recomputed.
+
+**The corpus list is bounded too**, not just each parse. Reading the artifact
+relation into memory before opening the first document would make a million-row
+corpus cost memory proportional to the corpus - a fix that looks complete and is
+not. The list is materialised once into the run database and read back a batch
+at a time, numbered rather than paged with a bare `LIMIT`/`OFFSET`: a view with
+no `ORDER BY` can hand back a different order on the next call, and a corpus
+that silently repeated or skipped documents is worse than one that would not fit
+in memory. `src.pdf`, `src.xml` and `src.html` all go through it.
+
+`src.html` takes the same contract, for the case where the corpus is pages
+rather than documents. It reads each page whole rather than streaming, because
+a CSS selector needs the DOM built before it can match anything - there is
+nothing streaming would save.
+
+One writer serves the whole corpus, so the bounded-parts machinery below bounds
+**all** the documents rather than each one: a million small files cannot do what
+one huge file already could not. `onError: skip` keeps going past a document
+that will not read, and says how many it skipped - a corpus that quietly lost
+documents is the failure this contract exists to prevent.
+
+### Bounded materialization for large XML (`src.xml`)
+
+The XML parser is a pull parser, so live memory is one row plus the nesting
+depth however big the file is. The intermediate was not bounded the same way:
+every parsed row went to one NDJSON file that grew to the size of the whole
+result, and NDJSON repeats every property name on every row - so a 30GB
+compressed source could put hundreds of gigabytes on the temp volume.
+
+**With a declared schema**, rows are rolled to a compressed Parquet part every
+250,000 rows (`batchRows`), the NDJSON only ever holds the tail, and the parts
+are read back as one relation. The uncompressed intermediate is bounded by one
+part rather than by the result, and the rest is columnar, so the property names
+are stored once per part instead of once per row.
+
+The declared schema is what makes this available: each part is typed as it is
+written, because two parts inferring different types for the same column would
+fail to union at the end. The node reports how many parts it took, so the
+bounding is visible rather than assumed.
+
+### Unpack an archive into artifacts (`xf.archive.extract`)
+
+Bulk data is published as archives far more often than as readable files, and
+unpacking one used to mean a shell stage. As an **artifact operation** rather
+than something built into each parser, a ZIP of CSVs, a TAR of JSON and a GZIP
+of NDJSON all land the same way and each member then flows into whichever
+parser suits it.
+
+One archive row in, one artifact row per member out: `archive_uri`,
+`member_name`, `member_index`, `uri`, `media_type`, `compressed_size`,
+`size_bytes` and `sha256`. ZIP, TAR, TAR.GZ and GZIP.
+
+TAR and GZIP are read front to back and stream straight from the source, so an
+archive nobody has to hold is an archive whose size does not matter. A ZIP is
+spooled one at a time, because its central directory is at the END of the file
+and a reader has to seek.
+
+Two things about untrusted input, because an archive from an external publisher
+is exactly that. **A member path can never escape the destination**, however the
+archive names it. And an archive is a compression format, so a small one can
+expand to fill a volume - the expansion limit is applied **while reading**,
+which refuses rather than discovering it from a disk-full error.
+
+### Land the bytes somewhere durable (`xf.artifact.copy`)
+
+An artifact is a reference - a uri, a media type, a size, a hash - so a
+pipeline can carry one around for nothing. At some point the actual bytes have
+to move, and that is this step: between "the feed says there is a new 4GB
+bundle" and "it is in our raw zone, hashed, and we can prove which bytes we
+parsed".
+
+It reads a `uri` column - whatever `src.changed`, `src.artifact` or a query
+produced - and copies from `https://`, `s3://`, `sftp://` or a local path to
+an `s3://` prefix or a local directory.
+
+**Streamed and hashed in one pass.** Memory is bounded by the part size rather
+than by the object, so a 40GB model file does not become 40GB of RSS, and the
+`sha256` recorded is of the bytes that actually transferred. Reading twice -
+once to hash, once to upload - would double the transfer off a remote source;
+hashing first would mean holding the whole thing.
+
+Naming is `keep` (the source's file name), `path` (its layout preserved under
+the prefix) or `hash` (content-addressed, which makes the store immutable and
+de-duplicating at the cost of reading each source twice, because the key is
+the hash). A source-derived name can never climb out of the destination
+prefix.
+
+`ifExists: skip` is the default and is what a raw zone wants: re-running a
+feed does not re-upload what already landed. The row still comes out, with
+`copied = false`, because downstream still needs to know the artifact exists.
+
+Emits `uri`, `source_uri`, `name`, `media_type`, `size_bytes`, `sha256` and
+`copied`.
+
+**Remote artifacts reach the signed run manifest.** `.ducklock` pinned local
+file inputs by path, and a remote object has no path - so the boundary that
+matters most in a raw-zone pipeline, where the bytes came from, was the one
+thing the manifest did not record. Every object a run reads or writes now
+appears in it with its uri, size, media type, and either a `sha256` when the
+bytes actually passed through the run or an ETag and mtime when they did not.
+An object that was merely observed carries no hash, because claiming one would
+be a lie. The manifest also records the resource limits the run was given, so
+two runs that spilled differently can be told apart from two runs handed
+different budgets.
+
+### Tumbling windows that survive between runs (`xf.tumble`)
+
+Aggregating a stream by time needs a window to stay open across batches, and
+needs to know when it can be closed. `xf.tumble` assigns each row to a
+fixed-size bucket by its EVENT time, holds it until the bucket closes, then
+emits it with `window_start` / `window_end` for an ordinary `GROUP BY`
+downstream.
+
+Closing is decided by a **watermark** - the greatest event time seen so far,
+across runs - not by the wall clock. Replaying last year's data therefore
+produces last year's windows, instead of finding every one of them older than
+"now" and closing the lot at once.
+
+`allowedLateness` holds a window open past its end for out-of-order arrivals.
+Anything that arrives after its window was already delivered is **dropped and
+counted**, not emitted: sending it would hand a downstream consumer a second,
+partial copy of a window it already has, with different numbers in it.
+
+The rows in still-open windows and the watermark ride the same deferred flush
+as every source position, so a batch that fails downstream leaves them intact
+and re-processes rather than losing what it was holding.
+
 ### Web panel (remote management console)
 
 To run and monitor pipelines on a server with a browser instead of the desktop app, start the built-in **web panel** - it is part of the same `duckle-runner` binary, so there is nothing extra to install:
@@ -483,6 +2974,7 @@ Open `http://localhost:8080`. The panel has eight views:
 - **Plans** - several pipelines in the order you chose. See [Plans](#plans-several-pipelines-in-an-order-you-chose).
 - **Catalog** - everything the workspace reads and writes, who owns it, and what is written but never read. See [Workspace catalog](#workspace-catalog-what-reads-and-writes-what).
 - **Batches** - work queued for workers: progress, what is running now, what failed, and a retry for the failures.
+- **Backfills** - re-run a partitioned pipeline over a range of dates, slice by slice: preview what would queue before queueing it, then watch the slices, retry the ones that failed, and cancel the ones that have not started. A chunked extract appears here too, because it is the same ledger.
 - **People** - the accounts that may sign in and the keys machines use, with the role each one has. Admin only.
 - **Audit** - who signed in, what they changed and who was turned away. Admin only, and shown only to admins.
 
@@ -881,7 +3373,7 @@ Duckle is not a CSV tool with extras. It reads a broad set of formats and source
 
 ### Sources
 
-**113 sources available today.**
+**121 sources available today.**
 
 | Group | Connectors | Status |
 |---|---|---|
@@ -893,8 +3385,8 @@ Duckle is not a CSV tool with extras. It reads a broad set of formats and source
 | **Lakehouse table formats** | Apache Iceberg, Delta Lake, DuckLake (catalog in a local file or a `postgres:` / `mysql:` / `sqlite:` DSN, with the catalog schema and `META_*` parameters - including `META_SECRET` - settable on the node) | Available |
 | **Embedded databases** | SQLite (read tables), DuckDB (read tables or run a query) | Available |
 | **Network relational DBs** | PostgreSQL, MySQL, MariaDB, CockroachDB | Available (live CI for PG + MySQL) |
-| **Network relational DBs** | SQL Server (TDS), Oracle (Instant Client at runtime), ClickHouse (HTTP API) | Available |
-| **Network relational DBs** | IBM DB2, generic JDBC | Planned |
+| **Network relational DBs** | SQL Server (TDS), Oracle (Instant Client at runtime), ClickHouse (HTTP API), **IBM DB2** (IBM Data Server ODBC driver), **Turso / libSQL** (HTTP pipeline API - no driver install; `libsql://` URLs accepted) | Available |
+| **Network relational DBs** | generic JDBC | Planned |
 | **Object storage** | Amazon S3, Google Cloud Storage, Azure Blob, HTTP(S), MinIO, Cloudflare R2, Backblaze B2 | Available (live CI for MinIO) |
 | **Cloud warehouses** | MotherDuck, Snowflake (SQL API + PAT/JWT), BigQuery, Redshift (postgres ATTACH), Databricks SQL (Statement Execution + chunk follow), Azure Synapse (TDS), **Teradata** (ODBC, Windows / Linux), **DuckDB Quack** (May 2026 remote protocol - HTTP on :9494, SECRET-based token auth) | Available |
 | **Streaming** | Apache Kafka / Redpanda (pure-Rust `rskafka`), NATS JetStream, GCP Pub/Sub (REST + auto-ack), RabbitMQ (`lapin` AMQP), AWS Kinesis (HTTP + SigV4 - no AWS SDK), WebSocket (`ws://` / `wss://`, optional subscribe frame) | Available |
@@ -902,10 +3394,10 @@ Duckle is not a CSV tool with extras. It reads a broad set of formats and source
 | **APIs and SaaS (REST)** | Salesforce, HubSpot, Pipedrive, Zendesk, Intercom, Stripe, QuickBooks, Xero, Shopify, Notion, Airtable, Asana, Trello, ClickUp, Monday.com, GitHub, GitLab, Linear, Jira, Slack, Discord, Telegram, Twilio, Mailchimp, SendGrid, Segment - thin pre-configured wrappers over `src.rest` / `src.graphql`. `src.rest` takes a configurable API-key auth header name and offset pagination that stops on a body `total_count`. **Salesforce Bulk** (`src.salesforce.bulk`) - Bulk API 2.0 query source for migration-scale reads: SOQL as an async query job (query / queryAll), paged CSV result sets streamed to disk via `Sforce-Locator`, typed empty relations on 0 records | Available |
 | **APIs (protocols)** | OData v4 (follows `@odata.nextLink`), SOAP / generic XML APIs (XML response parsing with namespace local-name match) | Available |
 | **Health data (DHIS2)** | `src.dhis2` reads the DHIS2 Web API: aggregate `dataValueSets`, paged metadata lists, tracker exports, and `analytics/dataValueSet.json`. `snk.dhis2` imports back: chunked requests, `importStrategy` (CREATE_AND_UPDATE is DHIS2's upsert), `dryRun`, and real import-summary parsing, so conflicts and a non-zero `ignored` count fail the run instead of passing as a green HTTP 200. Auth via personal access token or HTTP Basic. Raw `/api/analytics` (columnar `headers[]` + `rows[][]`) is not supported | Available |
-| **NoSQL and search** | MongoDB (official driver), Cassandra / ScyllaDB (CQL), Elasticsearch / OpenSearch (from+size + search_after), Redis (SCAN + GET), CouchDB (`_all_docs`), DynamoDB (HTTP + SigV4 - no AWS SDK; auto-unwraps typed attributes) | Available |
+| **NoSQL and search** | **Neo4j** (Cypher over the HTTP Query API - self-hosted or Aura, no Bolt driver; optional `$parameters`), MongoDB (official driver), Cassandra / ScyllaDB (CQL), Elasticsearch / OpenSearch (from+size + search_after), **Manticore Search** (HTTP JSON `/search`; `table` + limit/offset, and a window past the default 1000 best-ranked matches raises `max_matches` to suit), Redis (SCAN + GET), CouchDB (`_all_docs`), DynamoDB (HTTP + SigV4 - no AWS SDK; auto-unwraps typed attributes) | Available |
 | **Vector / AI databases** | pgvector (postgres ATTACH), Qdrant (`/points/scroll`), Weaviate (`/v1/objects`), Milvus (`/v1/vector/query`) | Available |
 | **Vector / AI databases** | Pinecone (no list-all-vectors API), Chroma, LanceDB | Preview |
-| **File transfer** | FTP / FTPS (pure-Rust `suppaftp`) and SFTP (SSH, pure-Rust `russh` + `russh-sftp` on the ring backend; password or private-key auth, optional host-fingerprint pin) - one File Transfer component, pick the protocol. Glob filter, base64 content per file | Available |
+| **File transfer** | FTP / FTPS (pure-Rust `suppaftp`) and SFTP (SSH, pure-Rust `russh` + `russh-sftp` on the ring backend; password or private-key auth) - one File Transfer component, pick the protocol. Glob filter, base64 content per file. **Host keys are verified**: pin a SHA256 fingerprint to accept only that key, or leave it empty and the first key seen for a host is recorded in `<workspace>/.duckle/known_hosts`, after which a different key is refused. A host that presents an OpenSSH certificate is accepted only when it certifies the key you pinned. `DUCKLE_SFTP_HOST_KEY_POLICY=accept-any` opts out for a host whose key changes per connection | Available |
 | **Mailbox** | IMAP (rustls TLS, `mail-parser`) - basic auth today, OAuth (gmail / o365) on the roadmap | Available |
 | **Webhook listener** | Binds `127.0.0.1:port`, collects N inbound HTTP requests with a timeout, parses JSON-object / JSON-array bodies into rows | Available |
 | **Desktop** | System clipboard (pure-Rust `arboard`, auto-detects JSON-array shape) | Available |
@@ -917,7 +3409,7 @@ For JSON sources, a **Format** selector picks how the file is read (auto / array
 
 ### Transforms
 
-**130 transforms available today.**
+**144 transforms available today.**
 
 | Group | Operations |
 |---|---|
@@ -1001,18 +3493,18 @@ Validators split their input: passing rows continue on the main port, failures r
 |---|---|---|
 | **Files** | CSV, TSV, Parquet (ZSTD), JSON, JSONL / NDJSON, Excel (.xlsx), YAML, TOML, XML (configurable wrappers), Avro (schema inferred from first row). Parquet + CSV support Hive-partitioned writes | Available |
 | **Geospatial files** | GeoJSON, GeoPackage, Shapefile, KML, GPX via GDAL | Available (lazy-loaded) |
-| **Lakehouse** | Apache Iceberg (full table layout), DuckLake - modes: **overwrite**, **append**, **truncate**, **upsert** (set-based delete-by-key + re-insert), **merge** (partial-column `MERGE INTO` that preserves columns the source omits) with optional CDC delete propagation | Available |
+| **Lakehouse** | Apache Iceberg (full table layout), DuckLake - modes: **overwrite**, **append**, **truncate**, **upsert** (set-based delete-by-key + re-insert), **merge** (partial-column `MERGE INTO` that preserves columns the source omits) with optional CDC delete propagation, plus **publish groups** - several DuckLake sinks sharing a group name commit as one snapshot, so readers see all of their tables update together or none of them, and a run that cannot honour the group is refused rather than publishing part of it | Available |
 | **Embedded databases** | SQLite, DuckDB - modes: **overwrite**, **append**, **upsert** (set-based delete-by-key + re-insert, no PK required), **merge** (partial-column `MERGE INTO` that preserves columns the source omits) with optional CDC delete propagation | Available |
 | **Network relational DBs** | PostgreSQL, MySQL, MariaDB, CockroachDB - modes: **overwrite**, **append**, **truncate**, **upsert** (ON CONFLICT / ON DUPLICATE KEY) with optional CDC delete propagation | Available (live CI for PG + MySQL) |
-| **Network relational DBs** | SQL Server / Azure Synapse (TDS, multi-row VALUES batched; auto-creates the table if absent; **upsert** via MERGE), Oracle (Instant Client; INSERT ALL, batched per statement; auto-creates the table if absent; **upsert** via MERGE), ClickHouse (HTTP JSONEachRow; upsert by pointing at a ReplacingMergeTree target table) - every MERGE sink supports **CDC delete propagation** (a delete-flag column removes matched rows) | Available (SQL Server + Oracle + MySQL upsert and delete propagation verified live in Docker) |
-| **Network relational DBs** | IBM DB2, generic JDBC | Planned |
+| **Network relational DBs** | SQL Server / Azure Synapse (TDS, multi-row VALUES batched; auto-creates the table if absent; **upsert** via MERGE), Oracle (Instant Client; INSERT ALL, batched per statement; auto-creates the table if absent; **upsert** via MERGE), ClickHouse (HTTP JSONEachRow; upsert by pointing at a ReplacingMergeTree target table), **IBM DB2** (ODBC; auto-creates the table, booleans as SMALLINT 1/0 so DB2 for z/OS also accepts them), **Turso / libSQL** (HTTP pipeline API; auto-creates the table, values sent as bound parameters) - every MERGE sink supports **CDC delete propagation** (a delete-flag column removes matched rows) | Available (SQL Server + Oracle + MySQL upsert and delete propagation verified live in Docker) |
+| **Network relational DBs** | generic JDBC | Planned |
 | **Object storage** | S3, GCS, Azure Blob via DuckDB `httpfs` (MinIO / R2 / B2 via endpoint) | Available |
 | **Hugging Face** | Push to a Hugging Face Hub dataset repo (`snk.huggingface`): the upstream is materialized to Parquet and committed over the Hub API (create-repo → preupload → git-LFS → commit); write token required, repo auto-created (public or private) | Available |
 | **Cloud warehouses** | MotherDuck, Snowflake (PAT or JWT RS256; **upsert** + delete propagation via MERGE), BigQuery, Redshift, Databricks SQL (**upsert** + delete propagation via MERGE), Azure Synapse, **Teradata** (ODBC), **DuckDB Quack** (concurrent writers to remote DuckDB via the May 2026 protocol) | Available (Snowflake MERGE verified live against the SQL-API emulator) |
 | **HTTP APIs** | REST (POST/PUT/PATCH batched JSON-array; configurable API-key auth header name), Webhook (one POST per row), GraphQL mutations | Available |
 | **SaaS / CRM** | Salesforce (`snk.salesforce`) - sObject Collections API: **insert / update / upsert (by external Id) / delete**, ≤200 records/request, Bearer token or OAuth 2.0 client-credentials (fresh token minted per run, same auth as `src.salesforce`). **Salesforce Bulk** (`snk.salesforce.bulk`) - Bulk API 2.0 for migration-scale loads: **insert / update / upsert / delete / hardDelete**, DuckDB streams to CSV and each ≤90 MB part runs as an async job | Available |
 | **Email (SMTP)** | Per-row SMTP send via pure-Rust `lettre` + rustls. Plain text v1; HTML + attachments follow. | Available |
-| **NoSQL** | MongoDB (insert_many batched; **upsert** via replace_one on a key, plus delete propagation via delete_one), Cassandra / ScyllaDB (CQL), Elasticsearch / OpenSearch (`_bulk` NDJSON), Redis (pipelined SET) | Available |
+| **NoSQL** | **Neo4j** (rows as nodes over the HTTP Query API; one `UNWIND $rows` round trip per batch, `mergeKeys` switches CREATE to MERGE so re-runs update rather than duplicate), MongoDB (insert_many batched; **upsert** via replace_one on a key, plus delete propagation via delete_one), Cassandra / ScyllaDB (CQL), Elasticsearch / OpenSearch (`_bulk` NDJSON), **Manticore Search** (HTTP JSON `/bulk`; the doc rides inside the action line, insert or replace, and a batch the server rejects at HTTP 200 fails the run), Redis (pipelined SET) | Available |
 | **NoSQL** | DynamoDB | Planned |
 | **Streaming** | Kafka / Redpanda (`rskafka`), NATS JetStream, GCP Pub/Sub (REST + OAuth2), RabbitMQ (`lapin`), WebSocket (`ws://` / `wss://`) | Available |
 | **Streaming** | Pulsar, Kinesis | Planned |
@@ -1109,6 +3601,9 @@ Then run workers against it:
 duckle-runner work --workspace /path/to/workspace     # drain every batch
 duckle-runner work --batch fe-20260816T101112123      # just this one
 duckle-runner work --once                             # one item, then exit
+
+duckle-runner work status                             # what is stuck, and why
+duckle-runner work retry --dead                       # start the stuck ones over
 ```
 
 Start it on several machines pointed at one workspace and they share the batch.
@@ -1118,6 +3613,17 @@ to clean up: the kernel drops the lock and the item becomes claimable again.
 There is no lease, no heartbeat and no timeout, because there is nothing to
 expire. Progress is appended to `batches/<id>.ledger.ndjson`, so re-running a
 worker resumes rather than repeats.
+
+**Retries are bounded.** A failed item stays claimable and is tried again on a
+later pass, which is right for a timeout and wrong for a 404 that will always be
+a 404: without a limit that item takes a worker slot on every pass forever. Set
+**Max attempts per item** on the For Each node, with a fixed or exponential
+backoff, and an item that uses them up is left alone and reported as dead rather
+than chased. `work status` lists what is waiting out a backoff and what is dead,
+with the last error; `work retry --dead` starts the dead ones over. A retry
+appends a reset marker rather than rewriting the ledger, so the failures stay
+readable - an item that died four times before someone fixed the source still
+says so. Leave max attempts at 0 and behaviour is exactly what it was.
 
 Items run **at least once, not exactly once.** The ledger is written after an
 item succeeds, so a worker that finishes an item and then dies leaves it
@@ -1171,7 +3677,7 @@ Every node has an **Advanced** tab with fields the engine honours at run time:
 | **Run feedback** | Streaming run events light nodes up stage by stage, with per-node row counts, real mid-query cancel, and run history. |
 | **Error traceback** | A failed stage reports the exact compiled SQL plus the underlying DuckDB message, in both the Run view and the NDJSON run log, so any component's failure is debuggable. |
 | **Column lineage** | A top-bar **Lineage** button shows, per node, each output column traced back to the source column(s) it derives from. |
-| **Dives + dashboards** | Local-first, live-querying, shareable data views, stitched into multi-chart dashboards. Generate a chart from a plain-language question, export a dive to a self-contained HTML file, open standalone `/dive/<id>` and `/dash/<id>` share pages, and find everything in the top-bar **Dives** gallery. |
+| **Dives + dashboards** | Live-querying, shareable data views that run where your data already is, stitched into multi-chart dashboards. Generate a chart from a plain-language question, export a dive to a self-contained HTML file, open standalone `/dive/<id>` and `/dash/<id>` share pages, and find everything in the top-bar **Dives** gallery. |
 | **Artifacts** | `src.artifact` gives one row per file described the way a pipeline can reason about it - `uri`, `name`, `media_type`, `size_bytes`, `sha256`, `modified_at` - for PDFs, images, archives, OCR output and model binaries. An artifact is a reference, not the bytes, so it joins, filters and iterates like any other table. Hashing is off by default because it reads every byte |
 | **Python, row or table** | `code.python` takes `process(row)` for a row at a time, or `transform(table)` to be handed the whole table as a pyarrow Table - for polars/pandas work, OCR, entity resolution or ML. The table path goes through Parquet rather than JSON: measured 2.11s -> 0.74s on 200k rows, and it keeps types, where the row path turns every timestamp into a string. Needs pyarrow only when `transform` is used |
 | **A workspace's own Python** | A Python stage is only reproducible if the packages it needs travel with the pipeline rather than being whatever the machine happens to have. Put a virtual environment at `.venv` in the workspace - `uv venv && uv pip install pyarrow polars`, or the stdlib `python -m venv` - and `code.python` uses that interpreter on every machine, laptop, CI and headless runner alike. Nothing is installed at run time, so an air-gapped box stays air-gapped, and `DUCKLE_PYTHON_BIN` still overrides everything |
@@ -1181,11 +3687,13 @@ Every node has an **Advanced** tab with fields the engine honours at run time:
 | **Runs that outlive the request** | A backfill can run for hours, and a synchronous HTTP call is the wrong place to keep it: clients, proxies and load balancers all time out while the pipeline is still legitimately working. `POST /api/run/async` answers `202` with a `runId` straight away; `GET /api/run/status?runId=` reports `queued`, `running` or `finished` with the pipeline's own status; `DELETE /api/run?runId=` cancels, which is polled at every stage boundary and kills the active DuckDB child so even a long query stops promptly. Every run record now carries the id it was accepted under, so a console that restarted mid-run can still answer for it. `POST /api/run` is unchanged for anything that wants to wait |
 | **HTML as a source** | A great deal of public data is published only as HTML: registries, filing pages, results tables. `src.html` reads a local file or an http(s) URL and turns it into rows by CSS selector. Name a column per sub-selector (`a@href` reads an attribute), or leave the columns empty and let a table be a table: the `th` cells name the columns and each `tr` is a row. Parsed with a tolerant HTML parser, so the unclosed tags and unquoted attributes real pages carry - and that the strict XML reader rejects outright - are fine. A selector that does not parse fails the run naming it, rather than quietly producing a table of nulls |
 | **HTTP transport, set once** | Proxies, timeouts and a User-Agent are transport, not credentials, and every HTTP-backed component wants the same ones. A saved **HTTP transport** connection carries a proxy, a read timeout, a connect timeout and a User-Agent, and `src.rest` and `src.html` reference it alongside their auth connection, so a corporate proxy is one edit rather than one per node. What a node sets itself still wins. Every request in the engine also now has deadlines: a connect timeout of 30s and a read timeout of 300s, both overridable with `DUCKLE_HTTP_CONNECT_TIMEOUT` and `DUCKLE_HTTP_READ_TIMEOUT`. They are per-read, not per-transfer, so streaming a large file is unaffected while a dead socket can no longer park a stage indefinitely - which matters more now that AI stages keep several requests in flight |
-| **PDF pages as rows** | A great deal of data engineering starts from documents, not tables: filings, annual accounts, invoices, regulatory publications. `src.pdf` gives one row per page - `document_id`, `page_number`, `text`, `has_text_layer`, `width`, `height` and the document's own metadata - from a file or a whole folder, using the text layer the PDF already carries. `document_id` is the same value `src.artifact` puts in `uri`, so a file listing and its pages join without translation. There is no OCR, deliberately: rasterising a scanned page needs a native rendering engine and per-language trained data, which would end the self-contained cross-OS build. A scanned page arrives with `has_text_layer` false instead, which is what lets you filter those pages out and route them to whatever OCR you already run |
+| **PDF pages as rows** | A great deal of data engineering starts from documents, not tables: filings, annual accounts, invoices, regulatory publications. `src.pdf` gives one row per page - `document_id`, `page_number`, `text`, `has_text_layer`, `width`, `height` and the document's own metadata - from a file or a whole folder, using the text layer the PDF already carries. `document_id` is the same value `src.artifact` puts in `uri`, so a file listing and its pages join without translation. **Wire an artifact relation into it** and the documents are whatever those rows name rather than a configured path, so `src.changed -> Copy Artifact -> PDF pages` is one pipeline: each page carries `document_uri` and the `source_sha256` carried from the row, which is what makes the raw bytes and the parsed rows the same provenance chain. A remote document is fetched to a temporary file because a PDF reader seeks - its cross-reference table is at the end - one document at a time, removed as soon as it has been parsed, so the bound is one document rather than the corpus. With nothing wired in it reads its path exactly as before. There is no OCR, deliberately: rasterising a scanned page needs a native rendering engine and per-language trained data, which would end the self-contained cross-OS build. A scanned page arrives with `has_text_layer` false instead, which is what lets you filter those pages out and route them to whatever OCR you already run |
 | **Model cards, not a model store** | Once a pipeline can train a model it needs to answer which model produced this output, and where it lives. `snk.model` records a card - the artifact URI your training script wrote, plus whatever metrics, framework and hashes it reported - to `<folder>/<name>/<version>.json`, with a `latest.json` pointer beside it; `src.model` reads one back as a row, addressed as `name@version` or `name@latest`. The engine never touches the model bytes and never loads a model: the row carries the URI and your Python stage does the rest. What it does add is the part a convention cannot - the card is written only if the whole run succeeded, so a training pipeline that fails afterwards never registers a model and a failed retrain never moves the pointer off the model that still works |
+| **Kafka security that is actually applied** | The Kafka form has offered a security protocol, a SASL mechanism, a username and a password since the connector shipped, and the engine read none of them: a node configured for SASL_SSL connected in plaintext, unauthenticated, and said nothing about it. All four are now honoured - TLS reuses the same merged OS-plus-bundled trust store every other connection uses, and PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512 are supported. A mechanism outside that set fails the run naming what is available, rather than quietly downgrading to an unauthenticated connection. *Consumer group* has been removed: the Kafka client Duckle uses implements no consumer groups, so it could never have done anything - use *Resume where the last run stopped* instead, which is the job it looked like it was doing |
+| **Kafka that resumes** | Tick *Resume where the last run stopped* on a Kafka source and it remembers the offset it reached, carrying on from there next run. That is what turns a schedule into a stream: without it, *Earliest* re-reads the whole backlog every run and *Latest* skips everything that arrived in between, so repeated runs could never be stitched together. The position is written only when the **whole run succeeded**, so a failure after the read re-delivers those records rather than losing them - at-least-once, deliberately, since the alternative is committing an offset for rows no sink ever wrote. A saved position records the topic and partition it belongs to and is ignored if either changes |
 | **Response provenance** | Tick *Add response metadata* on a REST source and every row carries `_http_url` (the exact URL fetched, per page), `_http_status` and `_fetched_at`, so you can tell whether a result changed because the source changed or because the parser did |
 | **Reuse a stage's output** | Tick *Reuse this stage's output* on an expensive deterministic stage and it writes its rows once, then reads them back while its SQL, everything above it, and the size/modified time of any local file it reads are unchanged. Off by default and per stage: a cache that guesses when it is still valid serves stale rows silently. `rm -r .duckle/duckle_cache` clears it |
-| **Pipeline tests** | `duckle test` runs a pipeline against a fixed input and asserts the rows out of one node. `validate` catches what will not compile; this catches a transform that compiles and computes the wrong thing. A case stops at the node it asserts on, so no sink writes. Exit 1 on a failed assertion, so CI gates on it |
+| **Pipeline tests** | `duckle test` runs a pipeline against a fixed input and asserts the rows out of one node. `validate` catches what will not compile; this catches a transform that compiles and computes the wrong thing. The node's WHOLE output is compared, not a sample of it. Comparison is strict: `5` and `"5"` are different, and so are `null`, a missing field and `""` - a case can opt back into text with `"compareAs": "text"`. An expectation can also assert column TYPES with `"schema": {"day": "DATE", "n": "BIGINT"}` - a rendered-value comparison cannot see DATE becoming VARCHAR or BIGINT becoming DECIMAL, since both render identically, and precision is not compared. A type name it does not recognise fails the case rather than quietly meaning VARCHAR. Spell out the precision - `"DECIMAL(18,2)"` - and precision is compared too, because `DECIMAL(18,3)` becoming `DECIMAL(10,2)` rounds and eventually overflows while still reading as the same broad type; a bare `"DECIMAL"` still means the family. SQL without an ORDER BY has no guaranteed order, so `"orderBy": ["id"]` sorts both sides before comparing and `"unordered": true` compares as a bag - neither is on by default, so a case asserting the pipeline own ORDER BY still does. Beyond rows, an expectation takes `rowCount`, `unique`, `notNull`, `tolerance` for float noise, and `sql` for anything else (`SELECT max(amt) < 100 FROM {rows}`) - and with one of those present it need not list rows at all. A source that reads no file (S3 behind a connection, REST, DuckLake) is replaced by a reader for the fixture, so a pipeline can be tested without production credentials. `--json` for CI and agents, and the MCP server exposes the same thing as `run_tests` so a coding agent can run the suite without shell access. Exit 1 on a failed assertion |
 | **Run to a node** | `duckle-runner --target <node>` stops at that node and prints its rows; the MCP `run_pipeline` tool takes the same `target`. Nothing downstream runs, so no sink past it writes - the run-from-here the desktop preview uses, for checking one step without executing the rest |
 | **Run logs** | Every run writes component-level NDJSON to `<workspace>/logs/<pipeline name>/runtime.log` (start/finish per stage, row counts, durations, `ctl.log` / `ctl.warn` / `ctl.die` messages). Tail it straight into Splunk or Dynatrace. |
 | **Schedules** | Cron, fixed-interval, and file-watch triggers, driven by an in-process scheduler. |
@@ -1221,7 +3729,7 @@ Duckle ships a thin shell and installs its engines on first launch.
 | Engine | Role | Status |
 |---|---|---|
 | **DuckDB** | Default execution engine: analytics, file formats, cloud reads, SQL pushdown. Tracking **v1.5.3** (latest stable). A lock-free single-SELECT read (`Engine::query`) powers dives. | Working |
-| **Duckie AI Assistant** | Local chat assistant via **llama.cpp** + **Qwen 2.5 Coder 1.5B GGUF**. Downloads ~1.1 GB; runs entirely offline once installed. Managed as a `llama-server` subprocess exposing an OpenAI-compatible API on `127.0.0.1`. | Installable |
+| **Duckie AI Assistant** | Local chat assistant via **llama.cpp** + **Qwen 2.5 Coder 1.5B GGUF**. Downloads ~1.1 GB and needs no network once installed, or point it at your own OpenAI-compatible endpoint and skip the download entirely. Managed as a `llama-server` subprocess exposing an OpenAI-compatible API on `127.0.0.1`. | Installable |
 | **SlothDB** | Alternate embedded analytical engine ([SouravRoy-ETL/slothdb](https://github.com/SouravRoy-ETL/slothdb)), installed the same way and selectable per pipeline. | Installable |
 | **Native** | In-process Rust streaming / incremental engine. | Planned |
 
@@ -1495,7 +4003,7 @@ For Claude Desktop and other clients, add it to `mcpServers`:
 
 Tools: `list_components`, `get_component_schema`, `create_pipeline`,
 `validate_pipeline`, `run_pipeline`, `list_pipelines`, `read_pipeline`,
-`read_run_logs`, `build_pipeline`, `list_connections`, `create_connection`.
+`read_run_logs`, `build_pipeline`, `list_connections`, `create_connection`, `backfill_list`, `backfill_set`, `backfill_clear`.
 `run_pipeline` / `build_pipeline` need a DuckDB binary (`DUCKLE_DUCKDB_BIN`);
 `build_pipeline` also needs `duckle-runner` (`DUCKLE_RUNNER_BIN`). Full guide:
 [docs/current/mcp.md](docs/current/mcp.md).
@@ -1671,7 +4179,7 @@ It covers similar ground - moving data across 190 sources and destinations - but
 <details>
 <summary><b>Can I run ETL pipelines without the cloud or a data warehouse?</b></summary>
 
-Yes. Duckle executes on the embedded DuckDB engine, so there is no external warehouse, no server, and no account. It runs fully offline, which suits air-gapped, on-premise, and compliance-sensitive work. Pipelines can still read from and write to cloud systems when needed - it just is not required to run.
+Yes. Duckle executes on the embedded DuckDB engine, so there is no vendor warehouse to buy, no vendor platform to sign up to, and no account. You run it where you choose: a server or VM you own, a container in your own AWS, Azure or GCP account, or a workstation. It needs no outbound network of its own, which suits air-gapped, on-premise and compliance-sensitive work. Pipelines still read from and write to cloud systems whenever you point them at one.
 
 </details>
 
@@ -1685,9 +4193,9 @@ Airbyte focuses on hosted extract-and-load connectors; dbt focuses on SQL transf
 <details>
 <summary><b>Does Duckle send my data anywhere?</b></summary>
 
-No. The app runs entirely on your machine. The engines (DuckDB, llama.cpp) are downloaded from official upstream releases on first launch and then run locally. The only network calls Duckle makes on your behalf are the ones your pipelines explicitly do (e.g. a `src.s3` reading from your S3 bucket, or `xf.ai.embed` if you configure it to hit OpenAI).
+No. Duckle makes no outbound calls of its own from wherever you run it, laptop or server. The engines (DuckDB, llama.cpp) are downloaded from official upstream releases on first launch and then run in place. The only network calls Duckle makes on your behalf are the ones your pipelines explicitly do (e.g. a `src.s3` reading from your S3 bucket, or `xf.ai.embed` if you configure it to hit OpenAI).
 
-Duckie AI Assistant runs **fully offline** once the model is downloaded.
+Duckie needs no network once its model is downloaded - and if you would rather it did not run in-process at all, point it at your own OpenAI-compatible endpoint.
 
 </details>
 
@@ -1752,7 +4260,7 @@ For 90% of common pipelines (read source -> simple transforms -> sink), yes - th
 <details>
 <summary><b>Does the Duckie panel need internet after install?</b></summary>
 
-No. Once `llama-server` and the Qwen GGUF are downloaded into your app-data directory, Duckie runs fully offline. Tested by killing wifi and asking it for a pipeline - works fine.
+No. Once `llama-server` and the Qwen GGUF are downloaded into your app-data directory, Duckie needs no network at all. Nor does it have to run in-process: point it at your own OpenAI-compatible endpoint and it uses that instead. Tested by killing wifi and asking it for a pipeline - works fine.
 
 </details>
 
@@ -1842,6 +4350,95 @@ gh release edit vX.Y.Z --draft=false --latest
 
 ---
 
+## What's new in v0.7.2
+
+185 commits.
+
+- **Settings the engine honoured, that the form never offered.** CSV offers the malformed-row handling and a typable
+  delimiter of any length plus the full encoding list; Excel reads every sheet
+  or a named set and honours the cell range; cloud sources expose the read
+  options they already applied; GraphQL takes its query; Synapse draws the
+  connection it actually makes; sort takes more than one column. A REST source
+  with no upstream is no longer reported as broken.
+- **Options that ran and did something else.** A quality gate set to "keep the
+  row" dropped it; `onFail: fail` did not fail the run; the four set operations
+  ignored their column-match setting; a join family advertised a reject port
+  nothing filled; `INITCAP` does not exist in DuckDB; date arithmetic offered
+  units it could not add; the IP parser offered fields DuckDB cannot compute.
+  Each was found by running the option, not by reading it.
+- **A node that is not configured says so.** A quality gate with no columns
+  evaluated to `TRUE` and passed every row while reporting success. A SQLite
+  source with no table asked DuckDB for a table named `""` and got an internal
+  assertion (#335); the DuckDB source returned a placeholder and wrote a file
+  whose only column was named `placeholder`; the file list globbed the
+  filesystem root. All four now refuse, and `duckle-runner validate` catches
+  them before anything is opened.
+- **Scheduling that can be held to account.** A schedule records every
+  occurrence it was due for, catches up what it missed by policy, and honours
+  its zone and exclusion calendar at fire time. A retry replays the parameters
+  the run was given and reuses a verified durable output instead of re-running
+  upstream. Operational ledgers prune without losing what is kept.
+- **Publications, subscriptions and ordered chains.** A durable log of every
+  successful publication, a pipeline that runs when the data it reads is
+  published, a failed delivery that is visible and retryable, and a
+  subscription that refuses to close a trigger loop. An ordered delta chain
+  blocks a slice whose predecessor has not landed, and a feed that republishes a
+  full snapshot recovers from a permanently broken delta by opening a new epoch
+  on it rather than needing state edited by hand.
+- **One capability registry, and the engine answers it.** Which components run
+  a process, which advance durable state, which do incremental reads - reported
+  from the registry rather than asserted in a document, reachable over MCP, and
+  the connector matrices are generated from it.
+- **Security, ending in checks rather than prose.** The console enforces MFA by
+  requiring the `acr` and `amr` claims back, and a missing claim is refused
+  rather than waived. `${VAULT:NAME}` stopped being offered as a run parameter,
+  which had made the editor prompt the author for the credential and then
+  substitute it client-side, so the vault was never consulted. `tokenUrl`
+  matched the `token` needle and was treated as a secret, which blocked deploy
+  and rewrote a public OAuth endpoint to `${ENV:TOKENURL}` in built bundles. A
+  `src.git` revision could carry a `-` and be read as a git option. Credential
+  inputs are masked centrally rather than on 46 declarations, one of which had
+  the flag.
+- **Supply chain.** Dependency scanning on every push and weekly, a CycloneDX
+  SBOM, and keyless build provenance over every release artifact - so a
+  download can be bound to the commit and workflow that produced it, which a
+  checksum cannot do. Every accepted advisory carries a reachability analysis
+  and a review date.
+- **New checks that fail the build.** A field gated on a value its dropdown
+  cannot produce; a credential shown in the clear; the capability matrix, the
+  component catalog and the site index out of step with the manifests.
+- **Arch Linux packaging**, built and linted in a real Arch container on every
+  change, including a clean-install test that runs a pipeline - which is how
+  the runner package was found to install cleanly and be unable to run
+  anything.
+
+---
+
+## What's new in v0.7.1
+
+Ten days and 220 commits. A legacy Talend estate that imports and runs, a REST
+fan-out that survives millions of parent rows and resumes where it died, a
+ceiling on the AI bill, and boundaries that hold where the act happens rather
+than where it was planned.
+
+- **A Talend estate imports and runs, not just parses.** 57 commits of it, and most are a specific reading that turned a working step into a broken one. Mapper expressions translate (the character helpers, dates, counters, conditions, the shipped routines, arithmetic written with signs, a comma inside a literal that is not an argument separator), mapper semantics survive (outputs kept apart, the condition deciding which rows reach an output, a lookup joined rather than dropped and travelling with the loop it feeds, declared types including exact decimals), and job structure survives (a loop body becomes a pipeline the loop can name, a reusable body is spliced into its caller keeping its boundary ports, ordering links order the run without becoming data edges and never close a loop). Context references resolve from the job's own context, and a Java body that only sets context values is carried over to nodes. What cannot be translated **refuses to compile** rather than silently doing nothing, and the report says which Java bodies carry no rules.
+- **A REST fan-out that survives two million parents.** One request per row of an upstream table, with the response stamped onto the rows it produced. Parent rows are streamed rather than held in memory. A fan-out that died at row 900,001 resumes: each successful parent is recorded as it completes and replayed on rerun without reissuing the request. The incremental cursor reaches the request, and does **not** advance past a parent that failed under `skip` or `reject`, because advancing past rows that were never fetched loses them for good. The original response is kept, named by its own content, and can be archived to object storage.
+- **A ceiling on the AI bill, and a run that admits it stopped.** Request, token and cost budgets, enforced with a compare-and-swap so the ceiling is exact under concurrency, and a stop is not counted as a purchase. Hitting a budget marks the run **incomplete** rather than reporting a truncated dataset as a clean success, and that marker reaches the run history rather than only the CLI. Structured output asks for a shape and checks the reply is that shape, refusing a field that would collide with, or overwrite, an upstream column.
+- **A stage whose inputs did not change does not run again.** An opt-in reuse cache keyed on the stage config, its input fingerprint and the engine version, so an engine upgrade invalidates it. Inspect, drop and distrust it from the CLI.
+- **Python runs in the environment you declared.** The workspace's own virtual environment is used, and a run whose `.venv` is not what `uv.lock` describes is refused rather than run against the wrong packages. A script can be handed the whole table through Parquet, or streamed.
+- **Read the schema the feed already published.** Point `src.xml` at an XSD and the columns come from it, with the exact schema bytes recorded in the signed run manifest. XML, HTML and PDF can all read a corpus an upstream relation names rather than one configured path. HTML reads rows by CSS selector and follows the pagination a server rendered; a walk cut short by a failed page reports as incomplete instead of as a clean run. PDF gives one row per page. Archives unpack into artifacts.
+- **Continuous runs.** `follow` for pipelines that track their position, `listen` and `src.spool` so a push source stops losing what arrives, `src.changed` to poll a remote source (including S3) without downloading it, and `xf.tumble` for event-time windows that survive between runs. Kafka resumes where the last successful run stopped, decodes Confluent-framed Avro, and applies the security settings the form has always offered.
+- **`duckle test`: assert what a pipeline produces from a fixed input.** Row count, uniqueness, not-null, a SQL predicate, numeric tolerance, column **types** rather than only rendered values, DECIMAL precision where the expectation spells it out, and deterministic ordering for a case that never promised one. An agent can run the suite over MCP without a shell.
+- **Boundaries that hold where the act happens.** The policy is enforced at the point of the act, not only at plan time, so a URL built from a row or a redirect hop meets the same refusal. DuckDB is now inside that boundary: under `mode: enforce` with a domain allowlist, a run starts with DuckDB's remote filesystems disabled and community extensions refused, both of which DuckDB will not let a later statement undo. `${VAULT:NAME}` fetches a credential at run time and now resolves on **every** way of running a pipeline, including the MCP server, which had been handing the connector the literal placeholder. SFTP remembers host keys, so an unpinned connection notices a change.
+- **Neo4j, Turso/libSQL and IBM DB2**, GeoParquet from the Geospatial sink, a Snowflake `writeMode` that replaces rather than appends, and DuckLake maintenance and multi-table snapshots through the same pipelines that fill the lake.
+- **Server and backfill.** Accept a run, answer for it later, and cancel it. Headless backfill across the console API, MCP and the web editor, without a backfill set destroying other state. A resource budget so one job cannot take the machine down.
+- **Silent-data fixes.** Describing a node in the editor used to run that node's SQL, which for a sink meant executing its `COPY ... TO` against an empty stub and truncating the real output file on a click. A JSON column that appears late is no longer lost, Flatten actually flattens, a headerless CSV takes its names from its declared schema, GCS carries the bucket's region into the secret, a model is registered only when the run succeeded, and XML entities stopped being dropped.
+- **21 dependency commits**, including axum 0.8, aes-gcm 0.11, ed25519-dalek 3, quick-xml 0.42, odbc-api 29, the arrow family onto one major, TypeScript 7 and Vite 8, with advisories reaching the shipped binary patched. The encrypted-secret format was **proved** to survive the crypto majors rather than assumed to.
+
+**Upgrade note.** If your policy sets `network.allowedDomains` with `mode: enforce`, DuckDB itself is now off the network, so a pipeline that relied on DuckDB reading `https://` or `s3://` directly fails closed instead of quietly bypassing the allowlist. Route the read through a Duckle connector, or set `network.allowDuckdbExternalIo: true` in the server policy. Local file access is untouched.
+
+---
+
 ## What's new in v0.7.0
 
 A server somebody can set up in a browser, an ordered plan of pipelines, a
@@ -1854,7 +4451,7 @@ three times to answer one question.
 - **A Data Catalog across pipelines, not inside one.** The workspace graph now spans pipelines: which asset feeds which, what is orphaned, who owns it, and how fresh it is, because every run records what it touched. Columns, descriptions, tags and a glossary are editable in a **Data Catalog** screen, exposed to the console and to agents through MCP, and a saved graph can tell you when the pipelines have moved on.
 - **Queued work, and a worker that claims it.** A ForEach can dispatch its items as a batch rather than running them here. A worker claims queued items, the console shows what is queued and lets you retry what failed, and the queue says whether items can safely run at once. Each sub-pipeline runs under its own name and keeps its own watermark.
 - **Runs stopped scanning the source three times.** Every node's row count was a separate `SELECT COUNT(*)`, and since nodes are views, each one re-ran the whole chain. A source to filter to sink pipeline read a 96M-row Postgres table three times to do one pass of work. Each relation is now counted once, and a sink takes its count from the Parquet footer of the file it just wrote, which is a metadata read: 0.06s against 16.7s for the equivalent count over the source. Measured on that pipeline, baseline against this release, interleaved on one machine: 56.3s to 18.8s, and 288,159,946 tuples scanned down to 96,011,803. That puts it level with a hand-written DuckDB `COPY` doing the same work, at 1.02x. A remote XML stream over SFTP was reading 8 KiB per round trip and now reads 256 KiB: 75 MB and 700,000 rows went from 17.0s to 10.0s.
-- **Security fixes, two of them serious.** The streaming run route accepted work without authentication, and the in-app updater pointed at a GitHub organisation nobody had registered, so whoever claimed the name could have served the next update. Both are closed. Beyond those: connection secrets are bound to the field and connection they belong to, so a ciphertext cannot be moved between fields; bundle keys are derived with Argon2id and a per-bundle salt instead of an unsalted hash; downloaded engines and models are verified against a pinned checksum; run parameters can no longer redefine builtins or inject shell syntax; sidecars stage in a private directory instead of shared temp; decrypted connection secrets stay out of browser storage; a cached git token is re-encrypted and never written world-readable; and a deploy refuses to send a pipeline carrying a credential in plain text.
+- **Security fixes, two of them serious.** The streaming run route accepted work without authentication, and the in-app updater pointed at a GitHub organisation nobody had registered, so whoever claimed the name could have served the next update. Both are closed. Beyond those: connection secrets are bound to the field and connection they belong to, so a ciphertext cannot be moved between fields; bundle keys are derived with Argon2id and a per-bundle salt instead of an unsalted hash; downloaded engines and models run through a checksum gate that fails closed on a mismatch, though the digests themselves are not yet pinned, so today it warns and proceeds (see `UNPINNED` in `engine_manager.rs`, and issue #288); run parameters can no longer redefine builtins, inject shell syntax, or carry SQL syntax into the statement they are substituted into (a value with a quote, semicolon or comment marker is refused unless the pipeline's author declared that parameter with an `enum` or `pattern` allowing it - authoring needs admin, supplying a run parameter needs only operator); sidecars stage in a private directory instead of shared temp; decrypted connection secrets stay out of browser storage; a cached git token is re-encrypted and never written world-readable; and a deploy refuses to send a pipeline carrying a credential in plain text.
 - **Saved connections are a reference, not a copy.** Picking a saved connection used to copy its values onto the node, so the credential was duplicated into the pipeline file and a later edit to the connection did not reach it. The node now stores only the reference and resolves it at run time. The editor shows what the connection will supply rather than the manifest's default, so a node pointing at a connection on a non-standard port stops displaying the standard one, and a secret says only that it is covered.
 - **Home is a launcher, and the tour goes first.** The app opens on three tiles rather than dropping you into a canvas, modules are one level in, and a first run walks every capability once instead of showing the tour and Home at the same time. Settings can ask again.
 - **Deploying is documented, including the uncomfortable parts.** A deployment guide for AWS, Azure and Google Cloud, the client and server architecture, promoting from CI, driving Duckle from another orchestrator, and a walkthrough of the whole server flow. The docs now say plainly that a failed run still answers 200, before somebody trusts it.
@@ -1978,4 +4575,5 @@ Licensed under either of **MIT** or **Apache-2.0** at your option.
 <sub>Built with Rust, Tauri, React, and DuckDB by <a href="https://github.com/slothflowlabs">SlothFlowLabs</a></sub>
 </div>
 
-<!-- Suggested GitHub topics: etl, elt, data-engineering, data-pipeline, duckdb, rust, tauri, react, typescript, local-first, embedded, drag-and-drop, data-cleaning, vector-database, ai, ai-assistant, llm, llama-cpp, qwen, desktop-app, no-code, low-code, sql, pipeline-builder -->
+<!-- GitHub topics, as actually set on the repo. local-first and desktop-app were deliberately removed: they framed Duckle as a laptop tool, which is the read this copy exists to avoid. Keep this list in step with the repo settings.
+     cdc, connectors, data-engineering, data-integration, data-orchestration, data-pipeline, data-quality, data-transformation, dbt, duckdb, elt, etl, kubernetes, lakehouse, low-code, mcp, no-code, open-source, reverse-etl, self-hosted -->

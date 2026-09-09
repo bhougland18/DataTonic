@@ -1,0 +1,66 @@
+name: LanceDB sidecar
+
+# The routine CI excludes duckle-lance from BOTH gates - `cargo test
+# --workspace --exclude duckle-lance` and the same on clippy - because lancedb
+# pulls DataFusion and needs protoc, which would put minutes and a toolchain on
+# every push. That exclusion is the right call, but it left the crate with no
+# gate at all: the only place it was ever built was the release job, so a
+# dependency bump could go fully green and break the sidecar, and the first
+# thing to notice would be a release.
+#
+# That is not hypothetical. A grouped major bump raised arrow/parquet 58 -> 59
+# while lancedb, bumped in the same PR, still pinned arrow 58.4 - two arrow
+# majors in one binary with RecordBatches passed between them - and vortex
+# 0.75 -> 0.85 removed `vortex::array::arrow`, `into_arrow_preferred` and
+# `ArrayRef::from_arrow`. Nine compile errors, and CI was green on all of them.
+#
+# Compiling it is not enough on its own either. vortex 0.85 compiles once the
+# arrow bridge is repointed to `vortex::arrow`, and then refuses to write:
+# "Extension DType vortex.date not permitted by enabled editions", and with the
+# date column removed, "struct column writer finished before all chunks were
+# sent". So this runs the crate's round-trip test, which drives the real
+# subcommands the engine shells out to.
+#
+# Only when something that could affect the sidecar changed, so the minutes are
+# paid on dependency and sidecar edits rather than on every push.
+#
+# The path list is written out twice because GitHub Actions does not support
+# YAML anchors. Keep the two copies in step.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/duckle-lance/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/lance-sidecar.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/duckle-lance/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/lance-sidecar.yml"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # DataFusion + lance + vortex is a large tree; the default runner image
+      # leaves too little room for it once the cargo cache is restored.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # lancedb -> lance pulls prost-build, which shells out to protoc.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # --locked so this exercises the versions the lockfile actually resolves,
+      # which is the thing a dependency bump changes.
+      - name: Round-trip a Parquet file through the sidecar
+        run: cargo test -p duckle-lance --locked

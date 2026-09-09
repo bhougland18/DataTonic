@@ -181,17 +181,109 @@ pub fn has_trailer(exe: &Path) -> Result<bool, String> {
 /// The temp cache accrues one extracted copy per distinct artifact hash and
 /// is not auto-pruned (a future LRU could reclaim it); the same artifact run
 /// repeatedly reuses its extraction instantly.
+/// Where extracted artifacts live: a directory belonging to this user.
+///
+/// GHSA-58g9-237h-ch2g. The per-artifact directory name is `sha256(payload)`,
+/// and the payload's boundaries are public - a 16-byte trailer anyone holding
+/// the file can read - so every user on the host computes the same name. In a
+/// shared `/tmp` that is a name an attacker can claim before the victim's first
+/// run, and `/tmp`'s sticky bit does not stop creating an entry, only removing
+/// someone else's.
+///
+/// So the cache is not in the shared temp dir. `XDG_CACHE_HOME` or `~/.cache`
+/// on unix, `LOCALAPPDATA` on Windows; the process temp dir only when there is
+/// no home to use, where [`is_private_to_us`] is what still has to hold.
+pub(crate) fn cache_base() -> PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    };
+    match home {
+        Some(h) => h.join("duckle").join("artifacts"),
+        None => std::env::temp_dir().join("duckle").join("artifacts"),
+    }
+}
+
+/// Is this directory one only we could have written?
+///
+/// The `.duckle-ok` marker used to be the whole trust decision, and anyone who
+/// could create the directory could create the marker - after which `bin/duckdb`
+/// is whatever they left there, and the engine spawns it once per SQL stage as
+/// the victim.
+///
+/// On unix that means owned by the effective uid and not writable by group or
+/// other. On Windows there is no uid to compare: `LOCALAPPDATA` is per-user and
+/// carries its own ACL, which is what stands in for this.
+pub(crate) fn is_private_to_us(dir: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return false;
+    };
+    if !meta.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid cannot fail and touches no memory.
+        let me = unsafe { libc::geteuid() };
+        if meta.uid() != me {
+            return false;
+        }
+        if meta.mode() & 0o022 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn extract_to_cache(payload: &[u8]) -> Result<PathBuf, String> {
     let key = hex(&Sha256::digest(payload));
-    let root = std::env::temp_dir().join(format!("duckle-artifact-{key}"));
+    let base = cache_base();
+    let root = base.join(format!("duckle-artifact-{key}"));
     let ok = root.join(".duckle-ok");
     if ok.exists() {
+        // Reuse only what we could have written ourselves. A cache directory
+        // somebody else owns, or that anyone can write to, is refused rather
+        // than repaired: re-extracting into it would leave whatever they planted
+        // beside what we unpack.
+        if !is_private_to_us(&root) {
+            return Err(format!(
+                "refusing to reuse the artifact cache at {}: it is not owned by this user, or \
+                 it is writable by others. Remove it and run this again. Anything under that \
+                 path could have been put there by someone else, and this runner would then \
+                 execute it.",
+                root.display()
+            ));
+        }
         return Ok(root);
+    }
+
+    // The base has to exist, and has to be ours, before anything is unpacked
+    // beneath it. Made 0700 on unix so the staging directory and the finished
+    // one are both out of everybody else's reach.
+    std::fs::create_dir_all(&base).map_err(|e| format!("mkdir {}: {}", base.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+    }
+    if !is_private_to_us(&base) {
+        return Err(format!(
+            "refusing to use the artifact cache at {}: it is not owned by this user, or it is \
+             writable by others. Remove it and run this again.",
+            base.display()
+        ));
     }
 
     let mut rand = [0u8; 8];
     getrandom::fill(&mut rand).map_err(|e| format!("rand: {}", e))?;
-    let tmp = std::env::temp_dir().join(format!(
+    // Staged inside the same base, not in the shared temp dir: the rename below
+    // has to stay on one filesystem, and the half-unpacked copy should be no
+    // more reachable than the finished one.
+    let tmp = base.join(format!(
         "duckle-artifact-{key}-tmp-{}-{}",
         std::process::id(),
         hex(&rand)
@@ -212,12 +304,20 @@ pub fn extract_to_cache(payload: &[u8]) -> Result<PathBuf, String> {
     match std::fs::rename(&tmp, &root) {
         Ok(()) => Ok(root),
         Err(e) => {
-            // Another process may have won the race and populated root.
-            if ok.exists() {
-                let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_dir_all(&tmp);
+            // Another process may have won the race and populated root - but
+            // "somebody got there first" and "somebody planted it" look
+            // identical from here, so losing the race is not on its own a reason
+            // to trust what is now in the way.
+            if ok.exists() && is_private_to_us(&root) {
                 Ok(root)
+            } else if ok.exists() {
+                Err(format!(
+                    "refusing to reuse the artifact cache at {}: it is not owned by this user, \
+                     or it is writable by others. Remove it and run this again.",
+                    root.display()
+                ))
             } else {
-                let _ = std::fs::remove_dir_all(&tmp);
                 Err(format!("rename {} -> {}: {}", tmp.display(), root.display(), e))
             }
         }
@@ -301,4 +401,76 @@ fn set_exec_755(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_exec_755(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+mod cache_trust {
+    use super::*;
+
+    /// GHSA-58g9-237h-ch2g: the cache path is a pure function of the payload,
+    /// and the payload's boundaries are public, so anyone holding the artifact
+    /// computes the same directory name. On a shared `/tmp` that is a place an
+    /// attacker can reach before the victim's first run.
+    ///
+    /// It must not be a shared directory at all.
+    #[test]
+    fn the_artifact_cache_is_private_to_this_user() {
+        let base = cache_base();
+        let shared = std::env::temp_dir();
+        // On Windows the process temp dir is already per-user, so equality there
+        // is not the failure it is on unix.
+        if cfg!(unix) {
+            assert_ne!(
+                base, shared,
+                "the artifact cache must not sit directly in the shared temp dir",
+            );
+        }
+        assert!(
+            base.ends_with("artifacts"),
+            "expected a duckle-owned artifacts dir, got {}",
+            base.display(),
+        );
+    }
+
+    /// The marker file was the whole trust decision: `.duckle-ok` present meant
+    /// "this was extracted, use it". Anyone who could create the directory could
+    /// create the marker, and then `bin/duckdb` is whatever they put there - and
+    /// the engine spawns it once per SQL stage, as the victim.
+    ///
+    /// Unix only: the check is uid and mode, and Windows has neither. A per-user
+    /// LOCALAPPDATA with its own ACL is what carries it there.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_directory_anyone_could_have_written_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let planted = tmp.path().join("duckle-artifact-deadbeef");
+        std::fs::create_dir_all(planted.join("bin")).unwrap();
+        std::fs::write(planted.join("bin").join("duckdb"), b"#!/bin/sh\necho pwned\n").unwrap();
+        std::fs::write(planted.join(".duckle-ok"), b"ok").unwrap();
+
+        // Group- and world-writable: what a directory planted in a shared temp
+        // looks like, and what our own 0700 extraction never looks like.
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            !is_private_to_us(&planted),
+            "a world-writable cache directory was accepted as our own",
+        );
+
+        // The same directory, locked down, is ours to reuse.
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            is_private_to_us(&planted),
+            "a 0700 directory we own is exactly what extraction leaves behind",
+        );
+    }
+
+    /// A missing directory is not a trusted one. Guards the ordering: the caller
+    /// asks this before deciding to skip extraction.
+    #[test]
+    fn a_directory_that_is_not_there_is_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_private_to_us(&tmp.path().join("nothing-here")));
+    }
 }

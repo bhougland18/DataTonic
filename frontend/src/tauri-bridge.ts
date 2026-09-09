@@ -1,3 +1,4 @@
+import type { ComponentDef } from './workflow-ui/palette-data';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { isTauri } from './tauri-dialog';
 import { isWebBackend } from './web-fs';
@@ -298,6 +299,28 @@ export type CatalogView = {
 /// Errors are propagated, never flattened to an empty catalog: "this workspace
 /// has no assets" and "the catalog could not be read" look identical as an
 /// empty list, and only one of them is good news.
+/**
+ * #307: the external components a workspace installs, for the palette.
+ *
+ * Read from their manifests on the backend; opening a workspace never runs
+ * third-party code just to draw a tile. A workspace with none, or a backend too
+ * old to answer, yields an empty list rather than an error - an editor that
+ * refuses to open because there is no components/ directory would be absurd.
+ */
+export async function externalComponents(
+    workspace: string,
+): Promise<{ components: ComponentDef[]; problems: string[] }> {
+    try {
+        const r = await invoke<{ components?: ComponentDef[]; problems?: string[] }>(
+            'external_components',
+            { workspace },
+        );
+        return { components: r?.components ?? [], problems: r?.problems ?? [] };
+    } catch {
+        return { components: [], problems: [] };
+    }
+}
+
 export async function workspaceCatalog(workspace: string): Promise<CatalogView> {
     return await invoke<CatalogView>('workspace_catalog', { workspace });
 }
@@ -351,6 +374,10 @@ export type WatermarkEntry = {
     kind: string;
     value: string;
     value_type?: string;
+    /// False for kinds that can be cleared but not hand-set - a Kafka resume
+    /// point or a tumbling window's buffer pointer has no single value that
+    /// means the same thing to the node that wrote it.
+    editable?: boolean;
 };
 
 export async function watermarkList(
@@ -647,8 +674,15 @@ export async function deployTargetClaim(
     name: string,
     url: string,
     adminLabel: string,
+    setupCode: string,
 ): Promise<string> {
-    return await invoke<string>('deploy_target_claim', { workspacePath, name, url, adminLabel });
+    return await invoke<string>('deploy_target_claim', {
+        workspacePath,
+        name,
+        url,
+        adminLabel,
+        setupCode,
+    });
 }
 
 /** Save a server that is already set up, with a key an administrator gave you. */
@@ -759,6 +793,113 @@ export async function compilePipelineSql(
     return await invoke<StageSql[]>('compile_pipeline', {
         pipeline: { nodes, edges },
     });
+}
+
+/**
+ * #226: the columns a node really produces, worked out by the engine.
+ *
+ * The editor's per-component rules cannot see a transform that adds several
+ * columns, removes one, or adds a column that is not text. This asks DuckDB
+ * instead: it runs the node's own compiled SQL against a zero-row typed stub of
+ * its inputs and reports what came out. Reads nothing - no file, no credential,
+ * no network - so it is cheap enough to ask on every selection.
+ *
+ * null when there is no backend to ask, exactly like the other helpers here.
+ */
+export async function describeNodeColumns(
+    nodes: Node<DuckleNodeData>[],
+    edges: Edge[],
+    nodeId: string,
+    inputs: Array<[string, Column[]]>,
+): Promise<Column[] | null> {
+    if (!isTauri() && !isWebBackend()) return null;
+    return await invoke<Column[]>('describe_node_columns', {
+        // The same shape every other pipeline command takes: the nodes as they
+        // are, not a hand-rolled projection that could drop a field the engine
+        // needs.
+        pipeline: { nodes, edges },
+        nodeId,
+        inputs,
+    });
+}
+
+/** What binding a node's SQL said (#314). */
+export type SqlDiagnostic = {
+    kind: string;
+    message: string;
+    line?: number;
+    column?: number;
+    candidates?: string[];
+};
+
+export type NodeAnalysis = {
+    nodeId: string;
+    component: string;
+    dialect: string;
+    columns?: Column[];
+    diagnostics?: SqlDiagnostic[];
+    validated: boolean;
+    note?: string;
+};
+
+/**
+ * #314: the columns a node produces AND what DuckDB objected to.
+ *
+ * Replaces `describeNodeColumns` for the editor: the engine has always caught a
+ * typo here, and the message, the position and the column it suggests instead
+ * were being thrown away, leaving the editor able to say only that the node did
+ * not resolve.
+ */
+export async function analyzeNodeSql(
+    nodes: Node<DuckleNodeData>[],
+    edges: Edge[],
+    nodeId: string,
+    inputs: Array<[string, Column[]]>,
+): Promise<NodeAnalysis | null> {
+    if (!isTauri() && !isWebBackend()) return null;
+    return await invoke<NodeAnalysis>('analyze_node_sql', {
+        pipeline: { nodes, edges },
+        nodeId,
+        inputs,
+    });
+}
+
+/** One suggestion for a cursor position in a node's SQL (#314). */
+export type SqlCompletion = {
+    text: string;
+    kind: 'column' | 'function' | 'keyword' | 'parameter' | 'relation';
+    detail?: string;
+};
+
+/**
+ * #314: what could come next, for the SQL field.
+ *
+ * Cheap on the engine side - a cached function list and a pure ranking - so it
+ * is safe to ask while someone types. Returns nothing rather than throwing when
+ * there is no backend, because a missing suggestion list must never interrupt
+ * typing.
+ */
+export async function completeNodeSql(
+    nodes: Node<DuckleNodeData>[],
+    edges: Edge[],
+    nodeId: string,
+    inputs: Array<[string, Column[]]>,
+    cursor: number,
+): Promise<SqlCompletion[]> {
+    if (!isTauri() && !isWebBackend()) return [];
+    try {
+        return (
+            (await invoke<SqlCompletion[]>('complete_node_sql', {
+                pipeline: { nodes, edges },
+                nodeId,
+                inputs,
+                cursor,
+                limit: 12,
+            })) ?? []
+        );
+    } catch {
+        return [];
+    }
 }
 
 /** A resolved origin column for lineage (#103). */

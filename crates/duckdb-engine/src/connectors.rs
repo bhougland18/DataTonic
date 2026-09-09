@@ -2478,7 +2478,30 @@ impl DuckdbEngine {
         // Truncate + insert write mode (#138): clear existing rows but keep the
         // table (and its grants / indexes) before the plain-insert path. Only
         // for non-upsert writes; upsert has its own MERGE path below.
+        //
+        // Not on an empty upstream. Every other clearing sink checks this first
+        // and SnowflakeSinkSpec.truncate_first states the rule: "Only applied
+        // when there are rows to write. A run that produced nothing leaves the
+        // target alone rather than emptying it on the strength of an upstream
+        // that may simply have failed to produce." Only the COLUMNS were checked
+        // here, which an empty view still has, so a source that hiccuped or a
+        // filter that matched nothing emptied the Oracle table and put nothing
+        // back.
+        //
+        // LIMIT 1 rather than a count: the question is whether ANY row exists,
+        // and the rows are materialized further down anyway.
         if spec.upsert_keys.is_empty() && spec.mode == "truncate" {
+            let probe = format!(
+                "SELECT 1 FROM {} LIMIT 1",
+                plan::quote_ident(&spec.from_view)
+            );
+            let rows = self.run_rows(Some(db), &probe)?;
+            if rows.is_empty() {
+                return Ok(format!(
+                    "oracle: 0 rows upstream, left {} as it was",
+                    qualified
+                ));
+            }
             conn.execute(&format!("TRUNCATE TABLE {}", qualified), &[])
                 .map_err(|e| EngineError::Query(format!("oracle truncate: {}", e)))?;
         }
@@ -2900,6 +2923,18 @@ impl DuckdbEngine {
             }
             count += 1;
             if count % 25_000 == 0 {
+                // Stop has to be felt DURING the fetch. An Oracle extract is
+                // the longest single thing this engine does - minutes on a
+                // multi-million-row table - and this streaming path checked
+                // nothing, so Cancel did not take effect until the whole
+                // result set had been drained. The Arrow path beside it
+                // (oracle_write_parquet_part) already checks per batch.
+                //
+                // On the existing progress cadence rather than per row: the
+                // check is one relaxed atomic load, but so is the branch it
+                // rides on, and 25k rows of a prefetched buffer is well under
+                // a second.
+                self.check_cancelled()?;
                 mark(&format!("fetched {} rows", count));
             }
         }
@@ -3390,7 +3425,7 @@ impl DuckdbEngine {
             // DECIMAL(4,2), and using the total would silently truncate it.
             let bare = format!("replace({}, '-', '')", c);
             aggs.push(format!(
-                "max(CASE WHEN {c} IS NULL THEN 0                    WHEN strpos({c}, '.') > 0 OR strpos(upper({c}), 'E') > 0 THEN 2                    ELSE 1 END),                  max(CASE WHEN strpos({b}, '.') > 0 THEN strpos({b}, '.') - 1                    ELSE length({b}) END),                  max(CASE WHEN strpos({c}, '.') > 0                    THEN length({c}) - strpos({c}, '.') ELSE 0 END),                  max(CASE WHEN strpos(upper({c}), 'E') > 0 THEN 1 ELSE 0 END)",
+                "max(CASE WHEN {c} IS NULL THEN 0 WHEN strpos({c}, '.') > 0 OR strpos(upper({c}), 'E') > 0 THEN 2 ELSE 1 END), max(CASE WHEN strpos({b}, '.') > 0 THEN strpos({b}, '.') - 1 ELSE length({b}) END), max(CASE WHEN strpos({c}, '.') > 0 THEN length({c}) - strpos({c}, '.') ELSE 0 END), max(CASE WHEN strpos(upper({c}), 'E') > 0 THEN 1 ELSE 0 END)",
                 c = c,
                 b = bare
             ));
@@ -3509,7 +3544,7 @@ impl DuckdbEngine {
         };
         let props = WriterProperties::builder()
             .set_statistics_enabled(EnabledStatistics::None)
-            .set_max_row_group_size(row_group)
+            .set_max_row_group_row_count(Some(row_group))
             .set_compression(codec)
             // The default 1 MB dictionary budget is per column, and a wide fact
             // table full of repeated text blows through it immediately; once it
@@ -4107,7 +4142,7 @@ impl DuckdbEngine {
             .options
             .iter()
             .map(|(k, v)| (OptionDatabase::from(k.as_str()), OptionValue::String(v.clone())));
-        let mut database = driver
+        let database = driver
             .new_database_with_opts(opts)
             .map_err(|e| EngineError::Query(format!("adbc: open database: {}", e)))?;
         let mut conn = database
@@ -4154,7 +4189,7 @@ impl DuckdbEngine {
         use parquet::file::properties::{EnabledStatistics, WriterProperties};
         let props = WriterProperties::builder()
             .set_statistics_enabled(EnabledStatistics::None)
-            .set_max_row_group_size(1_000_000)
+            .set_max_row_group_row_count(Some(1_000_000))
             .build();
         let writer_schema = schema.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel::<arrow_array::RecordBatch>(8);
@@ -4285,7 +4320,7 @@ impl DuckdbEngine {
             .options
             .iter()
             .map(|(k, v)| (OptionDatabase::from(k.as_str()), OptionValue::String(v.clone())));
-        let mut database = driver
+        let database = driver
             .new_database_with_opts(opts)
             .map_err(|e| EngineError::Query(format!("adbc: open database: {}", e)))?;
         let mut conn = database
@@ -4799,32 +4834,40 @@ impl DuckdbEngine {
     /// casts (read all VARCHAR, then TRY_CAST each column to its DuckDB type) so
     /// numbers / decimals / dates / timestamps keep their types - the same
     /// typed-finalize the Snowflake source uses. (#122)
-    #[cfg(feature = "teradata")]
-    pub(crate) fn run_teradata_source(
+    /// Shared ODBC read: connect, describe the result columns, stream the rows
+    /// out as text and finalize with per-column typed casts. Teradata and DB2
+    /// differ only in the driver behind the connection string and the name in
+    /// the messages, so `family` is the only thing that varies.
+    #[cfg(feature = "odbc")]
+    pub(crate) fn run_odbc_source(
         &self,
         db: &Path,
-        spec: &plan::TeradataSourceSpec,
+        family: &str,
+        conn_str: &str,
+        query: &str,
+        batch_rows: usize,
+        node_id: &str,
     ) -> Result<String, EngineError> {
         use odbc_api::buffers::TextRowSet;
         use odbc_api::{ColumnDescription, ConnectionOptions, Cursor, Environment, ResultSetMetadata};
 
         let env = Environment::new()
-            .map_err(|e| EngineError::Query(format!("teradata: ODBC environment: {}", e)))?;
+            .map_err(|e| EngineError::Query(format!("{}: ODBC environment: {}", family, e)))?;
         let conn = env
-            .connect_with_connection_string(&spec.conn_str, ConnectionOptions::default())
-            .map_err(|e| EngineError::Query(format!("teradata: connect failed: {}", e)))?;
+            .connect_with_connection_string(conn_str, ConnectionOptions::default())
+            .map_err(|e| EngineError::Query(format!("{}: connect failed: {}", family, e)))?;
         let mut cursor = conn
-            .execute(&spec.query, (), None)
-            .map_err(|e| EngineError::Query(format!("teradata: query failed: {}", e)))?
+            .execute(query, (), None)
+            .map_err(|e| EngineError::Query(format!("{}: query failed: {}", family, e)))?
             .ok_or_else(|| {
-                EngineError::Query("teradata: the query returned no result set".into())
+                EngineError::Query(format!("{}: the query returned no result set", family))
             })?;
 
         // Column metadata: build the index-aligned name list, the read_json
         // columns map (everything VARCHAR), and the typed projection.
         let ncols = cursor
             .num_result_cols()
-            .map_err(|e| EngineError::Query(format!("teradata: column count: {}", e)))?
+            .map_err(|e| EngineError::Query(format!("{}: column count: {}", family, e)))?
             as u16;
         let mut names: Vec<String> = Vec::with_capacity(ncols as usize);
         let mut columns_spec_parts: Vec<String> = Vec::with_capacity(ncols as usize);
@@ -4834,7 +4877,7 @@ impl DuckdbEngine {
         for i in 1..=ncols {
             cursor
                 .describe_col(i, &mut cd)
-                .map_err(|e| EngineError::Query(format!("teradata: describe column {}: {}", i, e)))?;
+                .map_err(|e| EngineError::Query(format!("{}: describe column {}: {}", family, i, e)))?;
             let raw = cd.name_to_string().unwrap_or_else(|_| format!("col{}", i));
             let name = unique_column_name(&raw, &mut used_names);
             let ident = plan::quote_ident(&name);
@@ -4855,17 +4898,17 @@ impl DuckdbEngine {
         // Fetch in batches as text, writing each row to the NDJSON file. ODBC
         // text rendering keeps the source's textual form; the typed finalize
         // casts each column afterwards.
-        let mut writer = JsonLinesWriter::open(&spec.node_id)?;
-        let batch = spec.batch_rows.max(1);
+        let mut writer = JsonLinesWriter::open(node_id)?;
+        let batch = batch_rows.max(1);
         let buffers = TextRowSet::for_cursor(batch, &mut cursor, Some(65536))
-            .map_err(|e| EngineError::Query(format!("teradata: alloc buffers: {}", e)))?;
+            .map_err(|e| EngineError::Query(format!("{}: alloc buffers: {}", family, e)))?;
         let mut rows_cursor = cursor
             .bind_buffer(buffers)
-            .map_err(|e| EngineError::Query(format!("teradata: bind buffers: {}", e)))?;
+            .map_err(|e| EngineError::Query(format!("{}: bind buffers: {}", family, e)))?;
         let mut count = 0usize;
         while let Some(view) = rows_cursor
             .fetch()
-            .map_err(|e| EngineError::Query(format!("teradata: fetch: {}", e)))?
+            .map_err(|e| EngineError::Query(format!("{}: fetch: {}", family, e)))?
         {
             self.check_cancelled()?;
             for r in 0..view.num_rows() {
@@ -4885,21 +4928,68 @@ impl DuckdbEngine {
         }
         drop(rows_cursor);
         drop(conn);
-        writer.finalize_typed(self.binary(), db, &spec.node_id, &columns_spec, &select_list)?;
+        writer.finalize_typed(self.binary(), db, node_id, &columns_spec, &select_list)?;
         Ok(format!(
-            "teradata: materialized {} rows into {}",
-            count, spec.node_id
+            "{}: materialized {} rows into {}",
+            family, count, node_id
         ))
     }
 
-    #[cfg(not(feature = "teradata"))]
+    /// Teradata source over the Teradata ODBC driver (there is no DuckDB
+    /// Teradata extension or native Rust driver).
+    #[cfg(feature = "odbc")]
+    pub(crate) fn run_teradata_source(
+        &self,
+        db: &Path,
+        spec: &plan::TeradataSourceSpec,
+    ) -> Result<String, EngineError> {
+        self.run_odbc_source(
+            db,
+            "teradata",
+            &spec.conn_str,
+            &spec.query,
+            spec.batch_rows,
+            &spec.node_id,
+        )
+    }
+
+    /// IBM DB2 source over the IBM Data Server ODBC driver. Same transport as
+    /// Teradata; DB2 ships no DuckDB extension and no native Rust driver.
+    #[cfg(feature = "odbc")]
+    pub(crate) fn run_db2_source(
+        &self,
+        db: &Path,
+        spec: &plan::Db2SourceSpec,
+    ) -> Result<String, EngineError> {
+        self.run_odbc_source(
+            db,
+            "db2",
+            &spec.conn_str,
+            &spec.query,
+            spec.batch_rows,
+            &spec.node_id,
+        )
+    }
+
+    #[cfg(not(feature = "odbc"))]
+    pub(crate) fn run_db2_source(
+        &self,
+        _db: &Path,
+        _spec: &plan::Db2SourceSpec,
+    ) -> Result<String, EngineError> {
+        Err(EngineError::Config(
+            "db2: this build was compiled without ODBC support (enable the `db2` feature)".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "odbc"))]
     pub(crate) fn run_teradata_source(
         &self,
         _db: &Path,
         _spec: &plan::TeradataSourceSpec,
     ) -> Result<String, EngineError> {
         Err(EngineError::Config(
-            "teradata: this build was compiled without the `teradata` (ODBC) feature".into(),
+            "teradata: this build was compiled without ODBC support (enable the `teradata` feature)".into(),
         ))
     }
 
@@ -4908,7 +4998,7 @@ impl DuckdbEngine {
     /// overwrite clears it first. Teradata's VALUES clause is single-row, so
     /// rows are inserted one statement at a time (large loads should use
     /// Teradata's bulk utilities). No upsert. (#122)
-    #[cfg(feature = "teradata")]
+    #[cfg(feature = "odbc")]
     pub(crate) fn run_teradata_sink(
         &self,
         db: &Path,
@@ -4996,14 +5086,2693 @@ impl DuckdbEngine {
         ))
     }
 
-    #[cfg(not(feature = "teradata"))]
+    #[cfg(not(feature = "odbc"))]
     pub(crate) fn run_teradata_sink(
         &self,
         _db: &Path,
         _spec: &plan::TeradataSinkSpec,
     ) -> Result<String, EngineError> {
         Err(EngineError::Config(
-            "teradata: this build was compiled without the `teradata` (ODBC) feature".into(),
+            "teradata: this build was compiled without ODBC support (enable the `teradata` feature)".into(),
+        ))
+    }
+
+    /// IBM DB2 sink over ODBC: auto-create the target table from the upstream
+    /// column types, then INSERT row by row. DB2 has no CREATE TABLE IF NOT
+    /// EXISTS, so the create is attempted and "already exists" tolerated.
+    #[cfg(feature = "odbc")]
+    pub(crate) fn run_db2_sink(
+        &self,
+        db: &Path,
+        spec: &plan::Db2SinkSpec,
+    ) -> Result<String, EngineError> {
+        use odbc_api::{ConnectionOptions, Environment};
+
+        let select = format!("SELECT * FROM {}", plan::quote_ident(&spec.from_view));
+        let rows = self.run_rows(Some(db), &select)?;
+        if rows.is_empty() {
+            return Ok(format!("db2: 0 rows to insert into {}", spec.table));
+        }
+        let cols: Vec<String> = match rows[0].as_object() {
+            Some(o) => o.keys().cloned().collect(),
+            None => {
+                return Err(EngineError::Query(
+                    "db2: upstream rows aren't JSON objects".into(),
+                ));
+            }
+        };
+        let col_types: std::collections::HashMap<String, String> =
+            describe_columns(self, db, &spec.from_view).into_iter().collect();
+        // DB2 delimited identifiers use double quotes (doubled to escape).
+        let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let qualified = match &spec.schema {
+            Some(d) => format!("{}.{}", q(d), q(&spec.table)),
+            None => q(&spec.table),
+        };
+        let col_defs = cols
+            .iter()
+            .map(|c| {
+                let ty = duckdb_type_to_db2(
+                    col_types.get(c).map(|s| s.as_str()).unwrap_or("VARCHAR"),
+                );
+                format!("{} {}", q(c), ty)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cols_list = cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        let create_sql = format!("CREATE TABLE {} ({})", qualified, col_defs);
+
+        let env = Environment::new()
+            .map_err(|e| EngineError::Query(format!("db2: ODBC environment: {}", e)))?;
+        let conn = env
+            .connect_with_connection_string(&spec.conn_str, ConnectionOptions::default())
+            .map_err(|e| EngineError::Query(format!("db2: connect failed: {}", e)))?;
+        // DB2 reports an existing table as SQLCODE -601 / SQLSTATE 42710.
+        if let Err(e) = conn.execute(&create_sql, (), None) {
+            let msg = e.to_string();
+            let lower = msg.to_lowercase();
+            if !(msg.contains("42710") || msg.contains("-601") || lower.contains("already exists"))
+            {
+                return Err(EngineError::Query(format!("db2: create table: {}", msg)));
+            }
+        }
+        if spec.mode == "overwrite" {
+            conn.execute(&format!("DELETE FROM {}", qualified), (), None)
+                .map_err(|e| EngineError::Query(format!("db2: clear table: {}", e)))?;
+        }
+        let mut total = 0usize;
+        for row in &rows {
+            self.check_cancelled()?;
+            let obj = row.as_object();
+            let vals: Vec<String> = cols
+                .iter()
+                .map(|c| {
+                    let v = obj.and_then(|o| o.get(c)).unwrap_or(&JsonValue::Null);
+                    sql_literal(v, col_types.get(c).map(|s| s.as_str()), Dialect::Db2)
+                })
+                .collect();
+            let stmt = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                qualified,
+                cols_list,
+                vals.join(", ")
+            );
+            conn.execute(&stmt, (), None)
+                .map_err(|e| EngineError::Query(format!("db2: insert: {}", e)))?;
+            total += 1;
+        }
+        Ok(format!(
+            "db2: {} {} rows into {}",
+            if spec.mode == "overwrite" { "overwrote with" } else { "inserted" },
+            total,
+            spec.table
+        ))
+    }
+
+    #[cfg(not(feature = "odbc"))]
+    pub(crate) fn run_db2_sink(
+        &self,
+        _db: &Path,
+        _spec: &plan::Db2SinkSpec,
+    ) -> Result<String, EngineError> {
+        Err(EngineError::Config(
+            "db2: this build was compiled without ODBC support (enable the `db2` feature)".into(),
+        ))
+    }
+
+    /// Neo4j source over the HTTP Query API (`POST /db/{db}/query/v2`), which
+    /// every Neo4j 5.x server and Aura exposes on the same port as Browser.
+    /// Bolt would need a driver crate and a second wire protocol for no gain
+    /// here: the API returns the whole result set as JSON, which is exactly
+    /// what materializing a relation needs.
+    ///
+    /// The response is columnar - `{"data":{"fields":[..],"values":[[..]]}}` -
+    /// so it is zipped back into one JSON object per row. Node and
+    /// relationship values arrive as nested objects and are kept as-is, so
+    /// DuckDB reads them as STRUCT rather than losing the properties.
+    pub(crate) fn run_neo4j_source(
+        &self,
+        db: &Path,
+        spec: &plan::Neo4jSourceSpec,
+    ) -> Result<String, EngineError> {
+        let url = format!(
+            "{}/db/{}/query/v2",
+            spec.endpoint.trim_end_matches('/'),
+            spec.database
+        );
+        let body = serde_json::json!({
+            "statement": spec.cypher,
+            "parameters": spec.parameters.clone().unwrap_or_else(|| serde_json::json!({})),
+        });
+        let resp = match neo4j_request(spec.user.as_deref(), spec.password.as_deref(), &url)
+            .send_json(body)
+        {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                return Err(EngineError::Query(format!(
+                    "neo4j: HTTP {} on query: {}",
+                    code,
+                    neo4j_error_detail(r.into_string().unwrap_or_default())
+                )));
+            }
+            Err(e) => return Err(EngineError::Query(format!("neo4j: HTTP transport: {}", e))),
+        };
+        let response: JsonValue = resp
+            .into_json()
+            .map_err(|e| EngineError::Query(format!("neo4j: response not JSON: {}", e)))?;
+        let data = response.get("data");
+        let fields: Vec<String> = data
+            .and_then(|d| d.get("fields"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .enumerate()
+                    .map(|(i, f)| match f.as_str() {
+                        Some(s) if !s.is_empty() => s.to_string(),
+                        _ => format!("col{}", i + 1),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let values = data
+            .and_then(|d| d.get("values"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let rows: Vec<JsonValue> = values
+            .iter()
+            .map(|row| {
+                let cells = row.as_array().cloned().unwrap_or_default();
+                let mut obj = serde_json::Map::with_capacity(fields.len());
+                for (i, name) in fields.iter().enumerate() {
+                    obj.insert(name.clone(), cells.get(i).cloned().unwrap_or(JsonValue::Null));
+                }
+                JsonValue::Object(obj)
+            })
+            .collect();
+        let count = rows.len();
+        materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &rows)?;
+        Ok(format!(
+            "neo4j: materialized {} rows into {}",
+            count, spec.node_id
+        ))
+    }
+
+    /// Neo4j sink: write upstream rows as nodes over the same Query API.
+    /// Rows go up in batches as the `$rows` parameter and are expanded server
+    /// side with UNWIND, so one round trip writes `batch_size` nodes rather
+    /// than one statement per row.
+    ///
+    /// `merge_keys` picks MERGE over CREATE, so re-running a pipeline updates
+    /// the matched nodes instead of duplicating them.
+    pub(crate) fn run_neo4j_sink(
+        &self,
+        db: &Path,
+        spec: &plan::Neo4jSinkSpec,
+    ) -> Result<String, EngineError> {
+        let select = format!("SELECT * FROM {}", plan::quote_ident(&spec.from_view));
+        let rows = self.run_rows(Some(db), &select)?;
+        if rows.is_empty() {
+            return Ok(format!("neo4j: 0 rows to write to :{}", spec.label));
+        }
+        let url = format!(
+            "{}/db/{}/query/v2",
+            spec.endpoint.trim_end_matches('/'),
+            spec.database
+        );
+        let cypher = match &spec.cypher {
+            Some(c) => c.clone(),
+            None if !spec.merge_keys.is_empty() => {
+                let keys = spec
+                    .merge_keys
+                    .iter()
+                    .map(|k| format!("{k}: row.{k}", k = cypher_ident(k)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "UNWIND $rows AS row MERGE (n:{} {{{}}}) SET n += row",
+                    cypher_ident(&spec.label),
+                    keys
+                )
+            }
+            None => format!(
+                "UNWIND $rows AS row CREATE (n:{}) SET n = row",
+                cypher_ident(&spec.label)
+            ),
+        };
+
+        let batch = spec.batch_size.max(1);
+        let mut written = 0usize;
+        for chunk in rows.chunks(batch) {
+            self.check_cancelled()?;
+            let body = serde_json::json!({
+                "statement": cypher,
+                "parameters": { "rows": chunk },
+            });
+            match neo4j_request(spec.user.as_deref(), spec.password.as_deref(), &url)
+                .send_json(body)
+            {
+                Ok(_) => {}
+                Err(ureq::Error::Status(code, r)) => {
+                    return Err(EngineError::Query(format!(
+                        "neo4j: HTTP {} writing the batch starting at row {}: {}",
+                        code,
+                        written,
+                        neo4j_error_detail(r.into_string().unwrap_or_default())
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!(
+                        "neo4j: HTTP transport writing the batch starting at row {}: {}",
+                        written, e
+                    )))
+                }
+            }
+            written += chunk.len();
+        }
+        Ok(if spec.label.is_empty() {
+            format!("neo4j: wrote {} rows via the supplied cypher", written)
+        } else {
+            format!("neo4j: wrote {} rows as :{} nodes", written, spec.label)
+        })
+    }
+
+    /// Turso / libSQL source over the HTTP pipeline API (`POST /v2/pipeline`).
+    pub(crate) fn run_turso_source(
+        &self,
+        db: &Path,
+        spec: &plan::TursoSourceSpec,
+    ) -> Result<String, EngineError> {
+        let url = format!("{}/v2/pipeline", turso_base_url(&spec.url));
+        let body = serde_json::json!({
+            "requests": [
+                { "type": "execute", "stmt": { "sql": spec.query } },
+                { "type": "close" },
+            ]
+        });
+        let response = turso_send(spec.auth_token.as_deref(), &url, body)?;
+        let result = response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .and_then(|results| {
+                results.iter().find_map(|r| {
+                    let resp = r.get("response")?;
+                    if resp.get("type").and_then(|v| v.as_str()) == Some("execute") {
+                        resp.get("result")
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| {
+                EngineError::Query("turso: the pipeline returned no execute result".into())
+            })?;
+        let names: Vec<String> = result
+            .get("cols")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        c.get("name")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("col{}", i + 1))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let raw_rows = result
+            .get("rows")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let rows: Vec<JsonValue> = raw_rows
+            .iter()
+            .map(|row| {
+                let cells = row.as_array().cloned().unwrap_or_default();
+                let mut obj = serde_json::Map::with_capacity(names.len());
+                for (i, name) in names.iter().enumerate() {
+                    let v = cells.get(i).map(turso_cell_to_json).unwrap_or(JsonValue::Null);
+                    obj.insert(name.clone(), v);
+                }
+                JsonValue::Object(obj)
+            })
+            .collect();
+        let count = rows.len();
+        materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &rows)?;
+        Ok(format!(
+            "turso: materialized {} rows into {}",
+            count, spec.node_id
+        ))
+    }
+
+    /// Turso / libSQL sink. Turso is SQLite, so CREATE TABLE IF NOT EXISTS is
+    /// available and the type set is the SQLite storage classes. Values go up
+    /// as bound arguments rather than inlined literals, and many statements
+    /// ride one pipeline round trip.
+    pub(crate) fn run_turso_sink(
+        &self,
+        db: &Path,
+        spec: &plan::TursoSinkSpec,
+    ) -> Result<String, EngineError> {
+        let select = format!("SELECT * FROM {}", plan::quote_ident(&spec.from_view));
+        let rows = self.run_rows(Some(db), &select)?;
+        if rows.is_empty() {
+            return Ok(format!("turso: 0 rows to insert into {}", spec.table));
+        }
+        let cols: Vec<String> = match rows[0].as_object() {
+            Some(o) => o.keys().cloned().collect(),
+            None => {
+                return Err(EngineError::Query(
+                    "turso: upstream rows aren't JSON objects".into(),
+                ))
+            }
+        };
+        let col_types: std::collections::HashMap<String, String> =
+            describe_columns(self, db, &spec.from_view).into_iter().collect();
+        let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let table = q(&spec.table);
+        let col_defs = cols
+            .iter()
+            .map(|c| {
+                let ty =
+                    duckdb_type_to_sqlite(col_types.get(c).map(|s| s.as_str()).unwrap_or("VARCHAR"));
+                format!("{} {}", q(c), ty)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cols_list = cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        let placeholders = vec!["?"; cols.len()].join(", ");
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table, cols_list, placeholders
+        );
+        let url = format!("{}/v2/pipeline", turso_base_url(&spec.url));
+
+        let mut setup = vec![serde_json::json!({
+            "type": "execute",
+            "stmt": { "sql": format!("CREATE TABLE IF NOT EXISTS {} ({})", table, col_defs) }
+        })];
+        if spec.mode == "overwrite" {
+            setup.push(serde_json::json!({
+                "type": "execute",
+                "stmt": { "sql": format!("DELETE FROM {}", table) }
+            }));
+        }
+        setup.push(serde_json::json!({ "type": "close" }));
+        turso_send(spec.auth_token.as_deref(), &url, serde_json::json!({ "requests": setup }))?;
+
+        let batch = spec.batch_size.max(1);
+        let mut total = 0usize;
+        for chunk in rows.chunks(batch) {
+            self.check_cancelled()?;
+            let mut requests: Vec<JsonValue> = Vec::with_capacity(chunk.len() + 1);
+            for row in chunk {
+                let obj = row.as_object();
+                let args: Vec<JsonValue> = cols
+                    .iter()
+                    .map(|c| {
+                        json_to_turso_arg(obj.and_then(|o| o.get(c)).unwrap_or(&JsonValue::Null))
+                    })
+                    .collect();
+                requests.push(serde_json::json!({
+                    "type": "execute",
+                    "stmt": { "sql": insert_sql, "args": args }
+                }));
+            }
+            requests.push(serde_json::json!({ "type": "close" }));
+            turso_send(
+                spec.auth_token.as_deref(),
+                &url,
+                serde_json::json!({ "requests": requests }),
+            )?;
+            total += chunk.len();
+        }
+        Ok(format!(
+            "turso: {} {} rows into {}",
+            if spec.mode == "overwrite" { "overwrote with" } else { "inserted" },
+            total,
+            spec.table
+        ))
+    }
+
+    /// Produce an EMPTY relation for a spool pass that read nothing new.
+    ///
+    /// An idle pass is the normal case for a streaming source - most polls of
+    /// a quiet spool have nothing in them - so it must not fail the run. It
+    /// would, though: materializing zero rows with no declared schema is an
+    /// error, because there is no way to know what columns the empty result
+    /// has (issue #170).
+    ///
+    /// The spool itself knows. It is append-only, so the records it already
+    /// delivered are still there: the LAST complete line gives the column
+    /// shape. Materialize that one row, then delete it, and downstream sees a
+    /// 0-row relation with the right columns instead of an error.
+    ///
+    /// A spool with no records at all genuinely cannot say, and falls back to
+    /// the declared-schema path and its error message.
+    fn spool_empty_relation(
+        &self,
+        db: &Path,
+        node_id: &str,
+        path: &std::path::Path,
+    ) -> Result<(), EngineError> {
+        if let Some(row) = last_complete_json_line(path) {
+            materialize_jsonobjects_as_table(&self.bin, db, node_id, &[row])?;
+            self.run(
+                Some(db),
+                &format!("DELETE FROM {}", plan::quote_ident(node_id)),
+                false,
+            )?;
+            return Ok(());
+        }
+        materialize_jsonobjects_as_table(&self.bin, db, node_id, &[])
+    }
+
+    /// xf.tumble: event-time tumbling windows across runs.
+    ///
+    /// Each run computes from `buffered rows UNION new rows`, emits the ones
+    /// whose window has closed, and writes what remains to a NEW buffer file.
+    /// The old buffer is left untouched until the run succeeds: the pointer to
+    /// the current buffer lives in the deferred state, so a run that fails
+    /// downstream leaves the previous buffer authoritative and the same rows
+    /// come back next time.
+    ///
+    /// That replace-don't-mutate shape is what makes it safe. Appending to a
+    /// shared buffer during the run would double-count on a retry, because the
+    /// source position has not advanced either.
+    pub(crate) fn run_tumble(
+        &self,
+        db: &Path,
+        spec: &plan::TumbleSpec,
+        pipeline_name: Option<&str>,
+        pending: &mut Vec<crate::PendingWrite>,
+    ) -> Result<String, EngineError> {
+        let state_path = incremental_state_path(pipeline_name, &spec.node_id).ok_or_else(|| {
+            EngineError::Config(
+                "xf.tumble: needs a workspace to keep its open windows in (DUCKLE_WORKSPACE)".into(),
+            )
+        })?;
+        let dir = state_path.with_extension("tumble");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| EngineError::Query(format!("tumble: state dir {}: {}", dir.display(), e)))?;
+
+        // The raw text as READ, so the flush can tell whether somebody changed
+        // this while the run was in flight.
+        let prior = crate::read_state_snapshot(&state_path);
+        let saved: Option<JsonValue> = prior
+            .as_deref()
+            .and_then(|t| serde_json::from_str(t).ok());
+        // The buffer the LAST SUCCESSFUL run left. Anything else in the folder
+        // is from a run that did not finish, and is ignored then cleaned up.
+        let prev_buf = saved
+            .as_ref()
+            .and_then(|v| v.get("buffer"))
+            .and_then(|v| v.as_str())
+            .map(|f| dir.join(f))
+            .filter(|p| p.exists());
+        let prev_watermark = saved
+            .as_ref()
+            .and_then(|v| v.get("watermark"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        // How far emission has already reached. A row for a window at or below
+        // this arrived too late to be counted and is dropped rather than
+        // emitted as a second, partial copy of a window already delivered.
+        let emitted_through = saved
+            .as_ref()
+            .and_then(|v| v.get("emitted_through"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let ts = plan::quote_ident(&spec.time_column);
+        let upstream = plan::quote_ident(&spec.from_view);
+        let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let esc_path = |p: &std::path::Path| p.display().to_string().replace('\\', "/").replace('\'', "''");
+
+        // Everything in play this run: what was still open, plus what arrived.
+        let all = match &prev_buf {
+            Some(p) => format!(
+                "SELECT * FROM {up} UNION ALL BY NAME SELECT * FROM read_parquet('{buf}')",
+                up = upstream,
+                buf = esc_path(p)
+            ),
+            None => format!("SELECT * FROM {}", upstream),
+        };
+
+        // The watermark is computed ONCE, here, and used as a literal in every
+        // statement below. Recomputing it per statement is how the equivalent
+        // elsewhere ends up deleting more than it collected.
+        // Real tables, not TEMP views: every self.run / self.run_rows below is a
+        // separate duckdb invocation, and a temp view dies with the one that
+        // created it. These live in the run's own database and are dropped at
+        // the end.
+        let t_all = plan::quote_ident(&format!("duckle_tumble_all_{}", spec.node_id));
+        let t_b = plan::quote_ident(&format!("duckle_tumble_b_{}", spec.node_id));
+        let t_late = plan::quote_ident(&format!("duckle_tumble_late_{}", spec.node_id));
+        let wm_sql = format!(
+            "CREATE OR REPLACE TABLE {t_all} AS {all};
+             SELECT COALESCE(MAX({ts}), NULL)::VARCHAR AS wm FROM {t_all}",
+            t_all = t_all,
+            all = all,
+            ts = ts
+        );
+        let wm_rows = self.run_rows(Some(db), &wm_sql)?;
+        let batch_max = wm_rows
+            .first()
+            .and_then(|r| r.get("wm"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        // Monotonic: a batch of older data must not drag the watermark back and
+        // re-open windows that already closed.
+        let watermark = match (batch_max, prev_watermark.clone()) {
+            (Some(b), Some(p)) => Some(if b > p { b } else { p }),
+            (Some(b), None) => Some(b),
+            (None, p) => p,
+        };
+        let watermark = match watermark {
+            Some(w) => w,
+            // Nothing has ever been seen, so nothing can be closed.
+            None => {
+                self.run(
+                    Some(db),
+                    &format!(
+                        "CREATE OR REPLACE TABLE {out} AS SELECT *, \
+                           CAST(NULL AS TIMESTAMP) AS window_start, \
+                           CAST(NULL AS TIMESTAMP) AS window_end \
+                         FROM {t_all} LIMIT 0",
+                        out = plan::quote_ident(&spec.node_id),
+                        t_all = t_all
+                    ),
+                    false,
+                )?;
+                return Ok(format!("tumble: no rows yet in {}", spec.node_id));
+            }
+        };
+
+        let bucketed = format!(
+            "SELECT *, \
+               time_bucket(INTERVAL {size}, CAST({ts} AS TIMESTAMP)) AS window_start, \
+               time_bucket(INTERVAL {size}, CAST({ts} AS TIMESTAMP)) + INTERVAL {size} AS window_end \
+             FROM {t_all}",
+            size = lit(&spec.size),
+            ts = ts,
+            t_all = t_all
+        );
+        let closed = format!(
+            "window_end + INTERVAL {late} <= CAST({wm} AS TIMESTAMP)",
+            late = lit(&spec.allowed_lateness),
+            wm = lit(&watermark)
+        );
+        // A row whose window closed before the last emission is late beyond
+        // rescue: emitting it now would deliver a second, partial copy of a
+        // window a downstream consumer already has.
+        let too_late = match &emitted_through {
+            Some(e) => format!(
+                "window_end + INTERVAL {late} <= CAST({e} AS TIMESTAMP)",
+                late = lit(&spec.allowed_lateness),
+                e = lit(e)
+            ),
+            None => "FALSE".to_string(),
+        };
+
+        let next_buf_name = format!(
+            "buf-{}-{}.parquet",
+            std::process::id(),
+            TUMBLE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let next_buf = dir.join(&next_buf_name);
+        let out = plan::quote_ident(&spec.node_id);
+
+        // One script: stage everything, emit the closed windows, and write what
+        // stays open to a NEW file. Nothing the previous run left is touched.
+        let script = format!(
+            "CREATE OR REPLACE TABLE {t_b} AS {bucketed};
+             CREATE OR REPLACE TABLE {t_late} AS \
+               SELECT * FROM {t_b} WHERE {too_late};
+             CREATE OR REPLACE TABLE {out} AS \
+               SELECT * FROM {t_b} WHERE {closed} AND NOT ({too_late});
+             COPY (SELECT * EXCLUDE (window_start, window_end) FROM {t_b} \
+                   WHERE NOT ({closed})) TO '{next}' (FORMAT PARQUET);",
+            t_b = t_b,
+            t_late = t_late,
+            bucketed = bucketed,
+            too_late = too_late,
+            closed = closed,
+            out = out,
+            next = esc_path(&next_buf)
+        );
+        self.run(Some(db), &script, false)?;
+
+        let emitted = self
+            .run_rows(Some(db), &format!("SELECT count(*) AS n FROM {}", out))?
+            .first()
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let dropped = self
+            .run_rows(Some(db), &format!("SELECT count(*) AS n FROM {}", t_late))?
+            .first()
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let still_open = self
+            .run_rows(
+                Some(db),
+                &format!("SELECT count(*) AS n FROM read_parquet('{}')", esc_path(&next_buf)),
+            )?
+            .first()
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        // The scratch tables have served their purpose; leaving them behind would
+        // put them in front of the user as if they were pipeline output.
+        let _ = self.run(
+            Some(db),
+            &format!(
+                "DROP TABLE IF EXISTS {t_all}; DROP TABLE IF EXISTS {t_b}; DROP TABLE IF EXISTS {t_late};"
+            ),
+            false,
+        );
+
+        // Emission only advances the mark when something was emitted; a quiet
+        // run must not move it and turn merely-early rows into "too late".
+        let next_emitted_through = if emitted > 0 {
+            Some(watermark.clone())
+        } else {
+            emitted_through.clone()
+        };
+        pending.push(crate::PendingWrite::state(
+            state_path,
+            serde_json::json!({
+                "buffer": next_buf_name,
+                "watermark": watermark,
+                "emitted_through": next_emitted_through,
+            }),
+            prior,
+        ));
+        // Old buffers from runs that did not finish are dead weight; the one
+        // the last success pointed at stays until this run is itself committed.
+        prune_tumble_buffers(&dir, &next_buf_name, prev_buf.as_deref());
+
+        Ok(format!(
+            "tumble: {} row(s) in closed windows into {}, {} still open{} (watermark {})",
+            emitted,
+            spec.node_id,
+            still_open,
+            if dropped > 0 {
+                format!(", {} dropped as too late", dropped)
+            } else {
+                String::new()
+            },
+            watermark
+        ))
+    }
+
+    /// src.changed: probe remote metadata and emit only what changed.
+    ///
+    /// Cheap check first is the whole point: a HEAD or a stat costs nothing
+    /// next to the object it decides about. When nothing changed the node
+    /// reports `unchanged` rather than a bare success, so a working poll and a
+    /// broken one are told apart.
+    pub(crate) fn run_changed_source(
+        &self,
+        db: &Path,
+        spec: &plan::ChangedSourceSpec,
+        pipeline_name: Option<&str>,
+        pending: &mut Vec<crate::PendingWrite>,
+        artifacts: &mut Vec<crate::ArtifactRef>,
+    ) -> Result<String, EngineError> {
+        let state_path = if spec.track_state {
+            incremental_state_path(pipeline_name, &spec.node_id)
+        } else {
+            None
+        };
+        let prior = state_path.as_deref().and_then(crate::read_state_snapshot);
+        // What has already been processed: uri -> fingerprint.
+        let mut seen: std::collections::BTreeMap<String, String> = prior
+            .as_deref()
+            .and_then(|t| serde_json::from_str::<JsonValue>(t).ok())
+            .and_then(|v| v.get("seen").cloned())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+
+        let entries = if spec.listing {
+            self.list_remote_entries(spec)?
+        } else {
+            vec![self.probe_remote_entry(spec)?]
+        };
+
+        let mut rows: Vec<JsonValue> = Vec::new();
+        let mut unchanged_count = 0usize;
+        for e in &entries {
+            let status = match seen.get(&e.uri) {
+                Some(prev) if *prev == e.fingerprint => {
+                    unchanged_count += 1;
+                    continue;
+                }
+                Some(_) => "changed",
+                None => "new",
+            };
+            rows.push(serde_json::json!({
+                "uri": e.uri,
+                "name": e.name,
+                "size": e.size,
+                "modified_at": e.modified_at,
+                "etag": e.etag,
+                "fingerprint": e.fingerprint,
+                "status": status,
+            }));
+            if rows.len() >= spec.max_entries {
+                break;
+            }
+        }
+
+        // Only what was EMITTED is recorded, and only if the run succeeds.
+        // Recording an entry this run did not emit - because max_entries cut it
+        // off - would skip it forever.
+        for r in &rows {
+            if let (Some(u), Some(f)) = (
+                r.get("uri").and_then(|v| v.as_str()),
+                r.get("fingerprint").and_then(|v| v.as_str()),
+            ) {
+                seen.insert(u.to_string(), f.to_string());
+            }
+        }
+
+        // What the run OBSERVED, for the provenance manifest. No sha256: the
+        // bytes were deliberately not read, which is the point of the component.
+        // The ETag with the size and mtime is what can honestly be claimed.
+        for e in &entries {
+            artifacts.push(crate::ArtifactRef {
+                node: spec.node_id.clone(),
+                role: "input".into(),
+                uri: e.uri.clone(),
+                name: Some(e.name.clone()),
+                media_type: None,
+                size_bytes: e.size,
+                sha256: None,
+                etag: e.etag.clone(),
+                modified_at: e.modified_at.clone(),
+            });
+        }
+
+        let emitted = rows.len();
+        if emitted == 0 {
+            // A typed empty relation, so a downstream stage sees the right
+            // columns rather than an error on a quiet poll.
+            self.changed_empty_relation(db, &spec.node_id)?;
+        } else {
+            materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &rows)?;
+        }
+
+        if let Some(p) = state_path {
+            pending.push(crate::PendingWrite::state(
+                p,
+                serde_json::json!({ "seen": seen }),
+                prior,
+            ));
+        }
+
+        let msg = format!(
+            "changed: {} of {} entr{} changed at {}{}",
+            emitted,
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" },
+            spec.uri,
+            if unchanged_count > 0 {
+                format!(" ({} unchanged)", unchanged_count)
+            } else {
+                String::new()
+            }
+        );
+        Ok(if emitted == 0 {
+            format!("{}{}", crate::UNCHANGED_MARKER, msg)
+        } else {
+            msg
+        })
+    }
+
+    /// The shape src.changed always emits, with no rows in it.
+    fn changed_empty_relation(&self, db: &Path, node_id: &str) -> Result<(), EngineError> {
+        self.run(
+            Some(db),
+            &format!(
+                "CREATE OR REPLACE TABLE {} (uri VARCHAR, name VARCHAR, size BIGINT, \
+                 modified_at VARCHAR, etag VARCHAR, fingerprint VARCHAR, status VARCHAR)",
+                plan::quote_ident(node_id)
+            ),
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// One object's metadata, without fetching it.
+    fn probe_remote_entry(
+        &self,
+        spec: &plan::ChangedSourceSpec,
+    ) -> Result<RemoteEntry, EngineError> {
+        if spec.uri.starts_with("sftp://") {
+            let (host, port, user, path) = parse_sftp_uri(&spec.uri)?;
+            let user = spec.user.clone().or(user).unwrap_or_default();
+            let stat = self.sftp_stat(spec, &host, port, &user, &path)?;
+            return Ok(stat);
+        }
+        if spec.uri.starts_with("s3://") || spec.uri.starts_with("s3a://") {
+            return self.s3_stat(spec);
+        }
+        if !(spec.uri.starts_with("http://") || spec.uri.starts_with("https://")) {
+            return Err(EngineError::Config(format!(
+                "changed: {} is not a URI this can probe - use https://, s3:// or sftp://",
+                spec.uri
+            )));
+        }
+        let mut req = crate::tls::http_agent().head(&spec.uri);
+        for (k, v) in &spec.headers {
+            req = req.set(k, v);
+        }
+        // A server that refuses HEAD is common enough to be worth naming, and
+        // falling back to GET would download the object this exists to avoid.
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(405, _)) => {
+                return Err(EngineError::Query(format!(
+                    "changed: {} rejected a HEAD request (405). This source cannot be \
+                     checked without downloading it, which is what this component exists \
+                     to avoid.",
+                    spec.uri
+                )))
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                return Err(EngineError::Query(format!(
+                    "changed: HTTP {} probing {}: {}",
+                    code,
+                    spec.uri,
+                    body.chars().take(200).collect::<String>()
+                )));
+            }
+            Err(e) => {
+                return Err(EngineError::Query(format!(
+                    "changed: probing {}: {}",
+                    spec.uri, e
+                )))
+            }
+        };
+        let etag = resp.header("etag").map(|s| s.trim_matches('"').to_string());
+        let modified = resp.header("last-modified").map(|s| s.to_string());
+        let size = resp
+            .header("content-length")
+            .and_then(|s| s.parse::<i64>().ok());
+        let name = spec
+            .uri
+            .rsplit('/')
+            .next()
+            .unwrap_or(&spec.uri)
+            .to_string();
+        Ok(RemoteEntry {
+            fingerprint: remote_fingerprint(etag.as_deref(), modified.as_deref(), size),
+            uri: spec.uri.clone(),
+            name,
+            size,
+            modified_at: modified,
+            etag,
+        })
+    }
+
+    /// The credentials for an `s3://` uri, or a message saying what is missing.
+    ///
+    /// An anonymous request to a private bucket comes back 403, which reads as
+    /// "wrong keys" rather than "no keys", so the absence is named here instead
+    /// of being discovered from a status code.
+    fn s3_config<'a>(
+        &self,
+        spec: &'a plan::ChangedSourceSpec,
+    ) -> Result<&'a crate::s3::S3Config, EngineError> {
+        spec.s3.as_ref().ok_or_else(|| {
+            EngineError::Config(format!(
+                "changed: {} needs S3 credentials - pick a saved S3 connection on the node, \
+                 or set its access key and secret key",
+                spec.uri
+            ))
+        })
+    }
+
+    /// One object's size, ETag and mtime, over a HEAD. No bytes transferred,
+    /// which is the whole reason this component exists.
+    fn s3_stat(&self, spec: &plan::ChangedSourceSpec) -> Result<RemoteEntry, EngineError> {
+        let cfg = self.s3_config(spec)?;
+        let (bucket, key) = crate::s3::parse_s3_uri(&spec.uri)?;
+        if key.is_empty() {
+            return Err(EngineError::Config(format!(
+                "changed: {} names a bucket but no object. Turn listing on to enumerate it.",
+                spec.uri
+            )));
+        }
+        let o = cfg.head(&bucket, &key)?;
+        Ok(RemoteEntry {
+            fingerprint: remote_fingerprint(o.etag.as_deref(), o.last_modified.as_deref(), o.size),
+            uri: spec.uri.clone(),
+            name: key.rsplit('/').next().unwrap_or(&key).to_string(),
+            size: o.size,
+            modified_at: o.last_modified,
+            etag: o.etag,
+        })
+    }
+
+    /// Every object under a prefix.
+    fn s3_list(&self, spec: &plan::ChangedSourceSpec) -> Result<Vec<RemoteEntry>, EngineError> {
+        let cfg = self.s3_config(spec)?;
+        let (bucket, prefix) = crate::s3::parse_s3_uri(&spec.uri)?;
+        // The cap goes DOWN into the listing rather than being applied after it:
+        // a prefix holding a million objects must not be walked in full to hand
+        // back a hundred. A suffix filter can discard some of what comes back,
+        // so the request asks for enough to still fill the cap afterwards.
+        let want = if spec.suffix.is_some() {
+            spec.max_entries.saturating_mul(4).max(spec.max_entries)
+        } else {
+            spec.max_entries
+        };
+        let objects = cfg.list(&bucket, &prefix, want)?;
+        let mut out: Vec<RemoteEntry> = objects
+            .into_iter()
+            .filter(|o| match &spec.suffix {
+                Some(sfx) => o.key.ends_with(sfx.as_str()),
+                None => true,
+            })
+            .map(|o| {
+                let name = o.key.rsplit('/').next().unwrap_or(&o.key).to_string();
+                RemoteEntry {
+                    fingerprint: remote_fingerprint(
+                        o.etag.as_deref(),
+                        o.last_modified.as_deref(),
+                        o.size,
+                    ),
+                    uri: format!("s3://{}/{}", bucket, o.key),
+                    name,
+                    size: o.size,
+                    modified_at: o.last_modified,
+                    etag: o.etag,
+                }
+            })
+            .collect();
+        // Oldest first, so a capped run works through a backlog in order rather
+        // than taking an arbitrary slice of it - the same rule the SFTP listing
+        // follows, and for the same reason. S3 returns keys in lexical order
+        // already; sorting by the leaf name matches what the SFTP side does when
+        // a prefix has sub-folders in it.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// xf.artifact.copy: land the bytes named by the upstream rows somewhere
+    /// durable, and emit a row per landed copy.
+    ///
+    /// An artifact is a reference, so a pipeline can carry one around for free.
+    /// At some point somebody has to move the actual bytes, and that is this:
+    /// the step between "the feed says there is a new 4GB PDF bundle" and "it is
+    /// in our raw zone, hashed, and we can prove which bytes we parsed".
+    ///
+    /// Streamed throughout. The source is read in one pass, hashed on the way
+    /// past, and written straight out, so memory is bounded by the part size and
+    /// not by the object. Reading it twice - once to hash, once to upload -
+    /// would double the transfer off a remote source, and hashing first would
+    /// mean holding the whole thing.
+    pub(crate) fn run_artifact_copy(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        spec: &plan::ArtifactCopySpec,
+        artifacts: &mut Vec<crate::ArtifactRef>,
+    ) -> Result<String, EngineError> {
+        let select = format!(
+            "{}SELECT * FROM {}",
+            secret_prefix,
+            plan::quote_ident(&spec.from_view)
+        );
+        let rows = self.run_rows(Some(db), &select)?;
+
+        let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
+        let mut copied = 0usize;
+        let mut skipped = 0usize;
+        let mut bytes_total: u64 = 0;
+        for row in &rows {
+            let src = row
+                .get(&spec.uri_column)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    EngineError::Query(format!(
+                        "artifact.copy: row has no '{}' to copy from. Set the URI column to \
+                         whichever column names the artifact.",
+                        spec.uri_column
+                    ))
+                })?;
+            let landed = self.copy_one_artifact(spec, &src)?;
+            if landed.copied {
+                copied += 1;
+                bytes_total += landed.size_bytes.unwrap_or(0) as u64;
+            } else {
+                skipped += 1;
+            }
+            // Both sides of the copy: what was read, and what was written. The
+            // output carries a real sha256 because these bytes DID pass through
+            // this run, which is the strongest provenance an artifact ever gets.
+            artifacts.push(crate::ArtifactRef {
+                node: spec.node_id.clone(),
+                role: "input".into(),
+                uri: src.clone(),
+                name: Some(landed.name.clone()),
+                media_type: Some(landed.media_type.to_string()),
+                size_bytes: landed.size_bytes,
+                sha256: landed.sha256.clone(),
+                etag: None,
+                modified_at: None,
+            });
+            artifacts.push(crate::ArtifactRef {
+                node: spec.node_id.clone(),
+                role: "output".into(),
+                uri: landed.uri.clone(),
+                name: Some(landed.name.clone()),
+                media_type: Some(landed.media_type.to_string()),
+                size_bytes: landed.size_bytes,
+                sha256: landed.sha256.clone(),
+                etag: None,
+                modified_at: None,
+            });
+            out.push(serde_json::json!({
+                "uri": landed.uri,
+                "source_uri": src,
+                "name": landed.name,
+                "media_type": landed.media_type,
+                "size_bytes": landed.size_bytes,
+                "sha256": landed.sha256,
+                "copied": landed.copied,
+            }));
+        }
+
+        if out.is_empty() {
+            // A typed empty relation, so a downstream stage sees the right
+            // columns rather than an error on a run with nothing to copy.
+            self.run(
+                Some(db),
+                &format!(
+                    "CREATE OR REPLACE TABLE {} (uri VARCHAR, source_uri VARCHAR, name VARCHAR, \
+                     media_type VARCHAR, size_bytes BIGINT, sha256 VARCHAR, copied BOOLEAN)",
+                    plan::quote_ident(&spec.node_id)
+                ),
+                false,
+            )?;
+        } else {
+            materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
+        }
+
+        let msg = format!(
+            "artifact.copy: {} copied ({}), {} already there, to {}",
+            copied,
+            human_bytes(bytes_total),
+            skipped,
+            spec.destination
+        );
+        // Nothing moved is a real outcome worth telling apart from a broken
+        // copy, the same way an unchanged poll is.
+        Ok(if copied == 0 && !rows.is_empty() {
+            format!("{}{}", crate::UNCHANGED_MARKER, msg)
+        } else {
+            msg
+        })
+    }
+
+    /// Copy one artifact, and describe what landed.
+    fn copy_one_artifact(
+        &self,
+        spec: &plan::ArtifactCopySpec,
+        src: &str,
+    ) -> Result<LandedArtifact, EngineError> {
+        let name = src
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("artifact")
+            .to_string();
+        let media_type = media_type_for(&name);
+
+        // "hash" naming needs the content hash BEFORE choosing the key, which
+        // means reading the object twice. That is the honest cost of a
+        // content-addressed store and it is opt-in for exactly that reason;
+        // "keep" and "path" are one pass.
+        let key_hint = match spec.naming.as_str() {
+            "path" => source_path_of(src),
+            _ => name.clone(),
+        };
+
+        if spec.naming == "hash" {
+            let (sha, size) = self.hash_source(spec, src)?;
+            let ext = name.rsplit_once('.').map(|(_, e)| format!(".{e}")).unwrap_or_default();
+            let dest = join_destination(&spec.destination, &format!("{sha}{ext}"));
+            // A content-addressed key that already exists holds the same bytes
+            // by construction, so the second copy is never worth making.
+            if self.artifact_exists(spec, &dest)? {
+                return Ok(LandedArtifact {
+                    uri: dest,
+                    name,
+                    media_type,
+                    size_bytes: Some(size as i64),
+                    sha256: Some(sha),
+                    copied: false,
+                });
+            }
+            let (sha2, size2) = self.stream_artifact(spec, src, &dest)?;
+            return Ok(LandedArtifact {
+                uri: dest,
+                name,
+                media_type,
+                size_bytes: Some(size2 as i64),
+                sha256: Some(sha2),
+                copied: true,
+            });
+        }
+
+        let dest = join_destination(&spec.destination, &key_hint);
+        match spec.if_exists.as_str() {
+            "error" if self.artifact_exists(spec, &dest)? => {
+                return Err(EngineError::Query(format!(
+                    "artifact.copy: {} already exists and ifExists is 'error'",
+                    dest
+                )))
+            }
+            "skip" if self.artifact_exists(spec, &dest)? => {
+                return Ok(LandedArtifact {
+                    uri: dest,
+                    name,
+                    media_type,
+                    size_bytes: None,
+                    sha256: None,
+                    copied: false,
+                })
+            }
+            _ => {}
+        }
+        let (sha, size) = self.stream_artifact(spec, src, &dest)?;
+        Ok(LandedArtifact {
+            uri: dest,
+            name,
+            media_type,
+            size_bytes: Some(size as i64),
+            sha256: Some(sha),
+            copied: true,
+        })
+    }
+
+    /// Open a source for reading, whatever scheme it is written in.
+    pub(crate) fn open_artifact(
+        &self,
+        auth: &plan::ArtifactAuth,
+        src: &str,
+    ) -> Result<Box<dyn std::io::Read + Send>, EngineError> {
+        if src.starts_with("s3://") || src.starts_with("s3a://") {
+            let cfg = auth.s3.as_ref().ok_or_else(|| {
+                EngineError::Config(format!(
+                    "artifact.copy: {} needs S3 credentials - pick a saved S3 connection on \
+                     the node, or set its access key and secret key",
+                    src
+                ))
+            })?;
+            let (bucket, key) = crate::s3::parse_s3_uri(src)?;
+            return cfg.get(&bucket, &key);
+        }
+        if src.starts_with("http://") || src.starts_with("https://") {
+            let mut req = crate::tls::http_agent().get(src);
+            for (k, v) in &auth.headers {
+                req = req.set(k, v);
+            }
+            let resp = req
+                .call()
+                .map_err(|e| EngineError::Query(format!("artifact.copy: fetching {src}: {e}")))?;
+            return Ok(Box::new(resp.into_reader()));
+        }
+        if src.starts_with("sftp://") {
+            // SFTP is read into a temp file first, because the session has to be
+            // driven on its own runtime and cannot be held open behind a plain
+            // Read. The file is streamed out of afterwards, so the destination
+            // upload is still bounded - only the local spool is not.
+            return self.sftp_spool(auth, src);
+        }
+        let f = std::fs::File::open(src)
+            .map_err(|e| EngineError::Query(format!("artifact.copy: opening {src}: {e}")))?;
+        Ok(Box::new(f))
+    }
+
+    /// Read a source once, hashing it, and throw the bytes away. Only used by
+    /// content-addressed naming, which has to know the hash before it knows
+    /// where the object goes.
+    fn hash_source(
+        &self,
+        spec: &plan::ArtifactCopySpec,
+        src: &str,
+    ) -> Result<(String, u64), EngineError> {
+        let reader = self.open_artifact(&spec.auth, src)?;
+        let mut hashing = crate::s3::HashingReader::new(reader);
+        std::io::copy(&mut hashing, &mut std::io::sink())
+            .map_err(|e| EngineError::Query(format!("artifact.copy: reading {src}: {e}")))?;
+        Ok(hashing.finish())
+    }
+
+    /// Copy the bytes to the destination, hashing them on the way past.
+    fn stream_artifact(
+        &self,
+        spec: &plan::ArtifactCopySpec,
+        src: &str,
+        dest: &str,
+    ) -> Result<(String, u64), EngineError> {
+        let reader = self.open_artifact(&spec.auth, src)?;
+        self.land_bytes(&spec.auth, reader, dest, spec.part_size_bytes)
+    }
+
+    /// Write a reader's bytes to a destination, hashing them on the way past.
+    ///
+    /// Shared by the copy and by archive extraction, because "land these bytes
+    /// somewhere durable and tell me their hash and size" is one operation and
+    /// two implementations of it would disagree about atomicity the first time
+    /// one was changed.
+    pub(crate) fn land_bytes(
+        &self,
+        auth: &plan::ArtifactAuth,
+        reader: impl std::io::Read,
+        dest: &str,
+        part_size: usize,
+    ) -> Result<(String, u64), EngineError> {
+        let mut hashing = crate::s3::HashingReader::new(reader);
+
+        if dest.starts_with("s3://") || dest.starts_with("s3a://") {
+            let cfg = auth.s3.as_ref().ok_or_else(|| {
+                EngineError::Config(format!(
+                    "writing to {} needs S3 credentials on the node",
+                    dest
+                ))
+            })?;
+            let (bucket, key) = crate::s3::parse_s3_uri(dest)?;
+            // Multipart regardless of size: the source's length is not known
+            // for an HTTP body without a Content-Length, and a plain PUT has to
+            // declare one. Multipart streams in bounded parts either way.
+            cfg.put_multipart(&bucket, &key, &mut hashing, part_size, Some(media_type_for(dest)))?;
+            return Ok(hashing.finish());
+        }
+
+        // Local: write beside the target and rename, so a crash mid-copy never
+        // leaves a half file that looks like a complete one. Everything else in
+        // the engine that writes a file does the same.
+        let path = std::path::Path::new(dest);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                EngineError::Query(format!("creating {}: {e}", dir.display()))
+            })?;
+        }
+        let tmp = path.with_extension(format!(
+            "{}.duckle-partial",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|e| {
+                EngineError::Query(format!("creating {}: {e}", tmp.display()))
+            })?;
+            std::io::copy(&mut hashing, &mut f)
+                .map_err(|e| EngineError::Query(format!("writing {dest}: {e}")))?;
+        }
+        // Windows will not rename over an existing file, so the old one goes
+        // first. Anything else silently leaves the previous copy in place.
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            EngineError::Query(format!("placing {dest}: {e}"))
+        })?;
+        Ok(hashing.finish())
+    }
+
+    /// Is something already at this destination?
+    fn artifact_exists(
+        &self,
+        spec: &plan::ArtifactCopySpec,
+        dest: &str,
+    ) -> Result<bool, EngineError> {
+        if dest.starts_with("s3://") || dest.starts_with("s3a://") {
+            let Some(cfg) = spec.auth.s3.as_ref() else {
+                return Ok(false);
+            };
+            let (bucket, key) = crate::s3::parse_s3_uri(dest)?;
+            return match cfg.head(&bucket, &key) {
+                Ok(_) => Ok(true),
+                // A 404 is the answer to the question, not a failure. Anything
+                // else is reported: treating a 403 as "not there" would re-copy
+                // on every run and never say why.
+                Err(e) if e.to_string().contains("HTTP 404") => Ok(false),
+                Err(e) => Err(e),
+            };
+        }
+        Ok(std::path::Path::new(dest).exists())
+    }
+
+    /// Read an SFTP object into a temp file, and hand back a reader over it.
+    ///
+    /// The session has to be driven on its own async runtime and cannot be held
+    /// open behind a plain `Read`, so this is the one scheme that touches disk
+    /// on the way past. The upload out of the spool is still streamed, so the
+    /// memory bound holds; it is the local disk that pays.
+    fn sftp_spool(
+        &self,
+        auth: &plan::ArtifactAuth,
+        src: &str,
+    ) -> Result<Box<dyn std::io::Read + Send>, EngineError> {
+        let (host, port, user, path) = parse_sftp_uri(src)?;
+        let user = auth.user.clone().or(user).unwrap_or_default();
+        // src.changed's SFTP helpers take a ChangedSourceSpec, so the copy node's
+        // equivalent auth is presented in that shape rather than duplicating the
+        // connect-and-verify path. One implementation, one host-key policy.
+        let as_changed = plan::ChangedSourceSpec {
+            node_id: String::new(),
+            uri: src.to_string(),
+            listing: false,
+            suffix: None,
+            max_entries: 1,
+            track_state: false,
+            user: Some(user.clone()),
+            password: auth.password.clone(),
+            private_key: auth.private_key.clone(),
+            key_passphrase: auth.key_passphrase.clone(),
+            host_fingerprint: auth.host_fingerprint.clone(),
+            headers: Vec::new(),
+            s3: None,
+        };
+        let p = path.clone();
+        let bytes = self.with_sftp(&as_changed, &host, port, &user, move |sftp| {
+            Box::pin(async move {
+                use tokio::io::AsyncReadExt;
+                let mut f = sftp
+                    .open(p.clone())
+                    .await
+                    .map_err(|e| format!("open {}: {}", p, e))?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf)
+                    .await
+                    .map_err(|e| format!("read {}: {}", p, e))?;
+                Ok(buf)
+            })
+        })?;
+        let path = std::env::temp_dir().join(format!(
+            "duckle_artifact_{}_{}.spool",
+            std::process::id(),
+            crate::now_nanos()
+        ));
+        std::fs::write(&path, &bytes)
+            .map_err(|e| EngineError::Query(format!("artifact.copy: spool write: {e}")))?;
+        let file = std::fs::File::open(&path)
+            .map_err(|e| EngineError::Query(format!("artifact.copy: spool reopen: {e}")))?;
+        // The guard removes the file when the reader is dropped, whether the
+        // copy succeeded or not.
+        Ok(Box::new(SpooledArtifact { path, file }))
+    }
+
+    /// src.ducklake.maintain: run one DuckLake maintenance operation and emit
+    /// what it did.
+    ///
+    /// Deliberately thin. Each operation is one DuckLake function, its options
+    /// are that function's options, and its output relation is that function's
+    /// own result rows - so a compaction can be alerted on, quality-gated or
+    /// joined exactly like anything else, and nothing here has to be kept in
+    /// step with DuckLake's storage semantics as they change.
+    pub(crate) fn run_ducklake_maintain(
+        &self,
+        db: &Path,
+        spec: &plan::DuckLakeMaintainSpec,
+    ) -> Result<String, EngineError> {
+        // Two maintenance runs against one catalog must not race. DuckLake
+        // itself would refuse the second commit, but a conflict error at the
+        // end of a two-hour compaction is a worse answer than waiting, and a
+        // scheduled weekly compact overlapping a monthly cleanup is exactly the
+        // shape #279 asks to be serialised rather than raced.
+        let _lock = std::env::var("DUCKLE_WORKSPACE")
+            .ok()
+            .filter(|w| !w.is_empty())
+            .map(|w| {
+                crate::runlock::lock_store(
+                    std::path::Path::new(&w),
+                    &format!("ducklake-maintain-{}", lock_key(&spec.catalog_path)),
+                )
+            })
+            .transpose()
+            .map_err(EngineError::Config)?;
+
+        let before = self.ducklake_totals(db, spec).ok();
+        let call = maintenance_call(spec)?;
+        let sql = format!(
+            "{}CREATE OR REPLACE TABLE {} AS SELECT * FROM {};",
+            spec.attach,
+            plan::quote_ident(&spec.node_id),
+            call
+        );
+        self.run(Some(db), &sql, false)?;
+
+        let rows = self
+            .run_rows(
+                Some(db),
+                &format!("SELECT COUNT(*) AS n FROM {}", plan::quote_ident(&spec.node_id)),
+            )
+            .ok()
+            .and_then(|r| r.first().and_then(|v| v.get("n")).and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        let after = self.ducklake_totals(db, spec).ok();
+
+        Ok(format!(
+            "ducklake {}{}: {} row(s){}",
+            spec.operation,
+            if spec.dry_run { " (dry run, nothing was deleted)" } else { "" },
+            rows,
+            match (before, after) {
+                // What the operation actually changed, which is the part an
+                // operator is reading the log for.
+                (Some(b), Some(a)) if b != a => format!(
+                    " - files {} -> {}, {} -> {}",
+                    b.0,
+                    a.0,
+                    human_bytes(b.1),
+                    human_bytes(a.1)
+                ),
+                _ => String::new(),
+            }
+        ))
+    }
+
+    /// Total files and bytes across the catalog, for the before/after line.
+    /// Best-effort: a failure here must not fail the maintenance itself.
+    fn ducklake_totals(
+        &self,
+        db: &Path,
+        spec: &plan::DuckLakeMaintainSpec,
+    ) -> Result<(u64, u64), EngineError> {
+        let sql = format!(
+            "{}SELECT COALESCE(SUM(file_count), 0) AS f, COALESCE(SUM(file_size_bytes), 0) AS b \
+             FROM ducklake_table_info({});",
+            spec.attach,
+            sql_string(catalog_alias(&spec.attach).as_deref().unwrap_or("duckle_dst"))
+        );
+        let rows = self.run_rows(Some(db), &sql)?;
+        let first = rows.first().ok_or_else(|| {
+            EngineError::Query("ducklake: catalog reported no table info".into())
+        })?;
+        // A SUM comes back from DuckDB's JSON output as a STRING, because it
+        // is a HUGEINT. Reading it only as a number yields 0 for both sides,
+        // they compare equal, and the before/after line silently disappears.
+        let num = |k: &str| -> u64 {
+            first
+                .get(k)
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0)
+        };
+        Ok((num("f"), num("b")))
+    }
+
+    /// The artifacts a parser should read this run, from its upstream relation
+    /// or from its configured path.
+    ///
+    /// #282: one resolver for every parser, so `src.pdf`, `src.xml` and
+    /// `src.html` agree about what a URI column is and what is carried out of
+    /// it. Giving each of them its own would produce conventions that agree
+    /// until one is changed.
+    pub(crate) fn resolve_artifact_inputs(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        input: &plan::ArtifactInput,
+    ) -> Result<Vec<ResolvedArtifact>, EngineError> {
+        let Some(view) = input.from_view.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let rows = self.run_rows(
+            Some(db),
+            &format!("{}SELECT * FROM {}", secret_prefix, plan::quote_ident(view)),
+        )?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let uri = row
+                .get(&input.uri_column)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    EngineError::Query(format!(
+                        "no '{}' to read on an upstream row. Set the URI column to whichever \
+                         column names the artifact.",
+                        input.uri_column
+                    ))
+                })?;
+            // Carried, never recomputed: whatever landed these bytes already
+            // hashed exactly them, and hashing again would cost a second full
+            // read AND describe whatever is at that URI now rather than what
+            // was parsed.
+            let sha256 = row
+                .get(&input.sha_column)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            out.push(ResolvedArtifact { uri, sha256, row });
+        }
+        Ok(out)
+    }
+
+    /// How many artifact rows are read back at a time.
+    ///
+    /// Each batch is one DuckDB invocation, so a small batch pays a process
+    /// spawn per few documents and a huge one is the unbounded read this
+    /// exists to remove. Five thousand rows is a few MB of JSON and, on a
+    /// million-document corpus, two hundred spawns against a million parses.
+    pub(crate) const ARTIFACT_BATCH: usize = 5_000;
+
+    /// The batch actually used, so the paging can be exercised.
+    ///
+    /// A bound nobody can cross in a test is a bound nobody has checked: a
+    /// corpus of five thousand documents is not something a test suite should
+    /// build, so the size is overridable and the test drives it down to a
+    /// handful instead.
+    fn artifact_batch() -> usize {
+        std::env::var("DUCKLE_ARTIFACT_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(Self::ARTIFACT_BATCH)
+    }
+
+    /// The artifacts a parser should read, handed over in bounded batches.
+    ///
+    /// #282: `resolve_artifact_inputs` loads the whole relation into a Vec
+    /// before the first document is opened, so a corpus of a million rows costs
+    /// memory proportional to the CORPUS even though every individual parse is
+    /// bounded. Bounding each parser and leaving that in place would be a fix
+    /// that looks complete and is not.
+    ///
+    /// The list is materialised ONCE into a numbered table in the run database
+    /// - on disk, which is where a list that size belongs - and read back a
+    /// batch at a time. Numbered rather than paged with a bare LIMIT/OFFSET,
+    /// because a view with no ORDER BY may hand back a different order on the
+    /// next call and a corpus that silently repeated or skipped documents is
+    /// worse than one that would not fit in memory.
+    pub(crate) fn for_each_artifact_input(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        input: &plan::ArtifactInput,
+        tag: &str,
+        mut visit: impl FnMut(ResolvedArtifact) -> Result<(), EngineError>,
+    ) -> Result<usize, EngineError> {
+        let Some(view) = input.from_view.as_deref() else {
+            return Ok(0);
+        };
+        // Per node, so two artifact-reading nodes in one pipeline cannot
+        // overwrite each other's list.
+        let list = format!("duckle_artifacts_{}", metric_ident(tag));
+        crate::apply_duckdb_sql(
+            &self.bin,
+            db,
+            &format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT row_number() OVER () AS duckle_rn, * FROM {}",
+                plan::quote_ident(&list),
+                plan::quote_ident(view)
+            ),
+        )?;
+
+        let result = self.drain_artifact_list(db, secret_prefix, input, &list, &mut visit);
+        // Dropped whether the walk succeeded or not: the list is scratch, and
+        // leaving it behind would grow the run database every time.
+        let _ = crate::apply_duckdb_sql(
+            &self.bin,
+            db,
+            &format!("DROP TABLE IF EXISTS {}", plan::quote_ident(&list)),
+        );
+        result
+    }
+
+    fn drain_artifact_list(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        input: &plan::ArtifactInput,
+        list: &str,
+        visit: &mut impl FnMut(ResolvedArtifact) -> Result<(), EngineError>,
+    ) -> Result<usize, EngineError> {
+        let batch_size = Self::artifact_batch();
+        let mut seen = 0usize;
+        let mut offset = 0usize;
+        loop {
+            self.check_cancelled()?;
+            let rows = self.run_rows(
+                Some(db),
+                &format!(
+                    "{}SELECT * FROM {} WHERE duckle_rn > {} AND duckle_rn <= {} ORDER BY duckle_rn",
+                    secret_prefix,
+                    plan::quote_ident(list),
+                    offset,
+                    offset + batch_size
+                ),
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            let batch = rows.len();
+            for mut row in rows {
+                // The paging column is ours, not the pipeline's, and must not
+                // reach a parsed row or a carried column.
+                if let Some(o) = row.as_object_mut() {
+                    o.remove("duckle_rn");
+                }
+                let uri = row
+                    .get(&input.uri_column)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        EngineError::Query(format!(
+                            "no '{}' to read on an upstream row. Set the URI column to whichever \
+                             column names the artifact.",
+                            input.uri_column
+                        ))
+                    })?;
+                let sha256 = row
+                    .get(&input.sha_column)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string);
+                visit(ResolvedArtifact { uri, sha256, row })?;
+                seen += 1;
+            }
+            if batch < batch_size {
+                break;
+            }
+            offset += batch_size;
+        }
+        Ok(seen)
+    }
+
+    /// A local path for an artifact, fetching it first if it is remote.
+    ///
+    /// A format that can be parsed from a stream should be; this is for the
+    /// ones that cannot. A PDF reader seeks - the cross-reference table is at
+    /// the END of the file - so a PDF has to be a file. The spool is one
+    /// artifact at a time and is deleted when the guard drops, whether the
+    /// parse succeeded or not, so the bound is one artifact times concurrency
+    /// rather than the size of the corpus.
+    pub(crate) fn local_copy_of_artifact(
+        &self,
+        auth: &plan::ArtifactAuth,
+        uri: &str,
+    ) -> Result<SpooledInput, EngineError> {
+        let remote = uri.starts_with("s3://")
+            || uri.starts_with("s3a://")
+            || uri.starts_with("http://")
+            || uri.starts_with("https://")
+            || uri.starts_with("sftp://");
+        if !remote {
+            // Already a file. Nothing is copied and nothing is deleted.
+            return Ok(SpooledInput { path: PathBuf::from(uri), temp: false });
+        }
+        let mut reader = self.open_artifact(auth, uri)?;
+        let name = uri
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("artifact");
+        let path = std::env::temp_dir().join(format!(
+            "duckle_input_{}_{}_{}",
+            std::process::id(),
+            crate::now_nanos(),
+            safe_file_name(name)
+        ));
+        let mut f = std::fs::File::create(&path)
+            .map_err(|e| EngineError::Query(format!("spooling {uri}: {e}")))?;
+        std::io::copy(&mut reader, &mut f)
+            .map_err(|e| EngineError::Query(format!("fetching {uri}: {e}")))?;
+        Ok(SpooledInput { path, temp: true })
+    }
+
+    /// xf.archive.extract: one archive artifact in, one artifact per member out.
+    ///
+    /// Bulk data is published as archives far more often than as readable
+    /// files, and unpacking one used to mean a shell stage. Doing it as an
+    /// ARTIFACT operation rather than inside each parser means a ZIP of CSVs, a
+    /// TAR of JSON and a GZIP of NDJSON all land the same way, with the same
+    /// provenance, and each member then flows into whichever parser suits it.
+    pub(crate) fn run_archive_extract(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        spec: &plan::ArchiveExtractSpec,
+        artifacts: &mut Vec<crate::ArtifactRef>,
+    ) -> Result<String, EngineError> {
+        let archives = self.resolve_artifact_inputs(db, secret_prefix, &spec.input)?;
+        let mut out: Vec<JsonValue> = Vec::new();
+        let mut skipped_archives = 0usize;
+
+        for archive in &archives {
+            self.check_cancelled()?;
+            match self.extract_one_archive(spec, archive, &mut out, artifacts) {
+                Ok(()) => {}
+                // "When an archive cannot be opened" is what this field says it
+                // governs, so it skips READ failures only. It used to catch
+                // every error, which disarmed two things the operator had
+                // deliberately armed: ifExists = "Fail the run" did not fail,
+                // and the member limit - whose own description says "reaching
+                // it fails the run" - was reduced to an arbitrary truncation
+                // that left a prefix of the archive on disk and reported ok.
+                Err(EngineError::Config(e)) => return Err(EngineError::Config(e)),
+                Err(e) if spec.on_error == "skip" => {
+                    eprintln!("duckle: archive.extract: skipping {}: {e}", archive.uri);
+                    skipped_archives += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if out.is_empty() {
+            // A typed empty relation, so a run where nothing new arrived still
+            // gives a downstream stage the right columns to bind against.
+            self.run(
+                Some(db),
+                &format!(
+                    "CREATE OR REPLACE TABLE {} (archive_uri VARCHAR, member_name VARCHAR, member_index BIGINT, uri VARCHAR, media_type VARCHAR, compressed_size BIGINT, size_bytes BIGINT, sha256 VARCHAR)",
+                    plan::quote_ident(&spec.node_id)
+                ),
+                false,
+            )?;
+        } else {
+            materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
+        }
+
+        let msg = format!(
+            "archive.extract: {} member(s) from {} archive(s) to {}{}",
+            out.len(),
+            archives.len() - skipped_archives,
+            spec.destination,
+            if skipped_archives > 0 {
+                format!(" ({} archive(s) skipped)", skipped_archives)
+            } else {
+                String::new()
+            }
+        );
+        Ok(if out.is_empty() && !archives.is_empty() {
+            format!("{}{}", crate::UNCHANGED_MARKER, msg)
+        } else {
+            msg
+        })
+    }
+
+    /// Unpack one archive, landing each member that passes the filters.
+    fn extract_one_archive(
+        &self,
+        spec: &plan::ArchiveExtractSpec,
+        archive: &ResolvedArtifact,
+        out: &mut Vec<JsonValue>,
+        artifacts: &mut Vec<crate::ArtifactRef>,
+    ) -> Result<(), EngineError> {
+        let kind = archive_kind(&archive.uri);
+        // A ZIP's central directory is at the END of the file, so a ZIP has to
+        // be seekable and a remote one is spooled. TAR and GZIP are read
+        // front to back and stream straight from the source, which is why they
+        // are not spooled: an archive nobody has to hold is an archive whose
+        // size does not matter.
+        let spooled = match kind {
+            ArchiveKind::Zip => Some(self.local_copy_of_artifact(&spec.input.auth, &archive.uri)?),
+            _ => None,
+        };
+
+        let mut budget = MemberBudget {
+            remaining_members: spec.max_members,
+            remaining_bytes: spec.max_uncompressed_bytes,
+            archive_uri: archive.uri.clone(),
+        };
+
+        match kind {
+            ArchiveKind::Zip => {
+                let path = &spooled.as_ref().expect("spooled above").path;
+                let file = std::fs::File::open(path)
+                    .map_err(|e| EngineError::Query(format!("archive: open {}: {e}", archive.uri)))?;
+                let mut zip = zip::ZipArchive::new(file).map_err(|e| {
+                    EngineError::Query(format!("archive: {} is not a readable zip: {e}", archive.uri))
+                })?;
+                for i in 0..zip.len() {
+                    let (name, compressed) = {
+                        let entry = zip.by_index(i).map_err(|e| {
+                            EngineError::Query(format!("archive: {} member {i}: {e}", archive.uri))
+                        })?;
+                        if entry.is_dir() {
+                            continue;
+                        }
+                        (entry.name().to_string(), entry.compressed_size())
+                    };
+                    if !member_wanted(&name, spec) {
+                        continue;
+                    }
+                    budget.take_member(&name)?;
+                    let entry = zip.by_index(i).map_err(|e| {
+                        EngineError::Query(format!("archive: {} member {i}: {e}", archive.uri))
+                    })?;
+                    self.land_member(
+                        spec,
+                        archive,
+                        &name,
+                        i,
+                        Some(compressed as i64),
+                        entry,
+                        &mut budget,
+                        out,
+                        artifacts,
+                    )?;
+                }
+            }
+            ArchiveKind::Tar | ArchiveKind::TarGz => {
+                let raw = self.open_artifact(&spec.input.auth, &archive.uri)?;
+                let stream: Box<dyn std::io::Read> = if matches!(kind, ArchiveKind::TarGz) {
+                    Box::new(flate2::read::GzDecoder::new(raw))
+                } else {
+                    Box::new(raw)
+                };
+                let mut tar = tar::Archive::new(stream);
+                let entries = tar.entries().map_err(|e| {
+                    EngineError::Query(format!("archive: {} is not a readable tar: {e}", archive.uri))
+                })?;
+                for (i, entry) in entries.enumerate() {
+                    let entry = entry.map_err(|e| {
+                        EngineError::Query(format!("archive: {} member {i}: {e}", archive.uri))
+                    })?;
+                    if !entry.header().entry_type().is_file() {
+                        continue;
+                    }
+                    let name = entry
+                        .path()
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| format!("member-{i}"));
+                    if !member_wanted(&name, spec) {
+                        continue;
+                    }
+                    budget.take_member(&name)?;
+                    let compressed = entry.header().size().ok().map(|n| n as i64);
+                    self.land_member(
+                        spec, archive, &name, i, compressed, entry, &mut budget, out, artifacts,
+                    )?;
+                }
+            }
+            ArchiveKind::Gzip => {
+                // One compressed stream rather than named members, so the name
+                // comes from the archive with its .gz taken off.
+                let raw = self.open_artifact(&spec.input.auth, &archive.uri)?;
+                let name = archive
+                    .uri
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("member")
+                    .trim_end_matches(".gz")
+                    .to_string();
+                if member_wanted(&name, spec) {
+                    budget.take_member(&name)?;
+                    let decoded = flate2::read::GzDecoder::new(raw);
+                    self.land_member(
+                        spec, archive, &name, 0, None, decoded, &mut budget, out, artifacts,
+                    )?;
+                }
+            }
+            ArchiveKind::Unknown => {
+                return Err(EngineError::Config(format!(
+                    "archive: {} is not an archive this can open - expected .zip, .tar, .tar.gz, \
+                     .tgz or .gz",
+                    archive.uri
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    /// Land one member and record what it produced.
+    #[allow(clippy::too_many_arguments)]
+    fn land_member(
+        &self,
+        spec: &plan::ArchiveExtractSpec,
+        archive: &ResolvedArtifact,
+        name: &str,
+        index: usize,
+        compressed_size: Option<i64>,
+        reader: impl std::io::Read,
+        budget: &mut MemberBudget,
+        out: &mut Vec<JsonValue>,
+        artifacts: &mut Vec<crate::ArtifactRef>,
+    ) -> Result<(), EngineError> {
+        let leaf = member_leaf(name).to_string();
+        let key = match spec.naming.as_str() {
+            "flat" => leaf.clone(),
+            // Content-addressed naming would need the hash before the key, and
+            // a member cannot be read twice out of a streaming archive without
+            // spooling it. So it is landed under its own name first and the
+            // hash reported; a content-addressed store is a copy away.
+            _ => name.to_string(),
+        };
+        let dest = join_destination(&spec.destination, &key);
+
+        // Bounded by the member, not by the archive: the reader is capped so a
+        // small archive that expands to fill the disk is refused while it is
+        // being read rather than after.
+        let capped = CappedReader { inner: reader, remaining: budget.remaining_bytes };
+        let (sha, size, remaining) = match spec.if_exists.as_str() {
+            "skip" if self.archive_dest_size(spec, &dest)?.is_some() => {
+                // #284: a skipped member used to be emitted with a NULL size
+                // and sha256 and never reached the run manifest. That is the
+                // normal retry path - extract, downstream fails, source state
+                // does not advance, same archive arrives again - so the exact
+                // same logical input produced weaker provenance the second
+                // time round. It now carries the identity it had on the run
+                // that wrote it.
+                let existing = self.archive_dest_size(spec, &dest)?.unwrap_or(-1);
+                let mut capped = capped;
+                let (sha, size) = Self::hash_member(&mut capped)?;
+                if existing != size {
+                    return Err(EngineError::Query(format!(
+                        concat!(
+                            "archive: {} already exists at {} bytes but ",
+                            "this member is {}. 'skip' means the destination is ",
+                            "already this member; it is not. Use ifExists 'replace' to ",
+                            "overwrite it or 'error' to stop sooner."
+                        ),
+                        dest, existing, size
+                    )));
+                }
+                budget.remaining_bytes = capped.remaining;
+                artifacts.push(crate::ArtifactRef {
+                    node: spec.node_id.clone(),
+                    role: "output".into(),
+                    uri: dest.clone(),
+                    name: Some(leaf.clone()),
+                    media_type: Some(media_type_for(&leaf).to_string()),
+                    size_bytes: Some(size),
+                    sha256: Some(sha.clone()),
+                    etag: None,
+                    modified_at: None,
+                });
+                out.push(serde_json::json!({
+                    "archive_uri": archive.uri,
+                    "member_name": name,
+                    "member_index": index as u64,
+                    "uri": dest,
+                    "media_type": media_type_for(&leaf),
+                    "compressed_size": compressed_size,
+                    "size_bytes": size,
+                    "sha256": sha,
+                }));
+                return Ok(());
+            }
+            "error" if self.archive_dest_size(spec, &dest)?.is_some() => {
+                // Config, not Query: this is the operator's own policy firing,
+                // and `onError = skip` governs archives that cannot be READ.
+                // As a Query error it was swallowed by that arm, so "Fail the
+                // run" quietly did not.
+                return Err(EngineError::Config(format!(
+                    "archive: {} already exists and ifExists is 'error'",
+                    dest
+                )))
+            }
+            _ => {
+                let mut capped = capped;
+                let (sha, size) =
+                    self.land_bytes(&spec.input.auth, &mut capped, &dest, spec.part_size_bytes)?;
+                if capped.remaining == 0 {
+                    return Err(EngineError::Query(format!(
+                        "archive: {} expands past the {} GB limit for one archive. An archive \
+                         from an external publisher is untrusted input, so this refuses rather \
+                         than filling the volume; raise the limit if the data really is that big.",
+                        budget.archive_uri,
+                        spec.max_uncompressed_bytes / (1024 * 1024 * 1024)
+                    )));
+                }
+                (sha, size, capped.remaining)
+            }
+        };
+        budget.remaining_bytes = remaining;
+
+        artifacts.push(crate::ArtifactRef {
+            node: spec.node_id.clone(),
+            role: "output".into(),
+            uri: dest.clone(),
+            name: Some(leaf.clone()),
+            media_type: Some(media_type_for(&leaf).to_string()),
+            size_bytes: Some(size as i64),
+            sha256: Some(sha.clone()),
+            etag: None,
+            modified_at: None,
+        });
+        out.push(serde_json::json!({
+            "archive_uri": archive.uri,
+            "member_name": name,
+            "member_index": index as u64,
+            "uri": dest,
+            "media_type": media_type_for(&leaf),
+            "compressed_size": compressed_size,
+            "size_bytes": size as i64,
+            "sha256": sha,
+        }));
+        Ok(())
+    }
+
+    /// The destination's size if it is already there.
+    ///
+    /// Size rather than a bare bool because `skip` has to report the artifact
+    /// it skipped, and "something is at this path" is not an identity.
+    fn archive_dest_size(
+        &self,
+        spec: &plan::ArchiveExtractSpec,
+        dest: &str,
+    ) -> Result<Option<i64>, EngineError> {
+        if dest.starts_with("s3://") || dest.starts_with("s3a://") {
+            let Some(cfg) = spec.input.auth.s3.as_ref() else {
+                return Ok(None);
+            };
+            let (bucket, key) = crate::s3::parse_s3_uri(dest)?;
+            return match cfg.head(&bucket, &key) {
+                Ok(o) => Ok(Some(o.size.unwrap_or(-1))),
+                Err(e) if e.to_string().contains("HTTP 404") => Ok(None),
+                Err(e) => Err(e),
+            };
+        }
+        Ok(std::fs::metadata(dest).ok().map(|m| m.len() as i64))
+    }
+
+    /// Read a member to its end, hashing it, writing nothing.
+    ///
+    /// This is what makes a skipped member keep its identity. The bytes have to
+    /// come off a streaming archive anyway to reach the next member, so hashing
+    /// them costs no extra I/O against the source, and it means a retry reports
+    /// the same sha256 as the run that actually wrote the file.
+    fn hash_member(reader: &mut impl std::io::Read) -> Result<(String, i64), EngineError> {
+        let mut hashing = crate::s3::HashingReader::new(reader);
+        std::io::copy(&mut hashing, &mut std::io::sink())
+            .map_err(|e| EngineError::Query(format!("archive: reading member: {e}")))?;
+        let (sha, size) = hashing.finish();
+        Ok((sha, size as i64))
+    }
+
+    /// qa.baseline: compare this run against what previous runs looked like.
+    ///
+    /// #281: the dangerous failure is the one that stays green. Every row can
+    /// satisfy the schema and every row-level rule while the dataset is nothing
+    /// like what normally arrives, and that publishes successfully.
+    ///
+    /// Deterministic on purpose - rolling summary statistics and explicit
+    /// thresholds, no model. What it compares against is the MEDIAN of the last
+    /// N accepted profiles, so one odd day does not drag the baseline with it.
+    pub(crate) fn run_baseline(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        spec: &plan::BaselineSpec,
+        pipeline_name: Option<&str>,
+        pending: &mut Vec<crate::PendingWrite>,
+    ) -> Result<String, EngineError> {
+        let current = self.profile_relation(db, secret_prefix, spec)?;
+        let path = baseline_state_path(pipeline_name, &spec.node_id);
+        let prior = path.as_deref().and_then(crate::read_state_snapshot);
+        let history: Vec<JsonValue> = prior
+            .as_deref()
+            .and_then(|t| serde_json::from_str::<JsonValue>(t).ok())
+            .and_then(|v| v.get("profiles").cloned())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+
+        let mut rows: Vec<JsonValue> = Vec::new();
+        let mut violations: Vec<String> = Vec::new();
+
+        if history.is_empty() {
+            // Nothing to compare against yet. This is the first run, not a
+            // pass: saying "ok" would let the very first run establish any
+            // baseline at all, including a broken one, and look verified doing
+            // it.
+            rows.push(serde_json::json!({
+                "metric": "baseline",
+                "column": JsonValue::Null,
+                "group": JsonValue::Null,
+                "baseline_value": JsonValue::Null,
+                "current_value": JsonValue::Null,
+                "change": JsonValue::Null,
+                "change_pct": JsonValue::Null,
+                "status": "first_run",
+                "detail": "no accepted profile yet - this run becomes the first baseline",
+            }));
+        } else {
+            for rule in &spec.rules {
+                let key = metric_key(&rule.metric, rule.column.as_deref());
+                let cur = current.get(&key).and_then(JsonValue::as_f64);
+                let base = median_of(&history, &key);
+                let (status, detail) = match (base, cur) {
+                    (Some(b), Some(c)) => judge(rule, b, c),
+                    (None, _) => (
+                        "unknown".to_string(),
+                        format!("no baseline for {key} in the accepted history"),
+                    ),
+                    (_, None) => (
+                        "unknown".to_string(),
+                        format!("{key} could not be measured on this run"),
+                    ),
+                };
+                let change = match (base, cur) {
+                    (Some(b), Some(c)) => Some(c - b),
+                    _ => None,
+                };
+                let change_pct = match (base, cur) {
+                    (Some(b), Some(c)) if b != 0.0 => Some((c - b) / b * 100.0),
+                    _ => None,
+                };
+                if status == "violation" {
+                    violations.push(detail.clone());
+                }
+                rows.push(serde_json::json!({
+                    "metric": rule.metric,
+                    "column": rule.column,
+                    "group": JsonValue::Null,
+                    "baseline_value": base,
+                    "current_value": cur,
+                    "change": change,
+                    "change_pct": change_pct,
+                    "status": status,
+                    "detail": detail,
+                }));
+            }
+
+            // A partition that disappeared is the case a row count cannot see:
+            // the total can stay in range while a whole country stops arriving.
+            if spec.require_existing_groups && !spec.group_by.is_empty() {
+                let cur_groups = group_set(&current);
+                let base_groups: std::collections::BTreeSet<String> = history
+                    .iter()
+                    .filter_map(|p| p.as_object())
+                    .flat_map(|p| group_set(p).into_iter())
+                    .collect();
+                for missing in base_groups.difference(&cur_groups) {
+                    let detail = format!("group '{missing}' was in the baseline and is not here");
+                    violations.push(detail.clone());
+                    rows.push(serde_json::json!({
+                        "metric": "group_present",
+                        "column": JsonValue::Null,
+                        "group": missing,
+                        "baseline_value": 1.0,
+                        "current_value": 0.0,
+                        "change": -1.0,
+                        "change_pct": -100.0,
+                        "status": "violation",
+                        "detail": detail,
+                    }));
+                }
+            }
+        }
+
+        materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &rows)?;
+
+        // #281: record what this run MEASURED, whatever it then decides.
+        //
+        // Deliberately not deferred like the accepted history below. The
+        // run that gets refused is precisely the one whose numbers an
+        // operator needs to look at and possibly accept as the new normal;
+        // writing the observation only on success would throw it away in
+        // every case where accepting is the thing you want to do.
+        if let Some(p) = path.as_deref() {
+            let status = if !violations.is_empty() {
+                "violation"
+            } else if history.is_empty() {
+                "first_run"
+            } else {
+                "ok"
+            };
+            crate::baseline::record_observation(
+                &p.with_extension("observed.json"),
+                &JsonValue::Object(current.clone().into_iter().collect()),
+                status,
+                &violations,
+            );
+        }
+
+        // The new profile is accepted only if the whole run succeeds - the same
+        // deferred flush a watermark gets, and for the same reason: a run that
+        // failed downstream must not leave today's numbers as the new normal.
+        if let Some(p) = path {
+            let mut kept = history.clone();
+            kept.push(JsonValue::Object(current.clone().into_iter().collect()));
+            let keep_from = kept.len().saturating_sub(spec.history);
+            let kept: Vec<JsonValue> = kept[keep_from..].to_vec();
+            pending.push(crate::PendingWrite::state(
+                p,
+                serde_json::json!({ "profiles": kept }),
+                prior,
+            ));
+        }
+
+        if !violations.is_empty() && spec.mode == "gate" {
+            return Err(EngineError::Query(format!(
+                "baseline: this run does not look like the ones before it. {}",
+                violations.join("; ")
+            )));
+        }
+        Ok(if violations.is_empty() {
+            format!("baseline: {} rule(s) checked, all within range", spec.rules.len())
+        } else {
+            format!(
+                "baseline: {} finding(s) reported - {}",
+                violations.len(),
+                violations.join("; ")
+            )
+        })
+    }
+
+    /// Measure this run: the dataset-level and per-column numbers a rule can be
+    /// written against, plus a row count per group when one is configured.
+    fn profile_relation(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        spec: &plan::BaselineSpec,
+    ) -> Result<serde_json::Map<String, JsonValue>, EngineError> {
+        let view = plan::quote_ident(&spec.from_view);
+        let described = self.run_rows(
+            Some(db),
+            &format!("{}DESCRIBE SELECT * FROM {}", secret_prefix, view),
+        )?;
+        let all: Vec<String> = described
+            .iter()
+            .filter_map(|r| r.get("column_name").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .collect();
+        let columns: Vec<String> = if spec.columns.is_empty() {
+            all
+        } else {
+            spec.columns
+                .iter()
+                .filter(|c| all.iter().any(|a| a == *c))
+                .cloned()
+                .collect()
+        };
+
+        let mut selects: Vec<String> = vec!["COUNT(*) AS row_count".to_string()];
+        for c in &columns {
+            let q = plan::quote_ident(c);
+            let safe = metric_ident(c);
+            selects.push(format!("COUNT({q}) AS \"{safe}__nonnull\""));
+            selects.push(format!("approx_count_distinct({q}) AS \"{safe}__distinct\""));
+            // Cast through DOUBLE so a rule can be written against any column
+            // whose values are ordered; a non-numeric column simply yields NULL
+            // rather than failing the whole profile.
+            selects.push(format!("TRY_CAST(MIN({q}) AS DOUBLE) AS \"{safe}__min\""));
+            selects.push(format!("TRY_CAST(MAX({q}) AS DOUBLE) AS \"{safe}__max\""));
+            selects.push(format!("TRY_CAST(AVG(TRY_CAST({q} AS DOUBLE)) AS DOUBLE) AS \"{safe}__mean\""));
+        }
+        let sql = format!(
+            "{}SELECT {} FROM {}",
+            secret_prefix,
+            selects.join(", "),
+            view
+        );
+        let measured = self.run_rows(Some(db), &sql)?;
+        let first = measured.first().cloned().unwrap_or(JsonValue::Null);
+
+        let num = |v: Option<&JsonValue>| -> Option<f64> {
+            v.and_then(|v| {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+            })
+        };
+        let row_count = num(first.get("row_count")).unwrap_or(0.0);
+        let mut out = serde_json::Map::new();
+        out.insert("row_count".into(), serde_json::json!(row_count));
+        for c in &columns {
+            let safe = metric_ident(c);
+            let nonnull = num(first.get(format!("{safe}__nonnull").as_str())).unwrap_or(0.0);
+            let nulls = (row_count - nonnull).max(0.0);
+            out.insert(metric_key("null_count", Some(c)), serde_json::json!(nulls));
+            out.insert(
+                metric_key("null_pct", Some(c)),
+                serde_json::json!(if row_count > 0.0 { nulls / row_count } else { 0.0 }),
+            );
+            for m in ["distinct", "min", "max", "mean"] {
+                let name = if m == "distinct" { "distinct_count" } else { m };
+                if let Some(v) = num(first.get(format!("{safe}__{m}").as_str())) {
+                    out.insert(metric_key(name, Some(c)), serde_json::json!(v));
+                }
+            }
+        }
+
+        if !spec.group_by.is_empty() {
+            let keys: Vec<String> = spec.group_by.iter().map(|g| plan::quote_ident(g)).collect();
+            let label = keys
+                .iter()
+                .map(|k| format!("COALESCE({k}::VARCHAR, '')"))
+                .collect::<Vec<_>>()
+                .join(" || '|' || ");
+            let sql = format!(
+                "{}SELECT {} AS g, COUNT(*) AS n FROM {} GROUP BY 1",
+                secret_prefix, label, view
+            );
+            let mut groups = serde_json::Map::new();
+            for r in self.run_rows(Some(db), &sql)? {
+                if let Some(g) = r.get("g").and_then(|v| v.as_str()) {
+                    groups.insert(g.to_string(), serde_json::json!(num(r.get("n")).unwrap_or(0.0)));
+                }
+            }
+            out.insert("__groups".into(), JsonValue::Object(groups));
+        }
+        Ok(out)
+    }
+
+    /// Every entry in a remote directory.
+    fn list_remote_entries(
+        &self,
+        spec: &plan::ChangedSourceSpec,
+    ) -> Result<Vec<RemoteEntry>, EngineError> {
+        if spec.uri.starts_with("s3://") || spec.uri.starts_with("s3a://") {
+            return self.s3_list(spec);
+        }
+        if !spec.uri.starts_with("sftp://") {
+            return Err(EngineError::Config(format!(
+                "changed: listing needs sftp:// or s3://, not {}. HTTP has no \
+                 standard directory listing, so there is nothing to enumerate over it.",
+                spec.uri
+            )));
+        }
+        let (host, port, user, path) = parse_sftp_uri(&spec.uri)?;
+        let user = spec.user.clone().or(user).unwrap_or_default();
+        self.sftp_list(spec, &host, port, &user, &path)
+    }
+
+    /// Connect, run `f` against the SFTP session, disconnect. Shared by the
+    /// stat and list paths so the auth and host-key handling exist once.
+    fn with_sftp<T, F>(
+        &self,
+        spec: &plan::ChangedSourceSpec,
+        host: &str,
+        port: u16,
+        user: &str,
+        f: F,
+    ) -> Result<T, EngineError>
+    where
+        F: for<'a> FnOnce(
+            &'a russh_sftp::client::SftpSession,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, String>> + 'a>,
+        >,
+    {
+        use russh_sftp::client::SftpSession;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| EngineError::Query(format!("changed/sftp: tokio rt: {}", e)))?;
+        let result: Result<T, String> = rt.block_on(async {
+            let config = std::sync::Arc::new(russh::client::Config::default());
+            let refused = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let handler = SftpVerifier {
+                expected: spec.host_fingerprint.clone(),
+                hostport: format!("{}:{}", host, port),
+                refused: refused.clone(),
+            };
+            let mut session = russh::client::connect(config, (host, port), handler)
+                .await
+                .map_err(|e| match refused.lock().unwrap().take() {
+                    Some(why) => why,
+                    None => format!("connect {}:{}: {}", host, port, e),
+                })?;
+            let authed = if let Some(pem) = &spec.private_key {
+                let key = russh::keys::decode_secret_key(pem, spec.key_passphrase.as_deref())
+                    .map_err(|e| format!("private key: {}", e))?;
+                let with_alg = russh::keys::PrivateKeyWithHashAlg::new(
+                    std::sync::Arc::new(key),
+                    Some(russh::keys::HashAlg::Sha256),
+                );
+                session
+                    .authenticate_publickey(user, with_alg)
+                    .await
+                    .map_err(|e| format!("publickey auth: {}", e))?
+                    .success()
+            } else if let Some(pw) = &spec.password {
+                session
+                    .authenticate_password(user, pw)
+                    .await
+                    .map_err(|e| format!("password auth: {}", e))?
+                    .success()
+            } else {
+                return Err("no credentials: set a password or a private key".into());
+            };
+            if !authed {
+                return Err(format!("authentication failed for user '{}'", user));
+            }
+            let channel = session
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("open channel: {}", e))?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .map_err(|e| format!("request sftp subsystem: {}", e))?;
+            let sftp = SftpSession::new(channel.into_stream())
+                .await
+                .map_err(|e| format!("sftp session: {}", e))?;
+            f(&sftp).await
+        });
+        result.map_err(|e| EngineError::Query(format!("changed/sftp: {}", e)))
+    }
+
+    /// One remote file's size and mtime.
+    fn sftp_stat(
+        &self,
+        spec: &plan::ChangedSourceSpec,
+        host: &str,
+        port: u16,
+        user: &str,
+        path: &str,
+    ) -> Result<RemoteEntry, EngineError> {
+        let uri = spec.uri.clone();
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        let p = path.to_string();
+        let (size, mtime) = self.with_sftp(spec, host, port, user, move |sftp| {
+            Box::pin(async move {
+                let md = sftp
+                    .metadata(p.clone())
+                    .await
+                    .map_err(|e| format!("stat {}: {}", p, e))?;
+                Ok((md.size.map(|s| s as i64), md.mtime))
+            })
+        })?;
+        let modified = mtime.map(|m| m.to_string());
+        Ok(RemoteEntry {
+            fingerprint: remote_fingerprint(None, modified.as_deref(), size),
+            uri,
+            name,
+            size,
+            modified_at: modified,
+            etag: None,
+        })
+    }
+
+    /// Every file in a remote directory, with size and mtime.
+    fn sftp_list(
+        &self,
+        spec: &plan::ChangedSourceSpec,
+        host: &str,
+        port: u16,
+        user: &str,
+        dir: &str,
+    ) -> Result<Vec<RemoteEntry>, EngineError> {
+        let d = dir.to_string();
+        let raw = self.with_sftp(spec, host, port, user, move |sftp| {
+            Box::pin(async move {
+                let entries = sftp
+                    .read_dir(d.clone())
+                    .await
+                    .map_err(|e| format!("list {}: {}", d, e))?;
+                let mut out = Vec::new();
+                for e in entries {
+                    let meta = e.metadata();
+                    // Directories are not objects to process. Recursing would
+                    // turn one poll into an unbounded walk.
+                    if meta.is_dir() {
+                        continue;
+                    }
+                    out.push((
+                        e.file_name(),
+                        meta.size.map(|s| s as i64),
+                        meta.mtime,
+                    ));
+                }
+                Ok(out)
+            })
+        })?;
+
+        let base = format!(
+            "sftp://{}{}{}",
+            if user.is_empty() { String::new() } else { format!("{}@", user) },
+            if port == 22 { host.to_string() } else { format!("{}:{}", host, port) },
+            dir
+        );
+        let base = base.trim_end_matches('/').to_string();
+        let mut out: Vec<RemoteEntry> = raw
+            .into_iter()
+            .filter(|(name, _, _)| match &spec.suffix {
+                Some(s) => name.ends_with(s.as_str()),
+                None => true,
+            })
+            .map(|(name, size, mtime)| {
+                let modified = mtime.map(|m| m.to_string());
+                RemoteEntry {
+                    fingerprint: remote_fingerprint(None, modified.as_deref(), size),
+                    uri: format!("{}/{}", base, name),
+                    name,
+                    size,
+                    modified_at: modified,
+                    etag: None,
+                }
+            })
+            .collect();
+        // Oldest first, so a capped run works through a backlog in order
+        // rather than taking an arbitrary slice of it.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// src.spool: read an append-only NDJSON file from where the last
+    /// successful run stopped.
+    ///
+    /// Reads bytes `[saved_offset, EOF)`, keeps whole lines only, and queues
+    /// the new offset for the deferred flush - so a run that fails downstream
+    /// leaves the offset where it was and the next pass re-reads exactly the
+    /// records that did not land.
+    ///
+    /// A partial trailing line is left for next time rather than parsed. The
+    /// writer appends, so a line that is short right now is a line still being
+    /// written, not a corrupt one.
+    pub(crate) fn run_spool_source(
+        &self,
+        db: &Path,
+        spec: &plan::SpoolSourceSpec,
+        pipeline_name: Option<&str>,
+        pending: &mut Vec<crate::PendingWrite>,
+    ) -> Result<String, EngineError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let path = std::path::Path::new(&spec.path);
+        let state_path = if spec.track_offset {
+            incremental_state_path(pipeline_name, &spec.node_id)
+        } else {
+            None
+        };
+        let prior = state_path.as_deref().and_then(crate::read_state_snapshot);
+        let saved = state_path
+            .as_deref()
+            .and_then(read_spool_offset_state)
+            .unwrap_or(0);
+
+        // A spool that does not exist yet is an empty one. A listener may not
+        // have received anything, and that is not an error.
+        let mut file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.spool_empty_relation(db, &spec.node_id, path)?;
+                return Ok(format!(
+                    "spool: {} does not exist yet; 0 records into {}",
+                    spec.path, spec.node_id
+                ));
+            }
+            Err(e) => {
+                return Err(EngineError::Query(format!("spool: open {}: {}", spec.path, e)))
+            }
+        };
+        let len = file
+            .metadata()
+            .map_err(|e| EngineError::Query(format!("spool: stat {}: {}", spec.path, e)))?
+            .len();
+
+        // The file got SHORTER than where we stopped, so it was truncated or
+        // rotated under us. Resuming at the old offset would read from the
+        // middle of a different file, so start again and say so - silently
+        // skipping to the end would drop everything written since.
+        let (start, rotated) = if saved > len { (0, true) } else { (saved, false) };
+
+        let take = (len - start).min(spec.max_bytes);
+        if take == 0 {
+            self.spool_empty_relation(db, &spec.node_id, path)?;
+            return Ok(format!(
+                "{}spool: no new records in {}",
+                crate::UNCHANGED_MARKER,
+                spec.path
+            ));
+        }
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| EngineError::Query(format!("spool: seek {}: {}", spec.path, e)))?;
+        let mut buf = vec![0u8; take as usize];
+        file.read_exact(&mut buf)
+            .map_err(|e| EngineError::Query(format!("spool: read {}: {}", spec.path, e)))?;
+
+        // Only whole lines. Everything after the last newline is a record still
+        // being written, or one cut off by max_bytes; either way it belongs to
+        // the next pass, and the offset must stop before it.
+        let consumed = match buf.iter().rposition(|b| *b == b'\n') {
+            Some(i) => i + 1,
+            None => 0,
+        };
+        if consumed == 0 {
+            self.spool_empty_relation(db, &spec.node_id, path)?;
+            return Ok(format!(
+                "spool: {} has a partial record and no complete one; waiting for the rest",
+                spec.path
+            ));
+        }
+        let text = String::from_utf8_lossy(&buf[..consumed]);
+        let mut rows: Vec<JsonValue> = Vec::new();
+        let mut skipped = 0usize;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<JsonValue>(line) {
+                Ok(v) => rows.push(v),
+                // One unparseable line must not wedge the spool forever: the
+                // offset moves past it either way, so count it and carry on.
+                Err(_) => skipped += 1,
+            }
+        }
+        let count = rows.len();
+        materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &rows)?;
+
+        let next_offset = start + consumed as u64;
+        if let Some(p) = state_path {
+            pending.push(crate::PendingWrite::state(
+                p,
+                serde_json::json!({
+                    "path": spec.path,
+                    "next_offset": next_offset,
+                }),
+                prior,
+            ));
+        }
+        Ok(format!(
+            "spool: materialized {} record(s) into {}{}{}{}",
+            count,
+            spec.node_id,
+            if skipped > 0 {
+                format!(" ({} unparseable line(s) skipped)", skipped)
+            } else {
+                String::new()
+            },
+            if rotated {
+                " (the file was shorter than the saved position, so it was read from the start)"
+            } else {
+                ""
+            },
+            if spec.track_offset {
+                format!(" (resumes at byte {} if this run succeeds)", next_offset)
+            } else {
+                String::new()
+            }
         ))
     }
 
@@ -5609,7 +8378,7 @@ impl DuckdbEngine {
         &self,
         db: &Path,
         spec: &ModelCardSpec,
-        pending: &mut Vec<(std::path::PathBuf, JsonValue)>,
+        pending: &mut Vec<crate::PendingWrite>,
     ) -> Result<String, EngineError> {
         self.check_cancelled()?;
         let rows = self.run_rows(
@@ -5664,10 +8433,13 @@ impl DuckdbEngine {
                 .collect()
         };
         let dir = std::path::Path::new(&spec.dir).join(safe(&spec.name));
-        pending.push((dir.join(format!("{}.json", safe(&version))), card.clone()));
+        pending.push(crate::PendingWrite::output(
+            dir.join(format!("{}.json", safe(&version))),
+            card.clone(),
+        ));
         // The pointer is a copy of the card, not a reference to it, so reading
         // `latest` is one read and cannot race with the versioned file moving.
-        pending.push((dir.join("latest.json"), card));
+        pending.push(crate::PendingWrite::output(dir.join("latest.json"), card));
         Ok(format!(
             "model: {} version {} will be registered if this run succeeds",
             spec.name, version
@@ -5691,11 +8463,47 @@ impl DuckdbEngine {
     pub(crate) fn run_pdf_source(
         &self,
         db: &Path,
+        secret_prefix: &str,
         spec: &PdfSourceSpec,
     ) -> Result<String, EngineError> {
         self.check_cancelled()?;
-        let files = expand_pdf_paths(&spec.path, spec.recursive);
-        if files.is_empty() {
+        // #282: the documents are whatever an upstream relation names, or
+        // the configured path when nothing is wired in.
+        //
+        // The upstream list is NOT collected: a corpus of a million rows
+        // would cost memory proportional to the corpus before the first
+        // document was opened. It is counted here and walked in bounded
+        // batches below. A folder listing is bounded by the folder, so that
+        // side stays a plain Vec.
+        let from_upstream = spec.input.from_view.is_some();
+        let local: Vec<String> = if from_upstream {
+            Vec::new()
+        } else {
+            expand_pdf_paths(&spec.path, spec.recursive)
+        };
+        // An upstream that named nothing is a legitimate quiet run - a change
+        // feed with no new documents - and must produce the empty typed
+        // relation rather than an error or a relation of unknown shape.
+        if from_upstream {
+            let view = spec.input.from_view.as_deref().unwrap_or_default();
+            let n = self
+                .run_rows(
+                    Some(db),
+                    &format!(
+                        "{}SELECT count(*) AS n FROM {}",
+                        secret_prefix,
+                        plan::quote_ident(view)
+                    ),
+                )?
+                .first()
+                .and_then(|r| r.get("n").cloned())
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0);
+            if n == 0 {
+                self.pdf_empty_relation(db, spec)?;
+                return Ok(format!("{}pdf: 0 documents to read", crate::UNCHANGED_MARKER));
+            }
+        } else if local.is_empty() {
             return Err(EngineError::Config(format!(
                 "pdf: no .pdf files at {}",
                 spec.path
@@ -5708,10 +8516,36 @@ impl DuckdbEngine {
             _ => JsonLinesWriter::open(&spec.node_id)?,
         };
         let mut count: usize = 0;
-        for file in &files {
+        let mut skipped: usize = 0;
+        let mut handle = |uri: &str,
+                          source_sha: &Option<String>,
+                          upstream_row: &JsonValue|
+         -> Result<(), EngineError> {
             self.check_cancelled()?;
-            let doc = lopdf::Document::load(file)
-                .map_err(|e| EngineError::Query(format!("pdf: open {}: {}", file, e)))?;
+            // A PDF reader SEEKS - the cross-reference table is at the end of
+            // the file - so a remote document has to become a local one. One at
+            // a time, and removed when the guard drops however the parse ended.
+            let spooled = match self.local_copy_of_artifact(&spec.input.auth, uri) {
+                Ok(s) => s,
+                Err(e) if spec.on_error == "skip" => {
+                    eprintln!("duckle: pdf: skipping {uri}: {e}");
+                    skipped += 1;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            let file = &spooled.path.to_string_lossy().to_string();
+            let doc = match lopdf::Document::load(file) {
+                Ok(d) => d,
+                Err(e) if spec.on_error == "skip" => {
+                    eprintln!("duckle: pdf: skipping {uri}: {e}");
+                    skipped += 1;
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!("pdf: open {}: {}", uri, e)))
+                }
+            };
             let pages = doc.get_pages();
             let page_count = pages.len();
 
@@ -5746,14 +8580,31 @@ impl DuckdbEngine {
             // a panic here would take the whole run down rather than failing one
             // stage with a message naming the file.
             let path_owned = file.clone();
+            // "Skip it and carry on" used to cover only the two OPEN failures
+            // above - fetching the bytes, and lopdf parsing the structure - so a
+            // document that opened cleanly and then failed HERE took the whole
+            // run down with it. That is the failure people choose skip for: one
+            // unreadable file among thousands, and by the note above it is also
+            // the likeliest one, since the text extractor panics on malformed
+            // input where lopdf is happy with the structure.
             let texts: Vec<String> =
                 match std::panic::catch_unwind(move || pdf_extract::extract_text_by_pages(&path_owned)) {
                     Ok(Ok(t)) => t,
+                    Ok(Err(e)) if spec.on_error == "skip" => {
+                        eprintln!("duckle: pdf: skipping {uri}: extract text: {e}");
+                        skipped += 1;
+                        return Ok(());
+                    }
                     Ok(Err(e)) => {
                         return Err(EngineError::Query(format!(
                             "pdf: extract text from {}: {}",
                             file, e
                         )))
+                    }
+                    Err(_) if spec.on_error == "skip" => {
+                        eprintln!("duckle: pdf: skipping {uri}: the file is malformed, or uses a feature the text extractor cannot read");
+                        skipped += 1;
+                        return Ok(());
                     }
                     Err(_) => {
                         return Err(EngineError::Query(format!(
@@ -5768,7 +8619,31 @@ impl DuckdbEngine {
                 let text = texts.get(idx).cloned().unwrap_or_default();
                 let mut row = serde_json::Map::new();
                 // Same value src.artifact puts in `uri`, so the two join.
-                row.insert("document_id".into(), JsonValue::String(file.clone()));
+                // The URI, not the spool path: a temp file nobody can look at
+                // afterwards is not provenance. Both names carry it, so a
+                // pipeline joining on `document_id` keeps working.
+                row.insert("document_id".into(), JsonValue::String(uri.to_string()));
+                row.insert("document_uri".into(), JsonValue::String(uri.to_string()));
+                // #282: the business keys that say what this document IS -
+                // company_id, filing_id - live on the artifact row and are lost
+                // the moment pages are emitted instead. Carrying them is what
+                // lets a page be joined back to the thing it came from.
+                for key in &spec.input.carry {
+                    row.insert(
+                        key.clone(),
+                        upstream_row.get(key).cloned().unwrap_or(JsonValue::Null),
+                    );
+                }
+                row.insert(
+                    "source_sha256".into(),
+                    match source_sha {
+                        // Carried from whatever landed the bytes. Absent rather
+                        // than recomputed: re-hashing would describe whatever is
+                        // at that URI now, not what was parsed.
+                        Some(h) => JsonValue::String(h.clone()),
+                        None => JsonValue::Null,
+                    },
+                );
                 row.insert("page_number".into(), JsonValue::from(*page_number as u64));
                 // A page whose text is only whitespace has no usable text layer,
                 // which is the scanned-page case worth routing elsewhere.
@@ -5789,7 +8664,18 @@ impl DuckdbEngine {
                 writer.write_row(&JsonValue::Object(row))?;
                 count += 1;
             }
-        }
+            Ok(())
+        };
+        let seen = if from_upstream {
+            self.for_each_artifact_input(db, secret_prefix, &spec.input, &spec.node_id, |a| {
+                handle(&a.uri, &a.sha256, &a.row)
+            })?
+        } else {
+            for path in &local {
+                handle(path, &None, &JsonValue::Null)?;
+            }
+            local.len()
+        };
         match &spec.declared_schema {
             Some(schema) if !schema.is_empty() => {
                 let (columns_spec, select_list) = xml_declared_columns(schema);
@@ -5798,11 +8684,92 @@ impl DuckdbEngine {
             _ => writer.finalize_into_table(&self.bin, db, &spec.node_id)?,
         }
         Ok(format!(
-            "pdf: materialized {} page(s) from {} file(s) into {}",
+            "pdf: materialized {} page(s) from {} document(s){}",
             count,
-            files.len(),
-            spec.node_id
+            seen - skipped,
+            if skipped > 0 {
+                format!(" ({} skipped as unreadable)", skipped)
+            } else {
+                String::new()
+            }
         ))
+    }
+
+    /// The shape src.pdf always emits, with no rows in it.
+    ///
+    /// A change feed that found no new documents is a quiet success, and a
+    /// downstream stage must see the right columns rather than an error or a
+    /// relation whose shape depends on whether anything arrived.
+    fn pdf_empty_relation(&self, db: &Path, spec: &PdfSourceSpec) -> Result<(), EngineError> {
+        self.run(
+            Some(db),
+            &format!(
+                "CREATE OR REPLACE TABLE {} (document_id VARCHAR, document_uri VARCHAR, source_sha256 VARCHAR, page_number BIGINT, text VARCHAR, has_text_layer BOOLEAN, width DOUBLE, height DOUBLE, metadata JSON)",
+                plan::quote_ident(&spec.node_id)
+            ),
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// One document's text, however it is addressed.
+    ///
+    /// #282: through the shared artifact reader when an upstream relation
+    /// named it, which signs S3 reads and reuses the proxy- and CA-aware
+    /// agent. HTML needs the whole DOM built anyway, so unlike XML there is
+    /// nothing here that streaming would save.
+    fn html_text(
+        &self,
+        spec: &HtmlSourceSpec,
+        uri: &str,
+        from_upstream: bool,
+    ) -> Result<String, EngineError> {
+        if from_upstream {
+            let mut reader = self.open_artifact(&spec.input.auth, uri)?;
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut buf)
+                .map_err(|e| EngineError::Query(format!("html: read {uri}: {e}")))?;
+            return Ok(String::from_utf8_lossy(&buf).into_owned());
+        }
+        let lower = uri.to_ascii_lowercase();
+        let html = if lower.starts_with("http://") || lower.starts_with("https://") {
+            let agent = match &spec.transport {
+                Some(t) => crate::tls::http_agent_with(t),
+                None => crate::tls::http_agent(),
+            };
+            let mut req = agent.get(uri);
+            for (k, v) in &spec.headers {
+                req = req.set(k, v);
+            }
+            match req.call() {
+                Ok(r) => r
+                    .into_string()
+                    .map_err(|e| EngineError::Query(format!("html: read {}: {}", uri, e)))?,
+                Err(ureq::Error::Status(code, r)) => {
+                    let body = r.into_string().unwrap_or_default();
+                    return Err(EngineError::Query(format!(
+                        "html: HTTP {} from {}: {}",
+                        code,
+                        uri,
+                        body.chars().take(300).collect::<String>()
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!(
+                        "html: HTTP transport to {}: {}",
+                        uri, e
+                    )))
+                }
+            }
+        } else {
+            // Lossy rather than strict: plenty of real pages are still served
+            // as latin-1, and a replacement character in one cell beats
+            // refusing to read the document at all.
+            let bytes = std::fs::read(uri)
+                .map_err(|e| EngineError::Query(format!("html: read {}: {}", uri, e)))?;
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        Ok(html)
     }
 
     /// src.html: rows out of an HTML page, by CSS selector (#255).
@@ -5822,44 +8789,9 @@ impl DuckdbEngine {
         spec: &HtmlSourceSpec,
     ) -> Result<String, EngineError> {
         self.check_cancelled()?;
-        let lower = spec.path.to_ascii_lowercase();
-        let html = if lower.starts_with("http://") || lower.starts_with("https://") {
-            let agent = match &spec.transport {
-                Some(t) => crate::tls::http_agent_with(t),
-                None => crate::tls::http_agent(),
-            };
-            let mut req = agent.get(&spec.path);
-            for (k, v) in &spec.headers {
-                req = req.set(k, v);
-            }
-            match req.call() {
-                Ok(r) => r
-                    .into_string()
-                    .map_err(|e| EngineError::Query(format!("html: read {}: {}", spec.path, e)))?,
-                Err(ureq::Error::Status(code, r)) => {
-                    let body = r.into_string().unwrap_or_default();
-                    return Err(EngineError::Query(format!(
-                        "html: HTTP {} from {}: {}",
-                        code,
-                        spec.path,
-                        body.chars().take(300).collect::<String>()
-                    )));
-                }
-                Err(e) => {
-                    return Err(EngineError::Query(format!(
-                        "html: HTTP transport to {}: {}",
-                        spec.path, e
-                    )))
-                }
-            }
-        } else {
-            // Lossy rather than strict: plenty of real pages are still served
-            // as latin-1, and a replacement character in one cell beats
-            // refusing to read the document at all.
-            let bytes = std::fs::read(&spec.path)
-                .map_err(|e| EngineError::Query(format!("html: read {}: {}", spec.path, e)))?;
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
+        // #282: the pages are whatever an upstream artifact relation names,
+        // or the configured path when nothing is wired in.
+        let from_upstream = spec.input.from_view.is_some();
 
         let compile = |sel: &str| -> Result<dom_query::Matcher, EngineError> {
             dom_query::Matcher::new(sel).map_err(|_| {
@@ -5867,6 +8799,12 @@ impl DuckdbEngine {
             })
         };
         let row_matcher = compile(&spec.row_selector)?;
+        // #255: compiled once, and compiled EARLY - a bad selector should be a
+        // configuration error before the first request, not after it.
+        let next_matcher = match spec.next_page_selector.trim() {
+            "" => None,
+            sel => Some(compile(sel)?),
+        };
         let mut col_matchers: Vec<Option<dom_query::Matcher>> = Vec::with_capacity(spec.columns.len());
         for c in &spec.columns {
             col_matchers.push(if c.selector.is_empty() {
@@ -5875,8 +8813,6 @@ impl DuckdbEngine {
                 Some(compile(&c.selector)?)
             });
         }
-
-        let doc = dom_query::Document::from(html);
         let mut writer = match &spec.declared_schema {
             Some(schema) if !schema.is_empty() => {
                 JsonLinesWriter::open_with_schema(&spec.node_id, Some(schema.clone()))?
@@ -5886,83 +8822,241 @@ impl DuckdbEngine {
         let mut count: usize = 0;
         let clean = |t: String| t.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        if spec.columns.is_empty() {
-            // Table mode: the row selector names a table, its header cells name
-            // the columns, and each body row is a row. This is the shape most
-            // "the data is only published as an HTML table" pages have, and
-            // making the user write a selector per column for it would be busy
-            // work.
-            let th = compile("th")?;
-            let td = compile("td")?;
-            let tr = compile("tr")?;
-            for table in doc.select_matcher(&row_matcher).iter() {
-                let headers: Vec<String> = table
-                    .select_matcher(&th)
-                    .iter()
-                    .map(|h| clean(h.text().to_string()))
-                    .collect();
-                for (ri, row) in table.select_matcher(&tr).iter().enumerate() {
-                    self.check_cancelled()?;
-                    let cells: Vec<String> = row
-                        .select_matcher(&td)
+        // The business keys that say what a page IS live on the artifact row
+        // and are lost the moment extracted rows come out instead. Nothing is
+        // added on the single-document route, so that shape is unchanged.
+        let decorate = |obj: &mut serde_json::Map<String, JsonValue>,
+                        uri: &str,
+                        source_sha: &Option<String>,
+                        upstream_row: &JsonValue,
+                        capture: &Option<(String, String)>| {
+            // #260: the archived page this row was parsed out of. Stamped
+            // before the upstream-only fields, because a capture happens on the
+            // configured-path route too - which is the route this was asked for.
+            if let Some((cap_uri, cap_sha)) = capture {
+                obj.insert("_response_uri".into(), JsonValue::String(cap_uri.clone()));
+                obj.insert("_response_sha256".into(), JsonValue::String(cap_sha.clone()));
+            }
+            if !from_upstream {
+                return;
+            }
+            for key in &spec.input.carry {
+                obj.insert(
+                    key.clone(),
+                    upstream_row.get(key).cloned().unwrap_or(JsonValue::Null),
+                );
+            }
+            obj.insert("source_uri".into(), JsonValue::String(uri.to_string()));
+            obj.insert(
+                "source_sha256".into(),
+                match source_sha {
+                    // Carried, never recomputed: re-hashing would describe
+                    // whatever is at that URI now, not what was parsed.
+                    Some(h) => JsonValue::String(h.clone()),
+                    None => JsonValue::Null,
+                },
+            );
+        };
+        let mut skipped: usize = 0;
+        // #255: a pagination walk that stopped early rather than finished.
+        // The next link lives ON the page, so a page that failed does not
+        // lose one page - it loses every page after it, and the walk ends.
+        let mut walk_cut_short: Option<&'static str> = None;
+
+        // One body, two drivers. The corpus walks it in bounded batches so
+        // the artifact list never lands in memory whole; a configured path
+        // with nothing wired in calls it exactly once.
+        // #255: the returned value is the NEXT page's URL, when this page named
+        // one. Reported from here rather than found by the caller, because only
+        // this scope has the parsed document.
+        let mut handle = |uri: &str,
+                          source_sha: &Option<String>,
+                          upstream_row: &JsonValue|
+         -> Result<Option<String>, EngineError> {
+            self.check_cancelled()?;
+            let html = match self.html_text(spec, uri, from_upstream) {
+                Ok(h) => h,
+                Err(e) if spec.on_error == "skip" => {
+                    eprintln!("duckle: html: skipping {uri}: {e}");
+                    skipped += 1;
+                    // Skipping a document in a corpus loses that document and
+                    // nothing else. Skipping a page in a CHAIN loses the rest
+                    // of the chain, because the link to it was on this page.
+                    if !from_upstream && next_matcher.is_some() {
+                        walk_cut_short = Some("pagination:page-failed");
+                    }
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            // #260: archive the exact bytes that are about to be parsed, and do
+            // it BEFORE parsing so no extracted row can exist without its
+            // source being durable. html_text fetched once, so this is the same
+            // response the parser sees - not a second request that might return
+            // something else.
+            let capture: Option<(String, String)> =
+                if spec.raw_response_destination.trim().is_empty() {
+                    None
+                } else {
+                    let sha = {
+                        use sha2::{Digest, Sha256};
+                        let mut h = Sha256::new();
+                        h.update(html.as_bytes());
+                        h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    };
+                    let dest = spec
+                        .raw_response_destination
+                        .replace("{sha256}", &sha)
+                        .replace("{date}", &chrono::Utc::now().format("%Y-%m-%d").to_string());
+                    self.capture_raw_response(&spec.input.auth, &dest, html.as_bytes())?;
+                    Some((dest, sha))
+                };
+            let doc = dom_query::Document::from(html);
+            if spec.columns.is_empty() {
+                // Table mode: the row selector names a table, its header cells name
+                // the columns, and each body row is a row. This is the shape most
+                // "the data is only published as an HTML table" pages have, and
+                // making the user write a selector per column for it would be busy
+                // work.
+                let th = compile("th")?;
+                let td = compile("td")?;
+                let tr = compile("tr")?;
+                for table in doc.select_matcher(&row_matcher).iter() {
+                    let headers: Vec<String> = table
+                        .select_matcher(&th)
                         .iter()
-                        .map(|c| clean(c.text().to_string()))
+                        .map(|h| clean(h.text().to_string()))
                         .collect();
-                    // The header row itself has no td cells; skip it rather than
-                    // emitting a row of nulls.
-                    if cells.is_empty() {
-                        continue;
+                    for (ri, row) in table.select_matcher(&tr).iter().enumerate() {
+                        self.check_cancelled()?;
+                        let cells: Vec<String> = row
+                            .select_matcher(&td)
+                            .iter()
+                            .map(|c| clean(c.text().to_string()))
+                            .collect();
+                        // The header row itself has no td cells; skip it rather than
+                        // emitting a row of nulls.
+                        if cells.is_empty() {
+                            continue;
+                        }
+                        let mut obj = serde_json::Map::new();
+                        for (i, cell) in cells.iter().enumerate() {
+                            let name = headers
+                                .get(i)
+                                .filter(|h| !h.is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| format!("column_{}", i + 1));
+                            obj.insert(name, JsonValue::String(cell.clone()));
+                        }
+                        let _ = ri;
+                        decorate(&mut obj, uri, source_sha, upstream_row, &capture);
+                        writer.write_row(&JsonValue::Object(obj))?;
+                        count += 1;
                     }
+                }
+            } else {
+                for row in doc.select_matcher(&row_matcher).iter() {
+                    self.check_cancelled()?;
                     let mut obj = serde_json::Map::new();
-                    for (i, cell) in cells.iter().enumerate() {
-                        let name = headers
-                            .get(i)
-                            .filter(|h| !h.is_empty())
-                            .cloned()
-                            .unwrap_or_else(|| format!("column_{}", i + 1));
-                        obj.insert(name, JsonValue::String(cell.clone()));
+                    for (col, matcher) in spec.columns.iter().zip(col_matchers.iter()) {
+                        // An empty selector means the row element itself, which is
+                        // how you read an attribute off the matched element.
+                        let value = match matcher {
+                            None => match &col.attr {
+                                Some(a) => row.attr(a).map(|v| v.to_string()),
+                                None => Some(row.text().to_string()),
+                            },
+                            Some(m) => {
+                                let found = row.select_matcher(m);
+                                if found.is_empty() {
+                                    None
+                                } else {
+                                    match &col.attr {
+                                        Some(a) => found.attr(a).map(|v| v.to_string()),
+                                        None => Some(found.text().to_string()),
+                                    }
+                                }
+                            }
+                        };
+                        // A column that did not match is NULL, not an empty string:
+                        // a missing price and a blank price are different facts.
+                        obj.insert(
+                            col.name.clone(),
+                            match value {
+                                Some(v) => JsonValue::String(clean(v)),
+                                None => JsonValue::Null,
+                            },
+                        );
                     }
-                    let _ = ri;
+                    decorate(&mut obj, uri, source_sha, upstream_row, &capture);
                     writer.write_row(&JsonValue::Object(obj))?;
                     count += 1;
                 }
             }
-        } else {
-            for row in doc.select_matcher(&row_matcher).iter() {
-                self.check_cancelled()?;
-                let mut obj = serde_json::Map::new();
-                for (col, matcher) in spec.columns.iter().zip(col_matchers.iter()) {
-                    // An empty selector means the row element itself, which is
-                    // how you read an attribute off the matched element.
-                    let value = match matcher {
-                        None => match &col.attr {
-                            Some(a) => row.attr(a).map(|v| v.to_string()),
-                            None => Some(row.text().to_string()),
-                        },
-                        Some(m) => {
-                            let found = row.select_matcher(m);
-                            if found.is_empty() {
-                                None
-                            } else {
-                                match &col.attr {
-                                    Some(a) => found.attr(a).map(|v| v.to_string()),
-                                    None => Some(found.text().to_string()),
-                                }
-                            }
-                        }
-                    };
-                    // A column that did not match is NULL, not an empty string:
-                    // a missing price and a blank price are different facts.
-                    obj.insert(
-                        col.name.clone(),
-                        match value {
-                            Some(v) => JsonValue::String(clean(v)),
-                            None => JsonValue::Null,
-                        },
-                    );
+            // #255: where the next page is, if this one says. Resolved
+            // against <base href> when the document sets one and against
+            // this page otherwise, which is what a browser does - a bare
+            // `?p=2` means the same document with a different query.
+            let next = match (&next_matcher, from_upstream) {
+                // A corpus already names every document it wants; following
+                // links out of one would fetch pages nobody listed.
+                (_, true) => None,
+                (None, _) => None,
+                (Some(m), false) => {
+                    let base = doc
+                        .select("base[href]")
+                        .iter()
+                        .next()
+                        .and_then(|b| b.attr("href").map(|v| v.to_string()))
+                        .and_then(|href| crate::util::resolve_url(uri, &href))
+                        .unwrap_or_else(|| uri.to_string());
+                    doc.select_matcher(m)
+                        .iter()
+                        .next()
+                        .and_then(|el| el.attr(&spec.next_page_attribute).map(|v| v.to_string()))
+                        .and_then(|href| crate::util::resolve_url(&base, &href))
                 }
-                writer.write_row(&JsonValue::Object(obj))?;
-                count += 1;
+            };
+            Ok(next)
+        };
+        if from_upstream {
+            self.for_each_artifact_input(db, "", &spec.input, &spec.node_id, |a| {
+                handle(&a.uri, &a.sha256, &a.row).map(|_| ())
+            })?;
+        } else {
+            // #255: server-rendered pagination. Follow the link this page
+            // names, then the one that page names, until there is none.
+            //
+            // Bounded three ways, because a pagination link is written by
+            // someone else: a hard page cap, a stop when the link does not
+            // move, and a stop when a URL repeats. The last one matters most
+            // - a 'next' that points back at page 1 is a cycle, not a long
+            // list, and without it the run never ends.
+            let mut url = spec.path.clone();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut pages: u64 = 0;
+            loop {
+                seen.insert(url.clone());
+                pages += 1;
+                let next = handle(&url, &None, &JsonValue::Null)?;
+                let Some(next) = next else { break };
+                if pages >= spec.max_pages {
+                    // Said out loud: a truncated result that looks complete
+                    // is worse than one that says it stopped.
+                    eprintln!(
+                        "duckle: html: stopped at the {}-page limit with more pages to follow ({})",
+                        spec.max_pages, next
+                    );
+                    // A cap reached with a link still to follow is the same
+                    // thing as a failure mid-walk: rows that are correct, and
+                    // are not all of them.
+                    walk_cut_short = Some("pagination:maxPages");
+                    break;
+                }
+                if !seen.insert(next.clone()) {
+                    break;
+                }
+                url = next;
             }
         }
 
@@ -5981,6 +9075,7 @@ impl DuckdbEngine {
                     .columns
                     .iter()
                     .map(|c| duckle_metadata::Column {
+                        tags: Vec::new(),
                         name: c.name.clone(),
                         data_type: duckle_metadata::DataType::String,
                         nullable: true,
@@ -5993,9 +9088,28 @@ impl DuckdbEngine {
             }
             _ => writer.finalize_into_table(&self.bin, db, &spec.node_id)?,
         }
+        // #255 + #258: rows that are correct and are not all of them. Says so,
+        // and stops anything downstream from publishing a partial chain as if
+        // it were the whole thing.
+        if let Some(reason) = walk_cut_short {
+            return Ok(format!(
+                "{}{} html: the page walk stopped early, so these {} row(s) are not the whole                  result",
+                crate::INCOMPLETE_MARKER,
+                reason,
+                count
+            ));
+        }
         Ok(format!(
-            "html: materialized {} rows into {}",
-            count, spec.node_id
+            "html: materialized {} rows into {}{}",
+            count,
+            spec.node_id,
+            if skipped > 0 {
+                // Named, not silent: a corpus that quietly lost pages is the
+                // failure this contract exists to make visible.
+                format!(" ({} page(s) skipped)", skipped)
+            } else {
+                String::new()
+            }
         ))
     }
 
@@ -6005,19 +9119,152 @@ impl DuckdbEngine {
     /// keys, text content goes to "_text" (or the value directly if
     /// the element has no children), nested elements nest naturally
     /// and convert to arrays when the same tag repeats.
+    /// #286: read an XSD and turn it into a declared schema.
+    ///
+    /// Local path or `http(s)://` - the same two the XML source itself takes
+    /// for a single document. A schema file is small and is read whole, unlike
+    /// the data it describes.
+    fn derive_schema_from_xsd(
+        &self,
+        xsd_path: &str,
+        row_path: &str,
+        node_id: &str,
+        change_policy: &str,
+        artifacts: &mut Vec<crate::ArtifactRef>,
+    ) -> Result<Vec<duckle_metadata::Column>, EngineError> {
+        let path = xsd_path.trim();
+        let text = if path.starts_with("http://") || path.starts_with("https://") {
+            let agent = crate::tls::http_agent();
+            agent
+                .get(path)
+                .call()
+                .map_err(|e| EngineError::Config(format!("xsd: fetch {path}: {e}")))?
+                .into_string()
+                .map_err(|e| EngineError::Config(format!("xsd: read {path}: {e}")))?
+        } else {
+            std::fs::read_to_string(path)
+                .map_err(|e| EngineError::Config(format!("xsd: read {path}: {e}")))?
+        };
+        // #286: a schema may pull in others. Reading them is this function's
+        // job rather than the parser's, because only here is it known what may
+        // be read: a local set is confined to the root schema's own directory,
+        // and a remote one goes through the shared agent, which is where the
+        // workspace network policy is enforced.
+        let base = path.replace('\\', "/");
+        let remote_root = base.starts_with("http://") || base.starts_with("https://");
+        let root_dir = if remote_root {
+            String::new()
+        } else {
+            match base.rfind('/') {
+                Some(i) => base[..i].to_string(),
+                None => ".".to_string(),
+            }
+        };
+        let mut fetched: Vec<(String, String)> = Vec::new();
+        let cols = {
+            let mut load = |loc: &str| -> Result<String, String> {
+                let child_remote = loc.starts_with("http://") || loc.starts_with("https://");
+                if child_remote && !remote_root {
+                    // A schema set that lives on disk must not reach the
+                    // network because one of its files said so. That is the
+                    // unpinned fetch nobody asked for.
+                    return Err(format!(
+                        "{loc} is remote, but the schema it is imported from is a local file. A                          local schema set is not allowed to fetch over the network. Point at a                          local copy of it."
+                    ));
+                }
+                let text = if child_remote {
+                    let agent = crate::tls::http_agent();
+                    agent
+                        .get(loc)
+                        .call()
+                        .map_err(|e| format!("fetch {loc}: {e}"))?
+                        .into_string()
+                        .map_err(|e| format!("read {loc}: {e}"))?
+                } else {
+                    if !crate::xsd::inside_root(&root_dir, loc) {
+                        return Err(format!(
+                            "{loc} is outside the schema root {root_dir}, so it was not read"
+                        ));
+                    }
+                    std::fs::read_to_string(loc).map_err(|e| format!("read {loc}: {e}"))?
+                };
+                fetched.push((loc.to_string(), text.clone()));
+                Ok(text)
+            };
+            let (cols, _loaded) =
+                crate::xsd::derive_resolved(&text, row_path, &base, &mut load)?;
+            cols
+        };
+        // #286: a configured path can stay the same while the bytes behind it
+        // change, and the derived column types change with them. Recording the
+        // path alone would say nothing about which schema this run actually
+        // used, so the HASH of the bytes goes into the signed manifest through
+        // the same artifact channel every other input uses. Every imported
+        // document is recorded the same way, because a change to any of them
+        // changes the derived columns just as much as a change to the root.
+        let sha = |t: &str| -> String {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(t.as_bytes());
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        };
+
+        // #315: the manifest records what a run USED, which is only ever read
+        // after the data is out. The whole resolved set is a parser contract,
+        // so check it against the accepted one BEFORE anything is parsed with
+        // it. Checked here rather than in the parser because only this side
+        // knows every document that was actually loaded.
+        let mut contract: Vec<(String, String)> = vec![(base.clone(), sha(&text))];
+        for (location, body) in &fetched {
+            contract.push((location.clone(), sha(body)));
+        }
+        check_xsd_contract(&base, &xsd_contract_fingerprint(&contract), change_policy)?;
+        artifacts.push(crate::ArtifactRef {
+            node: node_id.to_string(),
+            role: "input".into(),
+            uri: path.to_string(),
+            name: Some("xsd".into()),
+            media_type: Some("application/xml".into()),
+            size_bytes: Some(text.len() as i64),
+            sha256: Some(sha(&text)),
+            etag: None,
+            modified_at: None,
+        });
+        for (loc, body) in &fetched {
+            artifacts.push(crate::ArtifactRef {
+                node: node_id.to_string(),
+                role: "input".into(),
+                uri: loc.clone(),
+                name: Some("xsd-import".into()),
+                media_type: Some("application/xml".into()),
+                size_bytes: Some(body.len() as i64),
+                sha256: Some(sha(body)),
+                etag: None,
+                modified_at: None,
+            });
+        }
+        Ok(cols)
+    }
+
     pub(crate) fn run_xml_source(
         &self,
         db: &Path,
         spec: &XmlSourceSpec,
+        artifacts: &mut Vec<crate::ArtifactRef>,
     ) -> Result<String, EngineError> {
         use std::io::{BufReader, Read, Seek};
-        // Cloud object stores would need a signed streaming GET we don't have for
-        // XML yet (DuckDB's httpfs can't parse XML); fail early with a pointer
-        // rather than opening a temp file we'd leak.
+        // #282: the documents are whatever an upstream relation names, or
+        // the configured path when nothing is wired in.
+        let from_upstream = spec.input.from_view.is_some();
+        // Object storage on the CONFIGURED PATH still has no signed streaming
+        // GET here (DuckDB's httpfs cannot parse XML), so it fails early with a
+        // pointer rather than opening a temp file we would leak. Reached through
+        // an upstream artifact relation it works, because that route goes
+        // through open_artifact, which does sign S3 reads (#282).
         let lower = spec.path.to_ascii_lowercase();
         if let Some(scheme) = ["s3://", "gs://", "gcs://", "az://", "azure://"]
             .iter()
-            .find(|s| lower.starts_with(**s))
+            .find(|s| !from_upstream && lower.starts_with(**s))
         {
             return Err(EngineError::Config(format!(
                 "xml: {} object storage is not supported for src.xml yet; use an https:// or sftp:// URL, or download the file to a local path",
@@ -6026,14 +9273,121 @@ impl DuckdbEngine {
         }
 
         // A declared schema pins the output to exactly those columns and types.
-        let mut writer = match &spec.declared_schema {
+        //
+        // #283: it also turns on bounded materialization. Without it every
+        // parsed row goes to one NDJSON file that grows to the size of the whole
+        // result, and NDJSON repeats every property name on every row - so a
+        // 30 GB compressed source can put hundreds of gigabytes on the temp
+        // volume. With it, the text is rolled to a compressed Parquet part every
+        // `spec.batch_rows` rows and the NDJSON only ever holds the tail.
+        // #286: a published XSD already says what the feed contains, so a
+        // deeply nested schema does not have to be retyped by hand. Only
+        // consulted when the Schema tab is empty - a hand-written schema wins,
+        // because the person who typed it may know something the XSD does not.
+        let declared_schema: Option<Vec<duckle_metadata::Column>> =
+            match spec.declared_schema.as_ref().filter(|s| !s.is_empty()) {
+                Some(s) => Some(s.clone()),
+                None if !spec.xsd_path.trim().is_empty() => Some(self.derive_schema_from_xsd(
+                    &spec.xsd_path,
+                    &spec.row_path,
+                    &spec.node_id,
+                    &spec.xsd_change_policy,
+                    artifacts,
+                )?),
+                None => None,
+            };
+        let mut writer = match &declared_schema {
             Some(schema) if !schema.is_empty() => {
+                let (columns_spec, _) = xml_declared_columns(schema);
                 JsonLinesWriter::open_with_schema(&spec.node_id, Some(schema.clone()))?
+                    .spilling_every(&self.bin, db, &columns_spec, spec.batch_rows)?
             }
             _ => JsonLinesWriter::open(&spec.node_id)?,
         };
         let mut count: usize = 0;
-        {
+        let mut skipped: usize = 0;
+        if from_upstream {
+            // #282: a CORPUS rather than one document.
+            //
+            // Streamed straight out of the artifact reader. The pull parser
+            // never seeks, so spooling each document to disk first would buy
+            // nothing and cost a full local copy of every one of them.
+            //
+            // The writer is shared across all of them on purpose: the
+            // bounded-parts machinery from #283 then bounds the WHOLE corpus
+            // rather than each file, so a million small documents cannot do
+            // what one huge document already could not.
+            self.for_each_artifact_input(db, "", &spec.input, &spec.node_id, |artifact| {
+                let (uri, source_sha, upstream_row) =
+                    (&artifact.uri, &artifact.sha256, &artifact.row);
+                self.check_cancelled()?;
+                let mut emit = |row: &JsonValue| -> Result<(), EngineError> {
+                    let mut obj = match row {
+                        JsonValue::Object(o) => o.clone(),
+                        other => {
+                            let mut m = serde_json::Map::new();
+                            m.insert("value".into(), other.clone());
+                            m
+                        }
+                    };
+                    // The business keys that say what a document IS live on
+                    // the artifact row and are lost the moment rows are
+                    // emitted instead. Carrying them is what lets a row be
+                    // joined back to the document it came from.
+                    for key in &spec.input.carry {
+                        obj.insert(
+                            key.clone(),
+                            upstream_row.get(key).cloned().unwrap_or(JsonValue::Null),
+                        );
+                    }
+                    obj.insert("source_uri".into(), JsonValue::String(uri.clone()));
+                    obj.insert(
+                        "source_sha256".into(),
+                        match source_sha {
+                            // Carried from whatever landed the bytes, never
+                            // recomputed: re-hashing would describe whatever
+                            // is at that URI now, not what was parsed.
+                            Some(h) => JsonValue::String(h.clone()),
+                            None => JsonValue::Null,
+                        },
+                    );
+                    writer.write_row(&JsonValue::Object(obj))?;
+                    count += 1;
+                    Ok(())
+                };
+                if uri.to_ascii_lowercase().ends_with(".zip") {
+                    return Err(EngineError::Config(format!(
+                        concat!(
+                            "xml: {} is a zip, and a zip directory is at the END of ",
+                            "the file, so it cannot be streamed. Put xf.archive.extract ",
+                            "in front of this node to unpack it into artifacts, and ",
+                            "parse those."
+                        ),
+                        uri
+                    )));
+                }
+                let opened = match self.open_artifact(&spec.input.auth, uri) {
+                    Ok(r) => Some(r),
+                    Err(e) if spec.on_error == "skip" => {
+                        eprintln!("duckle: xml: skipping {uri}: {e}");
+                        skipped += 1;
+                        None
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(reader) = opened {
+                    match stream_remote_xml(reader, &spec.row_path, &self.cancel, &mut emit) {
+                        Ok(()) => {}
+                        Err(e) if spec.on_error == "skip" => {
+                            eprintln!("duckle: xml: skipping {uri}: {e}");
+                            skipped += 1;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })?;
+        } else {
             let mut emit = |row: &JsonValue| -> Result<(), EngineError> {
                 writer.write_row(row)?;
                 count += 1;
@@ -6115,16 +9469,34 @@ impl DuckdbEngine {
                 }
             }
         }
-        match &spec.declared_schema {
+        let parts = match &declared_schema {
             Some(schema) if !schema.is_empty() => {
                 let (columns_spec, select_list) = xml_declared_columns(schema);
-                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?;
+                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?
             }
-            _ => writer.finalize_into_table(&self.bin, db, &spec.node_id)?,
-        }
+            _ => {
+                writer.finalize_into_table(&self.bin, db, &spec.node_id)?;
+                0
+            }
+        };
         Ok(format!(
-            "xml: materialized {} rows into {}",
-            count, spec.node_id
+            "xml: materialized {} rows into {}{}{}",
+            count,
+            spec.node_id,
+            if skipped > 0 {
+                // Named, not silent: a corpus that quietly lost documents is
+                // the failure this whole contract exists to make visible.
+                format!(" ({} document(s) skipped)", skipped)
+            } else {
+                String::new()
+            },
+            // #283: how many bounded parts it took. The number is the whole
+            // point - it says the intermediate never held the full result.
+            if parts > 0 {
+                format!(" ({} bounded part(s))", parts)
+            } else {
+                String::new()
+            }
         ))
     }
 
@@ -6730,7 +10102,7 @@ impl DuckdbEngine {
                 .resolve(&schema)
                 .map_err(|e| EngineError::Query(format!("avro: encode row: {}", e)))?;
             writer
-                .append(value)
+                .append_value(value)
                 .map_err(|e| EngineError::Query(format!("avro: append: {}", e)))?;
             total += 1;
         }
@@ -6905,6 +10277,25 @@ impl DuckdbEngine {
         ))
     }
 
+    /// The trailing arguments both `src.git` modes share: which revision to
+    /// read, and an optional path filter.
+    ///
+    /// `--end-of-options` is load-bearing, not tidiness. The revision is an
+    /// ordinary node property, and git reads a leading `-` as an option: a
+    /// revision of `--output=<path>` made `git log` write its output to that
+    /// path and exit 0, so the node reported success while writing a file
+    /// nobody asked for. The path filter was already protected by `--`; the
+    /// revision cannot use `--` because it has to precede it, and this is the
+    /// separator git provides for that position.
+    fn git_revision_args(spec: &GitSourceSpec) -> Vec<String> {
+        let mut args = vec!["--end-of-options".to_string(), spec.revision.clone()];
+        if let Some(p) = &spec.path_filter {
+            args.push("--".to_string());
+            args.push(p.clone());
+        }
+        args
+    }
+
     /// Local git repo reader. Shells out to the system `git` CLI -
     /// no libgit2 dependency, no extra Rust crate. mode=log captures
     /// commit history as one row per commit; mode=files captures the
@@ -6931,10 +10322,7 @@ impl DuckdbEngine {
                     .arg(&max)
                     .arg("--date=iso-strict")
                     .arg("--pretty=format:%H%x09%h%x09%an%x09%ae%x09%ad%x09%s")
-                    .arg(&spec.revision);
-                if let Some(p) = &spec.path_filter {
-                    cmd.arg("--").arg(p);
-                }
+                    .args(Self::git_revision_args(spec));
                 let out = cmd
                     .output()
                     .map_err(|e| EngineError::Query(format!("git log: spawn: {}", e)))?;
@@ -6960,10 +10348,7 @@ impl DuckdbEngine {
                     .arg("-r")
                     .arg("-z")
                     .arg("--long")
-                    .arg(&spec.revision);
-                if let Some(p) = &spec.path_filter {
-                    cmd.arg("--").arg(p);
-                }
+                    .args(Self::git_revision_args(spec));
                 let out = cmd
                     .output()
                     .map_err(|e| EngineError::Query(format!("git ls-tree: spawn: {}", e)))?;
@@ -7549,23 +10934,27 @@ impl DuckdbEngine {
         // server key; without one, accept on trust (trust-on-first-use).
         struct Verifier {
             expected: Option<String>,
+            hostport: String,
+            /// Why the key was refused. russh turns a `false` into a bare
+            /// "unknown key", which tells the user nothing about what changed
+            /// or what to do, so the reason is carried out this way.
+            refused: std::sync::Arc<std::sync::Mutex<Option<String>>>,
         }
         impl russh::client::Handler for Verifier {
             type Error = russh::Error;
             async fn check_server_key(
                 &mut self,
-                server_public_key: &russh::keys::ssh_key::PublicKey,
+                server_public_key: &russh::keys::PublicKeyOrCertificate,
             ) -> Result<bool, Self::Error> {
-                match &self.expected {
-                    None => Ok(true),
-                    Some(want) => {
-                        let got = server_public_key
-                            .fingerprint(russh::keys::HashAlg::Sha256)
-                            .to_string();
-                        // Compare case-sensitively but tolerant of the
-                        // "SHA256:" prefix on either side.
-                        let norm = |s: &str| s.trim().trim_start_matches("SHA256:").to_string();
-                        Ok(norm(&got) == norm(want))
+                match verify_sftp_host_key(
+                    server_public_key,
+                    self.expected.as_deref(),
+                    &self.hostport,
+                ) {
+                    Ok(()) => Ok(true),
+                    Err(why) => {
+                        *self.refused.lock().unwrap() = Some(why);
+                        Ok(false)
                     }
                 }
             }
@@ -7581,13 +10970,19 @@ impl DuckdbEngine {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
             let config = std::sync::Arc::new(russh::client::Config::default());
+            let refused = std::sync::Arc::new(std::sync::Mutex::new(None));
             let handler = Verifier {
                 expected: spec.host_fingerprint.clone(),
+                hostport: format!("{}:{}", spec.host, spec.port),
+                refused: refused.clone(),
             };
             let mut session =
                 russh::client::connect(config, (spec.host.as_str(), spec.port), handler)
                     .await
-                    .map_err(|e| format!("connect {}:{}: {}", spec.host, spec.port, e))?;
+                    .map_err(|e| match refused.lock().unwrap().take() {
+                        Some(why) => why,
+                        None => format!("connect {}:{}: {}", spec.host, spec.port, e),
+                    })?;
 
             // Auth: a private key wins over a password if both are present.
             let authed = if let Some(pem) = &spec.private_key {
@@ -7804,21 +11199,27 @@ impl DuckdbEngine {
         // server key; without one, accept on trust (trust-on-first-use).
         struct Verifier {
             expected: Option<String>,
+            hostport: String,
+            /// Why the key was refused. russh turns a `false` into a bare
+            /// "unknown key", which tells the user nothing about what changed
+            /// or what to do, so the reason is carried out this way.
+            refused: std::sync::Arc<std::sync::Mutex<Option<String>>>,
         }
         impl russh::client::Handler for Verifier {
             type Error = russh::Error;
             async fn check_server_key(
                 &mut self,
-                server_public_key: &russh::keys::ssh_key::PublicKey,
+                server_public_key: &russh::keys::PublicKeyOrCertificate,
             ) -> Result<bool, Self::Error> {
-                match &self.expected {
-                    None => Ok(true),
-                    Some(want) => {
-                        let got = server_public_key
-                            .fingerprint(russh::keys::HashAlg::Sha256)
-                            .to_string();
-                        let norm = |s: &str| s.trim().trim_start_matches("SHA256:").to_string();
-                        Ok(norm(&got) == norm(want))
+                match verify_sftp_host_key(
+                    server_public_key,
+                    self.expected.as_deref(),
+                    &self.hostport,
+                ) {
+                    Ok(()) => Ok(true),
+                    Err(why) => {
+                        *self.refused.lock().unwrap() = Some(why);
+                        Ok(false)
                     }
                 }
             }
@@ -7844,13 +11245,19 @@ impl DuckdbEngine {
                 use tokio::io::AsyncWriteExt;
 
                 let config = std::sync::Arc::new(russh::client::Config::default());
+                let refused = std::sync::Arc::new(std::sync::Mutex::new(None));
                 let handler = Verifier {
                     expected: spec.host_fingerprint.clone(),
+                    hostport: format!("{}:{}", spec.host, spec.port),
+                    refused: refused.clone(),
                 };
                 let mut session =
                     russh::client::connect(config, (spec.host.as_str(), spec.port), handler)
                         .await
-                        .map_err(|e| format!("connect {}:{}: {}", spec.host, spec.port, e))?;
+                        .map_err(|e| match refused.lock().unwrap().take() {
+                            Some(why) => why,
+                            None => format!("connect {}:{}: {}", spec.host, spec.port, e),
+                        })?;
 
                 let authed = if let Some(pem) = &spec.private_key {
                     let key = russh::keys::decode_secret_key(pem, spec.key_passphrase.as_deref())
@@ -7987,21 +11394,43 @@ impl DuckdbEngine {
     /// retry in the engine is per stage, which re-sends the whole dataset from
     /// row 0. Transport errors are deliberately not retried, so a wrong host
     /// still fails as fast as it always did.
+    /// Send one request, retrying 429 and 5xx, under an optional ceiling.
+    ///
+    /// `Ok(None)` means the budget stopped it BEFORE anything was sent. That is
+    /// not an error and must not be turned into one: the rows already bought
+    /// are correct and paid for, and the caller reports an incomplete stage.
+    ///
+    /// The slot is claimed before the first attempt and not re-claimed per
+    /// retry: a retry is the same purchase, and charging the ceiling twice for
+    /// one row would make the limit depend on how flaky the endpoint was.
     fn ai_send_with_retry(
         &self,
         make: &dyn Fn() -> ureq::Request,
         body: &str,
         what: &str,
         max_retries: u32,
-    ) -> Result<JsonValue, EngineError> {
+        budget: Option<&crate::budget::Budget>,
+    ) -> Result<Option<JsonValue>, EngineError> {
+        if let Some(b) = budget {
+            if b.claim_request().is_some() {
+                return Ok(None);
+            }
+        }
         let mut attempt = 0u32;
         loop {
             self.check_cancelled()?;
             match make().send_string(body) {
                 Ok(r) => {
-                    return r
+                    let parsed: JsonValue = r
                         .into_json()
-                        .map_err(|e| EngineError::Query(format!("{} parse: {}", what, e)))
+                        .map_err(|e| EngineError::Query(format!("{} parse: {}", what, e)))?;
+                    // What it actually cost, from the provider's own usage
+                    // block. Recorded after the fact because that is the only
+                    // moment the number exists.
+                    if let Some(b) = budget {
+                        b.record_usage(&parsed);
+                    }
+                    return Ok(Some(parsed));
                 }
                 Err(ureq::Error::Status(code, r)) => {
                     let retryable = code == 429 || (500..600).contains(&code);
@@ -8118,7 +11547,12 @@ impl DuckdbEngine {
     /// Establishes the AI credential pattern the other xf.ai.* tiles
     /// will follow: apiKey lives in stage props for now (revisable
     /// later if we add a secure keystore - just rewires this one read).
-    pub(crate) fn run_ai_embed(&self, db: &Path, spec: &AiEmbedSpec) -> Result<String, EngineError> {
+    pub(crate) fn run_ai_embed(
+        &self,
+        db: &Path,
+        spec: &AiEmbedSpec,
+        pipeline_name: Option<&str>,
+    ) -> Result<String, EngineError> {
         self.check_cancelled()?;
         let rows = self.run_rows(
             Some(db),
@@ -8135,16 +11569,82 @@ impl DuckdbEngine {
         // #258: one request per batch as before, but up to `concurrency`
         // batches in flight. Results come back per chunk and are flattened in
         // chunk order, so the output row order is exactly the input order.
-        let chunks: Vec<&[JsonValue]> = rows.chunks(spec.batch_size).collect();
+        // #258: a row already embedded is not embedded again.
+        //
+        // Unlike the per-row transforms the billable unit here is the BATCH, so
+        // reuse cannot simply skip a call: the cached rows are taken out first
+        // and only what is left is chunked and sent. Rows are put back in their
+        // original positions afterwards, because the output order is the input
+        // order and an embedding against the wrong row is worse than paying.
+        let config_fp = crate::checkpoint::fingerprint(&serde_json::json!({
+            "model": spec.model,
+            "input_column": spec.input_column,
+            "output_column": spec.output_column,
+            "endpoint": endpoint,
+        }));
+        let store = if spec.checkpoint {
+            match std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.is_empty()) {
+                Some(ws) => Some(crate::checkpoint::Store::open(
+                    std::path::Path::new(&ws),
+                    pipeline_name.unwrap_or(UNNAMED_RUN_FOLDER),
+                    &spec.node_id,
+                )?),
+                None => {
+                    return Err(EngineError::Config(
+                        concat!(
+                            "ai.embed: checkpointing needs a workspace ",
+                            "(DUCKLE_WORKSPACE) to keep completed items in"
+                        )
+                        .into(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        // #258: the ceiling for this stage, built once. `stopped` is set by
+        // whichever worker first found it reached - concurrent workers all have
+        // to see it, and the stage's own message is what tells the run.
+        let budget = spec.budget.build()?;
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let keys: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| {
+                store.as_ref().map(|_| {
+                    crate::checkpoint::item_key(
+                        r,
+                        &spec.checkpoint_key,
+                        &spec.checkpoint_fingerprint,
+                        &config_fp,
+                    )
+                })
+            })
+            .collect();
+        let mut cached: Vec<Option<JsonValue>> = vec![None; rows.len()];
+        let mut todo: Vec<usize> = Vec::new();
+        for i in 0..rows.len() {
+            match (store.as_ref(), keys[i].as_ref()) {
+                (Some(st), Some(k)) => match st.get(k) {
+                    Some(v) => cached[i] = Some(v.clone()),
+                    None => todo.push(i),
+                },
+                _ => todo.push(i),
+            }
+        }
+        let reused = rows.len() - todo.len();
+
+        let chunks: Vec<Vec<usize>> =
+            todo.chunks(spec.batch_size.max(1)).map(|c| c.to_vec()).collect();
         let per_chunk = self.ai_map_concurrent(chunks.len(), spec.concurrency, |engine, ci| {
-            let chunk = chunks[ci];
+            let chunk: &[usize] = &chunks[ci];
             // Pull the text from each row; missing / non-string values
             // become empty strings so the API call doesn't fail on a
             // single bad row.
             let inputs: Vec<String> = chunk
                 .iter()
-                .map(|row| {
-                    row.get(&spec.input_column)
+                .map(|&i| {
+                    rows[i]
+                        .get(&spec.input_column)
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string()
@@ -8159,7 +11659,16 @@ impl DuckdbEngine {
                 &body.to_string(),
                 "ai.embed",
                 spec.max_retries,
+                budget.as_ref(),
             )?;
+            // #258: the ceiling was reached, so nothing more is bought. The
+            // rows already done stay done and stay checkpointed; the stage
+            // reports itself INCOMPLETE and the run stops before anything
+            // downstream can publish a partial dataset.
+            let Some(response) = response else {
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(Vec::new());
+            };
             // OpenAI shape: response.data is an array of {index, embedding: [...]}.
             // Order is guaranteed to match the input order per the API contract.
             let data = response
@@ -8175,23 +11684,64 @@ impl DuckdbEngine {
                 )));
             }
             let mut chunk_out = Vec::with_capacity(chunk.len());
-            for (row, item) in chunk.iter().zip(data.iter()) {
+            for (&i, item) in chunk.iter().zip(data.iter()) {
                 let embedding = item.get("embedding").cloned().unwrap_or(JsonValue::Null);
-                let mut obj = match row {
+                let mut obj = match &rows[i] {
                     JsonValue::Object(m) => m.clone(),
                     _ => serde_json::Map::new(),
                 };
                 obj.insert(spec.output_column.clone(), embedding);
-                chunk_out.push(JsonValue::Object(obj));
+                let produced = JsonValue::Object(obj);
+                // Recorded as this row's embedding arrives, so a later chunk
+                // failing keeps everything already bought.
+                if let (Some(store), Some(key)) = (store.as_ref(), keys[i].as_ref()) {
+                    store.record(key, &produced)?;
+                }
+                chunk_out.push((i, produced));
             }
             Ok(chunk_out)
         })?;
-        let out: Vec<JsonValue> = per_chunk.into_iter().flatten().collect();
+        // Back into input order. A cached row keeps its position; a freshly
+        // embedded one goes back where it came from.
+        let mut fresh: std::collections::BTreeMap<usize, JsonValue> =
+            per_chunk.into_iter().flatten().collect();
+        let out: Vec<JsonValue> = (0..rows.len())
+            .map(|i| {
+                cached[i]
+                    .take()
+                    .or_else(|| fresh.remove(&i))
+                    .unwrap_or_else(|| rows[i].clone())
+            })
+            .collect();
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
+        // #258: the stage did real work and did not finish it. The marker
+        // makes that a first-class outcome rather than a quiet success.
+        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            let reason = budget
+                .as_ref()
+                .and_then(|b| b.exhausted())
+                .unwrap_or("budget");
+            let spent = budget.as_ref().map(|b| b.spent_note()).unwrap_or_default();
+            return Ok(format!(
+                "{}{} ai.embed: stopped at the {} ceiling after {}; {} row(s) done, the rest not attempted",
+                crate::INCOMPLETE_MARKER,
+                reason,
+                reason,
+                spent,
+                count,
+            ));
+        }
         Ok(format!(
-            "ai.embed ({}): embedded {} row(s) into {}",
-            spec.model, count, spec.node_id
+            "ai.embed ({}): embedded {} row(s) into {}{}",
+            spec.model,
+            count,
+            spec.node_id,
+            if reused > 0 {
+                format!(" ({} reused from the checkpoint, {} embedded)", reused, count - reused)
+            } else {
+                String::new()
+            }
         ))
     }
 
@@ -8855,6 +12405,7 @@ impl DuckdbEngine {
             ]
             .iter()
             .map(|(name, dt)| duckle_metadata::Column {
+                tags: Vec::new(),
                 name: (*name).to_string(),
                 data_type: *dt,
                 nullable: true,
@@ -9201,6 +12752,266 @@ impl DuckdbEngine {
     /// defines process(row) -> dict; the engine wraps it in a harness that reads
     /// the upstream rows as JSON, applies process per row (None drops the row),
     /// and writes the result JSON back for materialization. No Python in-engine.
+    /// Can this DuckDB do Arrow IPC (#307)?
+    ///
+    /// The `arrow` extension is a COMMUNITY one - `INSTALL arrow` from the core
+    /// repository 404s - so it needs a network on first use and may simply be
+    /// unavailable. Asked once per process and cached, because the answer
+    /// cannot change under a running host and probing per node would add a
+    /// round trip to every external component.
+    fn arrow_available(&self) -> bool {
+        static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ANSWER.get_or_init(|| {
+            self.run(
+                None,
+                "INSTALL arrow FROM community; LOAD arrow; SELECT 1;",
+                true,
+            )
+            .is_ok()
+        })
+    }
+
+    /// #307: run an external component out of process.
+    ///
+    /// Parquet in, Parquet out, JSON control message on stdin. The component
+    /// never sees the pipeline, the database or a secret: it is handed the two
+    /// file paths and its own properties, which is the whole contract and the
+    /// reason a component written in any language can participate.
+    pub(crate) fn run_plugin(
+        &self,
+        db: &Path,
+        spec: &crate::plan::PluginSpec,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<String, EngineError> {
+        // Policy first: an external component runs code this workspace did not
+        // write, and finding out it was forbidden after running it is finding
+        // out too late.
+        crate::plugin::check_allowed(Some(workspace), &spec.component_id)
+            .map_err(EngineError::Config)?;
+        let installed = crate::plugin::find(workspace, &spec.component_id).ok_or_else(|| {
+            EngineError::Config(format!(
+                "{} is not installed in this workspace (looked in {}/)",
+                spec.component_id,
+                crate::plugin::DIR
+            ))
+        })?;
+
+        // #307: Arrow IPC when the component asked for it and this DuckDB can
+        // do it, Parquet otherwise. The extension is a community one, so a
+        // machine with no network cannot install it - and failing a run over an
+        // interchange preference would be absurd when the fallback is good.
+        let is_sink = installed.manifest.outputs.is_empty();
+        let arrow_ok = self.arrow_available();
+        let format =
+            crate::plugin::choose_interchange(&installed.manifest.runtime.interchange, arrow_ok);
+        // `.arrows`, not `.arrow`: what DuckDB writes is the Arrow IPC STREAM
+        // format, and `.arrow` conventionally means the file format with a
+        // footer. Measured rather than assumed - pyarrow's `open_file` rejects
+        // it and `open_stream` reads it - and a name that promised the other
+        // one would send every component author to the wrong reader.
+        let ext = match format {
+            crate::plugin::ARROW => "arrows",
+            _ => "parquet",
+        };
+        // `read_arrow` and `FORMAT ARROWS` come from the extension; the reader
+        // and writer must agree, so both are chosen here once.
+        let (prelude, writer, reader): (&str, &str, fn(&str) -> String) = match format {
+            crate::plugin::ARROW => (
+                "LOAD arrow; ",
+                "FORMAT ARROWS",
+                |p: &str| format!("read_arrow('{p}')"),
+            ),
+            _ => ("", "FORMAT PARQUET", |p: &str| format!("read_parquet('{p}')")),
+        };
+        let (in_path, out_path, _) = python_temp_paths(db, &spec.node_id);
+        let in_pq = in_path.with_extension(ext);
+        let out_pq = out_path.with_extension(ext);
+        let esc = |p: &Path| p.to_string_lossy().replace(char::from(92), "/").replace(char::from(39), "''");
+        let mut inputs = std::collections::BTreeMap::new();
+        if let Some(from) = &spec.from_view {
+            // An empty upstream still writes a file, so the component sees a
+            // table with the right columns and no rows rather than nothing -
+            // the empty-typed-input case the conformance kit asks for.
+            self.run(
+                Some(db),
+                &format!(
+                    "{prelude}COPY (SELECT * FROM {}) TO '{}' ({writer});",
+                    plan::quote_ident(from),
+                    esc(&in_pq)
+                ),
+                false,
+            )?;
+            inputs.insert("main".to_string(), in_pq.display().to_string());
+        }
+
+        let rej_pq = out_path.with_extension(format!("reject.{ext}"));
+        let _ = std::fs::remove_file(&rej_pq);
+        // #307: one directory per run and node, under the workspace, so files a
+        // component produces are findable afterwards and not scattered wherever
+        // the component happened to choose.
+        let artifact_dir = workspace
+            .join("artifacts")
+            .join(match run_id.is_empty() {
+                true => "adhoc",
+                false => run_id,
+            })
+            .join(&spec.node_id);
+        std::fs::create_dir_all(&artifact_dir)
+            .map_err(|e| EngineError::Other(format!("{}: {e}", artifact_dir.display())))?;
+        let request = crate::plugin::Request {
+            phase: crate::plugin::Phase::Execute,
+            protocol: crate::plugin::PROTOCOL,
+            component: spec.component_id.clone(),
+            version: installed.manifest.version.clone(),
+            properties: spec.properties.clone(),
+            inputs,
+            output: out_pq.display().to_string(),
+            reject: rej_pq.display().to_string(),
+            format: format.to_string(),
+            artifact_dir: artifact_dir.display().to_string(),
+            run_id: run_id.to_string(),
+        };
+        let body = serde_json::to_vec(&request)
+            .map_err(|e| EngineError::Other(format!("{}: {e}", spec.component_id)))?;
+
+        // One protocol implementation, shared with the conformance kit: two
+        // would eventually disagree about what conforming means.
+        // #307: progress lines reach the run's event stream as they arrive, and
+        // the engine's cancel flag stops the component rather than being
+        // noticed only after it finishes.
+        let node = spec.node_id.clone();
+        let component = spec.component_id.clone();
+        let mut on_progress = |p: crate::plugin::Progress| {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(r) = p.rows {
+                parts.push(format!("{r} row(s)"));
+            }
+            if let Some(f) = p.fraction {
+                parts.push(format!("{:.0}%", (f.clamp(0.0, 1.0)) * 100.0));
+            }
+            if let Some(m) = &p.message {
+                parts.push(m.clone());
+            }
+            if !parts.is_empty() {
+                eprintln!("  {node} {component}: {}", parts.join(", "));
+            }
+        };
+        let cancelled = self.cancel.clone();
+        let reply = crate::plugin::invoke_with(
+            &installed,
+            &request,
+            &mut on_progress,
+            &|| cancelled.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .map_err(|e| match e.as_str() {
+            "cancelled" => EngineError::Cancelled,
+            _ => EngineError::Other(format!("{}: {e}", spec.component_id)),
+        })?;
+        let _ = std::fs::remove_file(&in_pq);
+        let _ = std::fs::remove_file(&rej_pq.with_extension("tmp"));
+        // Checked before the output is published: an artifact a component
+        // declared and did not write, or wrote and mis-hashed, means the run
+        // did not produce what it says it did.
+        let artifacts = crate::plugin::verify_artifacts(&artifact_dir, &reply.artifacts)
+            .map_err(|e| EngineError::Other(format!("{}: {e}", spec.component_id)))?;
+        if !reply.ok {
+            return Err(EngineError::Other(format!(
+                "{}: {}",
+                spec.component_id,
+                reply.error.unwrap_or_else(|| "the component reported a failure".into())
+            )));
+        }
+        // A component declaring no outputs is a sink: it delivered the rows
+        // somewhere Duckle does not model - an API, a queue, a file of its own
+        // - and has no relation to hand back. Requiring one failed a sink that
+        // had already done its job, which is the worst moment to fail.
+        if !is_sink {
+            if !out_pq.exists() {
+                return Err(EngineError::Other(format!(
+                    "{} said it succeeded but wrote no output at {}",
+                    spec.component_id,
+                    out_pq.display()
+                )));
+            }
+            self.run(
+                Some(db),
+                &format!(
+                    "{prelude}CREATE OR REPLACE TABLE {} AS SELECT * FROM {};",
+                    plan::quote_ident(&spec.node_id),
+                    reader(&esc(&out_pq))
+                ),
+                false,
+            )?;
+        }
+        // #307: the reject relation, on the same `<node>__reject` contract every
+        // built-in uses - so a downstream edge reads it identically whoever
+        // wrote the component.
+        //
+        // Created even when the component wrote nothing, shaped like the rows
+        // it was given. A wired reject port whose table does not exist fails
+        // the whole run at bind time, and "this component rejects nothing" is a
+        // perfectly ordinary thing for a component to be.
+        let reject_view = format!("{}{}", spec.node_id, plan::REJECT_SUFFIX);
+        let reject_sql = match rej_pq.exists() {
+            true => format!(
+                "{prelude}CREATE OR REPLACE TABLE {} AS SELECT * FROM {};",
+                plan::quote_ident(&reject_view),
+                reader(&esc(&rej_pq))
+            ),
+            false => match &spec.from_view {
+                Some(from) => format!(
+                    "CREATE OR REPLACE TABLE {} AS SELECT * FROM {} WHERE 1=0;",
+                    plan::quote_ident(&reject_view),
+                    plan::quote_ident(from)
+                ),
+                // A source has no upstream to take a shape from, so the reject
+                // relation mirrors what it produced. A sink has neither, and
+                // gets none at all rather than one shaped like a table that
+                // does not exist.
+                None if !is_sink => format!(
+                    "CREATE OR REPLACE TABLE {} AS SELECT * FROM {} WHERE 1=0;",
+                    plan::quote_ident(&reject_view),
+                    plan::quote_ident(&spec.node_id)
+                ),
+                None => String::new(),
+            },
+        };
+        if !reject_sql.is_empty() {
+            self.run(Some(db), &reject_sql, false)?;
+        }
+        let rejected = self.count_rows(db, &reject_view).unwrap_or(0);
+        let _ = std::fs::remove_file(&rej_pq);
+        let _ = std::fs::remove_file(&out_pq);
+        let count = match is_sink {
+            // A sink's number is what it was GIVEN: it produced no relation to
+            // count, and reporting zero would read as "delivered nothing".
+            true => reply.rows.unwrap_or(0),
+            false => self.count_rows(db, &spec.node_id).unwrap_or(0),
+        };
+        // Nothing produced, nothing kept: an empty directory per node per run
+        // would accumulate forever in a workspace where no component makes
+        // files.
+        if artifacts.is_empty() {
+            let _ = std::fs::remove_dir(&artifact_dir);
+        }
+        let mut line = match rejected {
+            0 => match is_sink {
+                true => format!("{}: {} row(s) delivered", spec.component_id, count),
+                false => format!("{}: {} row(s) -> {}", spec.component_id, count, spec.node_id),
+            },
+            n => format!(
+                "{}: {} row(s) -> {}, {n} rejected",
+                spec.component_id, count, spec.node_id
+            ),
+        };
+        if !artifacts.is_empty() {
+            line.push_str(&format!(", {} artifact(s)", artifacts.len()));
+            self.record_artifacts(&spec.node_id, &artifacts);
+        }
+        Ok(line)
+    }
+
     pub(crate) fn run_python(
         &self,
         db: &Path,
@@ -9216,8 +13027,11 @@ impl DuckdbEngine {
         // It is also the difference between keeping a type and losing it. JSON leaves
         // through `default=str`, so every timestamp reaches Python as a string and any
         // decimal precision goes with it. Parquet carries timestamp[us, tz] as itself.
+        if defines_streaming_entry(&spec.script) {
+            return self.run_python_arrow(db, spec, true);
+        }
         if defines_vectorized_entry(&spec.script) {
-            return self.run_python_vectorized(db, spec);
+            return self.run_python_arrow(db, spec, false);
         }
         let rows = self.run_rows(
             Some(db),
@@ -9304,10 +13118,11 @@ impl DuckdbEngine {
     /// interchange swapped. DuckDB already writes Parquet everywhere in this engine and
     /// pyarrow, polars and pandas all read it, so the boundary costs a file each way
     /// rather than four format conversions.
-    fn run_python_vectorized(
+    fn run_python_arrow(
         &self,
         db: &Path,
         spec: &PythonSpec,
+        streaming: bool,
     ) -> Result<String, EngineError> {
         let (in_path, out_path, script_path) = python_temp_paths(db, &spec.node_id);
         let in_pq = in_path.with_extension("parquet");
@@ -9335,17 +13150,62 @@ impl DuckdbEngine {
         // needs it and a bare-Python install keeps working exactly as before. Missing,
         // it says so and stops - falling back to JSON would make the pipeline quietly
         // slower and stringify its timestamps, which is the thing this avoids.
-        let harness = [
+        let entry = if streaming { "transform_batches(batch)" } else { "transform(table)" };
+        let mut harness: Vec<String> = vec![
             "import sys".to_string(),
             "try:".to_string(),
             "    import pyarrow.parquet as __pq".to_string(),
             "except ImportError:".to_string(),
             "    sys.stderr.write(".to_string(),
-            "        'a script defining transform(table) needs pyarrow in ' + sys.executable"
-                .to_string(),
+            format!("        'a script defining {} needs pyarrow in ' + sys.executable", entry),
             "        + \"; install it, or define process(row) instead to keep the row-at-a-time mode\")"
                 .to_string(),
             "    raise SystemExit(1)".to_string(),
+            // The input Parquet is already on disk, so naming it costs nothing and
+            // lets a script reach past the harness - dataset.Scanner, polars
+            // scan_parquet, or DuckDB over the same file (#245).
+            "INPUT_PATH = sys.argv[1]".to_string(),
+            "OUTPUT_PATH = sys.argv[2]".to_string(),
+        ];
+        if streaming {
+            // Never materializes: batches in, batches out, one writer opened from
+            // the first result's schema. This is the whole point of the mode - a
+            // table that does not fit in memory still runs.
+            harness.extend([
+                "__pf = __pq.ParquetFile(sys.argv[1])".to_string(),
+                spec.script.clone(),
+                "__writer = None".to_string(),
+                "__rows = 0".to_string(),
+                "import pyarrow as __pa".to_string(),
+                // 64k rows a batch: big enough that per-batch Python overhead
+                // disappears, small enough that peak memory stays bounded, which
+                // is the entire reason for this mode.
+                "for __batch in __pf.iter_batches(batch_size=65536):".to_string(),
+                "    __res = transform_batches(__batch)".to_string(),
+                // Returning nothing means "unchanged", the same contract the
+                // whole-table mode uses.
+                "    if __res is None:".to_string(),
+                "        __res = __batch".to_string(),
+                "    if hasattr(__res, 'to_arrow'):".to_string(),
+                "        __res = __res.to_arrow()".to_string(),
+                "    if isinstance(__res, __pa.RecordBatch):".to_string(),
+                "        __res = __pa.Table.from_batches([__res])".to_string(),
+                "    elif not hasattr(__res, 'schema'):".to_string(),
+                "        __res = __pa.Table.from_pandas(__res)".to_string(),
+                "    if __writer is None:".to_string(),
+                "        __writer = __pq.ParquetWriter(sys.argv[2], __res.schema)".to_string(),
+                "    __writer.write_table(__res)".to_string(),
+                "    __rows += __res.num_rows".to_string(),
+                "if __writer is None:".to_string(),
+                // An upstream with no rows still has to leave a file with the
+                // right columns, or the next stage sees nothing rather than an
+                // empty relation.
+                "    __pq.write_table(__pf.schema_arrow.empty_table(), sys.argv[2])".to_string(),
+                "else:".to_string(),
+                "    __writer.close()".to_string(),
+            ]);
+        } else {
+        harness.extend([
             "__table = __pq.read_table(sys.argv[1])".to_string(),
             spec.script.clone(),
             "__out = transform(__table)".to_string(),
@@ -9360,8 +13220,9 @@ impl DuckdbEngine {
             "    import pyarrow as __pa".to_string(),
             "    __out = __pa.Table.from_pandas(__out)".to_string(),
             "__pq.write_table(__out, sys.argv[2])".to_string(),
-        ]
-        .join("
+        ]);
+        }
+        let harness = harness.join("
 ");
         if let Err(e) = std::fs::write(&script_path, harness) {
             cleanup(&in_pq, &out_pq, &script_path);
@@ -9502,6 +13363,7 @@ impl DuckdbEngine {
         &self,
         db: &Path,
         spec: &AiClassifySpec,
+        pipeline_name: Option<&str>,
     ) -> Result<String, EngineError> {
         self.check_cancelled()?;
         let rows = self.run_rows(
@@ -9519,8 +13381,63 @@ impl DuckdbEngine {
              Reply with only the category name and nothing else.",
             cat_list
         );
+        // #258: a row already classified is not classified again.
+        //
+        // The categories are part of the identity as much as the model is: the
+        // same text against a different category list is a different question,
+        // and reusing the old answer would be silently wrong.
+        let config_fp = crate::checkpoint::fingerprint(&serde_json::json!({
+            "model": spec.model,
+            "categories": spec.categories,
+            "system": system_prompt,
+            "input_column": spec.input_column,
+            "output_column": spec.output_column,
+            "endpoint": endpoint,
+        }));
+        let store = if spec.checkpoint {
+            match std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.is_empty()) {
+                Some(ws) => Some(crate::checkpoint::Store::open(
+                    std::path::Path::new(&ws),
+                    pipeline_name.unwrap_or(UNNAMED_RUN_FOLDER),
+                    &spec.node_id,
+                )?),
+                None => {
+                    return Err(EngineError::Config(
+                        concat!(
+                            "ai.classify: checkpointing needs a workspace ",
+                            "(DUCKLE_WORKSPACE) to keep completed items in"
+                        )
+                        .into(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        // #258: the ceiling for this stage, built once. `stopped` is set by
+        // whichever worker first found it reached - concurrent workers all have
+        // to see it, and the stage's own message is what tells the run.
+        let budget = spec.budget.build()?;
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let reused = std::sync::atomic::AtomicUsize::new(0);
+
         let out = self.ai_map_concurrent(rows.len(), spec.concurrency, |engine, i| {
             let row = &rows[i];
+            // Reuse before spending.
+            let ck = store.as_ref().map(|_| {
+                crate::checkpoint::item_key(
+                    row,
+                    &spec.checkpoint_key,
+                    &spec.checkpoint_fingerprint,
+                    &config_fp,
+                )
+            });
+            if let (Some(store), Some(key)) = (store.as_ref(), ck.as_ref()) {
+                if let Some(done) = store.get(key) {
+                    reused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(done.clone());
+                }
+            }
             let text = row
                 .get(&spec.input_column)
                 .and_then(|v| v.as_str())
@@ -9539,7 +13456,16 @@ impl DuckdbEngine {
                 &body.to_string(),
                 "ai.classify",
                 spec.max_retries,
+                budget.as_ref(),
             )?;
+            // #258: the ceiling was reached, so nothing more is bought. The
+            // rows already done stay done and stay checkpointed; the stage
+            // reports itself INCOMPLETE and the run stops before anything
+            // downstream can publish a partial dataset.
+            let Some(response) = response else {
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(row.clone());
+            };
             let raw = response
                 .pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str())
@@ -9560,13 +13486,44 @@ impl DuckdbEngine {
                 _ => serde_json::Map::new(),
             };
             obj.insert(spec.output_column.clone(), JsonValue::String(chosen));
-            Ok(JsonValue::Object(obj))
+            let produced = JsonValue::Object(obj);
+            // Recorded as this item finishes, not when the stage does: a
+            // failure on the next row keeps everything already bought.
+            if let (Some(store), Some(key)) = (store.as_ref(), ck.as_ref()) {
+                store.record(key, &produced)?;
+            }
+            Ok(produced)
         })?;
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
+        let reused = reused.load(std::sync::atomic::Ordering::Relaxed);
+        // #258: the stage did real work and did not finish it. The marker
+        // makes that a first-class outcome rather than a quiet success.
+        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            let reason = budget
+                .as_ref()
+                .and_then(|b| b.exhausted())
+                .unwrap_or("budget");
+            let spent = budget.as_ref().map(|b| b.spent_note()).unwrap_or_default();
+            return Ok(format!(
+                "{}{} ai.classify: stopped at the {} ceiling after {}; {} row(s) done, the rest not attempted",
+                crate::INCOMPLETE_MARKER,
+                reason,
+                reason,
+                spent,
+                count,
+            ));
+        }
         Ok(format!(
-            "ai.classify ({}): {} row(s) -> {}",
-            spec.model, count, spec.node_id
+            "ai.classify ({}): {} row(s) -> {}{}",
+            spec.model,
+            count,
+            spec.node_id,
+            if reused > 0 {
+                format!(" ({} reused from the checkpoint, {} called)", reused, count - reused)
+            } else {
+                String::new()
+            }
         ))
     }
 
@@ -9580,7 +13537,12 @@ impl DuckdbEngine {
     /// chat completions are one prompt per call - N rows = N HTTP
     /// requests. Users should keep dataset sizes manageable or chain
     /// with xf.rows.head to sample.
-    pub(crate) fn run_ai_llm(&self, db: &Path, spec: &AiLlmSpec) -> Result<String, EngineError> {
+    pub(crate) fn run_ai_llm(
+        &self,
+        db: &Path,
+        spec: &AiLlmSpec,
+        pipeline_name: Option<&str>,
+    ) -> Result<String, EngineError> {
         self.check_cancelled()?;
         let rows = self.run_rows(
             Some(db),
@@ -9591,8 +13553,108 @@ impl DuckdbEngine {
             return Ok(format!("ai.llm: 0 upstream rows -> {}", spec.node_id));
         }
         let endpoint = Self::ai_endpoint(&spec.base_url, &spec.endpoint_path, "/v1/chat/completions");
+        // #258: parsed once, before a single request is paid for. A schema
+        // that does not parse is a configuration mistake, and finding it after
+        // 400,000 calls would be an expensive way to learn it.
+        let schema: Option<JsonValue> = match spec.response_format {
+            AiResponseFormat::JsonSchema => {
+                let text = spec.json_schema.trim();
+                if text.is_empty() {
+                    return Err(EngineError::Config(
+                        "ai.llm: response format is JSON Schema but no schema was given".into(),
+                    ));
+                }
+                Some(serde_json::from_str(text).map_err(|e| {
+                    EngineError::Config(format!("ai.llm: the JSON Schema does not parse: {e}"))
+                })?)
+            }
+            _ => None,
+        };
+        // The columns a validated reply is allowed to introduce. Checked here
+        // rather than per row so a collision is reported before any spending.
+        if spec.expand_columns {
+            if let Some(first) = rows.first().and_then(|r| r.as_object()) {
+                for field in schema_top_level_fields(schema.as_ref()) {
+                    if first.contains_key(&field) {
+                        return Err(EngineError::Config(format!(
+                            "ai.llm: the schema field {field:?} has the same name as an upstream \
+                             column, so expanding it would silently overwrite the input. Rename \
+                             one of them."
+                        )));
+                    }
+                }
+            }
+        }
+
+        // #252: an item that was already paid for is not bought again.
+        //
+        // The configuration is part of the identity, so a changed model, prompt
+        // or temperature invalidates everything - the stored answer was produced
+        // by the old one and reusing it would be silently wrong.
+        let config_fp = crate::checkpoint::fingerprint(&serde_json::json!({
+            "model": spec.model,
+            "prompt": spec.prompt_template,
+            "system": spec.system_prompt,
+            "temperature": spec.temperature,
+            "max_tokens": spec.max_tokens,
+            "input_column": spec.input_column,
+            "output_column": spec.output_column,
+            "endpoint": endpoint,
+            // #258: asking for a different shape is different work. Without
+            // this, adding a field to the schema would hand back yesterday's
+            // answers, which do not have it.
+            "response_format": format!("{:?}", spec.response_format),
+            "json_schema": spec.json_schema,
+            "expand_columns": spec.expand_columns,
+        }));
+        let store = if spec.checkpoint {
+            match std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.is_empty()) {
+                Some(ws) => Some(crate::checkpoint::Store::open(
+                    std::path::Path::new(&ws),
+                    pipeline_name.unwrap_or(UNNAMED_RUN_FOLDER),
+                    &spec.node_id,
+                )?),
+                None => {
+                    return Err(EngineError::Config(
+                        concat!(
+                            "ai.llm: checkpointing needs a workspace (DUCKLE_WORKSPACE) ",
+                            "to keep completed items in"
+                        )
+                        .into(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        // #258: the ceiling for this stage, built once. `stopped` is set by
+        // whichever worker first found it reached - concurrent workers all have
+        // to see it, and the stage's own message is what tells the run.
+        let budget = spec.budget.build()?;
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let reused = std::sync::atomic::AtomicUsize::new(0);
+
         let out = self.ai_map_concurrent(rows.len(), spec.concurrency, |engine, i| {
             let row = &rows[i];
+            // Reuse before spending. The key covers the logical key, the whole
+            // input row and the configuration, so a hit means this exact work
+            // was done with this exact setup.
+            let ck = store
+                .as_ref()
+                .map(|_| {
+                    crate::checkpoint::item_key(
+                        row,
+                        &spec.checkpoint_key,
+                        &spec.checkpoint_fingerprint,
+                        &config_fp,
+                    )
+                });
+            if let (Some(store), Some(key)) = (store.as_ref(), ck.as_ref()) {
+                if let Some(done) = store.get(key) {
+                    reused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(done.clone());
+                }
+            }
             let user_text = if spec.prompt_template.is_empty() {
                 row.get(&spec.input_column)
                     .and_then(|v| v.as_str())
@@ -9616,12 +13678,40 @@ impl DuckdbEngine {
             if let Some(max) = spec.max_tokens {
                 body["max_tokens"] = serde_json::json!(max);
             }
+            // #258: ask the provider to enforce the shape while it decodes,
+            // which is the only way to get it reliably. A provider that ignores
+            // the field is why the reply is re-checked below regardless.
+            match spec.response_format {
+                AiResponseFormat::Text => {}
+                AiResponseFormat::JsonObject => {
+                    body["response_format"] = serde_json::json!({"type": "json_object"});
+                }
+                AiResponseFormat::JsonSchema => {
+                    body["response_format"] = serde_json::json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": spec.schema_name,
+                            "strict": true,
+                            "schema": schema.clone().unwrap_or(JsonValue::Null),
+                        }
+                    });
+                }
+            }
             let response = engine.ai_send_with_retry(
                 &|| Self::ai_post(&endpoint, &spec.headers, &spec.api_key),
                 &body.to_string(),
                 "ai.llm",
                 spec.max_retries,
+                budget.as_ref(),
             )?;
+            // #258: the ceiling was reached, so nothing more is bought. The
+            // rows already done stay done and stay checkpointed; the stage
+            // reports itself INCOMPLETE and the run stops before anything
+            // downstream can publish a partial dataset.
+            let Some(response) = response else {
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(row.clone());
+            };
             let content = response
                 .pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str())
@@ -9631,14 +13721,99 @@ impl DuckdbEngine {
                 JsonValue::Object(m) => m.clone(),
                 _ => serde_json::Map::new(),
             };
-            obj.insert(spec.output_column.clone(), JsonValue::String(content));
-            Ok(JsonValue::Object(obj))
+            match spec.response_format {
+                AiResponseFormat::Text => {
+                    obj.insert(spec.output_column.clone(), JsonValue::String(content));
+                }
+                _ => {
+                    // The reply is checked here even though the provider was
+                    // asked to enforce the schema: an OpenAI-compatible
+                    // endpoint may accept response_format and ignore it, and a
+                    // silently unstructured answer is exactly the failure this
+                    // feature exists to remove.
+                    match validate_structured_reply(&content, schema.as_ref()) {
+                        Ok(value) => {
+                            if spec.expand_columns {
+                                if let Some(fields) = value.as_object() {
+                                    for (k, v) in fields {
+                                        // The pre-flight refuses a SCHEMA field
+                                        // that collides, but what arrives is not
+                                        // limited to what the schema declared -
+                                        // and with json_object there was no
+                                        // schema to check at all. Overwriting
+                                        // here would replace the caller's own
+                                        // value with the model's and report ok,
+                                        // which is the input silently becoming
+                                        // the output.
+                                        if row.get(k).is_some() {
+                                            return Err(EngineError::Query(format!(
+                                                "ai.llm: the reply has a field {k:?}, which is                                                  already a column on the input row - expanding it                                                  would overwrite the caller's own value. Rename                                                  the column, or turn off expanding the reply."
+                                            )));
+                                        }
+                                        obj.insert(k.clone(), v.clone());
+                                    }
+                                } else {
+                                    // A schema whose root is not an object has
+                                    // no fields to become columns.
+                                    obj.insert(spec.output_column.clone(), value);
+                                }
+                            } else {
+                                obj.insert(spec.output_column.clone(), value);
+                            }
+                        }
+                        Err(why) => match spec.on_invalid {
+                            AiOnInvalid::Fail => {
+                                return Err(EngineError::Query(format!(
+                                    "ai.llm: row {i}: {why}. The reply was: {}",
+                                    tail_chars(&content, 400)
+                                )))
+                            }
+                            AiOnInvalid::Null => {
+                                obj.insert(spec.output_column.clone(), JsonValue::Null);
+                            }
+                        },
+                    }
+                }
+            }
+            let produced = JsonValue::Object(obj);
+            // Recorded HERE, as this item finishes, not when the stage does.
+            // That is the whole guarantee: a failure on the next row keeps
+            // everything already bought.
+            if let (Some(store), Some(key)) = (store.as_ref(), ck.as_ref()) {
+                store.record(key, &produced)?;
+            }
+            Ok(produced)
         })?;
         let count = out.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &out)?;
+        let reused = reused.load(std::sync::atomic::Ordering::Relaxed);
+        // #258: the stage did real work and did not finish it. The marker
+        // makes that a first-class outcome rather than a quiet success.
+        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            let reason = budget
+                .as_ref()
+                .and_then(|b| b.exhausted())
+                .unwrap_or("budget");
+            let spent = budget.as_ref().map(|b| b.spent_note()).unwrap_or_default();
+            return Ok(format!(
+                "{}{} ai.llm: stopped at the {} ceiling after {}; {} row(s) done, the rest not attempted",
+                crate::INCOMPLETE_MARKER,
+                reason,
+                reason,
+                spent,
+                count,
+            ));
+        }
         Ok(format!(
-            "ai.llm ({}): {} row(s) -> {}",
-            spec.model, count, spec.node_id
+            "ai.llm ({}): {} row(s) -> {}{}",
+            spec.model,
+            count,
+            spec.node_id,
+            if reused > 0 {
+                format!(" ({} reused from the checkpoint, {} called)", reused, count - reused)
+            } else {
+                String::new()
+            }
         ))
     }
 
@@ -10252,15 +14427,18 @@ impl DuckdbEngine {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        // Captured before the async block: `tls` would shadow the crate's tls
+        // module inside it.
+        let use_tls = spec.tls;
+        let sasl = spec.sasl.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| EngineError::Query(format!("kafka: tokio rt: {}", e)))?;
         let total: Result<usize, String> = rt.block_on(async {
             use rskafka::client::partition::{Compression, UnknownTopicHandling};
-            use rskafka::client::ClientBuilder;
             use rskafka::record::Record;
-            let client = ClientBuilder::new(bootstrap)
+            let client = kafka_client_builder(bootstrap, use_tls, sasl.as_ref())?
                 .build()
                 .await
                 .map_err(|e| format!("connect: {}", e))?;
@@ -10321,22 +14499,39 @@ impl DuckdbEngine {
         &self,
         db: &Path,
         spec: &KafkaSourceSpec,
+        pipeline_name: Option<&str>,
+        pending: &mut Vec<crate::PendingWrite>,
     ) -> Result<String, EngineError> {
         let cancel = self.cancel.clone();
+        // Where the resume point lives, and what it says. Shares the state
+        // folder xf.incremental uses: a node is one or the other, never both.
+        let state_path = if spec.track_offset {
+            incremental_state_path(pipeline_name, &spec.node_id)
+        } else {
+            None
+        };
+        let prior = state_path.as_deref().and_then(crate::read_state_snapshot);
+        let resume = state_path
+            .as_deref()
+            .and_then(|p| read_kafka_offset_state(p, &spec.topic, spec.partition_id));
         let bootstrap: Vec<String> = spec
             .bootstrap_servers
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        // Captured before the async block: `tls` would shadow the crate's tls
+        // module inside it.
+        let registry = spec.schema_registry_url.clone();
+        let use_tls = spec.tls;
+        let sasl = spec.sasl.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| EngineError::Query(format!("kafka: tokio rt: {}", e)))?;
-        let rows: Result<Vec<JsonValue>, String> = rt.block_on(async {
+        let rows: Result<(Vec<JsonValue>, i64), String> = rt.block_on(async {
             use rskafka::client::partition::UnknownTopicHandling;
-            use rskafka::client::ClientBuilder;
-            let client = ClientBuilder::new(bootstrap)
+            let client = kafka_client_builder(bootstrap, use_tls, sasl.as_ref())?
                 .build()
                 .await
                 .map_err(|e| format!("connect: {}", e))?;
@@ -10347,7 +14542,13 @@ impl DuckdbEngine {
             // start_offset sentinels: -2 = latest tip (only messages produced
             // after this read starts), any other negative = earliest available,
             // >= 0 = that literal offset.
-            let mut next_offset = if spec.start_offset == -2 {
+            // A committed resume point wins over the configured start. That is
+            // the whole point: `latest` would otherwise jump to the current tip
+            // on every run and skip everything produced in between, while
+            // `earliest` would re-read the entire backlog every time.
+            let mut next_offset = if let Some(o) = resume {
+                o
+            } else if spec.start_offset == -2 {
                 pc.get_offset(rskafka::client::partition::OffsetAt::Latest)
                     .await
                     .map_err(|e| format!("latest offset: {}", e))?
@@ -10358,6 +14559,9 @@ impl DuckdbEngine {
             } else {
                 spec.start_offset
             };
+            let mut schema_cache: std::collections::HashMap<u32, apache_avro::Schema> =
+                std::collections::HashMap::new();
+            let http = crate::tls::http_agent();
             let mut out: Vec<JsonValue> = Vec::new();
             while (out.len() as u64) < spec.max_records {
                 if cancel.load(Ordering::Relaxed) {
@@ -10377,21 +14581,34 @@ impl DuckdbEngine {
                         "timestamp_ms".into(),
                         JsonValue::from(r.record.timestamp.timestamp_millis()),
                     );
+                    // A Confluent-framed field is decoded against the schema
+                    // its id names; anything else stays text. Schemas are
+                    // fetched once per id and kept for the rest of the read.
+                    let mut decode = |b: &[u8]| -> Result<JsonValue, String> {
+                        if let Some(reg) = registry.as_deref() {
+                            if let Some((id, payload)) = confluent_envelope(b) {
+                                if !schema_cache.contains_key(&id) {
+                                    let sc = fetch_registry_schema(&http, reg, id)?;
+                                    schema_cache.insert(id, sc);
+                                }
+                                return avro_datum_to_json(&schema_cache[&id], payload);
+                            }
+                        }
+                        Ok(JsonValue::String(String::from_utf8_lossy(b).to_string()))
+                    };
                     obj.insert(
                         "key".into(),
-                        r.record
-                            .key
-                            .as_ref()
-                            .map(|b| JsonValue::String(String::from_utf8_lossy(b).to_string()))
-                            .unwrap_or(JsonValue::Null),
+                        match r.record.key.as_ref() {
+                            Some(b) => decode(b)?,
+                            None => JsonValue::Null,
+                        },
                     );
                     obj.insert(
                         "value".into(),
-                        r.record
-                            .value
-                            .as_ref()
-                            .map(|b| JsonValue::String(String::from_utf8_lossy(b).to_string()))
-                            .unwrap_or(JsonValue::Null),
+                        match r.record.value.as_ref() {
+                            Some(b) => decode(b)?,
+                            None => JsonValue::Null,
+                        },
                     );
                     out.push(JsonValue::Object(obj));
                     next_offset = r.offset + 1;
@@ -10400,18 +14617,44 @@ impl DuckdbEngine {
                     }
                 }
             }
-            Ok(out)
+            Ok((out, next_offset))
         });
-        let rows = match rows {
+        let (rows, next_offset) = match rows {
             Ok(r) => r,
             Err(e) if e == "cancelled" => return Err(EngineError::Cancelled),
             Err(e) => return Err(EngineError::Query(format!("kafka source: {}", e))),
         };
         let count = rows.len();
         materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &rows)?;
+        // Queue the resume point rather than writing it: it lands only if the
+        // WHOLE run succeeds, so a failure downstream re-delivers these records
+        // next run instead of losing them. At-least-once, deliberately - the
+        // alternative is committing an offset for rows no sink ever wrote.
+        //
+        // Written even when nothing was read, because that is exactly the case
+        // a `latest` start gets wrong: the first run pins the tip so the next
+        // one resumes from it, instead of jumping to a new tip and skipping
+        // whatever arrived in between.
+        if let Some(path) = state_path {
+            pending.push(crate::PendingWrite::state(
+                path,
+                serde_json::json!({
+                    "topic": spec.topic,
+                    "partition": spec.partition_id,
+                    "next_offset": next_offset,
+                }),
+                prior,
+            ));
+        }
         Ok(format!(
-            "kafka: materialized {} record(s) into {}",
-            count, spec.node_id
+            "kafka: materialized {} record(s) into {}{}",
+            count,
+            spec.node_id,
+            if spec.track_offset {
+                format!(" (resumes at offset {} if this run succeeds)", next_offset)
+            } else {
+                String::new()
+            }
         ))
     }
 
@@ -11483,6 +15726,190 @@ impl DuckdbEngine {
         ))
     }
 
+    /// Manticore Search source (#340): POST /search, walk `hits.hits[]`,
+    /// materialize each `_source` as a row.
+    ///
+    /// Manticore answers in Elasticsearch's response shape but takes its own
+    /// request: the table is named in the BODY (`index` became `table` in
+    /// Manticore 6.0) and the window is `limit`/`offset`.
+    pub(crate) fn run_manticore_source(
+        &self,
+        db: &Path,
+        spec: &ManticoreSourceSpec,
+    ) -> Result<String, EngineError> {
+        let url = format!("{}/search", spec.endpoint.trim_end_matches('/'));
+        let query_dsl: JsonValue = match &spec.query {
+            Some(q) => serde_json::from_str(q).map_err(|e| {
+                EngineError::Config(format!("manticore: invalid query JSON: {}", e))
+            })?,
+            None => serde_json::json!({ "match_all": {} }),
+        };
+        let mut all_rows: Vec<JsonValue> = Vec::new();
+        let mut pages = 0_u64;
+        let mut truncated = false;
+        let mut offset = 0_u64;
+        loop {
+            self.check_cancelled()?;
+            let window = offset.saturating_add(spec.limit);
+            let mut body = serde_json::json!({
+                "table": spec.table,
+                "query": query_dsl,
+                "limit": spec.limit,
+                "offset": offset,
+            });
+            // Manticore keeps only the 1000 best-ranked matches per query
+            // unless the request raises max_matches, so a window reaching
+            // past that default has to ask for the room it needs or the
+            // server refuses the page.
+            if window > 1000 {
+                body["max_matches"] = serde_json::json!(window);
+            }
+            let body_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
+            let req = manticore_request(spec.username.as_deref(), spec.password.as_deref(), &url)
+                .set("Content-Type", "application/json");
+            let mut response: JsonValue = match req.send_string(&body_str) {
+                Ok(r) => r.into_json().map_err(|e| {
+                    EngineError::Query(format!("Manticore response not JSON: {}", e))
+                })?,
+                Err(ureq::Error::Status(code, r)) => {
+                    let body = r.into_string().unwrap_or_default();
+                    return Err(EngineError::Query(format!(
+                        "Manticore HTTP {} from {}: {}",
+                        code,
+                        url,
+                        body.chars().take(300).collect::<String>()
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!(
+                        "Manticore HTTP transport to {}: {}",
+                        url, e
+                    )))
+                }
+            };
+            // A failed search answers 200 with an `error` string and no hits,
+            // which would otherwise read as "zero rows".
+            if let Some(err) = response.get("error").and_then(|e| match e {
+                JsonValue::String(s) if !s.is_empty() => Some(s.clone()),
+                JsonValue::Object(_) => Some(e.to_string()),
+                _ => None,
+            }) {
+                return Err(EngineError::Query(format!("Manticore search failed: {}", err)));
+            }
+            let hits = response
+                .pointer_mut("/hits/hits")
+                .and_then(|v| v.as_array_mut())
+                .map(std::mem::take)
+                .unwrap_or_default();
+            let hit_count = hits.len();
+            for mut h in hits {
+                let source = h
+                    .get_mut("_source")
+                    .map(JsonValue::take)
+                    .unwrap_or_else(|| JsonValue::Object(Default::default()));
+                all_rows.push(source);
+            }
+            pages += 1;
+            if (hit_count as u64) < spec.limit {
+                break;
+            }
+            if pages >= spec.max_pages {
+                truncated = true;
+                break;
+            }
+            offset = window;
+        }
+        if truncated {
+            return Err(pagination_capped_err(
+                "manticore",
+                all_rows.len(),
+                spec.max_pages,
+            ));
+        }
+        materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &all_rows)?;
+        Ok(format!(
+            "manticore: materialized {} rows ({} page(s)) into {}",
+            all_rows.len(),
+            pages,
+            spec.node_id
+        ))
+    }
+
+    /// Manticore Search sink (#340): POST /bulk as NDJSON, one line per row.
+    ///
+    /// Manticore nests the document inside the action line
+    /// (`{"insert":{"table":"t","doc":{...}}}`) rather than putting it on a
+    /// second line the way Elasticsearch does, and it reports a rejected
+    /// batch as HTTP 200 with `errors: true` - so the response body, not the
+    /// status code, decides whether the write happened.
+    pub(crate) fn run_manticore_sink(
+        &self,
+        db: &Path,
+        secret_prefix: &str,
+        spec: &ManticoreSinkSpec,
+    ) -> Result<String, EngineError> {
+        let select = format!(
+            "{}SELECT * FROM {}",
+            secret_prefix,
+            plan::quote_ident(&spec.from_view)
+        );
+        let rows = self.run_rows(Some(db), &select)?;
+        let url = format!("{}/bulk", spec.endpoint.trim_end_matches('/'));
+        let batch = spec.batch_size.max(1);
+        let mut batches = 0_usize;
+        for chunk in rows.chunks(batch) {
+            self.check_cancelled()?;
+            let mut body = String::with_capacity(chunk.len() * 128);
+            for row in chunk {
+                let mut inner = serde_json::Map::new();
+                inner.insert("table".into(), JsonValue::String(spec.table.clone()));
+                inner.insert("doc".into(), row.clone());
+                let mut line = serde_json::Map::new();
+                line.insert(spec.action.clone(), JsonValue::Object(inner));
+                body.push_str(
+                    &serde_json::to_string(&JsonValue::Object(line)).unwrap_or_else(|_| "{}".into()),
+                );
+                body.push('\n');
+            }
+            let req = manticore_request(spec.username.as_deref(), spec.password.as_deref(), &url)
+                .set("Content-Type", "application/x-ndjson");
+            let response: JsonValue = match req.send_string(&body) {
+                Ok(r) => r.into_json().unwrap_or(JsonValue::Null),
+                Err(ureq::Error::Status(code, r)) => {
+                    let body = r.into_string().unwrap_or_default();
+                    return Err(EngineError::Query(format!(
+                        "Manticore HTTP {} from {}: {}",
+                        code,
+                        url,
+                        body.chars().take(300).collect::<String>()
+                    )));
+                }
+                Err(e) => {
+                    return Err(EngineError::Query(format!(
+                        "Manticore HTTP transport to {}: {}",
+                        url, e
+                    )))
+                }
+            };
+            if response.get("errors").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Err(EngineError::Query(format!(
+                    "Manticore rejected part of a /bulk batch ({} row(s) sent so far, none of \
+                     this batch is guaranteed written): {}",
+                    batches * batch,
+                    manticore_bulk_reason(&response)
+                )));
+            }
+            batches += 1;
+        }
+        Ok(format!(
+            "manticore: {}ed {} rows into {} ({} request(s))",
+            spec.action,
+            rows.len(),
+            spec.table,
+            batches
+        ))
+    }
+
     /// Generic HTTP REST source. Fetches the URL (optionally with a
     /// JSON body for POST APIs), parses the response, walks the
     /// configured JSON pointer to find the row array, and follows
@@ -11589,12 +16016,58 @@ impl DuckdbEngine {
         }))
     }
 
+    /// #260: write one captured response body where it was asked for.
+    ///
+    /// Content-addressed by default, so an unchanged body rewrites the same
+    /// object and a changed one becomes a new object. That is the difference
+    /// from a normal copy: a URL is a NAME that can be rebound, so naming the
+    /// capture after its URL and skipping when the file exists silently keeps
+    /// the old body when the resource changed.
+    fn capture_raw_response(
+        &self,
+        auth: &plan::ArtifactAuth,
+        dest: &str,
+        body: &[u8],
+    ) -> Result<(), EngineError> {
+        // #260: object storage, so a raw zone can BE the raw zone rather than a
+        // local staging step. Written HERE, before the caller parses, which is
+        // what keeps "durable before any parsed row flows" true - a later copy
+        // stage could not promise that.
+        if dest.starts_with("s3://") || dest.starts_with("s3a://") {
+            let cfg = auth.s3.as_ref().ok_or_else(|| {
+                EngineError::Config(format!(
+                    concat!(
+                        "raw capture to {} needs S3 credentials - pick a saved S3 ",
+                        "connection on this node, or capture to a local path."
+                    ),
+                    dest
+                ))
+            })?;
+            let (bucket, key) = crate::s3::parse_s3_uri(dest)?;
+            let owned = body.to_vec();
+            let len = owned.len() as u64;
+            cfg.put(&bucket, &key, std::io::Cursor::new(owned), len, None)?;
+            return Ok(());
+        }
+        let path = std::path::Path::new(dest);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                EngineError::Query(format!("rest: raw capture {}: {e}", parent.display()))
+            })?;
+        }
+        // Content-addressed: the same bytes are the same object, so rewriting is
+        // a no-op rather than a conflict.
+        std::fs::write(path, body)
+            .map_err(|e| EngineError::Query(format!("rest: raw capture {dest}: {e}")))
+    }
+
     pub(crate) fn run_rest_source(
         &self,
         db: &Path,
         spec: &RestSourceSpec,
+        pipeline_name: Option<&str>,
+        pending: &mut Vec<crate::PendingWrite>,
     ) -> Result<String, EngineError> {
-        let mut all_rows: Vec<JsonValue> = Vec::new();
         let mut pages = 0_u64;
         // One Agent for the whole pagination walk so keep-alive connections
         // are reused across pages instead of a fresh TCP+TLS handshake each
@@ -11616,27 +16089,94 @@ impl DuckdbEngine {
             eff_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
             eff_headers.push(("Authorization".into(), format!("Bearer {}", token)));
         }
+        // #257: request-side incremental state.
+        //
+        // Fetch-then-filter is not incremental for an API - filtering after the
+        // fetch still pays for the whole dataset every run - so the cursor has
+        // to reach the request. Read here, substituted below, and the NEXT mark
+        // is derived from the rows and queued for the deferred write that only
+        // flushes when the whole run succeeds.
+        let state_path = spec
+            .incremental_field
+            .as_ref()
+            .and_then(|_| incremental_state_path(pipeline_name, &spec.node_id));
+        let prior_state = state_path.as_ref().map(|p| crate::read_state_snapshot(p));
+        let saved_mark = state_path
+            .as_ref()
+            .and_then(read_incremental_state)
+            .map(|(v, _)| v);
+        let mark = saved_mark
+            .clone()
+            .unwrap_or_else(|| spec.incremental_initial.clone());
+        // Applied to everything that reaches the wire, because an API may take
+        // its cursor in any of them.
+        let sub = |t: &str| t.replace(INCREMENTAL_PLACEHOLDER, &mark);
+        let spec = &{
+            let mut s2 = spec.clone();
+            if s2.incremental_field.is_some() {
+                s2.url = sub(&s2.url);
+                s2.url_template = s2.url_template.as_deref().map(sub);
+                s2.body = s2.body.as_deref().map(sub);
+                s2.headers = s2.headers.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
+            }
+            s2
+        };
+        // ...and the headers that actually go out, which are not these.
+        // `eff_headers` was cloned from the pre-substitution spec further up
+        // (it has to be, because the OAuth token is merged into it before this
+        // point), and the request loop sends `eff_headers`, not `spec.headers`.
+        // So the line above rewrote a copy nothing reads, and an API taking its
+        // cursor as a header - If-Modified-Since, or a vendor's own - was sent
+        // the literal `{incremental}` on every run.
+        if spec.incremental_field.is_some() {
+            for (_, v) in eff_headers.iter_mut() {
+                *v = sub(v);
+            }
+        }
+
         // #257: a parent endpoint can feed a child endpoint. Without a URL
         // template there is one pass and no substitution, exactly what this
         // function did before, so every existing pipeline and all the vendor
         // aliases are untouched. The agent, the once-per-run OAuth token, the
         // headers, the row extraction and all five pagination strategies below
         // are shared across the fan-out rather than redone per request.
-        let parents: Vec<JsonValue> = match (&spec.from_view, &spec.url_template) {
-            (Some(view), Some(_)) => self.run_rows(
-                Some(db),
-                &format!("SELECT * FROM {};", quote_ident(view)),
-            )?,
-            _ => vec![JsonValue::Null],
+        let mut parents = match (&spec.from_view, &spec.url_template) {
+            (Some(view), Some(_)) => ParentStream::spill(&self.bin, db, view, &spec.node_id)?,
+            _ => ParentStream::single(),
         };
-        if spec.url_template.is_some() && parents.len() as u64 > spec.max_requests {
+        // The mark is substituted before the parent-row pass, so an upstream
+        // column of the same name would be shadowed without a word. Refuse
+        // rather than pick one silently.
+        if spec.incremental_field.is_some() {
+            if let Some(obj) = parents.peek_first().as_ref().and_then(|p| p.as_object()) {
+                if obj.contains_key(INCREMENTAL_NAME) {
+                    return Err(EngineError::Config(format!(
+                        "rest: the upstream has a column named {INCREMENTAL_NAME:?}, which is \
+                         the name this node substitutes the saved incremental mark under. \
+                         Rename the column, or turn the incremental field off."
+                    )));
+                }
+            }
+        }
+        // Counted rather than measured from a list, so the cap still refuses
+        // BEFORE the first request rather than after the Nth.
+        let parent_count = parents.count()?;
+        if spec.url_template.is_some() && parent_count > spec.max_requests {
             return Err(EngineError::Query(format!(
                 "rest: {} upstream rows would each make a request, past the cap of {}. Filter the upstream, or raise Max requests.",
-                parents.len(),
+                parent_count,
                 spec.max_requests
             )));
         }
-        for parent in &parents {
+        // #257: one parent's whole paginated walk, as a callable unit.
+        //
+        // Extracted so the fan-out can be driven either sequentially (which is
+        // byte for byte what this node did before) or by a bounded pool. It
+        // returns that parent's rows and the pages it walked; it accumulates
+        // nothing across parents, which is what lets the caller write results
+        // out as they finish instead of holding the whole child dataset.
+        let fetch_parent = |parent: &JsonValue| -> Result<(Vec<JsonValue>, u64), EngineError> {
+            let mut out: Vec<JsonValue> = Vec::new();
             self.check_cancelled()?;
             let mut url = match &spec.url_template {
                 Some(t) => render_url_template(t, parent)?,
@@ -11700,15 +16240,56 @@ impl DuckdbEngine {
                 // what answered and with what has to be taken here or not at all.
                 let page_status = response_raw.status();
                 let page_url = url.clone();
+                // #260: the rest of the provenance, taken here for the same
+                // reason - once the body is read the response is gone.
+                let page_content_type = response_raw.header("content-type").map(String::from);
+                let page_etag = response_raw.header("etag").map(String::from);
+                let page_last_modified = response_raw.header("last-modified").map(String::from);
                 // For XML, parse as text + walk row_path; pagination is
                 // not meaningful (SOAP has no cross-envelope convention)
                 // so we treat the JSON-pointer/cursor variants as no-ops
                 // by returning a Null response from this branch.
+                // Read once. The hash has to be of the bytes that were actually
+                // parsed, and a second read would describe a second response.
+                let page_body = response_raw.into_string().map_err(|e| {
+                    EngineError::Query(format!("REST response read: {}", e))
+                })?;
+                let page_sha256 = {
+                    // Reuse the hasher the artifact side already uses, so a
+                    // captured body and a copied artifact are comparable by the
+                    // same hash rather than two hashes that happen to agree.
+                    let mut hashing = crate::s3::HashingReader::new(page_body.as_bytes());
+                    std::io::copy(&mut hashing, &mut std::io::sink()).map_err(|e| {
+                        EngineError::Query(format!("rest: hashing the response: {e}"))
+                    })?;
+                    hashing.finish().0
+                };
+                // #260: persist the original body before parsing, so a later
+                // question about whether the PARSER or the SOURCE changed can be
+                // answered from the bytes rather than argued about.
+                // #260: kept, so each parsed row can NAME the artifact it came
+                // from. Reconstructing it downstream from the template would
+                // mean re-deriving {sha256} and {date} and hoping they still
+                // resolve the same way - and {date} would not, on a run that
+                // crossed midnight.
+                let page_raw_uri = if spec.raw_response_destination.trim().is_empty() {
+                    None
+                } else {
+                    let dest = spec
+                        .raw_response_destination
+                        .replace("{sha256}", &page_sha256)
+                        .replace("{date}", &chrono::Utc::now().format("%Y-%m-%d").to_string());
+                    // Written BEFORE the parse below, so a row can never name
+                    // an artifact that does not exist yet.
+                    self.capture_raw_response(&spec.raw_auth, &dest, page_body.as_bytes())?;
+                    Some(dest)
+                };
                 let (rows, response): (Vec<JsonValue>, JsonValue) = match spec.response_format {
                     RestResponseFormat::Json => {
-                        let response: JsonValue = response_raw.into_json().map_err(|e| {
-                            EngineError::Query(format!("REST response not JSON: {}", e))
-                        })?;
+                        let response: JsonValue =
+                            serde_json::from_str(&page_body).map_err(|e| {
+                                EngineError::Query(format!("REST response not JSON: {}", e))
+                            })?;
                         // Locate the rows: the whole response when no responsePath
                         // is set, else the JSON pointer target. A located ARRAY is
                         // the row set; a single OBJECT is one row (issue #13: APIs
@@ -11733,10 +16314,8 @@ impl DuckdbEngine {
                         (rows, response)
                     }
                     RestResponseFormat::Xml => {
-                        let body = response_raw.into_string().map_err(|e| {
-                            EngineError::Query(format!("REST XML response read: {}", e))
-                        })?;
-                        let rows = walk_xml_to_rows(&body, &spec.response_path, &self.cancel)?;
+                        let rows =
+                            walk_xml_to_rows(&page_body, &spec.response_path, &self.cancel)?;
                         (rows, JsonValue::Null)
                     }
                 };
@@ -11768,6 +16347,53 @@ impl DuckdbEngine {
                                     o.insert("_http_url".into(), JsonValue::from(page_url.clone()));
                                     o.insert("_http_status".into(), JsonValue::from(page_status));
                                     o.insert("_fetched_at".into(), JsonValue::from(at));
+                                    // #260: enough to answer "did the parsed
+                                    // result change because the source changed
+                                    // or because the parser did".
+                                    o.insert(
+                                        "_response_content_type".into(),
+                                        match &page_content_type {
+                                            Some(v) => JsonValue::from(v.clone()),
+                                            None => JsonValue::Null,
+                                        },
+                                    );
+                                    o.insert(
+                                        "_response_etag".into(),
+                                        match &page_etag {
+                                            Some(v) => JsonValue::from(v.clone()),
+                                            None => JsonValue::Null,
+                                        },
+                                    );
+                                    o.insert(
+                                        "_response_last_modified".into(),
+                                        match &page_last_modified {
+                                            Some(v) => JsonValue::from(v.clone()),
+                                            None => JsonValue::Null,
+                                        },
+                                    );
+                                    o.insert(
+                                        "_response_sha256".into(),
+                                        JsonValue::from(page_sha256.clone()),
+                                    );
+                                    // #260: the artifact this row was parsed
+                                    // out of. Null when nothing was captured,
+                                    // rather than a path to a file that was
+                                    // never written.
+                                    o.insert(
+                                        "_response_uri".into(),
+                                        match &page_raw_uri {
+                                            Some(u) => JsonValue::from(u.clone()),
+                                            None => JsonValue::Null,
+                                        },
+                                    );
+                                    // Per this parent's walk. A global counter
+                                    // would keep climbing across parents, so
+                                    // `_page_number` would say 4001 for the
+                                    // first page of the 4001st company.
+                                    o.insert(
+                                        "_page_number".into(),
+                                        JsonValue::from(parent_pages + 1),
+                                    );
                                 }
                                 r
                             })
@@ -11793,8 +16419,7 @@ impl DuckdbEngine {
                     }
                     _ => rows,
                 };
-                all_rows.extend(rows);
-                pages += 1;
+                out.extend(rows);
                 parent_pages += 1;
                 // Determine whether another page exists (and set up the next
                 // request URL as a side effect). Done BEFORE the page-cap
@@ -11897,25 +16522,313 @@ impl DuckdbEngine {
                 }
             }
             if truncated {
-                return Err(pagination_capped_err(
-                    "rest",
-                    all_rows.len(),
-                    spec.max_pages,
-                ));
+                return Err(pagination_capped_err("rest", out.len(), spec.max_pages));
+            }
+            Ok((out, parent_pages))
+        };
+
+        // #257 + #252: remember each parent as its walk finishes.
+        //
+        // The same store the AI transforms use. A fan-out with its own record
+        // of what succeeded would be a second answer to the same question, and
+        // two such records drift - so resume falls out of the execution shape
+        // rather than sitting beside it.
+        //
+        // Everything that shapes a request is in the identity, the saved
+        // incremental mark included, because `spec` here is already the
+        // mark-substituted clone: a different cursor is a different question,
+        // and replaying yesterday's answer for it would be silently wrong.
+        let ckpt_config_fp = crate::checkpoint::fingerprint(&serde_json::json!({
+            "url": spec.url,
+            "url_template": spec.url_template,
+            "method": spec.method,
+            "body": spec.body,
+            "response_path": spec.response_path,
+            "parent_key_column": spec.parent_key_column,
+            "response_metadata": spec.response_metadata,
+        }));
+        let store = if spec.checkpoint {
+            match std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.is_empty()) {
+                Some(ws) => Some(crate::checkpoint::Store::open(
+                    std::path::Path::new(&ws),
+                    pipeline_name.unwrap_or(UNNAMED_RUN_FOLDER),
+                    &spec.node_id,
+                )?),
+                None => {
+                    return Err(EngineError::Config(
+                        concat!(
+                            "rest: remembering completed rows needs a workspace ",
+                            "(DUCKLE_WORKSPACE) to keep them in"
+                        )
+                        .into(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        // Keyed on the carried parent key when there is one, and on the whole
+        // parent row otherwise - the same safe direction the AI checkpoint
+        // takes, where a volatile column costs reuse rather than producing a
+        // wrong answer.
+        let ckpt_keys: Vec<String> = spec
+            .parent_key_column
+            .as_deref()
+            .map(|c| vec![c.to_string()])
+            .unwrap_or_default();
+
+        // This parent's rows: from the store when it is already done, from the
+        // network otherwise.
+        //
+        // One closure so the two drivers cannot disagree about when a request
+        // is skipped. They differ in HOW they pull parents and must not differ
+        // in what a parent costs. The bool says whether it was reused, which is
+        // what the run message needs to be honest about.
+        let walk = |parent: &JsonValue| -> Result<(Vec<JsonValue>, u64, bool), EngineError> {
+            let key = store
+                .as_ref()
+                .map(|_| crate::checkpoint::item_key(parent, &ckpt_keys, &[], &ckpt_config_fp));
+            if let (Some(store), Some(key)) = (store.as_ref(), key.as_ref()) {
+                if let Some(done) = store.get(key) {
+                    return Ok((done.as_array().cloned().unwrap_or_default(), 0, true));
+                }
+            }
+            let (rows, pages) = fetch_parent(parent)?;
+            // Recorded HERE, as this parent finishes, not when the stage does.
+            // That is the whole guarantee: a failure on the next parent keeps
+            // every one already fetched.
+            if let (Some(store), Some(key)) = (store.as_ref(), key.as_ref()) {
+                store.record(key, &JsonValue::Array(rows.clone()))?;
+            }
+            Ok((rows, pages, false))
+        };
+
+        // #257: write as the walks finish, rather than accumulating.
+        //
+        // The old shape held every child row in one Vec until the stage ended,
+        // so a 2M-parent fan-out was bounded by RAM rather than by the API.
+        // Memory is now the parent list, the walks in flight and one write
+        // batch; the TOTAL number of children no longer appears in that sum.
+        // `materialize_jsonobjects_as_table_typed` is the same writer with a
+        // Vec in front of it, and its own comment says to use the writer
+        // directly for exactly this case.
+        let mut writer =
+            JsonLinesWriter::open_with_schema(&spec.node_id, spec.declared_schema.clone())?;
+        // #257 + #101: a parent that failed is a row, not just a log line. A
+        // 2M-parent run that half-failed is only operable if the failures are
+        // durable next to the successes.
+        let reject_policy = spec.on_parent_error.as_str();
+        let mut rejects: Vec<JsonValue> = Vec::new();
+        let mut written = 0_usize;
+        let mut failed = 0_usize;
+        // Atomic so both drivers count it the same way; the sequential path
+        // simply never contends for it.
+        let reused = std::sync::atomic::AtomicUsize::new(0);
+        // The highest value seen in the incremental field, across every parent.
+        let mut next_mark: Option<String> = None;
+
+        if spec.concurrency <= 1 {
+            while let Some(parent) = parents.next()? {
+                match walk(&parent) {
+                    Ok((rows, walked, from_store)) => {
+                        pages += walked;
+                        if from_store {
+                            reused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        for r in &rows {
+                            advance_mark(&mut next_mark, spec.incremental_field.as_deref(), r);
+                            writer.write_row(r)?;
+                            written += 1;
+                        }
+                    }
+                    Err(e) => match reject_policy {
+                        "fail" => return Err(e),
+                        p => {
+                            failed += 1;
+                            if p == "reject" {
+                                rejects.push(parent_failure_row(spec, &parent, &e));
+                            }
+                        }
+                    },
+                }
+            }
+        } else {
+            // Bounded pool. Workers pull the next parent index rather than
+            // being handed a slice, so one slow endpoint does not leave the
+            // other workers idle at the end of their share.
+            use std::sync::Mutex;
+            // Workers pull the next parent from the stream itself, so the list
+            // is never materialised even to hand work out.
+            let source = Mutex::new(&mut parents);
+            let shared: Mutex<(
+                &mut JsonLinesWriter,
+                &mut Vec<JsonValue>,
+                &mut u64,
+                &mut usize,
+                &mut usize,
+                &mut Option<String>,
+            )> = Mutex::new((
+                &mut writer,
+                &mut rejects,
+                &mut pages,
+                &mut written,
+                &mut failed,
+                &mut next_mark,
+            ));
+            let first_error: Mutex<Option<EngineError>> = Mutex::new(None);
+            let workers = spec.concurrency.min((parent_count as usize).max(1));
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| loop {
+                        if first_error.lock().map(|e| e.is_some()).unwrap_or(true) {
+                            return;
+                        }
+                        // The lock is held only to take one line, never
+                        // across a request.
+                        let taken = { source.lock().ok().map(|mut s| s.next()) };
+                        let parent = match taken {
+                            Some(Ok(Some(p))) => p,
+                            Some(Err(e)) => {
+                                if let Ok(mut slot) = first_error.lock() {
+                                    slot.get_or_insert(e);
+                                }
+                                return;
+                            }
+                            _ => return,
+                        };
+                        let outcome = walk(&parent);
+                        let Ok(mut g) = shared.lock() else { return };
+                        match outcome {
+                            Ok((rows, walked, from_store)) => {
+                                *g.2 += walked;
+                                if from_store {
+                                    reused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                for r in &rows {
+                                    advance_mark(
+                                        g.5,
+                                        spec.incremental_field.as_deref(),
+                                        r,
+                                    );
+                                    // A write failure is the stage's failure,
+                                    // not this parent's, so it stops everything
+                                    // rather than becoming a reject row.
+                                    if let Err(e) = g.0.write_row(r) {
+                                        if let Ok(mut slot) = first_error.lock() {
+                                            slot.get_or_insert(e);
+                                        }
+                                        return;
+                                    }
+                                    *g.3 += 1;
+                                }
+                            }
+                            Err(e) => match reject_policy {
+                                "fail" => {
+                                    if let Ok(mut slot) = first_error.lock() {
+                                        slot.get_or_insert(e);
+                                    }
+                                    return;
+                                }
+                                p => {
+                                    *g.4 += 1;
+                                    if p == "reject" {
+                                        g.1.push(parent_failure_row(spec, &parent, &e));
+                                    }
+                                }
+                            },
+                        }
+                    });
+                }
+            });
+            if let Some(e) = first_error.lock().ok().and_then(|mut s| s.take()) {
+                return Err(e);
             }
         }
+
+        writer.finalize_into_table(&self.bin, db, &spec.node_id)?;
+        // The reject relation is built even when empty, so a downstream node
+        // wired to it binds on a clean run instead of failing on a missing
+        // table - the same reason the main output is typed when empty.
+        //
+        // This used to sit behind `if reject_policy == "reject"`, which defeated
+        // the sentence above: with any other policy the table was never made, so
+        // wiring the reject port failed the run with "Catalog Error: Table with
+        // name <node>__reject does not exist!". The dropdown defaults to "fail"
+        // and the port is drawn on the tile, so connecting it was enough to kill
+        // a run in which nothing had gone wrong. `rejects` is simply empty under
+        // the other policies, which is exactly what a downstream node should
+        // bind to.
         materialize_jsonobjects_as_table_typed(
             &self.bin,
             db,
-            &spec.node_id,
-            &all_rows,
-            spec.declared_schema.as_deref(),
+            &format!("{}__reject", spec.node_id),
+            &rejects,
+            Some(&parent_failure_schema()),
         )?;
+        // #257: queued, not written. The deferred queue flushes only when the
+        // WHOLE run succeeds, so a pipeline that fails after this stage does
+        // not advance the cursor past rows no sink ever received.
+        //
+        // Only when it moved FORWARD. A page that came back out of order, or an
+        // API that returned an older record last, must not walk the mark
+        // backwards and re-fetch what was already taken.
+        //
+        // And only when every parent was actually FETCHED. A parent that was
+        // skipped or rejected had its rows never received - only the fact of
+        // the failure was - so moving the cursor past it means the next run
+        // asks from a point after data nothing ever collected, and nothing
+        // goes back for it. That is silent, permanent loss, and it is the
+        // failure the whole incremental design exists to prevent. Same rule a
+        // budget stop already follows: work that did not finish does not move
+        // the cursor.
+        if let (Some(path), Some(found)) = (state_path.as_ref(), next_mark.as_ref()) {
+            let moved = saved_mark
+                .as_deref()
+                .map(|old| mark_is_newer(found, old))
+                .unwrap_or(true);
+            if failed > 0 {
+                eprintln!(
+                    "duckle: rest: {failed} parent(s) failed, so the incremental mark was NOT                      advanced - the next run re-reads this window rather than stepping over it"
+                );
+            }
+            if moved && failed == 0 {
+                pending.push(crate::PendingWrite::state(
+                    path.clone(),
+                    serde_json::json!({ "value": found, "type": "VARCHAR" }),
+                    prior_state.unwrap_or(None),
+                ));
+            }
+        }
         Ok(format!(
-            "rest: materialized {} rows ({} page(s)) into {}",
-            all_rows.len(),
+            "rest: materialized {} rows ({} page(s)) into {}{}{}",
+            written,
             pages,
-            spec.node_id
+            spec.node_id,
+            {
+                let r = reused.load(std::sync::atomic::Ordering::Relaxed);
+                let mut note = String::new();
+                if r > 0 {
+                    note.push_str(&format!(
+                        ", {} parent(s) reused from the checkpoint",
+                        r
+                    ));
+                }
+                if failed > 0 {
+                    note.push_str(&format!(
+                        ", {} parent(s) failed and were {}",
+                        failed,
+                        if reject_policy == "reject" { "rejected" } else { "skipped" }
+                    ));
+                }
+                note
+            },
+            // Said here rather than left to be discovered when a downstream
+            // LIMIT 10 returns different rows on a rerun.
+            if spec.concurrency > 1 {
+                format!(" (unordered: {} requests in flight)", spec.concurrency)
+            } else {
+                String::new()
+            },
         ))
     }
 
@@ -12009,6 +16922,7 @@ impl DuckdbEngine {
         node_id: &str,
         child: &str,
         per_row: &[(std::collections::HashMap<String, String>, Option<String>)],
+        retry: Option<&crate::batch::RetryPolicy>,
     ) -> Result<String, EngineError> {
         // A batch is a file in the workspace, so without one there is nowhere
         // for the work to live and nothing could ever pick it up. Failing here
@@ -12031,6 +16945,7 @@ impl DuckdbEngine {
                 item: item.clone(),
                 child: child.to_string(),
                 vars: subs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                retry: retry.cloned(),
             })
             .collect();
         let path = crate::batch::write(ws, &batch_id, &items)?;
@@ -12163,13 +17078,14 @@ impl DuckdbEngine {
         db: &Path,
         spec: &plan::IncrementalSpec,
         pipeline_name: Option<&str>,
-        pending: &mut Vec<(std::path::PathBuf, JsonValue)>,
+        pending: &mut Vec<crate::PendingWrite>,
     ) -> Result<String, EngineError> {
         let col_q = plan::quote_ident(&spec.column);
         let up_q = plan::quote_ident(&spec.from_view);
         let node_q = plan::quote_ident(&spec.node_id);
 
         let state_path = incremental_state_path(pipeline_name, &spec.node_id);
+        let prior = state_path.as_deref().and_then(crate::read_state_snapshot);
         let saved = state_path
             .as_ref()
             .and_then(read_incremental_state)
@@ -12225,13 +17141,14 @@ impl DuckdbEngine {
                 .unwrap_or("VARCHAR")
                 .to_string();
             if let (Some(value), Some(path)) = (new_val, state_path) {
-                pending.push((
+                pending.push(crate::PendingWrite::state(
                     path,
                     serde_json::json!({
                         "column": spec.column,
                         "value": value,
                         "type": new_ty,
                     }),
+                    prior,
                 ));
             }
         }
@@ -12251,7 +17168,7 @@ impl DuckdbEngine {
         db: &Path,
         spec: &plan::DuckLakeCdcSpec,
         pipeline_name: Option<&str>,
-        pending: &mut Vec<(std::path::PathBuf, JsonValue)>,
+        pending: &mut Vec<crate::PendingWrite>,
     ) -> Result<String, EngineError> {
         let path = spec.path.replace('\\', "/").replace('\'', "''");
         // This path builds its own ATTACH rather than reusing ducklake_attach,
@@ -12297,6 +17214,7 @@ impl DuckdbEngine {
             .unwrap_or(0);
 
         let state_path = incremental_state_path(pipeline_name, &spec.node_id);
+        let prior = state_path.as_deref().and_then(crate::read_state_snapshot);
         let last = state_path
             .as_ref()
             .and_then(read_snapshot_state)
@@ -12350,7 +17268,11 @@ impl DuckdbEngine {
             .unwrap_or(0);
 
         if let Some(path) = state_path {
-            pending.push((path, serde_json::json!({ "snapshot_id": current })));
+            pending.push(crate::PendingWrite::state(
+                path,
+                serde_json::json!({ "snapshot_id": current }),
+                prior,
+            ));
         }
         Ok(format!(
             "ducklake-cdc: {} change row(s) from snapshot {} to {}",
@@ -13095,7 +18017,7 @@ fn prepare_dbt_invocation(spec: &DbtSpec, db: &Path) -> Result<DbtInvocation, En
     std::fs::create_dir_all(&profiles_dir)
         .map_err(|e| EngineError::Query(format!("xf.dbt: profiles dir: {}", e)))?;
     let profiles_yaml = format!(
-        "{}:\n  target: duckle\n  outputs:\n    duckle:\n      type: duckdb\n      path: \"{}\"\n      schema: {}\n      threads: 1\n",
+        "{}:\n  target: duckle\n  outputs:\n duckle:\n type: duckdb\n path: \"{}\"\n schema: {}\n threads: 1\n",
         profile_name, target_db_yaml, spec.schema
     );
     // write-if-changed: a rewritten profiles.yml would needlessly invalidate the
@@ -13368,6 +18290,20 @@ pub(crate) fn defines_vectorized_entry(script: &str) -> bool {
     })
 }
 
+/// A script defining `transform_batches` is streamed a RecordBatch at a time
+/// rather than handed the whole table (#245).
+///
+/// `defines_vectorized_entry` cannot be reused: it matches `def transform(`
+/// including the paren, so `def transform_batches(` is not a false positive
+/// there - but it does mean the two are independent checks, and streaming is
+/// tested first because a script may reasonably define both.
+pub(crate) fn defines_streaming_entry(script: &str) -> bool {
+    script.lines().any(|l| {
+        let t = l.trim_start();
+        l.starts_with("def transform_batches(") || (t == l && t.starts_with("def transform_batches("))
+    })
+}
+
 /// Temp file paths (input JSON, output JSON, harness script) for a code.python
 /// stage, unique to this run. (#203)
 ///
@@ -13442,6 +18378,335 @@ pub(crate) fn python_in_workspace(ws: &Path) -> Option<String> {
     None
 }
 
+/// #258: the top-level property names a JSON Schema declares.
+///
+/// Used to spot a collision with an upstream column BEFORE any request is paid
+/// for. An empty list when the schema has no object root, which is the honest
+/// answer rather than a guess.
+pub(crate) fn schema_top_level_fields(schema: Option<&JsonValue>) -> Vec<String> {
+    schema
+        .and_then(|s| s.get("properties"))
+        .and_then(|p| p.as_object())
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// #258: is this reply the shape it was asked for?
+///
+/// Deliberately NOT a full JSON Schema validator. It checks that the reply
+/// parses, that every `required` property is present, and that each present
+/// property matches the `type` the schema declares for it at the top level.
+/// Nested schemas are sent to the provider, which enforces them during
+/// decoding under `strict: true`; re-implementing draft 2020-12 here to check
+/// them a second time would be a large dependency for a second opinion.
+///
+/// The local check exists for one specific failure: an OpenAI-COMPATIBLE
+/// endpoint that accepts `response_format` and ignores it. Prose where an
+/// object was expected has to be caught, and it is.
+pub(crate) fn validate_structured_reply(
+    content: &str,
+    schema: Option<&JsonValue>,
+) -> Result<JsonValue, String> {
+    let text = strip_code_fence(content.trim());
+    let value: JsonValue = serde_json::from_str(text)
+        .map_err(|e| format!("the reply is not JSON ({e})"))?;
+    let Some(schema) = schema else {
+        return Ok(value);
+    };
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return Ok(value);
+    };
+    let Some(obj) = value.as_object() else {
+        return Err("the reply is JSON but not an object, and the schema declares one".into());
+    };
+    if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
+        for name in req.iter().filter_map(|v| v.as_str()) {
+            if !obj.contains_key(name) {
+                return Err(format!("the reply is missing the required field {name:?}"));
+            }
+        }
+    }
+    for (name, decl) in props {
+        let Some(got) = obj.get(name) else { continue };
+        let Some(want) = decl.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        if !json_matches_type(got, want) {
+            return Err(format!(
+                "field {name:?} should be {want} and is {}",
+                json_type_name(got)
+            ));
+        }
+    }
+    Ok(value)
+}
+
+/// A model told to answer in JSON often wraps it in a ```json fence anyway.
+/// Unwrapping it is not leniency about the shape - the shape is still checked -
+/// it just avoids failing on punctuation.
+fn strip_code_fence(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    // Skip an optional language tag on the opening fence.
+    let rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
+    rest.trim_end().strip_suffix("```").unwrap_or(rest).trim()
+}
+
+fn json_type_name(v: &JsonValue) -> &'static str {
+    match v {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
+fn json_matches_type(v: &JsonValue, want: &str) -> bool {
+    match want {
+        // A whole number arriving as `2.0` is still an integer to every
+        // producer that matters, and rejecting it would fail correct replies.
+        "integer" => v.as_i64().is_some() || v.as_f64().is_some_and(|f| f.fract() == 0.0),
+        "number" => v.is_number(),
+        "string" => v.is_string(),
+        "boolean" => v.is_boolean(),
+        "array" => v.is_array(),
+        "object" => v.is_object(),
+        "null" => v.is_null(),
+        // A type the checker does not know is not a reason to reject an answer
+        // the provider already validated.
+        _ => true,
+    }
+}
+
+/// #257: the parent rows a fan-out drives, one at a time.
+///
+/// The fan-out used to read every parent through `run_rows`, which parses the
+/// whole relation into a Vec of JsonValue. For a registry-scale walk that is a
+/// second thing sized by the total work rather than by the work in flight -
+/// and a parsed JsonValue is several times the size of the text it came from.
+///
+/// The relation is spilled once to newline-delimited JSON and then read a line
+/// at a time. It costs one DuckDB spawn, which is exactly what `run_rows` cost,
+/// so the small case is no slower; what changes is that a 2M-parent list is
+/// bytes on disk instead of objects in memory.
+///
+/// DuckDB escapes a newline inside a string as `\n`, so a physical newline
+/// always ends a record - which is what makes both the line count and the
+/// line-by-line read exact.
+pub(crate) struct ParentStream {
+    lines: Option<std::io::Lines<std::io::BufReader<std::fs::File>>>,
+    path: Option<std::path::PathBuf>,
+    /// The single synthetic parent for a node that is not fanning out. `None`
+    /// once taken, which is what ends that stream after one item.
+    single: Option<JsonValue>,
+}
+
+impl ParentStream {
+    /// A node with no fan-out: exactly one pass, no upstream, no spill.
+    fn single() -> Self {
+        ParentStream { lines: None, path: None, single: Some(JsonValue::Null) }
+    }
+
+    /// Spill `view` to NDJSON beside the run database and stream it.
+    fn spill(
+        bin: &Path,
+        db: &Path,
+        view: &str,
+        node_id: &str,
+    ) -> Result<Self, EngineError> {
+        let path = db.with_file_name(format!(
+            "{}.parents-{}.ndjson",
+            db.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+            sanitize_path_segment(node_id)
+        ));
+        let sql = format!(
+            "COPY (SELECT * FROM {}) TO '{}' (FORMAT JSON)",
+            quote_ident(view),
+            path.to_string_lossy().replace('\\', "/").replace('\'', "''")
+        );
+        crate::apply_duckdb_sql(bin, db, &sql)?;
+        let file = std::fs::File::open(&path)
+            .map_err(|e| EngineError::Query(format!("rest: read parents: {e}")))?;
+        Ok(ParentStream {
+            lines: Some(std::io::BufRead::lines(std::io::BufReader::with_capacity(
+                256 * 1024,
+                file,
+            ))),
+            path: Some(path),
+            single: None,
+        })
+    }
+
+    /// How many parents there are, without parsing any of them.
+    ///
+    /// Counted so the request cap can still refuse BEFORE the first request
+    /// rather than after N of them. A byte scan of a local file is far cheaper
+    /// than a second pass over the relation.
+    fn count(&self) -> Result<u64, EngineError> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(1);
+        };
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| EngineError::Query(format!("rest: count parents: {e}")))?;
+        let mut buf = [0u8; 256 * 1024];
+        let mut n = 0_u64;
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => n += buf[..k].iter().filter(|b| **b == b'\n').count() as u64,
+                Err(e) => return Err(EngineError::Query(format!("rest: count parents: {e}"))),
+            }
+        }
+        Ok(n)
+    }
+
+    /// The first parent, for the checks that need to see the upstream's shape.
+    /// Reads it without consuming the stream.
+    fn peek_first(&self) -> Option<JsonValue> {
+        let path = self.path.as_ref()?;
+        let file = std::fs::File::open(path).ok()?;
+        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(file));
+        serde_json::from_str(&lines.next()?.ok()?).ok()
+    }
+
+    /// The next parent, or None at the end.
+    ///
+    /// A line that does not parse ends the stream rather than being skipped:
+    /// silently dropping a parent would silently drop its children, and a short
+    /// result that looks complete is the failure this whole node avoids.
+    fn next(&mut self) -> Result<Option<JsonValue>, EngineError> {
+        if let Some(v) = self.single.take() {
+            return Ok(Some(v));
+        }
+        let Some(lines) = self.lines.as_mut() else {
+            return Ok(None);
+        };
+        loop {
+            let Some(line) = lines.next() else { return Ok(None) };
+            let line = line.map_err(|e| EngineError::Query(format!("rest: read parents: {e}")))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            return serde_json::from_str(&line)
+                .map(Some)
+                .map_err(|e| EngineError::Query(format!("rest: parse parent row: {e}")));
+        }
+    }
+}
+
+impl Drop for ParentStream {
+    fn drop(&mut self) {
+        // The spill is scratch. Leaving it would put a copy of every parent
+        // list beside the run database for ever.
+        self.lines = None;
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// #257: the name the saved incremental mark is substituted under.
+///
+/// Reserved: an upstream column of this name is refused rather than shadowed.
+pub(crate) const INCREMENTAL_NAME: &str = "incremental";
+pub(crate) const INCREMENTAL_PLACEHOLDER: &str = "{incremental}";
+
+/// Is `candidate` past `current`?
+///
+/// Numeric when both parse as numbers, textual otherwise - which is what makes
+/// ISO-8601 work without a date parser, since it sorts lexically by design. A
+/// format that does not sort lexically (`03/04/2026`) is not usable as a cursor
+/// here, and would not be usable as one against the API either.
+pub(crate) fn mark_is_newer(candidate: &str, current: &str) -> bool {
+    match (candidate.parse::<f64>(), current.parse::<f64>()) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => candidate > current,
+    }
+}
+
+/// Raise `mark` to this row's value, if the row carries a higher one.
+///
+/// The field is a plain key (`updated_at`) or a JSON pointer
+/// (`/meta/updated_at`). A row missing it is skipped rather than treated as
+/// empty: a null cursor would drag the mark down to nothing.
+pub(crate) fn advance_mark(mark: &mut Option<String>, field: Option<&str>, row: &JsonValue) {
+    let Some(field) = field else { return };
+    let found = if field.starts_with('/') {
+        row.pointer(field)
+    } else {
+        row.get(field)
+    };
+    let Some(v) = found else { return };
+    let text = match v {
+        JsonValue::String(s) => s.clone(),
+        JsonValue::Null => return,
+        other => other.to_string(),
+    };
+    if text.is_empty() {
+        return;
+    }
+    match mark {
+        Some(current) if !mark_is_newer(&text, current) => {}
+        _ => *mark = Some(text),
+    }
+}
+
+/// #257: the columns a rejected parent produces.
+///
+/// Declared rather than inferred so the reject relation has the same shape on a
+/// clean run as on a bad one - a downstream node wired to it must bind either
+/// way, and inferring from zero rows cannot type anything.
+fn parent_failure_schema() -> Vec<duckle_metadata::Column> {
+    use duckle_metadata::{Column, DataType};
+    let col = |name: &str, t: DataType| Column {
+        tags: Vec::new(),
+        name: name.to_string(),
+        data_type: t,
+        nullable: true,
+        primary_key: None,
+        format: None,
+    };
+    vec![
+        col("parent_key", DataType::String),
+        col("url", DataType::String),
+        col("error", DataType::String),
+        col("failed_at", DataType::String),
+    ]
+}
+
+/// #257: one parent's failure, as a row.
+///
+/// Carries the parent key rather than the whole parent row: the key is what
+/// joins the failure back to its source, and a whole row of arbitrary width
+/// would make the reject relation's shape depend on the upstream's.
+fn parent_failure_row(spec: &RestSourceSpec, parent: &JsonValue, e: &EngineError) -> JsonValue {
+    let key = spec
+        .parent_key_column
+        .as_deref()
+        .and_then(|c| parent.get(c))
+        .map(|v| match v {
+            JsonValue::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    let url = spec
+        .url_template
+        .as_deref()
+        .map(|t| render_url_template(t, parent).unwrap_or_else(|_| t.to_string()))
+        .unwrap_or_else(|| spec.url.clone());
+    serde_json::json!({
+        "parent_key": key,
+        "url": url,
+        "error": e.to_string(),
+        "failed_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
 /// Last `max` characters of `s` (UTF-8-safe) - used to keep the useful end
 /// of a long tool log (dbt prints the failing model last) in error messages.
 fn tail_chars(s: &str, max: usize) -> &str {
@@ -13458,7 +18723,228 @@ fn tail_chars(s: &str, max: usize) -> &str {
 /// TRY_CAST it to. `None` means "leave it as VARCHAR" (no cast) - for char /
 /// binary / unknown types whose ODBC text rendering is already what we want.
 /// Decimals keep their precision/scale (clamped to DuckDB's max of 38).
-#[cfg(feature = "teradata")]
+
+/// Backtick-quote a Cypher identifier. Labels and property keys cannot be
+/// bound as parameters, so they are interpolated - which makes escaping the
+/// only thing standing between a label like `` a`b `` and a broken query.
+fn cypher_ident(s: &str) -> String {
+    format!("`{}`", s.replace('`', "``"))
+}
+
+/// A Manticore HTTP JSON request with optional Basic credentials. Manticore
+/// runs unauthenticated by default; both its own `auth = 1` mode and a
+/// reverse proxy in front of it accept HTTP Basic.
+fn manticore_request(user: Option<&str>, password: Option<&str>, url: &str) -> ureq::Request {
+    let mut req = crate::tls::http_agent()
+        .post(url)
+        .set("Accept", "application/json");
+    if let Some(u) = user {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let creds = B64.encode(format!("{}:{}", u, password.unwrap_or("")));
+        req = req.set("Authorization", &format!("Basic {}", creds));
+    }
+    req
+}
+
+/// Pull the readable reason out of a /bulk response. Manticore puts a
+/// top-level `error` on some failures and a per-item `error` on others, so
+/// take whichever is there rather than echoing the whole envelope.
+fn manticore_bulk_reason(response: &JsonValue) -> String {
+    if let Some(e) = response.get("error").and_then(|v| v.as_str()) {
+        if !e.is_empty() {
+            return e.to_string();
+        }
+    }
+    let per_item = response
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| {
+                    it.as_object()
+                        .and_then(|o| o.values().next())
+                        .and_then(|v| v.get("error"))
+                        .map(|e| match e.as_str() {
+                            Some(s) => s.to_string(),
+                            None => e.to_string(),
+                        })
+                })
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    if per_item.is_empty() {
+        response.to_string().chars().take(300).collect()
+    } else {
+        per_item
+    }
+}
+
+/// A Query API request with optional Basic auth. Neo4j accepts the same
+/// user/password pair for a self-hosted server and for Aura.
+fn neo4j_request(user: Option<&str>, password: Option<&str>, url: &str) -> ureq::Request {
+    let mut req = crate::tls::http_agent()
+        .post(url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json");
+    if let Some(u) = user {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let creds = B64.encode(format!("{}:{}", u, password.unwrap_or("")));
+        req = req.set("Authorization", &format!("Basic {}", creds));
+    }
+    req
+}
+
+/// Pull the human-readable message out of a Query API error body. Neo4j
+/// reports Cypher problems in an `errors` array; without this the user would
+/// see only the status code, which never says which clause was wrong.
+fn neo4j_error_detail(text: String) -> String {
+    serde_json::from_str::<JsonValue>(&text)
+        .ok()
+        .and_then(|v| {
+            let e = v.get("errors")?.as_array()?.first()?;
+            e.get("message")
+                .or_else(|| e.get("error"))?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| text.chars().take(300).collect())
+}
+
+/// Normalize a Turso database URL for HTTP. Turso hands out `libsql://` URLs,
+/// which are the same host over HTTPS - rejecting them would mean every user
+/// had to rewrite the URL the dashboard gave them.
+fn turso_base_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    match trimmed.strip_prefix("libsql://") {
+        Some(rest) => format!("https://{}", rest),
+        None => trimmed.to_string(),
+    }
+}
+
+/// POST a pipeline request and check it for statement-level failures.
+///
+/// The pipeline endpoint answers HTTP 200 even when a statement failed - the
+/// failure is an `error` entry inside `results` - so without this check a
+/// broken query would look like an empty table and a failed INSERT would look
+/// like a successful write.
+fn turso_send(
+    auth_token: Option<&str>,
+    url: &str,
+    body: JsonValue,
+) -> Result<JsonValue, EngineError> {
+    let mut req = crate::tls::http_agent()
+        .post(url)
+        .set("Content-Type", "application/json");
+    if let Some(t) = auth_token {
+        req = req.set("Authorization", &format!("Bearer {}", t));
+    }
+    let resp = match req.send_json(body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let text = r.into_string().unwrap_or_default();
+            return Err(EngineError::Query(format!(
+                "turso: HTTP {}: {}",
+                code,
+                text.chars().take(300).collect::<String>()
+            )));
+        }
+        Err(e) => return Err(EngineError::Query(format!("turso: HTTP transport: {}", e))),
+    };
+    let v: JsonValue = resp
+        .into_json()
+        .map_err(|e| EngineError::Query(format!("turso: response not JSON: {}", e)))?;
+    if let Some(results) = v.get("results").and_then(|r| r.as_array()) {
+        for r in results {
+            if r.get("type").and_then(|t| t.as_str()) == Some("error") {
+                let msg = r
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                return Err(EngineError::Query(format!("turso: {}", msg)));
+            }
+        }
+    }
+    Ok(v)
+}
+
+/// Decode one libSQL cell into plain JSON.
+///
+/// libSQL sends integers as STRINGS (`{"type":"integer","value":"42"}`) so
+/// that 64-bit values survive JSON's double-precision numbers. Passing that
+/// through untouched would make every integer column arrive as VARCHAR, so
+/// it is parsed back to a number here - and left as text if it genuinely
+/// does not fit an i64, which loses nothing.
+fn turso_cell_to_json(cell: &JsonValue) -> JsonValue {
+    let ty = cell.get("type").and_then(|v| v.as_str()).unwrap_or("null");
+    match ty {
+        "null" => JsonValue::Null,
+        "integer" => match cell.get("value") {
+            Some(JsonValue::String(s)) => match s.parse::<i64>() {
+                Ok(n) => JsonValue::Number(n.into()),
+                Err(_) => JsonValue::String(s.clone()),
+            },
+            Some(other) => other.clone(),
+            None => JsonValue::Null,
+        },
+        "float" => cell.get("value").cloned().unwrap_or(JsonValue::Null),
+        "text" => cell.get("value").cloned().unwrap_or(JsonValue::Null),
+        // Blobs come back base64-encoded under `base64`, not `value`.
+        "blob" => cell
+            .get("base64")
+            .or_else(|| cell.get("value"))
+            .cloned()
+            .unwrap_or(JsonValue::Null),
+        _ => cell.get("value").cloned().unwrap_or(JsonValue::Null),
+    }
+}
+
+/// Encode a JSON cell as a libSQL bound argument. The mirror of
+/// `turso_cell_to_json`: integers go up as strings, and SQLite has no boolean
+/// or nested types, so those become 1/0 and JSON text respectively.
+fn json_to_turso_arg(v: &JsonValue) -> JsonValue {
+    match v {
+        JsonValue::Null => serde_json::json!({ "type": "null" }),
+        JsonValue::Bool(b) => {
+            serde_json::json!({ "type": "integer", "value": if *b { "1" } else { "0" } })
+        }
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::json!({ "type": "integer", "value": i.to_string() })
+            } else {
+                serde_json::json!({ "type": "float", "value": n.as_f64().unwrap_or(0.0) })
+            }
+        }
+        JsonValue::String(s) => serde_json::json!({ "type": "text", "value": s }),
+        JsonValue::Array(_) | JsonValue::Object(_) => serde_json::json!({
+            "type": "text",
+            "value": serde_json::to_string(v).unwrap_or_else(|_| "null".into())
+        }),
+    }
+}
+
+/// Map a DuckDB column type to a SQLite storage class, for auto-creating a
+/// Turso table. SQLite has no boolean, date or decimal type: booleans land in
+/// INTEGER as 1/0 and everything textual or temporal stays TEXT, which keeps
+/// the ISO form readable and sortable.
+fn duckdb_type_to_sqlite(t: &str) -> String {
+    let up = t.trim().to_ascii_uppercase();
+    match up.as_str() {
+        "BOOLEAN" | "BOOL" | "TINYINT" | "UTINYINT" | "SMALLINT" | "INT2" | "USMALLINT"
+        | "INTEGER" | "INT" | "INT4" | "UINTEGER" | "BIGINT" | "INT8" | "UBIGINT" => "INTEGER",
+        "REAL" | "FLOAT" | "FLOAT4" | "DOUBLE" | "FLOAT8" => "REAL",
+        "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => "BLOB",
+        _ => "TEXT",
+    }
+    .to_string()
+}
+
+#[cfg(feature = "odbc")]
 fn odbc_type_to_duckdb(dt: &odbc_api::DataType) -> Option<String> {
     use odbc_api::DataType as D;
     match dt {
@@ -13632,6 +19118,244 @@ fn read_incremental_state(path: &std::path::PathBuf) -> Option<(String, String)>
     Some((value, ty))
 }
 
+/// Split a Confluent-framed Kafka message into its schema id and Avro payload.
+///
+/// The framing is a zero magic byte, a big-endian u32 schema id, then the raw
+/// Avro datum - note DATUM, not a container file: there is no embedded schema,
+/// which is exactly why the id has to be resolved against a registry.
+///
+/// Anything not carrying that frame returns None and is left as text. That is
+/// deliberate rather than lax: Confluent topics routinely pair a plain string
+/// key with an Avro value, so refusing an unframed key would break the common
+/// case. A zero first byte is not valid UTF-8 text, so this cannot misfire on a
+/// string.
+pub(crate) fn confluent_envelope(bytes: &[u8]) -> Option<(u32, &[u8])> {
+    if bytes.len() < 5 || bytes[0] != 0 {
+        return None;
+    }
+    let id = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    Some((id, &bytes[5..]))
+}
+
+/// Decode one raw Avro datum against a schema and render it as JSON.
+pub(crate) fn avro_datum_to_json(
+    schema: &apache_avro::Schema,
+    payload: &[u8],
+) -> Result<JsonValue, String> {
+    let mut cursor = payload;
+    let reader = apache_avro::reader::datum::GenericDatumReader::builder(schema)
+        .build()
+        .map_err(|e| format!("avro decode: {}", e))?;
+    let value = reader
+        .read_value(&mut cursor)
+        .map_err(|e| format!("avro decode: {}", e))?;
+    JsonValue::try_from(value).map_err(|e| format!("avro value to json: {}", e))
+}
+
+/// Fetch a writer schema from a Confluent Schema Registry by id.
+///
+/// Goes through the engine's shared agent, so a registry behind a corporate CA
+/// or a proxy is reached the same way every other HTTPS call is. Credentials in
+/// the URL (https://user:pass@host) are honoured by the agent.
+fn fetch_registry_schema(
+    agent: &ureq::Agent,
+    registry: &str,
+    id: u32,
+) -> Result<apache_avro::Schema, String> {
+    let url = format!("{}/schemas/ids/{}", registry.trim_end_matches('/'), id);
+    let body: JsonValue = match agent.get(&url).call() {
+        Ok(r) => r
+            .into_json()
+            .map_err(|e| format!("schema registry {}: response was not JSON: {}", url, e))?,
+        Err(ureq::Error::Status(code, r)) => {
+            let text = r.into_string().unwrap_or_default();
+            return Err(format!(
+                "schema registry {}: HTTP {}: {}",
+                url,
+                code,
+                text.chars().take(200).collect::<String>()
+            ));
+        }
+        Err(e) => return Err(format!("schema registry {}: {}", url, e)),
+    };
+    let text = body
+        .get("schema")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("schema registry {}: no \"schema\" field in the response", url))?;
+    apache_avro::Schema::parse_str(text)
+        .map_err(|e| format!("schema registry {}: schema {} does not parse: {}", url, id, e))
+}
+
+/// Turn a mechanism name into the SASL config rskafka wants.
+///
+/// Only the mechanisms rskafka implements are accepted. An unrecognised one is
+/// an error naming what IS supported, rather than a silent downgrade to an
+/// unauthenticated connection - which is what happened while nothing read
+/// these fields at all.
+fn kafka_sasl_config(sasl: &plan::KafkaSasl) -> Result<rskafka::client::SaslConfig, String> {
+    let creds = rskafka::client::Credentials::new(sasl.username.clone(), sasl.password.clone());
+    // Accept the punctuation people actually type: SCRAM-SHA-256, scram_sha_256.
+    let m = sasl
+        .mechanism
+        .to_ascii_uppercase()
+        .replace('_', "-")
+        .replace(' ', "");
+    match m.as_str() {
+        "PLAIN" => Ok(rskafka::client::SaslConfig::Plain(creds)),
+        "SCRAM-SHA-256" => Ok(rskafka::client::SaslConfig::ScramSha256(creds)),
+        "SCRAM-SHA-512" => Ok(rskafka::client::SaslConfig::ScramSha512(creds)),
+        other => Err(format!(
+            "kafka: SASL mechanism '{}' is not supported; use PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512",
+            other
+        )),
+    }
+}
+
+/// Apply a node's transport security to a Kafka client builder.
+///
+/// TLS reuses the engine's shared trust config - the merged OS store plus the
+/// bundled roots - so a broker behind a corporate CA works the same way every
+/// other TLS connection in Duckle does.
+fn kafka_client_builder(
+    bootstrap: Vec<String>,
+    tls: bool,
+    sasl: Option<&plan::KafkaSasl>,
+) -> Result<rskafka::client::ClientBuilder, String> {
+    let mut builder = rskafka::client::ClientBuilder::new(bootstrap);
+    if tls {
+        builder = builder.tls_config(std::sync::Arc::new(crate::tls::build_client_config()));
+    }
+    if let Some(s) = sasl {
+        builder = builder.sasl_config(kafka_sasl_config(s)?);
+    }
+    Ok(builder)
+}
+
+/// One remote object's identity, as far as a metadata probe can see it.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteEntry {
+    pub uri: String,
+    pub name: String,
+    pub size: Option<i64>,
+    pub modified_at: Option<String>,
+    pub etag: Option<String>,
+    pub fingerprint: String,
+}
+
+/// Combine whatever signals the protocol gave into one comparable string.
+///
+/// Conservative on purpose. None of these are guarantees: an ETag can be
+/// absent, can weaken under compression, and on S3 is a digest-of-digests for
+/// a multipart upload rather than the object's hash; Last-Modified has
+/// one-second resolution; SFTP gives mtime and size. When NOTHING usable came
+/// back the fingerprint is unique per call, so the object reads as changed and
+/// gets processed. Re-reading something unnecessarily costs compute; skipping
+/// something that did change loses data, and nothing would report it.
+pub fn remote_fingerprint(
+    etag: Option<&str>,
+    modified: Option<&str>,
+    size: Option<i64>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(e) = etag.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("etag={}", e));
+    }
+    if let Some(m) = modified.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("mtime={}", m));
+    }
+    if let Some(sz) = size {
+        parts.push(format!("size={}", sz));
+    }
+    if parts.is_empty() {
+        // Nothing to compare. Treat as changed rather than as unchanged.
+        return format!(
+            "unknown-{}-{}",
+            std::process::id(),
+            CHANGED_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+    parts.join(" ")
+}
+
+static CHANGED_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sequence for tumble buffer filenames, so two runs in one process never pick
+/// the same name.
+static TUMBLE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Delete buffer files that no longer matter: anything that is neither the one
+/// this run just wrote nor the one the last SUCCESSFUL run pointed at. The
+/// previous buffer has to survive until this run commits, or a failure would
+/// leave nothing authoritative behind.
+fn prune_tumble_buffers(dir: &std::path::Path, keep: &str, prev: Option<&std::path::Path>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("buf-") || !name.ends_with(".parquet") {
+            continue;
+        }
+        if name == keep || prev.map(|p| p == path.as_path()).unwrap_or(false) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The last complete JSON line in a file, used to learn a spool's column shape
+/// when a pass has nothing new. Reads only the tail rather than the whole file,
+/// which matters when a listener has been running for a long time.
+fn last_complete_json_line(path: &std::path::Path) -> Option<JsonValue> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let window = len.min(256 * 1024);
+    f.seek(SeekFrom::Start(len - window)).ok()?;
+    let mut buf = vec![0u8; window as usize];
+    f.read_exact(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find_map(|l| serde_json::from_str::<JsonValue>(l).ok())
+}
+
+/// Read a saved spool byte offset. Missing or malformed reads as "start".
+fn read_spool_offset_state(path: &std::path::Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: JsonValue = serde_json::from_str(&text).ok()?;
+    v.get("next_offset").and_then(|x| x.as_u64())
+}
+
+/// Read a saved Kafka resume point.
+///
+/// The offset is only meaningful for the topic and partition it was written
+/// for. Point the node at a different topic, or a different partition, and the
+/// number means something else entirely - so a mismatch reads as "no saved
+/// offset" and the node falls back to its configured start rather than
+/// resuming at a position from another stream.
+fn read_kafka_offset_state(path: &std::path::Path, topic: &str, partition: i32) -> Option<i64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: JsonValue = serde_json::from_str(&text).ok()?;
+    if v.get("topic").and_then(|x| x.as_str()) != Some(topic) {
+        return None;
+    }
+    if v.get("partition").and_then(|x| x.as_i64()) != Some(partition as i64) {
+        return None;
+    }
+    v.get("next_offset")
+        .and_then(|x| x.as_i64())
+        .filter(|o| *o >= 0)
+}
+
 /// Read a saved DuckLake snapshot id from CDC state. Missing / unreadable
 /// reads as "no prior snapshot".
 fn read_snapshot_state(path: &std::path::PathBuf) -> Option<u64> {
@@ -13658,7 +19382,7 @@ fn sanitize_sql_type(ty: &str) -> String {
 }
 
 /// Filesystem-safe single path segment (mirrors the run-log folder rule).
-fn sanitize_path_segment(name: &str) -> String {
+pub(crate) fn sanitize_path_segment(name: &str) -> String {
     let cleaned: String = name
         .trim()
         .chars()
@@ -14386,9 +20110,9 @@ mod xml_remote_tests {
     fn declared_columns_build_varchar_read_and_typed_cast() {
         use duckle_metadata::{Column, DataType};
         let schema = vec![
-            Column { name: "id".into(), data_type: DataType::Int64, nullable: true, primary_key: None, format: None },
-            Column { name: "price".into(), data_type: DataType::Float64, nullable: true, primary_key: None, format: None },
-            Column { name: "title".into(), data_type: DataType::String, nullable: true, primary_key: None, format: None },
+            Column { name: "id".into(), data_type: DataType::Int64, nullable: true, primary_key: None, format: None, tags: Vec::new() },
+            Column { name: "price".into(), data_type: DataType::Float64, nullable: true, primary_key: None, format: None, tags: Vec::new() },
+            Column { name: "title".into(), data_type: DataType::String, nullable: true, primary_key: None, format: None, tags: Vec::new() },
         ];
         let (columns_spec, select_list) = xml_declared_columns(&schema);
         // read_json reads every declared column as text...
@@ -14672,6 +20396,88 @@ mod connector_helper_tests {
         // An HTTP-date Retry-After is not a number: fall back to backoff
         // rather than reading it as zero and hammering the provider.
         assert_eq!(w(Some("Wed, 21 Oct 2026 07:28:00 GMT"), 1), 1_000);
+    }
+
+    #[test]
+    /// #258: an OpenAI-COMPATIBLE endpoint may accept `response_format` and
+    /// ignore it, so the reply is re-checked here. Prose where an object was
+    /// asked for is the failure this exists to catch.
+    #[test]
+    fn prose_where_an_object_was_asked_for_is_rejected() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "vendor": { "type": "string" } },
+            "required": ["vendor"]
+        });
+        let err = super::validate_structured_reply("Sure! The vendor is Acme.", Some(&schema))
+            .expect_err("prose must not pass as an object");
+        assert!(err.contains("not JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn a_missing_required_field_is_named() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "vendor": {"type": "string"}, "total": {"type": "number"} },
+            "required": ["vendor", "total"]
+        });
+        let err = super::validate_structured_reply(r#"{"vendor":"Acme"}"#, Some(&schema)).unwrap_err();
+        assert!(err.contains("total"), "the error must name the field; got: {err}");
+    }
+
+    #[test]
+    fn a_field_of_the_wrong_type_is_named_with_both_types() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "total": {"type": "number"} }
+        });
+        let err =
+            super::validate_structured_reply(r#"{"total":"forty two"}"#, Some(&schema)).unwrap_err();
+        assert!(err.contains("total"), "got: {err}");
+        assert!(err.contains("number") && err.contains("string"), "got: {err}");
+    }
+
+    /// A model told to answer in JSON often wraps it in a fence anyway.
+    /// Unwrapping that is not leniency about the shape, which is still checked.
+    #[test]
+    fn a_fenced_reply_is_still_the_object_it_contains() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "vendor": {"type": "string"} },
+            "required": ["vendor"]
+        });
+        let v = super::validate_structured_reply(
+            "```json\n{\"vendor\":\"Acme\"}\n```",
+            Some(&schema),
+        )
+        .expect("a fenced object is an object");
+        assert_eq!(v["vendor"], "Acme");
+    }
+
+    /// A whole number arriving as 2.0 is an integer to every producer that
+    /// matters; rejecting it would fail correct replies.
+    #[test]
+    fn a_whole_number_written_as_a_float_satisfies_integer() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "count": {"type": "integer"} }
+        });
+        assert!(super::validate_structured_reply(r#"{"count":2.0}"#, Some(&schema)).is_ok());
+        assert!(super::validate_structured_reply(r#"{"count":2.5}"#, Some(&schema)).is_err());
+    }
+
+    /// Expanding a field over an upstream column would silently overwrite the
+    /// input, so the collision has to be found before it happens.
+    #[test]
+    fn the_top_level_fields_are_what_expansion_would_add() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "vendor": {"type": "string"}, "total": {"type": "number"} }
+        });
+        let mut got = super::schema_top_level_fields(Some(&schema));
+        got.sort();
+        assert_eq!(got, vec!["total".to_string(), "vendor".to_string()]);
+        assert!(super::schema_top_level_fields(None).is_empty());
     }
 
     #[test]
@@ -15381,27 +21187,808 @@ fn parse_sftp_uri(uri: &str) -> Result<(String, u16, Option<String>, String), En
     Ok((host, port, user, path))
 }
 
-/// Host-key verifier for src.xml's SFTP reader. With a pinned SHA256 fingerprint
-/// it refuses any other server key; without one it trusts on first use. Mirrors
-/// the verifier in run_sftp_source.
+/// Does the host key the SFTP server presented match the pinned SHA256
+/// fingerprint?
+///
+/// One function rather than the three copies that used to sit inline, because
+/// three copies of a security check is three chances for one of them to drift.
+///
+/// russh 0.63 changed what the server can present: `check_server_key` now
+/// receives a `PublicKeyOrCertificate` instead of a bare `PublicKey`, because
+/// a host may answer with an OpenSSH host CERTIFICATE rather than a raw key.
+///
+/// A pinned fingerprint names one exact host key, so a certificate is accepted
+/// only when the key it certifies IS that key, and refused otherwise.
+///
+/// That is exactly as strong as pinning the raw key, which is worth spelling
+/// out because it is the whole security argument. russh documents that "the
+/// key exchange is signed with the key the certificate contains", and it
+/// verifies that signature before calling this. So a server can only present a
+/// certificate for the pinned key if it holds that key's private half - the
+/// same thing it must prove to present the key bare. An attacker with their
+/// own CA cannot mint a certificate that gets them in, because they would
+/// still have to sign the handshake with a key whose fingerprint we refuse.
+///
+/// The CA signature, validity window and principals are therefore NOT
+/// consulted. There is no CA to check against here: the trust anchor is the
+/// pinned key itself, not a delegation. Treating a certificate as trusted
+/// because it is a certificate would accept keys the pin never named, which
+/// is the failure this function exists to prevent.
+///
+/// Accepting it also means a host that later starts presenting a certificate
+/// for the same key keeps working rather than failing to connect.
+///
+/// Comparison tolerates a `SHA256:` prefix on either side, and is otherwise
+/// exact - base64 is case-significant.
+pub(crate) fn sftp_host_key_matches(
+    presented: &russh::keys::PublicKeyOrCertificate,
+    expected: &str,
+) -> bool {
+    use russh::keys::PublicKeyOrCertificate;
+    use russh::keys::HashAlg;
+    let got = match presented {
+        PublicKeyOrCertificate::PublicKey { key, .. } => {
+            key.fingerprint(HashAlg::Sha256).to_string()
+        }
+        PublicKeyOrCertificate::Certificate(cert) => {
+            cert.public_key().fingerprint(HashAlg::Sha256).to_string()
+        }
+    };
+    let norm = |s: &str| s.trim().trim_start_matches("SHA256:").to_string();
+    norm(&got) == norm(expected)
+}
+
+
+/// SFTP host-key pinning. This is the check that decides whether we are
+/// talking to the right server, so it is tested against real OpenSSH key
+/// material rather than mocks.
+///
+/// Two ed25519 host keys and one genuine host certificate, generated with
+/// `ssh-keygen` and pasted verbatim. The certificate certifies key A and is
+/// signed by a separate CA, which is the shape russh 0.63 can now hand to
+/// `check_server_key`.
+#[cfg(test)]
+mod sftp_host_key_tests {
+    use super::sftp_host_key_matches;
+    use russh::keys::ssh_key::{Certificate, PublicKey};
+    use russh::keys::PublicKeyOrCertificate;
+
+    pub(super) const A_PUB: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHNVp/MHziYS4wV2vfmafB+E18nSV2BaMmWYWkE84KvN host-a";
+    pub(super) const A_FP: &str = "SHA256:1DIjFMJ6GUWygd6cLo4NLs110cetW5xyQ2G14cRCLvo";
+    pub(super) const B_PUB: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP3A5IyXwvuYr2UKxn6b7Cojrd3YdI8NnzSLGM7rk+QH host-b";
+    pub(super) const B_FP: &str = "SHA256:/pqI89pghckzSXZ9Bv/gh591hqgcKir1JWVadnrr+uQ";
+    /// A host certificate for key A, signed by an unrelated CA.
+    pub(super) const A_CERT: &str = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIHmHd8n5oQYlP+gkjXwD4kYvou8OvSLgxS8IH4ETkeccAAAAIHNVp/MHziYS4wV2vfmafB+E18nSV2BaMmWYWkE84KvNAAAAAAAAAAAAAAACAAAAC2hvc3QtYS1jZXJ0AAAAFAAAABBzZnRwLmV4YW1wbGUuY29tAAAAAGqOyLUAAAAAfU7uNQAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAgKC5vUjky6nk4ceKsLufuOAGlIT3wkfHjOzg+FsstFW0AAABTAAAAC3NzaC1lZDI1NTE5AAAAQOXEYugiHUPCBT01h6WSbhBBv/Dt7JI1fQ5epfAxVWf2kgKo7Qd1MdOvK0m8y2PAannkUXMx3KcHFAT/m9982QQ= host-a";
+
+    pub(super) fn raw_key(openssh: &str) -> PublicKeyOrCertificate {
+        PublicKeyOrCertificate::PublicKey {
+            key: PublicKey::from_openssh(openssh).expect("parses"),
+            hash_alg: None,
+        }
+    }
+
+    fn cert(openssh: &str) -> PublicKeyOrCertificate {
+        PublicKeyOrCertificate::Certificate(Certificate::from_openssh(openssh).expect("parses"))
+    }
+
+    #[test]
+    fn the_pinned_key_is_accepted() {
+        assert!(sftp_host_key_matches(&raw_key(A_PUB), A_FP));
+    }
+
+    /// The whole point. A different host key must be refused, or pinning is
+    /// decoration.
+    #[test]
+    fn a_different_key_is_refused() {
+        assert!(
+            !sftp_host_key_matches(&raw_key(B_PUB), A_FP),
+            "a server presenting a key other than the pinned one must be refused"
+        );
+        assert!(!sftp_host_key_matches(&raw_key(A_PUB), B_FP));
+    }
+
+    /// russh 0.63 can hand us a certificate where 0.62 always handed a key.
+    /// A certificate FOR the pinned key is that key, so it is accepted - the
+    /// server proved possession of the private half before this ran.
+    #[test]
+    fn a_certificate_for_the_pinned_key_is_accepted() {
+        assert!(
+            sftp_host_key_matches(&cert(A_CERT), A_FP),
+            "a host that starts presenting a certificate for the same key must \
+             keep working, not fail to connect"
+        );
+    }
+
+    /// The new code path's real risk: reading a certificate as trusted because
+    /// it is a certificate, rather than because it certifies the pinned key.
+    #[test]
+    fn a_certificate_for_a_different_key_is_refused() {
+        assert!(
+            !sftp_host_key_matches(&cert(A_CERT), B_FP),
+            "a certificate is not a free pass - it must certify the pinned key, \
+             and this one certifies a different one"
+        );
+    }
+
+    /// The certificate's OWN fingerprint is not the certified key's, and is not
+    /// what a user pins. Matching on it would accept the wrong host.
+    #[test]
+    fn the_pin_is_compared_against_the_certified_key_not_the_certificate_blob() {
+        let c = Certificate::from_openssh(A_CERT).expect("parses");
+        let inner = c
+            .public_key()
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+        assert_eq!(
+            inner.trim_start_matches("SHA256:"),
+            A_FP.trim_start_matches("SHA256:"),
+            "the certified key must be key A"
+        );
+    }
+
+    #[test]
+    fn the_sha256_prefix_is_optional_on_either_side() {
+        let bare = A_FP.trim_start_matches("SHA256:");
+        assert!(sftp_host_key_matches(&raw_key(A_PUB), bare));
+        assert!(sftp_host_key_matches(&raw_key(A_PUB), A_FP));
+        assert!(sftp_host_key_matches(&raw_key(A_PUB), &format!("  {}  ", A_FP)));
+    }
+
+    /// Base64 is case-significant, so a fingerprint that differs only in case
+    /// is a different key and must not be waved through.
+    #[test]
+    fn comparison_stays_case_sensitive() {
+        assert!(
+            !sftp_host_key_matches(&raw_key(A_PUB), &A_FP.to_lowercase()),
+            "lower-casing a base64 fingerprint makes it a different value"
+        );
+    }
+
+    #[test]
+    fn nonsense_never_matches() {
+        for junk in ["", "SHA256:", "not-a-fingerprint", "SHA256:AAAA"] {
+            assert!(
+                !sftp_host_key_matches(&raw_key(A_PUB), junk),
+                "{junk:?} must not match"
+            );
+        }
+    }
+}
+
+/// Where the workspace remembers SFTP host keys it has seen.
+///
+/// `None` when there is no workspace, which is the case in a bare unit test or
+/// an embedded call with nothing configured. Without somewhere to remember, the
+/// policy below degrades to the old accept-anything behaviour rather than
+/// refusing every connection.
+pub(crate) fn known_hosts_path() -> Option<std::path::PathBuf> {
+    let ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|s| !s.is_empty())?;
+    Some(std::path::Path::new(&ws).join(".duckle").join("known_hosts"))
+}
+
+/// #315: the fingerprint of a whole resolved schema set, taken as one contract.
+///
+/// The SET decides the columns, not the root: an `xs:include` three levels down
+/// can change a column's type, so a root whose bytes never moved is no evidence
+/// that the parser contract held. Every document in the closure is therefore
+/// part of the identity.
+///
+/// Canonical, so the fingerprint answers to the CONTENT and nothing else:
+/// entries are sorted, which means a change in resolution order (a schema that
+/// reorders its imports, a document reached from a different parent) cannot
+/// move the fingerprint on its own. Only bytes or membership can.
+pub(crate) fn xsd_contract_fingerprint(docs: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = docs
+        .iter()
+        .map(|(location, sha)| format!("{sha}  {location}"))
+        .collect();
+    lines.sort();
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(lines.join("\n").as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Where a workspace remembers the schema contracts it has accepted.
+///
+/// `None` when there is no workspace, exactly like [`known_hosts_path`]: with
+/// nowhere to remember, the check degrades to the old accept-anything
+/// behaviour rather than refusing every run.
+pub(crate) fn xsd_contracts_path() -> Option<std::path::PathBuf> {
+    let ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|s| !s.is_empty())?;
+    Some(std::path::Path::new(&ws).join(".duckle").join("xsd_contracts"))
+}
+
+/// The contract already accepted for this schema root, if any.
+///
+/// One `<uri> <fingerprint>` per line, `#` for comments. Greppable, and a line
+/// can be deleted by hand - which is the whole escape hatch when a publisher
+/// legitimately reissues a schema.
+pub(crate) fn read_xsd_contract(path: &std::path::Path, uri: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .find_map(|l| {
+            let (u, fp) = l.split_once(char::is_whitespace)?;
+            (u == uri).then(|| fp.trim().to_string())
+        })
+}
+
+/// Accept a contract. Best-effort: a workspace that cannot be written still
+/// runs, because failing a run over bookkeeping would be a worse failure than
+/// the one being prevented.
+fn record_xsd_contract(path: &std::path::Path, uri: &str, fingerprint: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Replace any line for this uri rather than appending a second one: unlike
+    // a host behind a load balancer, a schema root has exactly one accepted
+    // contract at a time, and two lines would make "which one held?" ambiguous.
+    let mut out: Vec<String> = existing
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with('#') {
+                return true;
+            }
+            t.split_once(char::is_whitespace).map(|(u, _)| u != uri).unwrap_or(true)
+        })
+        .map(str::to_string)
+        .collect();
+    out.push(format!("{uri} {fingerprint}"));
+    let _ = std::fs::write(path, out.join("\n") + "\n");
+}
+
+/// #315: hold the parser contract still, or say plainly that it moved.
+///
+/// A publisher can replace the bytes behind a URL that never changed, and the
+/// next run then parses with a different contract and publishes the result as
+/// though nothing happened. The run manifest records what was used, but only
+/// after the data is out.
+///
+/// - `allow` does not look. The behaviour before this existed.
+/// - `warn` remembers on first sight, says so once when it moves, and accepts
+///   the new contract so a legitimate reissue does not need a hand edit.
+/// - `fail` refuses the change and does NOT record it, so accepting is a
+///   deliberate act: delete the line.
+pub(crate) fn check_xsd_contract(
+    uri: &str,
+    fingerprint: &str,
+    policy: &str,
+) -> Result<(), EngineError> {
+    if policy.eq_ignore_ascii_case("allow") {
+        return Ok(());
+    }
+    let path = match xsd_contracts_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let accepted = match read_xsd_contract(&path, uri) {
+        Some(a) => a,
+        None => {
+            record_xsd_contract(&path, uri, fingerprint);
+            return Ok(());
+        }
+    };
+    if accepted == fingerprint {
+        return Ok(());
+    }
+    if policy.eq_ignore_ascii_case("fail") {
+        return Err(EngineError::Config(format!(
+            "xsd: the schema set behind {uri} is not the one this workspace accepted. \
+             Accepted {accepted}, found {fingerprint}. The columns this feed is parsed \
+             into come from that whole set, including anything it imports, so this is a \
+             change to the parser itself and not only to a file. It is also what a \
+             legitimate reissue looks like. To accept it, delete the line for {uri} from \
+             {} and the next run will record the new one.",
+            path.display()
+        )));
+    }
+    eprintln!(
+        "duckle: xsd: the schema set behind {uri} changed ({accepted} -> {fingerprint}); \
+         accepting it because changePolicy is warn. Set it to fail to require approval."
+    );
+    record_xsd_contract(&path, uri, fingerprint);
+    Ok(())
+}
+
+/// Fingerprints already recorded for `host:port`.
+///
+/// The format is one `host:port SHA256:fingerprint` per line, `#` for comments.
+/// Deliberately NOT OpenSSH's known_hosts: that format carries hashed
+/// hostnames, per-algorithm entries and revocation markers, and half-reading it
+/// would be worse than not claiming to read it at all. This is greppable, and a
+/// line can be deleted by hand, which is the escape hatch when a host really
+/// does rotate its key.
+///
+/// Several lines for one host are allowed and any of them matches - an SFTP
+/// service behind a load balancer legitimately answers with a different key per
+/// node. They only accumulate when a human adds them: a key that is not already
+/// listed is refused, never quietly appended.
+pub(crate) fn read_known_hosts(path: &std::path::Path, hostport: &str) -> Vec<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let (h, fp) = l.split_once(char::is_whitespace)?;
+            (h == hostport).then(|| normalize_fingerprint(fp.trim()))
+        })
+        .collect()
+}
+
+/// Record a host key on first sight. Best-effort: a workspace that cannot be
+/// written still connects, because refusing to talk to a server over a failed
+/// bookkeeping write would be a worse failure than the one being prevented.
+fn record_known_host(path: &std::path::Path, hostport: &str, fingerprint: &str) {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    use std::io::Write as _;
+    let line = format!("{} {}\n", hostport, fingerprint);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+}
+
+/// Strip the `SHA256:` prefix and surrounding space. Base64 is
+/// case-significant, so nothing else is normalized.
+pub(crate) fn normalize_fingerprint(s: &str) -> String {
+    s.trim().trim_start_matches("SHA256:").to_string()
+}
+
+/// The SHA256 fingerprint of whatever the server presented.
+///
+/// A certificate is reduced to the key it certifies. See
+/// `sftp_host_key_matches` for why that key, and not the certificate, is the
+/// thing worth comparing.
+pub(crate) fn presented_fingerprint(presented: &russh::keys::PublicKeyOrCertificate) -> String {
+    use russh::keys::HashAlg;
+    use russh::keys::PublicKeyOrCertificate;
+    match presented {
+        PublicKeyOrCertificate::PublicKey { key, .. } => {
+            key.fingerprint(HashAlg::Sha256).to_string()
+        }
+        PublicKeyOrCertificate::Certificate(cert) => {
+            cert.public_key().fingerprint(HashAlg::Sha256).to_string()
+        }
+    }
+}
+
+/// Decide whether to talk to this server, and say why not when the answer is no.
+///
+/// Three policies, in order of strength:
+///
+/// 1. **A pinned fingerprint wins outright.** Match or refuse; the known-hosts
+///    file is not consulted, because the user named the key explicitly.
+/// 2. **Otherwise, trust on first use - and actually remember it.** The first
+///    key seen for a host is recorded, and a later connection offering a
+///    different key is refused. Previously an unpinned connection accepted any
+///    key on every connection, which is not trust-on-first-use at all: it means
+///    a machine-in-the-middle is undetected on the first connection AND every
+///    one after it.
+/// 3. **`DUCKLE_SFTP_HOST_KEY_POLICY=accept-any` opts out**, for a host whose
+///    key genuinely changes per connection. It is an env var rather than a node
+///    field on purpose: it is an operator's decision about a machine, not a
+///    property of a pipeline, and it should be visible in the deployment rather
+///    than buried in a saved document.
+pub(crate) fn verify_sftp_host_key(
+    presented: &russh::keys::PublicKeyOrCertificate,
+    pinned: Option<&str>,
+    hostport: &str,
+) -> Result<(), String> {
+    if let Some(want) = pinned {
+        return if sftp_host_key_matches(presented, want) {
+            Ok(())
+        } else {
+            Err(format!(
+                "sftp: {} presented host key {}, which does not match the pinned \
+                 fingerprint {}. Refusing to connect.",
+                hostport,
+                presented_fingerprint(presented),
+                want.trim()
+            ))
+        };
+    }
+
+    if std::env::var("DUCKLE_SFTP_HOST_KEY_POLICY")
+        .map(|v| v.trim().eq_ignore_ascii_case("accept-any"))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let got = presented_fingerprint(presented);
+    let path = match known_hosts_path() {
+        Some(p) => p,
+        // Nothing to remember with. Behave as before rather than refusing every
+        // connection in a workspace-less context.
+        None => return Ok(()),
+    };
+    let known = read_known_hosts(&path, hostport);
+    if known.is_empty() {
+        record_known_host(&path, hostport, &got);
+        return Ok(());
+    }
+    if known.iter().any(|k| *k == normalize_fingerprint(&got)) {
+        return Ok(());
+    }
+    Err(format!(
+        "sftp: {} presented host key {}, but this workspace has seen a different \
+         key for it. Refusing to connect - this is what a machine-in-the-middle \
+         looks like, and it is also what a legitimate key rotation looks like. \
+         If the change is expected, remove the line for {} from {} and the new \
+         key will be recorded on the next connection.",
+        hostport,
+        got,
+        hostport,
+        path.display()
+    ))
+}
+
+
+/// #315: a schema set is a parser contract, and it must not move unnoticed.
+#[cfg(test)]
+mod xsd_contract_tests {
+    use super::{check_xsd_contract, read_xsd_contract, xsd_contract_fingerprint, xsd_contracts_path};
+
+    // DUCKLE_WORKSPACE is process-wide, so these take the SAME lock every other
+    // workspace-env test takes. A private mutex here would only serialise these
+    // tests against each other, and would still race the known-hosts tests,
+    // which is exactly what it did before this line.
+    use crate::util::workspace_env_guard as guard;
+
+    fn set(docs: &[(&str, &str)]) -> Vec<(String, String)> {
+        docs.iter().map(|(l, h)| (l.to_string(), h.to_string())).collect()
+    }
+
+    /// The fingerprint answers to CONTENT, not to the order documents happened
+    /// to be resolved in. A schema that reorders its own imports, or one reached
+    /// through a different parent, must not look like a changed contract.
+    #[test]
+    fn the_fingerprint_ignores_resolution_order() {
+        let a = xsd_contract_fingerprint(&set(&[("root.xsd", "aa"), ("common.xsd", "bb")]));
+        let b = xsd_contract_fingerprint(&set(&[("common.xsd", "bb"), ("root.xsd", "aa")]));
+        assert_eq!(a, b, "order must not move the fingerprint");
+    }
+
+    /// The property the whole feature rests on: the root is not the contract.
+    /// An include three levels down decides column types just as much, so a
+    /// root whose bytes never moved is no evidence that anything held.
+    #[test]
+    fn a_changed_import_changes_the_contract_even_when_the_root_did_not() {
+        let before = xsd_contract_fingerprint(&set(&[("root.xsd", "aa"), ("common.xsd", "bb")]));
+        let after = xsd_contract_fingerprint(&set(&[("root.xsd", "aa"), ("common.xsd", "CHANGED")]));
+        assert_ne!(
+            before, after,
+            "the root is unchanged, but the set that decides the columns is not"
+        );
+    }
+
+    /// Adding or dropping a document is a change too, not just editing one.
+    #[test]
+    fn membership_is_part_of_the_contract() {
+        let two = xsd_contract_fingerprint(&set(&[("root.xsd", "aa"), ("common.xsd", "bb")]));
+        let one = xsd_contract_fingerprint(&set(&[("root.xsd", "aa")]));
+        assert_ne!(two, one, "a dropped import changes what can be parsed");
+    }
+
+    /// Trust on first use, and actually remember it - then an identical set is
+    /// silent on every later run.
+    #[test]
+    fn a_first_run_records_and_an_unchanged_set_passes() {
+        let _g = guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+
+        let uri = "schemas/company.xsd";
+        let fp = xsd_contract_fingerprint(&set(&[("schemas/company.xsd", "aa")]));
+        assert!(check_xsd_contract(uri, &fp, "fail").is_ok(), "first sight must not refuse");
+
+        let path = xsd_contracts_path().expect("workspace");
+        assert_eq!(
+            read_xsd_contract(&path, uri).as_deref(),
+            Some(fp.as_str()),
+            "it has to be remembered, or every run is a first run"
+        );
+        assert!(check_xsd_contract(uri, &fp, "fail").is_ok(), "the same set must stay accepted");
+
+        std::env::remove_var("DUCKLE_WORKSPACE");
+    }
+
+    /// `fail` refuses the change AND does not record it, so accepting is a
+    /// deliberate act rather than something the next run does for you.
+    #[test]
+    fn fail_refuses_a_changed_set_and_does_not_accept_it() {
+        let _g = guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+
+        let uri = "https://registry.example/company.xsd";
+        let first = xsd_contract_fingerprint(&set(&[("https://registry.example/company.xsd", "aa")]));
+        check_xsd_contract(uri, &first, "fail").expect("first sight");
+
+        let moved = xsd_contract_fingerprint(&set(&[("https://registry.example/company.xsd", "bb")]));
+        let err = check_xsd_contract(uri, &moved, "fail").unwrap_err().to_string();
+        assert!(err.contains(uri), "must name the schema: {err}");
+        assert!(err.contains("xsd_contracts"), "must say where to accept it: {err}");
+
+        let path = xsd_contracts_path().expect("workspace");
+        assert_eq!(
+            read_xsd_contract(&path, uri).as_deref(),
+            Some(first.as_str()),
+            "a refused change must NOT be recorded, or the next run passes silently"
+        );
+
+        std::env::remove_var("DUCKLE_WORKSPACE");
+    }
+
+    /// `warn` says so once and accepts, so a legitimate reissue does not need a
+    /// hand edit - and does not warn forever either.
+    #[test]
+    fn warn_accepts_the_change_after_saying_so() {
+        let _g = guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+
+        let uri = "schemas/a.xsd";
+        let first = xsd_contract_fingerprint(&set(&[("schemas/a.xsd", "aa")]));
+        check_xsd_contract(uri, &first, "warn").expect("first sight");
+        let moved = xsd_contract_fingerprint(&set(&[("schemas/a.xsd", "bb")]));
+        check_xsd_contract(uri, &moved, "warn").expect("warn must not refuse");
+
+        let path = xsd_contracts_path().expect("workspace");
+        assert_eq!(
+            read_xsd_contract(&path, uri).as_deref(),
+            Some(moved.as_str()),
+            "warn accepts, so the new contract is what is remembered"
+        );
+        // And exactly one line for the uri, not two.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with(uri)).count(),
+            1,
+            "a second line would make \"which contract held\" ambiguous: {text}"
+        );
+
+        std::env::remove_var("DUCKLE_WORKSPACE");
+    }
+
+    /// `allow` is the behaviour from before this existed: it does not look, and
+    /// it does not record.
+    #[test]
+    fn allow_does_not_look() {
+        let _g = guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+
+        let uri = "schemas/b.xsd";
+        check_xsd_contract(uri, "anything", "allow").expect("allow never refuses");
+        let path = xsd_contracts_path().expect("workspace");
+        assert!(
+            read_xsd_contract(&path, uri).is_none(),
+            "allow must not write a contract somebody did not ask for"
+        );
+
+        std::env::remove_var("DUCKLE_WORKSPACE");
+    }
+
+    /// With no workspace there is nowhere to remember, so the check degrades to
+    /// the old behaviour rather than refusing every run.
+    #[test]
+    fn no_workspace_degrades_to_allowing() {
+        let _g = guard();
+        std::env::remove_var("DUCKLE_WORKSPACE");
+        assert!(check_xsd_contract("x.xsd", "fp", "fail").is_ok());
+    }
+}
+
+/// Unpinned SFTP connections: trust on first use, and actually remember it.
+///
+/// Before this, an unpinned connection returned `Ok(true)` for any key on
+/// every connection. That is not trust-on-first-use - nothing was trusted and
+/// nothing was remembered, so a machine-in-the-middle was undetected on the
+/// first connection and every one after. These tests pin the behaviour that
+/// replaced it.
+#[cfg(test)]
+mod sftp_known_hosts_tests {
+    use super::sftp_host_key_tests::{raw_key, A_FP, A_PUB, B_FP, B_PUB};
+    use super::{read_known_hosts, verify_sftp_host_key};
+
+    use crate::util::workspace_env_guard as guard;
+
+    struct Workspace {
+        _dir: tempfile::TempDir,
+        _g: std::sync::MutexGuard<'static, ()>,
+    }
+    impl Workspace {
+        fn new() -> Self {
+            let g = guard();
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("DUCKLE_WORKSPACE", dir.path());
+            std::env::remove_var("DUCKLE_SFTP_HOST_KEY_POLICY");
+            Self { _dir: dir, _g: g }
+        }
+        fn known_hosts(&self) -> std::path::PathBuf {
+            self._dir.path().join(".duckle").join("known_hosts")
+        }
+    }
+
+    #[test]
+    fn the_first_key_seen_is_accepted_and_recorded() {
+        let ws = Workspace::new();
+        assert!(verify_sftp_host_key(&raw_key(A_PUB), None, "sftp.example.com:22").is_ok());
+        let recorded = read_known_hosts(&ws.known_hosts(), "sftp.example.com:22");
+        assert_eq!(
+            recorded,
+            vec![A_FP.trim_start_matches("SHA256:").to_string()],
+            "the key must be written down, or nothing can notice it changing"
+        );
+    }
+
+    /// The reason this exists.
+    #[test]
+    fn a_changed_key_is_refused() {
+        let ws = Workspace::new();
+        verify_sftp_host_key(&raw_key(A_PUB), None, "sftp.example.com:22").expect("first is fine");
+        let err = verify_sftp_host_key(&raw_key(B_PUB), None, "sftp.example.com:22")
+            .expect_err("a different key for a known host must be refused");
+        assert!(err.contains("different key"), "message should say what happened: {err}");
+        assert!(
+            err.contains(&ws.known_hosts().display().to_string()),
+            "message should name the file to edit: {err}"
+        );
+        // And it must not have quietly appended itself.
+        assert_eq!(
+            read_known_hosts(&ws.known_hosts(), "sftp.example.com:22").len(),
+            1,
+            "a refused key must not be recorded, or the next connection would accept it"
+        );
+    }
+
+    #[test]
+    fn the_same_key_on_a_later_connection_is_accepted() {
+        let _ws = Workspace::new();
+        for _ in 0..3 {
+            assert!(verify_sftp_host_key(&raw_key(A_PUB), None, "sftp.example.com:22").is_ok());
+        }
+    }
+
+    /// Host and port together are the identity: the same hostname on another
+    /// port is a different service and gets its own entry.
+    #[test]
+    fn hosts_are_tracked_separately() {
+        let ws = Workspace::new();
+        verify_sftp_host_key(&raw_key(A_PUB), None, "a.example.com:22").expect("a");
+        verify_sftp_host_key(&raw_key(B_PUB), None, "b.example.com:22").expect("b");
+        verify_sftp_host_key(&raw_key(B_PUB), None, "a.example.com:2222").expect("other port");
+        assert_eq!(read_known_hosts(&ws.known_hosts(), "a.example.com:22").len(), 1);
+        assert_eq!(read_known_hosts(&ws.known_hosts(), "b.example.com:22").len(), 1);
+        assert_eq!(read_known_hosts(&ws.known_hosts(), "a.example.com:2222").len(), 1);
+        // And key B is still refused on a.example.com:22 despite being known elsewhere.
+        assert!(verify_sftp_host_key(&raw_key(B_PUB), None, "a.example.com:22").is_err());
+    }
+
+    /// Several keys for one host is the load-balancer case. They only
+    /// accumulate when a human writes them, which is what the next test checks.
+    #[test]
+    fn any_key_a_human_listed_for_the_host_is_accepted() {
+        let ws = Workspace::new();
+        let path = ws.known_hosts();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "# a cluster behind one name\n\
+                 sftp.example.com:22 {A_FP}\n\
+                 sftp.example.com:22 {B_FP}\n"
+            ),
+        )
+        .unwrap();
+        assert!(verify_sftp_host_key(&raw_key(A_PUB), None, "sftp.example.com:22").is_ok());
+        assert!(verify_sftp_host_key(&raw_key(B_PUB), None, "sftp.example.com:22").is_ok());
+    }
+
+    #[test]
+    fn a_pin_outranks_the_known_hosts_file() {
+        let ws = Workspace::new();
+        let path = ws.known_hosts();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The file says key B is fine for this host...
+        std::fs::write(&path, format!("sftp.example.com:22 {B_FP}\n")).unwrap();
+        // ...but the pipeline pinned key A, and the pin is the stronger claim.
+        assert!(
+            verify_sftp_host_key(&raw_key(B_PUB), Some(A_FP), "sftp.example.com:22").is_err(),
+            "a pinned fingerprint must not be softened by what the file remembers"
+        );
+        assert!(verify_sftp_host_key(&raw_key(A_PUB), Some(A_FP), "sftp.example.com:22").is_ok());
+    }
+
+    #[test]
+    fn a_pin_mismatch_says_what_was_presented() {
+        let _ws = Workspace::new();
+        let err = verify_sftp_host_key(&raw_key(B_PUB), Some(A_FP), "sftp.example.com:22")
+            .expect_err("mismatch");
+        assert!(err.contains(B_FP.trim_start_matches("SHA256:")), "names the key seen: {err}");
+        assert!(err.contains(A_FP.trim_start_matches("SHA256:")), "names the key wanted: {err}");
+    }
+
+    #[test]
+    fn the_opt_out_accepts_anything() {
+        let _ws = Workspace::new();
+        verify_sftp_host_key(&raw_key(A_PUB), None, "sftp.example.com:22").expect("first");
+        std::env::set_var("DUCKLE_SFTP_HOST_KEY_POLICY", "accept-any");
+        assert!(
+            verify_sftp_host_key(&raw_key(B_PUB), None, "sftp.example.com:22").is_ok(),
+            "the documented escape hatch for a host whose key changes per connection"
+        );
+        std::env::remove_var("DUCKLE_SFTP_HOST_KEY_POLICY");
+        // ...and removing it restores the refusal, so the opt-out is not sticky.
+        assert!(verify_sftp_host_key(&raw_key(B_PUB), None, "sftp.example.com:22").is_err());
+    }
+
+    /// Comments and blank lines are for humans editing the file by hand, which
+    /// is the documented way to accept a rotated key.
+    #[test]
+    fn comments_and_blank_lines_are_ignored() {
+        let ws = Workspace::new();
+        let path = ws.known_hosts();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("\n# rotated 2026-08-01\n\n   sftp.example.com:22 {A_FP}   \n"),
+        )
+        .unwrap();
+        assert!(verify_sftp_host_key(&raw_key(A_PUB), None, "sftp.example.com:22").is_ok());
+    }
+
+    /// With no workspace there is nowhere to remember, so the old behaviour
+    /// stands rather than refusing every connection.
+    #[test]
+    fn without_a_workspace_it_does_not_refuse() {
+        let _g = guard();
+        let saved = std::env::var("DUCKLE_WORKSPACE").ok();
+        std::env::remove_var("DUCKLE_WORKSPACE");
+        std::env::remove_var("DUCKLE_SFTP_HOST_KEY_POLICY");
+        let r = verify_sftp_host_key(&raw_key(A_PUB), None, "sftp.example.com:22");
+        if let Some(v) = saved {
+            std::env::set_var("DUCKLE_WORKSPACE", v);
+        }
+        assert!(r.is_ok(), "no workspace means nowhere to record; do not break the connection");
+    }
+}
+
+/// Host-key verifier for src.xml's SFTP reader. A pinned SHA256 fingerprint
+/// refuses any other server key; without one, the first key seen for the host
+/// is remembered and a later change is refused. See `verify_sftp_host_key`.
 struct SftpVerifier {
     expected: Option<String>,
+    hostport: String,
+    refused: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl russh::client::Handler for SftpVerifier {
     type Error = russh::Error;
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        match &self.expected {
-            None => Ok(true),
-            Some(want) => {
-                let got = server_public_key
-                    .fingerprint(russh::keys::HashAlg::Sha256)
-                    .to_string();
-                let norm = |s: &str| s.trim().trim_start_matches("SHA256:").to_string();
-                Ok(norm(&got) == norm(want))
+        match verify_sftp_host_key(server_public_key, self.expected.as_deref(), &self.hostport) {
+            Ok(()) => Ok(true),
+            Err(why) => {
+                *self.refused.lock().unwrap() = Some(why);
+                Ok(false)
             }
         }
     }
@@ -15446,12 +22033,18 @@ impl SftpFileReader {
         let (session, sftp, file) = rt
             .block_on(async {
                 let config = std::sync::Arc::new(russh::client::Config::default());
+                let refused = std::sync::Arc::new(std::sync::Mutex::new(None));
                 let handler = SftpVerifier {
                     expected: host_fingerprint.map(|s| s.to_string()),
+                    hostport: format!("{}:{}", host, port),
+                    refused: refused.clone(),
                 };
                 let mut session = russh::client::connect(config, (host, port), handler)
                     .await
-                    .map_err(|e| format!("connect {}:{}: {}", host, port, e))?;
+                    .map_err(|e| match refused.lock().unwrap().take() {
+                        Some(why) => why,
+                        None => format!("connect {}:{}: {}", host, port, e),
+                    })?;
                 let authed = if let Some(pem) = private_key {
                     let key = russh::keys::decode_secret_key(pem, key_passphrase)
                         .map_err(|e| format!("private key: {}", e))?;
@@ -16103,10 +22696,185 @@ impl DuckdbEngine {
 
 #[cfg(test)]
 mod incremental_state_tests {
+    /// The two Arrow entry points are detected independently, and a script
+    /// defining `transform_batches` must not be read as defining `transform`.
+    #[test]
+    fn the_two_arrow_entry_points_are_told_apart() {
+            use super::{defines_streaming_entry, defines_vectorized_entry};
+
+        assert!(defines_streaming_entry("def transform_batches(batch):\n return batch"));
+        assert!(!defines_vectorized_entry(
+            "def transform_batches(batch):\n return batch"
+        ));
+        assert!(defines_vectorized_entry("def transform(table):\n return table"));
+        assert!(!defines_streaming_entry("def transform(table):\n return table"));
+        // A nested def is a helper, not the entry point the harness calls.
+        assert!(!defines_streaming_entry(
+            "def outer():\n def transform_batches(b):\n return b"
+        ));
+        // A script may define both; streaming is tested first, so both report true
+        // and the caller's ordering decides.
+        let both = "def transform(table):\n return table\n\n\ndef transform_batches(batch):\n return batch";
+        assert!(defines_streaming_entry(both) && defines_vectorized_entry(both));
+    }
+
+
+    #[test]
+    fn a_confluent_framed_message_decodes_against_its_schema() {
+        // Build a real Confluent-framed message the way a producer does: a zero
+        // magic byte, a big-endian schema id, then a RAW Avro datum - no
+        // container header, which is why the id has to name the schema.
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"Order","fields":[
+                 {"name":"id","type":"long"},
+                 {"name":"customer","type":"string"},
+                 {"name":"total","type":"double"}
+               ]}"#,
+        )
+        .unwrap();
+        let mut rec = apache_avro::types::Record::new(&schema).unwrap();
+        rec.put("id", 77i64);
+        rec.put("customer", "acme");
+        rec.put("total", 12.5f64);
+        let datum = apache_avro::to_avro_datum(&schema, rec).unwrap();
+
+        let mut framed = vec![0u8];
+        framed.extend_from_slice(&4242u32.to_be_bytes());
+        framed.extend_from_slice(&datum);
+
+        let (id, payload) = super::confluent_envelope(&framed).expect("framed message");
+        assert_eq!(id, 4242, "the schema id is a big-endian u32 after the magic byte");
+
+        let json = super::avro_datum_to_json(&schema, payload).unwrap();
+        assert_eq!(json.get("id").and_then(|v| v.as_i64()), Some(77));
+        assert_eq!(json.get("customer").and_then(|v| v.as_str()), Some("acme"));
+        assert_eq!(json.get("total").and_then(|v| v.as_f64()), Some(12.5));
+    }
+
+    #[test]
+    fn plain_text_is_not_mistaken_for_a_framed_message() {
+        // Confluent topics routinely pair a plain string key with an Avro
+        // value, so an unframed field has to pass through as text rather than
+        // fail the read. A zero first byte is not valid UTF-8 text, so this
+        // check cannot misfire on a string.
+        assert!(super::confluent_envelope(b"just-a-key").is_none());
+        assert!(super::confluent_envelope(br#"{"id":1}"#).is_none());
+        // Too short to carry an id, even though it starts with zero.
+        assert!(super::confluent_envelope(&[0u8, 1, 2]).is_none());
+        assert!(super::confluent_envelope(&[]).is_none());
+        // A zero byte followed by four bytes IS the frame, even with no payload
+        // left - an empty datum is the schema's problem, not the framing's.
+        assert_eq!(
+            super::confluent_envelope(&[0u8, 0, 0, 0, 7]).map(|(id, p)| (id, p.len())),
+            Some((7, 0))
+        );
+    }
+
+    #[test]
+    fn a_datum_that_does_not_match_its_schema_is_an_error_not_garbage() {
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"R","fields":[{"name":"n","type":"long"}]}"#,
+        )
+        .unwrap();
+        // Bytes that are not a valid encoding of this record must fail loudly
+        // rather than produce a plausible-looking wrong row.
+        let err = super::avro_datum_to_json(&schema, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        assert!(err.is_err(), "malformed datum should not decode");
+    }
+
+    #[test]
+    fn a_kafka_sasl_mechanism_is_recognised_or_refused() {
+        let creds = |m: &str| crate::plan::KafkaSasl {
+            mechanism: m.to_string(),
+            username: "svc".into(),
+            password: "hunter2".into(),
+        };
+        // The three rskafka implements, in the punctuation people actually type.
+        for m in ["PLAIN", "plain", "SCRAM-SHA-256", "scram_sha_256", "SCRAM-SHA-512"] {
+            assert!(
+                super::kafka_sasl_config(&creds(m)).is_ok(),
+                "{} should be accepted",
+                m
+            );
+        }
+        // Anything else must FAIL rather than quietly connect without
+        // authenticating, which is what happened while nothing read these
+        // fields at all.
+        let err = super::kafka_sasl_config(&creds("GSSAPI")).unwrap_err();
+        assert!(err.contains("GSSAPI"), "the error should name what was asked for: {}", err);
+        assert!(
+            err.contains("PLAIN") && err.contains("SCRAM-SHA-256"),
+            "the error should name what IS supported: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_kafka_resume_point_is_only_used_for_the_stream_it_came_from() {
+        // The saved offset is a position in ONE topic partition. Re-point the
+        // node and the number means something else entirely, so it must be
+        // ignored rather than resumed from - reading another stream's position
+        // would silently skip or re-read an arbitrary amount of data.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("kafka.json");
+        std::fs::write(
+            &path,
+            r#"{"topic":"orders","partition":0,"next_offset":4200}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::read_kafka_offset_state(&path, "orders", 0),
+            Some(4200),
+            "the stream it was written for must resume"
+        );
+        assert_eq!(
+            super::read_kafka_offset_state(&path, "shipments", 0),
+            None,
+            "a different topic must not resume from this offset"
+        );
+        assert_eq!(
+            super::read_kafka_offset_state(&path, "orders", 3),
+            None,
+            "a different partition must not resume from this offset"
+        );
+
+        // Nothing saved yet, and anything unreadable, both mean "start where
+        // the node is configured to start" rather than failing the run.
+        assert_eq!(
+            super::read_kafka_offset_state(&tmp.path().join("absent.json"), "orders", 0),
+            None
+        );
+        let bad = tmp.path().join("bad.json");
+        std::fs::write(&bad, "not json at all").unwrap();
+        assert_eq!(super::read_kafka_offset_state(&bad, "orders", 0), None);
+
+        // A negative offset is not a position; treat it as absent rather than
+        // handing it to the broker as a sentinel and reading the wrong end.
+        let neg = tmp.path().join("neg.json");
+        std::fs::write(
+            &neg,
+            r#"{"topic":"orders","partition":0,"next_offset":-1}"#,
+        )
+        .unwrap();
+        assert_eq!(super::read_kafka_offset_state(&neg, "orders", 0), None);
+
+        // Offset zero IS a valid position - the start of a partition - and must
+        // not be confused with "nothing saved".
+        let zero = tmp.path().join("zero.json");
+        std::fs::write(
+            &zero,
+            r#"{"topic":"orders","partition":0,"next_offset":0}"#,
+        )
+        .unwrap();
+        assert_eq!(super::read_kafka_offset_state(&zero, "orders", 0), Some(0));
+    }
+
     use super::{child_run_name, incremental_state_path, inherited_incremental_state};
 
     /// Serialised: these tests set DUCKLE_WORKSPACE, which is process-global.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Shared with the SFTP known-hosts tests - see workspace_env_guard.
+    use crate::util::workspace_env_guard;
 
     fn workspace(tag: &str) -> std::path::PathBuf {
         let ws = std::env::temp_dir().join(format!("duckle_state_{tag}_{}", std::process::id()));
@@ -16132,7 +22900,7 @@ mod incremental_state_tests {
     /// the driving query is reordered.
     #[test]
     fn each_item_of_a_foreach_keeps_its_own_watermark() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = workspace_env_guard();
         let ws = workspace("peritem");
         std::env::set_var("DUCKLE_WORKSPACE", &ws);
 
@@ -16170,7 +22938,7 @@ mod incremental_state_tests {
     /// skips rows, the exact failure incremental loading exists to prevent.
     #[test]
     fn two_children_keep_separate_watermarks() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = workspace_env_guard();
         let ws = workspace("split");
         std::env::set_var("DUCKLE_WORKSPACE", &ws);
 
@@ -16196,7 +22964,7 @@ mod incremental_state_tests {
     /// somebody's production load.
     #[test]
     fn a_newly_named_child_inherits_the_old_shared_watermark_once() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = workspace_env_guard();
         let ws = workspace("inherit");
         std::env::set_var("DUCKLE_WORKSPACE", &ws);
 
@@ -16473,5 +23241,717 @@ mod infor_sink_tests {
         assert_eq!(produced.len(), 1);
         assert!(produced[0].starts_with("infor_Item_Create_"));
         assert!(produced[0].ends_with(".csv"));
+    }
+}
+
+/// What one copy produced.
+struct LandedArtifact {
+    uri: String,
+    name: String,
+    media_type: &'static str,
+    size_bytes: Option<i64>,
+    sha256: Option<String>,
+    /// False when the destination already held it and nothing was transferred.
+    copied: bool,
+}
+
+/// Named from the extension. Enough to route a pipeline - a PDF one way, an
+/// image another - without pretending to sniff content. The same table
+/// `src.artifact` uses, so the two agree about what a file is.
+fn media_type_for(name: &str) -> &'static str {
+    match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("tif") | Some("tiff") => "image/tiff",
+        Some("zip") => "application/zip",
+        Some("gz") => "application/gzip",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("csv") => "text/csv",
+        Some("txt") => "text/plain",
+        Some("html") | Some("htm") => "text/html",
+        Some("parquet") => "application/vnd.apache.parquet",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The source's path below its host or bucket, for "preserve the layout"
+/// naming. Leading slashes are dropped so joining cannot escape the prefix.
+fn source_path_of(src: &str) -> String {
+    let after_scheme = src.split_once("://").map(|(_, r)| r).unwrap_or(src);
+    let path = match src.split_once("://") {
+        // s3://bucket/a/b -> a/b. The first segment is the host or bucket.
+        Some(_) => after_scheme.split_once('/').map(|(_, r)| r).unwrap_or(after_scheme),
+        // A local path has no host or bucket to drop, and taking everything
+        // after its first slash would eat a real directory.
+        None => src,
+    };
+    let path = path.replace('\\', "/");
+    let path = path.trim_start_matches('/');
+    // A Windows source kept its drive letter, so the join produced
+    // `<dest>/C:/Users/...` - a segment with a colon in it, which no
+    // filesystem will create. Only a single letter before the colon is a
+    // drive; a key that legitimately contains one keeps it.
+    match path.split_once(':') {
+        Some((drive, rest))
+            if drive.len() == 1 && drive.chars().all(|c| c.is_ascii_alphabetic()) =>
+        {
+            rest.trim_start_matches('/').to_string()
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// The last component of an archive member's name.
+///
+/// Both `/` and `\` separate. A ZIP is specified to use `/`, but a member name
+/// is attacker-controlled bytes rather than a promise, and reading `\` as an
+/// ordinary character made the whole of `..\..\outside.txt` the "leaf" - so
+/// `flat` naming escaped the destination as readily as `preserve` did.
+fn member_leaf(name: &str) -> &str {
+    name.rsplit(['/', '\\']).next().unwrap_or(name)
+}
+
+/// Join a destination prefix and a key, without doubling or dropping the slash.
+///
+/// `..` is rejected rather than resolved: a source-derived name reaching a
+/// destination path is exactly the shape that writes outside the prefix, and a
+/// raw zone that can be escaped is not one.
+///
+/// Both `/` and `\` separate. Splitting on `/` alone meant a member named
+/// `..\..\outside.txt` held no separator this recognised: it stayed one segment,
+/// matched neither `.` nor `..`, and was joined verbatim - after which Windows
+/// read the backslashes and the write landed outside the destination. An
+/// absolute, drive-qualified or UNC name is defused the same way, by dropping
+/// the components rather than the name: `C:\x` lands at `<dest>/C/x`, inside.
+fn join_destination(prefix: &str, key: &str) -> String {
+    let safe: String = key
+        .split(['/', '\\'])
+        // A drive or UNC prefix only means anything at the START of a path, so
+        // once the components are landed under the destination it cannot
+        // reassert itself. The colon goes because Windows will not accept it in
+        // a file name.
+        .map(|seg| seg.trim_end_matches(':'))
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{}/{}", prefix.trim_end_matches('/'), safe)
+}
+
+/// Bytes as something a person reads in a run log.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", n, UNITS[0])
+    } else {
+        format!("{:.1} {}", v, UNITS[i])
+    }
+}
+
+/// Keeps an SFTP spool file alive for as long as something is reading it, and
+/// removes it afterwards however the copy ended.
+struct SpooledArtifact {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+
+impl std::io::Read for SpooledArtifact {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Drop for SpooledArtifact {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A stable, filesystem-safe key for one catalog, so two runs against the same
+/// lake take the same lock and two runs against different lakes do not.
+fn lock_key(catalog_path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(catalog_path.as_bytes());
+    h.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+}
+
+/// The alias the attach prelude bound the catalog to.
+fn catalog_alias(attach: &str) -> Option<String> {
+    let after = attach.rsplit_once(" AS ")?.1;
+    Some(
+        after
+            .split(|c: char| c == ' ' || c == ';' || c == '(')
+            .next()?
+            .trim()
+            .to_string(),
+    )
+}
+
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// The DuckLake call for one operation, with only the options that were set.
+///
+/// Every argument is passed by NAME. DuckLake's overloads take their options in
+/// different orders - `merge_adjacent_files` has two signatures whose second
+/// argument differs - so a positional call would bind the wrong option to the
+/// wrong meaning depending on which overload matched.
+fn maintenance_call(spec: &plan::DuckLakeMaintainSpec) -> Result<String, EngineError> {
+    let alias = catalog_alias(&spec.attach).unwrap_or_else(|| "duckle_dst".to_string());
+    let cat = sql_string(&alias);
+    let mut args: Vec<String> = vec![cat];
+
+    // A table-scoped operation takes the table as its second positional
+    // argument; a catalog-wide one must not be given one at all.
+    let table_scoped = matches!(spec.operation.as_str(), "compact" | "rewrite");
+    if table_scoped {
+        if let Some(t) = &spec.table_name {
+            args.push(sql_string(t));
+            if let Some(sc) = &spec.schema_name {
+                args.push(format!("schema => {}", sql_string(sc)));
+            }
+        } else if spec.schema_name.is_some() {
+            return Err(EngineError::Config(format!(
+                "ducklake {}: a schema without a table has nothing to scope - name the table \
+                 too, or leave both blank to maintain the whole catalog",
+                spec.operation
+            )));
+        }
+    }
+
+    let mut named: Vec<String> = Vec::new();
+    let mut push = |k: &str, v: String| named.push(format!("{k} => {v}"));
+
+    match spec.operation.as_str() {
+        "compact" => {
+            if let Some(n) = spec.min_file_size {
+                push("min_file_size", n.to_string());
+            }
+            if let Some(n) = spec.max_file_size {
+                push("max_file_size", n.to_string());
+            }
+            if let Some(n) = spec.max_compacted_files {
+                push("max_compacted_files", n.to_string());
+            }
+        }
+        "rewrite" => {
+            if let Some(t) = spec.delete_threshold {
+                push("delete_threshold", t.to_string());
+            }
+        }
+        "expireSnapshots" => {
+            if let Some(o) = &spec.older_than {
+                push("older_than", sql_string(o));
+            }
+            if let Some(v) = &spec.versions {
+                // A list literal, so several versions can be named at once.
+                let items: Vec<String> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                if !items.is_empty() {
+                    push("versions", format!("[{}]", items.join(", ")));
+                }
+            }
+            push("dry_run", spec.dry_run.to_string());
+        }
+        "cleanupFiles" | "deleteOrphans" => {
+            if let Some(o) = &spec.older_than {
+                push("older_than", sql_string(o));
+            }
+            if spec.cleanup_all {
+                push("cleanup_all", "true".to_string());
+            }
+            push("dry_run", spec.dry_run.to_string());
+        }
+        "flushInlined" => {
+            if let Some(t) = &spec.table_name {
+                push("table_name", sql_string(t));
+            }
+            if let Some(sc) = &spec.schema_name {
+                push("schema_name", sql_string(sc));
+            }
+        }
+        "stats" => {}
+        other => {
+            return Err(EngineError::Config(format!(
+                "ducklake: unknown maintenance operation '{other}'"
+            )))
+        }
+    }
+    args.extend(named);
+
+    let func = match spec.operation.as_str() {
+        "compact" => "ducklake_merge_adjacent_files",
+        "rewrite" => "ducklake_rewrite_data_files",
+        "expireSnapshots" => "ducklake_expire_snapshots",
+        "cleanupFiles" => "ducklake_cleanup_old_files",
+        "deleteOrphans" => "ducklake_delete_orphaned_files",
+        "flushInlined" => "ducklake_flush_inlined_data",
+        _ => "ducklake_table_info",
+    };
+    Ok(format!("{}({})", func, args.join(", ")))
+}
+
+/// One artifact a parser was asked to read, and what the upstream row said
+/// about it.
+pub(crate) struct ResolvedArtifact {
+    pub uri: String,
+    /// The hash of these bytes, if whatever produced the row knew it.
+    pub sha256: Option<String>,
+    /// The whole upstream row, so a reject can carry it back out.
+    pub row: JsonValue,
+}
+
+/// A local file for a parser to read, removed on drop when this fetched it.
+pub(crate) struct SpooledInput {
+    pub path: PathBuf,
+    temp: bool,
+}
+
+impl Drop for SpooledInput {
+    fn drop(&mut self) {
+        // Deterministic, and on every exit path: a parser that failed must not
+        // leave the document behind, or a long run fills the disk with the
+        // documents it could not read.
+        if self.temp {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// A file name that cannot escape the temp directory.
+fn safe_file_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+/// Which archive a URI names, from its extension.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ArchiveKind {
+    Zip,
+    Tar,
+    TarGz,
+    Gzip,
+    Unknown,
+}
+
+fn archive_kind(uri: &str) -> ArchiveKind {
+    let lower = uri.to_ascii_lowercase();
+    // Order matters: .tar.gz has to be recognised before .gz, or a tar of many
+    // members is treated as one compressed stream.
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        ArchiveKind::TarGz
+    } else if lower.ends_with(".zip") {
+        ArchiveKind::Zip
+    } else if lower.ends_with(".tar") {
+        ArchiveKind::Tar
+    } else if lower.ends_with(".gz") {
+        ArchiveKind::Gzip
+    } else {
+        ArchiveKind::Unknown
+    }
+}
+
+/// How much one archive is still allowed to produce.
+struct MemberBudget {
+    remaining_members: usize,
+    remaining_bytes: u64,
+    archive_uri: String,
+}
+
+impl MemberBudget {
+    fn take_member(&mut self, name: &str) -> Result<(), EngineError> {
+        if self.remaining_members == 0 {
+            // Config, not Query: the limit is the operator's own, and its
+            // description says reaching it fails the run. As a Query error the
+            // `onError = skip` arm swallowed it, turning a stated ceiling into
+            // a silent truncation that left an arbitrary prefix on disk.
+            return Err(EngineError::Config(format!(
+                "archive: {} holds more members than the limit allows (stopped at '{}'). Raise \
+                 the member limit, or narrow the include filter.",
+                self.archive_uri, name
+            )));
+        }
+        self.remaining_members -= 1;
+        Ok(())
+    }
+}
+
+/// A reader that stops after a fixed number of bytes.
+///
+/// The bound has to apply while the member is being READ, not after: an archive
+/// is a compression format, so a small one can expand to fill a volume, and
+/// discovering that from the disk-full error is too late.
+struct CappedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for CappedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = buf.len().min(self.remaining as usize);
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Does this member pass the include / exclude filters?
+fn member_wanted(name: &str, spec: &plan::ArchiveExtractSpec) -> bool {
+    let matches = |pat: &String| glob_match(pat, name);
+    if !spec.include.is_empty() && !spec.include.iter().any(matches) {
+        return false;
+    }
+    !spec.exclude.iter().any(matches)
+}
+
+/// Where a node's accepted profiles live.
+///
+/// A sub-directory, so `watermark::list` - which reads the top level and takes
+/// `*.json` - does not report a profile history as a resume position that could
+/// then be hand-edited.
+fn baseline_state_path(pipeline_name: Option<&str>, node_id: &str) -> Option<std::path::PathBuf> {
+    let ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|s| !s.is_empty())?;
+    let folder = sanitize_path_segment(pipeline_name.unwrap_or(UNNAMED_RUN_FOLDER));
+    Some(
+        std::path::Path::new(&ws)
+            .join("state")
+            .join(folder)
+            .join("baselines")
+            .join(format!("{}.json", sanitize_path_segment(node_id))),
+    )
+}
+
+/// The key one metric is stored under.
+fn metric_key(metric: &str, column: Option<&str>) -> String {
+    match column {
+        Some(c) => format!("{c}::{metric}"),
+        None => metric.to_string(),
+    }
+}
+
+/// A column name reduced to something safe inside a generated alias.
+fn metric_ident(column: &str) -> String {
+    column
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// The middle value of this metric across the accepted history.
+///
+/// Median rather than mean: one bad Tuesday should not drag the baseline
+/// towards itself, and the whole point is to notice a day that is unlike the
+/// others.
+fn median_of(history: &[JsonValue], key: &str) -> Option<f64> {
+    let mut vals: Vec<f64> = history
+        .iter()
+        .filter_map(|p| p.get(key).and_then(JsonValue::as_f64))
+        .collect();
+    if vals.is_empty() {
+        return None;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = vals.len() / 2;
+    Some(if vals.len() % 2 == 0 {
+        (vals[mid - 1] + vals[mid]) / 2.0
+    } else {
+        vals[mid]
+    })
+}
+
+/// The groups a profile saw.
+fn group_set(profile: &serde_json::Map<String, JsonValue>) -> std::collections::BTreeSet<String> {
+    profile
+        .get("__groups")
+        .and_then(JsonValue::as_object)
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Does this movement break the rule?
+fn judge(rule: &plan::BaselineRule, base: f64, cur: f64) -> (String, String) {
+    let label = match &rule.column {
+        Some(c) => format!("{} {}", c, rule.metric),
+        None => rule.metric.clone(),
+    };
+    let diff = cur - base;
+    let pct = if base != 0.0 { diff / base * 100.0 } else { f64::INFINITY };
+
+    let fail = |why: String| ("violation".to_string(), why);
+    if let Some(limit) = rule.max_decrease_pct {
+        if base != 0.0 && -pct > limit {
+            return fail(format!(
+                "{label} decreased {:.1}% ({} -> {}), limit {:.1}%",
+                -pct,
+                pretty(base),
+                pretty(cur),
+                limit
+            ));
+        }
+    }
+    if let Some(limit) = rule.max_increase_pct {
+        if base != 0.0 && pct > limit {
+            return fail(format!(
+                "{label} increased {:.1}% ({} -> {}), limit {:.1}%",
+                pct,
+                pretty(base),
+                pretty(cur),
+                limit
+            ));
+        }
+    }
+    // Absolute limits, for metrics where a percentage says nothing: a null rate
+    // going from 0% to 5% is an infinite percentage increase.
+    if let Some(limit) = rule.max_increase {
+        if diff > limit {
+            return fail(format!(
+                "{label} rose by {} ({} -> {}), limit {}",
+                pretty(diff),
+                pretty(base),
+                pretty(cur),
+                pretty(limit)
+            ));
+        }
+    }
+    if let Some(limit) = rule.max_decrease {
+        if -diff > limit {
+            return fail(format!(
+                "{label} fell by {} ({} -> {}), limit {}",
+                pretty(-diff),
+                pretty(base),
+                pretty(cur),
+                pretty(limit)
+            ));
+        }
+    }
+    if let Some(limit) = rule.max_difference {
+        if diff.abs() > limit {
+            return fail(format!(
+                "{label} moved by {} ({} -> {}), limit {}",
+                pretty(diff.abs()),
+                pretty(base),
+                pretty(cur),
+                pretty(limit)
+            ));
+        }
+    }
+    ("ok".to_string(), format!("{label} within range"))
+}
+
+/// A number as a person reads it in a run log.
+fn pretty(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{:.4}", v)
+    }
+}
+
+/// xf.artifact.copy naming = "path" ("Preserve the source path under the
+/// prefix") could not run at all against local files on Windows.
+///
+/// source_path_of strips a host or bucket by taking everything after the FIRST
+/// "/" beyond "://". A local path has neither, so the drive letter survived and
+/// the join produced `<dest>/C:/Users/.../file` - which no filesystem will
+/// create: "creating ...: The filename, directory name, or volume label syntax
+/// is incorrect". Measured against a real src.artifact upstream; naming = keep
+/// and hash both worked on the same input, so the naming value was the only
+/// difference.
+/// `src.git` passes its `revision` property to git as a positional argument,
+/// and git reads a leading `-` as an option rather than a revision.
+///
+/// Measured before the fix, against a real repository:
+///
+///   git -C repo log -z --max-count 50 ... "--output=/path/x"
+///
+/// wrote git's output to `/path/x` and **exited 0**, so the node reported
+/// success while writing a file nobody asked for. `revision` is an ordinary
+/// node property, so it can be a `${param}` a run supplies - and the shell
+/// metacharacter guard that covers executed properties would not have caught
+/// this, because `--output=/path/x` contains no metacharacters.
+///
+/// `--end-of-options` is the fix git provides for exactly this: everything
+/// after it is a revision or a path, never an option. Verified on git 2.53 for
+/// both `log` and `ls-tree` - the hostile value is refused and no file is
+/// written, while an ordinary revision still resolves.
+#[cfg(test)]
+mod destination_key_tests {
+    use super::*;
+
+    /// A member name must not be able to place a file outside the destination.
+    ///
+    /// The filter split on `/` only and REMOVED `..` rather than refusing it, so
+    /// a ZIP member named `..\..\outside.txt` contained no forward slash at all,
+    /// survived as a single segment, and was joined verbatim - after which
+    /// Windows read the backslashes as separators and the write landed two
+    /// directories above the destination the author chose.
+    ///
+    /// Removal was the second half of the problem: silently relocating a member
+    /// the author never asked for is not a safe default either, and the
+    /// function's own doc already said `..` is rejected.
+    #[test]
+    fn a_member_name_cannot_escape_the_destination() {
+        // The reported proof-of-concept, verbatim. It is defused the way the
+        // forward-slash form always was - the traversal components are dropped
+        // and the member lands INSIDE the destination - rather than by failing
+        // the run, which is what the two end-to-end tests already pin.
+        assert_eq!(join_destination("/dest", "..\\..\\outside.txt"), "/dest/outside.txt");
+        // The forward-slash form, kept as the control so a fix cannot pass by
+        // handling only one separator.
+        assert_eq!(join_destination("/dest", "../../outside.txt"), "/dest/outside.txt");
+        // Mixed, since a member name is bytes rather than a promise.
+        assert_eq!(join_destination("/dest", "a/../../b.txt"), "/dest/a/b.txt");
+        assert_eq!(join_destination("/dest", "a\\..\\..\\b.txt"), "/dest/a/b.txt");
+
+        // Rooted, drive-qualified and UNC names only mean anything at the start
+        // of a path, so landing their components under the destination defuses
+        // them. The colon goes because Windows rejects it in a file name.
+        assert_eq!(join_destination("/dest", "/etc/passwd"), "/dest/etc/passwd");
+        assert_eq!(
+            join_destination("/dest", "\\Windows\\system32\\x.dll"),
+            "/dest/Windows/system32/x.dll"
+        );
+        assert_eq!(join_destination("/dest", "C:\\evil.txt"), "/dest/C/evil.txt");
+        assert_eq!(
+            join_destination("/dest", "\\\\server\\share\\evil.txt"),
+            "/dest/server/share/evil.txt"
+        );
+
+        // Every result stays under the destination, which is the property that
+        // matters and the one a future edit must not lose.
+        for name in [
+            "..\\..\\outside.txt",
+            "../../outside.txt",
+            "C:\\evil.txt",
+            "\\\\server\\share\\evil.txt",
+            "a\\..\\..\\b.txt",
+        ] {
+            let joined = join_destination("/dest", name);
+            assert!(
+                joined.starts_with("/dest/") && !joined.contains(".."),
+                "{name:?} produced {joined:?}, which is not under the destination"
+            );
+        }
+
+        // And an ordinary member still lands where it should.
+        assert_eq!(join_destination("/dest", "a/b.txt"), "/dest/a/b.txt");
+        assert_eq!(join_destination("/dest", "a\\b.txt"), "/dest/a/b.txt");
+        assert_eq!(join_destination("/dest/", "a/./b.txt"), "/dest/a/b.txt");
+    }
+
+    /// `flat` naming takes the last path component, and it read `/` only - so
+    /// for `..\..\outside.txt` the whole string was the "leaf" and flat mode
+    /// escaped too, which the report confirmed.
+    #[test]
+    fn flat_naming_takes_the_leaf_of_either_separator() {
+        assert_eq!(member_leaf("a/b/c.txt"), "c.txt");
+        assert_eq!(member_leaf("a\\b\\c.txt"), "c.txt");
+        assert_eq!(member_leaf("..\\..\\outside.txt"), "outside.txt");
+        assert_eq!(member_leaf("plain.txt"), "plain.txt");
+    }
+}
+
+#[cfg(test)]
+mod git_revision_args_tests {
+    use super::*;
+
+    fn spec(revision: &str, path_filter: Option<&str>) -> GitSourceSpec {
+        GitSourceSpec {
+            node_id: "g".into(),
+            repo: "/tmp/repo".into(),
+            mode: "log".into(),
+            revision: revision.into(),
+            path_filter: path_filter.map(str::to_string),
+            max_rows: 10,
+        }
+    }
+
+    #[test]
+    fn the_revision_can_never_be_read_as_an_option() {
+        let args = DuckdbEngine::git_revision_args(&spec("--output=/tmp/pwned", None));
+        let marker = args
+            .iter()
+            .position(|a| a == "--end-of-options")
+            .expect("the revision must be introduced by --end-of-options");
+        let rev = args
+            .iter()
+            .position(|a| a == "--output=/tmp/pwned")
+            .expect("the revision itself must still be passed");
+        assert!(marker < rev, "the marker must come first: {args:?}");
+    }
+
+    #[test]
+    fn an_ordinary_revision_still_reaches_git() {
+        let args = DuckdbEngine::git_revision_args(&spec("HEAD", None));
+        assert_eq!(args, vec!["--end-of-options".to_string(), "HEAD".to_string()]);
+    }
+
+    #[test]
+    fn a_path_filter_is_still_separated_from_the_revision() {
+        let args = DuckdbEngine::git_revision_args(&spec("main", Some("src/")));
+        assert_eq!(
+            args,
+            vec![
+                "--end-of-options".to_string(),
+                "main".to_string(),
+                "--".to_string(),
+                "src/".to_string(),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_path_of_tests {
+    use super::source_path_of;
+
+    #[test]
+    fn a_bucket_or_host_is_stripped() {
+        assert_eq!(source_path_of("s3://bucket/a/b.txt"), "a/b.txt");
+        assert_eq!(source_path_of("https://host/x/y.pdf"), "x/y.pdf");
+    }
+
+    #[test]
+    fn a_windows_drive_is_not_carried_into_the_destination() {
+        // The colon is the part that made this unusable - a path segment
+        // cannot contain one.
+        for src in [
+            r"C:\Users\me\src\sub\inner.txt",
+            "C:/Users/me/src/sub/inner.txt",
+            r"D:\data\f.csv",
+        ] {
+            let got = source_path_of(src);
+            assert!(!got.contains(':'), "drive letter survived for {src}: {got}");
+            assert!(!got.starts_with('/'), "leading slash would escape the prefix: {got}");
+        }
+        assert_eq!(source_path_of(r"C:\Users\me\src\sub\inner.txt"), "Users/me/src/sub/inner.txt");
+    }
+
+    #[test]
+    fn a_unix_absolute_path_keeps_its_layout_without_the_leading_slash() {
+        assert_eq!(source_path_of("/data/in/sub/f.csv"), "data/in/sub/f.csv");
+    }
+
+    #[test]
+    fn a_colon_that_is_not_a_drive_is_left_alone() {
+        // Only a single-letter prefix is a drive. A key that legitimately
+        // contains a colon keeps it.
+        assert_eq!(source_path_of("s3://bucket/odd:name/f.txt"), "odd:name/f.txt");
     }
 }

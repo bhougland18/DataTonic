@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Search, ChevronDown, ChevronLeft, ChevronRight, Play, Loader2, Plus, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine, Save, Download, Upload, Bookmark } from 'lucide-react';
+import { Search, ChevronDown, ChevronLeft, ChevronRight, Play, Loader2, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine, Save, Download, Upload, Bookmark } from 'lucide-react';
 import InforProvider from '../InforProvider';
 import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
 import type { IonApiConfig } from './ionapi';

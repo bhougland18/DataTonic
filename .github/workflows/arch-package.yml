@@ -1,0 +1,186 @@
+name: Arch package
+
+# Builds the AUR PKGBUILDs in a real Arch container and lints them with namcap.
+#
+# The point is that "the PKGBUILD is fine" stops being an assertion. A PKGBUILD
+# is only correct if makepkg runs it, and neither the maintainers' machines nor
+# the rest of this CI is Arch - so without this, the packaging in
+# packaging/arch/ could only ever be reviewed by reading.
+#
+# Scoped to packaging changes and tags rather than every push: it downloads
+# release assets over the network, and nothing else in the repo can break it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/arch/**'
+      - '.github/workflows/arch-package.yml'
+  pull_request:
+    paths:
+      - 'packaging/arch/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  makepkg:
+    name: makepkg + namcap
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [duckle-runner-bin, duckle-bin]
+    steps:
+      # imagemagick is duckle-bin's makedepend. It has to be installed here
+      # because the build below passes --nodeps, and makepkg's --nodeps skips
+      # makedepends as well as depends - which is how the first run of this job
+      # got as far as package() and then died on "magick: command not found".
+      - name: Install the toolchain
+        run: pacman -Syu --noconfirm --needed base-devel git namcap imagemagick desktop-file-utils
+
+      - uses: actions/checkout@v7
+
+      # makepkg refuses to run as root, which is what a container runs as.
+      - name: Prepare an unprivileged build user
+        run: |
+          set -e
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+
+      - name: Build the package
+        run: |
+          set -e
+          # --nodeps because the runtime dependencies of a -bin package are not
+          # needed to assemble it, and pulling WebKitGTK into this container
+          # would only slow the check down without testing anything.
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch/${{ matrix.pkg }}' && makepkg --nodeps --noconfirm"
+
+      - name: What the package actually contains
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/packaging/arch/${{ matrix.pkg }}"
+          pkg=$(ls *.pkg.tar.* | head -1)
+          echo "built: $pkg"
+          bsdtar -tf "$pkg" | grep -v '^\.' | sort
+
+      # namcap is the lint AUR reviewers run. Reported, not enforced: a -bin
+      # package always trips a few of its rules (no source build, stripped
+      # binaries), and failing the job on those would just train people to
+      # ignore it. Read the output when changing packaging.
+      - name: namcap
+        continue-on-error: true
+        run: |
+          cd "$GITHUB_WORKSPACE/packaging/arch/${{ matrix.pkg }}"
+          namcap PKGBUILD || true
+          namcap ./*.pkg.tar.* || true
+
+      # .SRCINFO is what the AUR reads to index a package, and it rejects a
+      # push without one. Generating it needs makepkg, so it is produced here
+      # and attached to the run - that way the first manual submission does not
+      # require an Arch machine of your own.
+      - name: Generate .SRCINFO
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/packaging/arch/${{ matrix.pkg }}"
+          su builder -c "cd '$PWD' && makepkg --printsrcinfo" > .SRCINFO
+          echo "--- .SRCINFO ---"
+          cat .SRCINFO
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: srcinfo-${{ matrix.pkg }}
+          path: packaging/arch/${{ matrix.pkg }}/.SRCINFO
+          if-no-files-found: error
+          # .SRCINFO starts with a dot, and the action skips hidden files
+          # unless told otherwise - it reported "No files were found" for a
+          # file that had just been written.
+          include-hidden-files: true
+
+      - name: The desktop entry is valid
+        if: matrix.pkg == 'duckle-bin'
+        run: |
+          set -e
+          desktop-file-validate "$GITHUB_WORKSPACE/packaging/arch/duckle-bin/duckle.desktop"
+          echo "duckle.desktop is valid"
+
+  # What a fresh Arch box actually does with the package - the question a
+  # PKGBUILD review cannot answer. Installed to /usr/bin there is no `bin/duckdb`
+  # beside the runner, so DuckDB resolution falls through to PATH, and whether
+  # that is present is a packaging decision rather than a detail.
+  first-run:
+    name: First run on a clean Arch install
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install the toolchain
+        run: pacman -Syu --noconfirm --needed base-devel git
+
+      - uses: actions/checkout@v7
+
+      - name: Build and install duckle-runner-bin
+        run: |
+          set -e
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch/duckle-runner-bin' && makepkg --nodeps --noconfirm"
+          pacman -U --noconfirm "$GITHUB_WORKSPACE"/packaging/arch/duckle-runner-bin/*.pkg.tar.*
+          command -v duckle-runner
+
+      - name: A pipeline, on a box that has never seen Duckle
+        run: |
+          set -e
+          mkdir -p /tmp/ws && cd /tmp/ws
+          printf 'id,name\n1,alice\n2,bob\n' > in.csv
+          cat > p.json <<'JSON'
+          {"name":"smoke","nodes":[
+            {"id":"s","type":"source","position":{"x":0,"y":0},
+             "data":{"label":"s","componentId":"src.csv",
+                     "properties":{"path":"/tmp/ws/in.csv","hasHeader":true}}},
+            {"id":"k","type":"sink","position":{"x":300,"y":0},
+             "data":{"label":"k","componentId":"snk.csv",
+                     "properties":{"path":"/tmp/ws/out.csv","writeHeader":true}}}],
+           "edges":[{"id":"e1","source":"s","target":"k","sourceHandle":"main",
+                     "targetHandle":"main","data":{"connectionType":"main"}}]}
+          JSON
+
+          echo "===== the user's path: install the package, run a pipeline ====="
+          # duckdb arrives as a declared dependency of the package, which is the
+          # whole point - before it was declared, this install ran nothing.
+          command -v duckdb && duckdb --version
+          set +e
+          duckle-runner --pipeline p.json 2>&1 | tail -20
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit=$rc"
+          echo "----- output -----"
+          cat out.csv
+          [ "$rc" = "0" ] || { echo "::error::a package install cannot run a pipeline"; exit 1; }
+          grep -q alice out.csv || { echo "::error::the pipeline produced no rows"; exit 1; }
+
+          echo
+          echo "===== negative control: take duckdb away again ====="
+          # -Rdd ignores the dependency, which is the only way to reach the
+          # state the declaration exists to prevent. Without this the test
+          # would pass just as well with no `depends` at all.
+          pacman -Rdd --noconfirm duckdb
+          set +e
+          out=$(duckle-runner --pipeline p.json 2>&1)
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$out" | tail -8
+          [ "$rc" != "0" ] || { echo "::error::running without duckdb should fail"; exit 1; }
+
+          # Whether the message is ACTIONABLE here is a property of the released
+          # binary, not of this repository - this package installs the published
+          # artifact, which necessarily lags the source. So it is reported, not
+          # enforced: the wording itself is pinned by a unit test in the engine
+          # (the_missing_duckdb_message_helps_a_reader_with_no_desktop_app), and
+          # this line will simply stop firing once a release carries that fix.
+          if echo "$out" | grep -q 'DUCKLE_DUCKDB_BIN'; then
+            echo "refused, and told the reader how to fix it without a desktop app"
+          else
+            echo "::notice::The packaged binary still says 'Open Setup', which a headless install cannot do. Fixed in the source; this resolves itself at the next release."
+          fi

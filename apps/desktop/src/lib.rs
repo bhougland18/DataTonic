@@ -185,6 +185,9 @@ pub fn run() {
             watermark_clear,
             cancel_pipeline,
             compile_pipeline,
+            analyze_node_sql,
+            complete_node_sql,
+            describe_node_columns,
             pipeline_column_lineage,
             pipeline_trust_report,
             schedule_set_workspace,
@@ -197,6 +200,7 @@ pub fn run() {
             plans_save,
             plans_delete,
             plans_run,
+            external_components,
             workspace_catalog,
             workspace_catalog_rebuild,
             workspace_catalog_annotate,
@@ -457,6 +461,7 @@ async fn run_pipeline(
     duckle_duckdb_engine::context::apply_vault(&mut pipeline);
     ensure_pixeltable_if_used(&app, &pipeline);
     let name = pipeline_name.clone();
+    let receipt = begin_desktop_run(&workspace_path, &pipeline, pipeline_id.as_deref().unwrap_or("pipeline"), "desktop");
     let joined = tokio::task::spawn_blocking(move || {
         engine.execute_pipeline_with_events(&pipeline, None, name.as_deref(), |evt| {
             let _ = on_event.send(evt);
@@ -465,8 +470,47 @@ async fn run_pipeline(
     .await;
     *CURRENT_RUN.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let result = joined.map_err(|e| e.to_string())?;
+    if let Some((ws, r)) = receipt {
+        duckle_duckdb_engine::retry::finish(&ws, r, &result.status, duckle_duckdb_engine::retry::nodes_of(&result));
+    }
     record_history(&pipeline_id, &workspace_path, &result, "manual");
     Ok(result)
+}
+
+/// #259: record a canvas run, before and after.
+///
+/// The desktop is the most-used way to start a run, and it recorded no run id
+/// at all: `record_history` goes through `RunRecord::from_result`, which
+/// hard-codes `run_id: None`. So the runs people actually start were the ones
+/// that could not be found afterwards, which is the hole #259 exists to close.
+fn begin_desktop_run(
+    workspace: &Option<String>,
+    pipeline: &duckle_duckdb_engine::PipelineDoc,
+    pipeline_id: &str,
+    trigger: &str,
+) -> Option<(std::path::PathBuf, duckle_duckdb_engine::retry::RunReceipt)> {
+    // No workspace means nowhere to record into, which is the scratch-canvas
+    // case rather than an error.
+    let workspace = std::path::PathBuf::from(workspace.as_deref().filter(|w| !w.is_empty())?);
+    let workspace = &workspace;
+    let hash = duckle_duckdb_engine::retry::pipeline_hash(pipeline);
+    let run_id = duckle_duckdb_engine::retry::new_run_id(pipeline_id, trigger);
+    Some((
+        workspace.clone(),
+        duckle_duckdb_engine::retry::begin(
+            workspace,
+            &run_id,
+            trigger,
+            pipeline_id,
+            &workspace
+                .join("pipelines")
+                .join(format!("{pipeline_id}.json"))
+                .display()
+                .to_string(),
+            &hash,
+            None,
+        ),
+    ))
 }
 
 /// #166 stage 2: expand saved Salesforce connection refs into node auth props
@@ -529,6 +573,9 @@ async fn run_pipeline_partial(
     ensure_pixeltable_if_used(&app, &pipeline);
     let target = target_node_id;
     let name = pipeline_name.clone();
+    // Run-to-here is still a run, and the one most likely to be asked about
+    // afterwards ("what did that node actually produce?").
+    let receipt = begin_desktop_run(&workspace_path, &pipeline, pipeline_id.as_deref().unwrap_or("pipeline"), "desktop-partial");
     let joined = tokio::task::spawn_blocking(move || {
         engine.execute_pipeline_with_events(
             &pipeline,
@@ -542,6 +589,9 @@ async fn run_pipeline_partial(
     .await;
     *CURRENT_RUN.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let result = joined.map_err(|e| e.to_string())?;
+    if let Some((ws, r)) = receipt {
+        duckle_duckdb_engine::retry::finish(&ws, r, &result.status, duckle_duckdb_engine::retry::nodes_of(&result));
+    }
     record_history(&pipeline_id, &workspace_path, &result, "partial");
     Ok(result)
 }
@@ -636,6 +686,62 @@ fn cancel_pipeline() -> Result<(), String> {
 #[tauri::command]
 fn compile_pipeline(pipeline: PipelineDoc) -> Result<Vec<StageSql>, String> {
     compile_pipeline_sql(&pipeline).map_err(|e| e.to_string())
+}
+
+/// #226: the columns a node really produces, without running it.
+///
+/// The editor derives each node's schema from a per-component table in the
+/// frontend, and there are far more components than entries in it. A component
+/// that is missing falls through to "schema unchanged", so columns it adds
+/// never reach the Schema or Preview tabs and a column it drops stays listed
+/// and renders empty. This asks DuckDB instead, by running the node's own
+/// compiled SQL against a zero-row typed stub of its inputs.
+///
+/// Reads nothing: no file is opened, no credential used, no network touched.
+#[tauri::command]
+fn describe_node_columns(
+    pipeline: PipelineDoc,
+    node_id: String,
+    inputs: Vec<(String, Vec<duckle_duckdb_engine::Column>)>,
+) -> Result<Vec<duckle_duckdb_engine::Column>, String> {
+    engine()?
+        .describe_node_columns(&pipeline, &node_id, &inputs)
+        .map_err(|e| e.to_string())
+}
+
+/// #314: bind a node's SQL and report what DuckDB said about it.
+///
+/// The same side-effect-free bind `describe_node_columns` does, keeping the
+/// diagnostics instead of collapsing them into one error the editor can only
+/// render as "did not resolve". Reads nothing: no file, no credential, no
+/// network.
+#[tauri::command]
+fn analyze_node_sql(
+    pipeline: PipelineDoc,
+    node_id: String,
+    inputs: Vec<(String, Vec<duckle_duckdb_engine::Column>)>,
+) -> Result<duckle_duckdb_engine::NodeAnalysis, String> {
+    engine()?
+        .analyze_node_sql(&pipeline, &node_id, &inputs)
+        .map_err(|e| e.to_string())
+}
+
+/// #314: what could come next at a cursor position in a node's SQL.
+///
+/// Cheap by construction - the function list is cached for the process and the
+/// rest is a pure function - so an editor may call it while someone types.
+/// Reads nothing and runs nothing.
+#[tauri::command]
+fn complete_node_sql(
+    pipeline: PipelineDoc,
+    node_id: String,
+    inputs: Vec<(String, Vec<duckle_duckdb_engine::Column>)>,
+    cursor: usize,
+    limit: Option<usize>,
+) -> Result<Vec<duckle_duckdb_engine::sqlcomplete::Completion>, String> {
+    engine()?
+        .complete_node_sql(&pipeline, &node_id, &inputs, cursor, limit.unwrap_or(12))
+        .map_err(|e| e.to_string())
 }
 
 /// Column-level lineage for the whole pipeline: each node's output columns
@@ -906,6 +1012,25 @@ async fn plans_run(workspace_path: String, id: String) -> Result<plans::PlanRun,
 /// Reads the saved graph rather than rebuilding, so opening the screen never
 /// silently costs a full workspace rescan; `stale` says when a rebuild is due
 /// and `workspace_catalog_rebuild` is the deliberate act.
+/// #307: the external components installed in this workspace, catalog-shaped.
+///
+/// Read from their manifests without running anything, so opening a workspace
+/// never executes third-party code just to draw the palette.
+#[tauri::command]
+fn external_components(workspace: String) -> Result<serde_json::Value, String> {
+    let ws = std::path::Path::new(&workspace);
+    let (found, problems) = duckle_duckdb_engine::plugin::discover(ws);
+    Ok(serde_json::json!({
+        "components": found
+            .iter()
+            .map(duckle_duckdb_engine::plugin::as_catalog_entry)
+            .collect::<Vec<_>>(),
+        // Surfaced rather than swallowed: a component missing from the palette
+        // because its manifest is broken is a bug report about the wrong thing.
+        "problems": problems,
+    }))
+}
+
 #[tauri::command]
 fn workspace_catalog(
     workspace: String,
@@ -1296,8 +1421,9 @@ fn deploy_target_claim(
     name: String,
     url: String,
     admin_label: String,
+    setup_code: String,
 ) -> Result<String, String> {
-    deploy::claim(&ws_path(&workspace_path), &name, &url, &admin_label)
+    deploy::claim(&ws_path(&workspace_path), &name, &url, &admin_label, &setup_code)
 }
 
 #[tauri::command]

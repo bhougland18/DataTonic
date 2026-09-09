@@ -76,17 +76,78 @@ function placeholderAutodetect(format?: string): (
 
 // Field helpers ---------------------------------------------------------
 
-const encodingField = (): Field => ({
+// DuckDB's CSV reader accepts over a thousand encoding names, under ICU
+// spellings that are easy to get wrong - `KOI8_R` not `KOI8-R`, `EUC_KR` not
+// `EUC-KR`, `iso-8859_2-1999` not `ISO-8859-2`, and a wrong spelling is a hard
+// "does not support the encoding" error rather than a fallback. So the list
+// carries the names people actually need, spelled the way DuckDB accepts them,
+// and the field stays typable for the rest. Every value below was checked
+// against DuckDB 1.5.4.
+export const encodingField = (): Field => ({
     key: 'encoding',
     label: 'Encoding',
     kind: 'select',
+    allowCustom: true,
+    placeholder: 'utf-8',
     defaultValue: 'utf-8',
+    description:
+        'DuckDB accepts any ICU encoding name; the list is the common ones. A name it does not know is an error, not a fallback.',
     options: [
         { label: 'UTF-8', value: 'utf-8' },
         { label: 'UTF-16', value: 'utf-16' },
-        { label: 'Latin-1', value: 'latin-1' },
-        { label: 'Windows-1252', value: 'windows-1252' },
+        { label: 'Latin-1  (ISO-8859-1)', value: 'latin-1' },
+        { label: 'Windows-1252  Western', value: 'windows-1252' },
+        { label: 'Windows-1250  Central European', value: 'CP1250' },
+        { label: 'Windows-1251  Cyrillic', value: 'CP1251' },
+        { label: 'Windows-1253  Greek', value: 'CP1253' },
+        { label: 'Windows-1254  Turkish', value: 'CP1254' },
+        { label: 'Windows-1255  Hebrew', value: 'CP1255' },
+        { label: 'Windows-1256  Arabic', value: 'CP1256' },
+        { label: 'Windows-1257  Baltic', value: 'CP1257' },
+        { label: 'Windows-1258  Vietnamese', value: 'CP1258' },
+        { label: 'ISO-8859-2  Central European', value: 'iso-8859_2-1999' },
+        { label: 'ISO-8859-5  Cyrillic', value: 'iso-8859_5-1999' },
+        { label: 'ISO-8859-7  Greek', value: 'iso-8859_7-1987' },
+        { label: 'ISO-8859-15  Western with euro', value: 'iso-8859_15-1999' },
+        { label: 'Shift-JIS  Japanese', value: 'SHIFT_JIS' },
+        { label: 'EUC-JP  Japanese', value: 'EUC_JP' },
+        { label: 'EUC-KR  Korean', value: 'EUC_KR' },
+        { label: 'Big5  Traditional Chinese', value: 'BIG5' },
+        { label: 'GB18030  Simplified Chinese', value: 'GB18030' },
+        { label: 'KOI8-R  Cyrillic', value: 'KOI8_R' },
+        { label: 'CP852  DOS Central European', value: 'CP852' },
+        { label: 'CP866  DOS Cyrillic', value: 'CP866' },
+        { label: 'CP437  DOS US', value: 'CP437' },
     ],
+});
+
+/// The delimiter a delimited-text reader splits on.
+///
+/// Typable as well as pickable: a delimiter is whatever the system that wrote
+/// the file chose, and no list of options closes that set. DuckDB's `delim`
+/// takes a string rather than a character, so `||` and `<=>` are as valid as
+/// `,` - both measured against DuckDB 1.5.4.
+export const delimiterField = (defaultValue: string): Field => ({
+    key: 'delimiter',
+    label: 'Delimiter',
+    kind: 'select',
+    allowCustom: true,
+    placeholder: 'pick one, or type it - any length',
+    defaultValue,
+    options: [
+        { label: 'Comma  ,', value: ',' },
+        { label: 'Tab  \\t', value: '\t' },
+        { label: 'Semicolon  ;', value: ';' },
+        { label: 'Pipe  |', value: '|' },
+        { label: 'Space', value: ' ' },
+        { label: 'Colon  :', value: ':' },
+        { label: 'Caret  ^', value: '^' },
+        { label: 'Tilde  ~', value: '~' },
+        { label: 'Hash  #', value: '#' },
+        { label: 'Unit separator  0x1F', value: '' },
+    ],
+    description:
+        'Leave blank to let DuckDB sniff it. Anything not listed can be typed in, including a multi-character delimiter such as || or <=>.',
 });
 
 const writeModeField = (): Field => ({
@@ -94,16 +155,16 @@ const writeModeField = (): Field => ({
     label: 'Write mode',
     kind: 'select',
     defaultValue: 'overwrite',
-    options: [
-        { label: 'Overwrite', value: 'overwrite' },
-        { label: 'Error if exists', value: 'error' },
-    ],
+    // "Error if exists" was here and no file-sink builder reads `mode`: a COPY
+    // always replaces, so the option that promised to refuse a write silently
+    // performed one. build_sink_sql now refuses it rather than replacing.
+    options: [{ label: 'Overwrite', value: 'overwrite' }],
 });
 
 // Validate-before-insert / dead-letter for DB sinks (#101): split rows that
 // cannot be cast to the declared column types off to a file instead of failing
 // the whole load. Needs a declared schema on the node.
-const deadLetterFields = (): Field[] => [
+export const deadLetterFields = (): Field[] => [
     {
         key: 'validateBeforeInsert',
         label: 'Validate before insert (dead-letter bad rows)',
@@ -222,6 +283,8 @@ const CONNECTION_KIND_FOR: Record<string, string> = {
     'src.mysql': 'mysql', 'snk.mysql': 'mysql',
     'src.mariadb': 'mariadb', 'snk.mariadb': 'mariadb',
     'src.sqlserver': 'sqlserver', 'snk.sqlserver': 'sqlserver',
+    // Synapse is the same TDS connection under another name.
+    'src.synapse': 'sqlserver', 'snk.synapse': 'sqlserver',
     'src.oracle': 'oracle', 'snk.oracle': 'oracle',
     'src.clickhouse': 'clickhouse', 'snk.clickhouse': 'clickhouse',
     'src.mongodb': 'mongodb', 'snk.mongodb': 'mongodb',
@@ -422,8 +485,131 @@ function injectPgAdvancedSection(manifest: ComponentManifest): void {
     else manifest.sections.push(section);
 }
 
+// #256: the HTTP transport every HTTP-backed source honours.
+//
+// The engine already reads these four keys - `http_transport_from_props` in
+// plan/builders.rs, applied by run_rest_source and run_html_source - but no
+// component DECLARED them, so the only way to set a corporate proxy was to
+// hand-edit the pipeline JSON. That is the mirror of the usual bug: not a form
+// field nothing reads, but a setting the engine reads that no form offers.
+//
+// Injected from one place rather than added to thirty-four manifests, because
+// the whole point of #256 is that transport is configured once rather than
+// re-implemented per connector. The ids are exactly the branch in
+// plan/mod.rs that builds a spec carrying `transport`; a Rust test keeps the
+// two lists from drifting.
+const HTTP_TRANSPORT_IDS = new Set([
+    'src.rest', 'src.github', 'src.gitlab', 'src.airtable', 'src.notion',
+    'src.hubspot', 'src.jira', 'src.stripe', 'src.sendgrid', 'src.mailchimp',
+    'src.pipedrive', 'src.segment', 'src.salesforce', 'src.xero',
+    'src.quickbooks', 'src.zendesk', 'src.shopify', 'src.intercom',
+    'src.couchdb', 'src.odata', 'src.sap', 'src.soap', 'src.asana',
+    'src.trello', 'src.clickup', 'src.slack', 'src.discord', 'src.twilio',
+    'src.telegram', 'src.dhis2', 'src.graphql', 'src.linear', 'src.monday',
+    'src.html',
+]);
+
+// The GraphQL family is a different request shape wearing the same
+// synthesizer. Its arm in plan/mod.rs BUILDS the request body from `query` and
+// `variables`, and neither was declared - so every src.graphql, src.linear and
+// src.monday node the editor could produce failed at plan time on "query
+// required", and the hand-written pipeline that did work was failed by
+// `validate` for setting a property the checker believed was dead.
+const graphqlRequestFields = (): Field[] => [
+    {
+        key: 'query',
+        label: 'Query',
+        kind: 'expression',
+        required: true,
+        rows: 8,
+        monospace: true,
+        placeholder: 'query Issues($first: Int) { issues(first: $first) { nodes { id title updatedAt } } }',
+        description:
+            'The GraphQL document to POST. Put {incremental} anywhere in it, or in a variable, to have the saved mark substituted before the request goes out.',
+    },
+    {
+        key: 'variables',
+        label: 'Variables (JSON)',
+        kind: 'textarea',
+        rows: 4,
+        monospace: true,
+        placeholder: '{ "first": 50 }',
+        description:
+            'Sent as the request variables. Must be a JSON object; anything that does not parse is sent as an empty one.',
+    },
+];
+
+// What the REST arm reads and the GraphQL arm does not: it hardcodes the method
+// to POST and builds the body itself, so both controls would change nothing.
+const restMethodAndBodyFields = (): Field[] => [
+    {
+        key: 'method',
+        label: 'Method',
+        kind: 'select',
+        defaultValue: 'GET',
+        options: [
+            { label: 'GET', value: 'GET' },
+            { label: 'POST', value: 'POST' },
+            { label: 'PUT', value: 'PUT' },
+            { label: 'DELETE', value: 'DELETE' },
+        ],
+    },
+    { key: 'body', label: 'Request body', kind: 'textarea', rows: 4 },
+];
+
+const httpTransportFields = (): Field[] => [
+    {
+        key: 'httpProxy',
+        label: 'Proxy URL',
+        kind: 'text',
+        placeholder: 'http://proxy.example.com:8080',
+        description:
+            'Overrides the workspace proxy for this node only. Credentials may be embedded as http://user:pass@host:port - use ${ENV:NAME} rather than typing them in.',
+    },
+    {
+        key: 'httpUserAgent',
+        label: 'User-Agent',
+        kind: 'text',
+        placeholder: 'duckle/1.0 (+https://duckle.org)',
+        description: 'Some sites answer 403 to the default one.',
+    },
+    {
+        key: 'httpConnectTimeoutSecs',
+        label: 'Connect timeout (s)',
+        kind: 'integer',
+        placeholder: '30',
+        description: 'How long to wait for the connection itself.',
+    },
+    {
+        key: 'httpReadTimeoutSecs',
+        label: 'Read timeout (s)',
+        kind: 'integer',
+        placeholder: '300',
+        description:
+            'How long a single read may stall before the request fails. A per-read deadline, not a deadline on the whole transfer, so a large download is unaffected while bytes keep arriving.',
+    },
+];
+
+// Appended rather than spliced next to a named field: these sources have no one
+// field in common to anchor to, and transport is the last thing anyone sets.
+function injectHttpTransportSection(manifest: ComponentManifest): void {
+    manifest.sections.push({
+        label: 'HTTP transport',
+        fields: httpTransportFields(),
+        collapsible: true,
+        defaultCollapsed: true,
+    });
+}
+
 const dbReadFields = (): Field[] => [
     {
+        // #330: there was a third option here, "Incremental (by column)", and
+        // choosing it made the run fail before it started -
+        // build_relational_source refuses mode == "incremental" outright. The
+        // Err stays as the guard for pipelines saved while it was offered; what
+        // is removed is the offer. The `incrementalColumn` box that went with
+        // it is gone for the same reason, and with it the capability matrix's
+        // claim that these four sources do incremental reads.
         key: 'mode',
         label: 'Read mode',
         kind: 'select',
@@ -431,7 +617,6 @@ const dbReadFields = (): Field[] => [
         options: [
             { label: 'Whole table', value: 'table' },
             { label: 'Custom SQL', value: 'sql' },
-            { label: 'Incremental (by column)', value: 'incremental' },
         ],
     },
     { key: 'schemaName', label: 'Schema', kind: 'text', placeholder: 'public' },
@@ -443,19 +628,8 @@ const dbReadFields = (): Field[] => [
         rows: 5,
         placeholder: 'SELECT * FROM orders WHERE status = $1',
     },
-    {
-        key: 'incrementalColumn',
-        label: 'Incremental column',
-        kind: 'text',
-        placeholder: 'updated_at',
-    },
-    {
-        key: 'fetchSize',
-        label: 'Fetch size',
-        kind: 'integer',
-        defaultValue: 1000,
-        description: 'Rows fetched per round-trip.',
-    },
+    // A `fetchSize` box was here. build_relational_source never reads it -
+    // the round-trip size is DuckDB's, not ours to set.
 ];
 
 // Read-mode fields shared by the ATTACH-backed duck sources (ducklake,
@@ -557,10 +731,17 @@ function base(
 
 /// Map a component id to the autodetect format the runtime understands.
 function formatFromComponent(componentId: string): string | undefined {
-    const part = componentId.split('.')[1];
-    if (!part) return undefined;
-    // src.csv -> csv, snk.parquet -> parquet, etc.
-    return part;
+    // Everything after the kind, not just the next segment: taking
+    // `split('.')[1]` turned src.ducklake.changes into `ducklake`, so
+    // Autodetect on DuckLake CDC probed a plain DuckLake source with CDC
+    // properties and reported "autodetect failed for src.ducklake" - naming a
+    // component the author had not chosen. The same applied to DuckLake Data
+    // Diff and Maintenance, Salesforce Bulk and SAP RFC.
+    const parts = componentId.split('.');
+    if (parts.length < 2) return undefined;
+    // src.csv -> csv, snk.parquet -> parquet, src.ducklake.changes ->
+    // ducklake.changes.
+    return parts.slice(1).join('.');
 }
 
 // Port topology per component ----------------------------------------------
@@ -573,7 +754,48 @@ const REJECT_OUT: NodePorts['outputs'][number] = {
     type: 'reject',
     optional: true,
 };
+
+// Components that can actually FILL a reject port.
+//
+// The default below is `[MAIN_OUT, REJECT_OUT]`, so nearly every transform,
+// control and quality component advertised one - and only these can produce the
+// `<node>__reject` relation a wired edge reads. Wiring any of the others failed
+// the whole run:
+//
+//     Catalog Error: Table with name t__reject does not exist!
+//
+// measured on a plain xf.distinct. Three producers exist and all three are here:
+// build_reject_sql's own match arms; the REST family, which writes a reject
+// relation when onParentError is "reject" (connectors.rs, the run_rest_source
+// reject_policy branch); and external ext.* components, which get one on the
+// same contract whether or not they wrote to it (#307).
+//
+// The GraphQL trio is deliberately absent even though it rides RestSourceSpec:
+// its arm hardcodes on_parent_error to "fail", so it can never take that path.
+const FILLS_REJECT = new Set([
+    // build_reject_sql
+    'src.csv', 'src.tsv', 'xf.filter',
+    'qa.notnull', 'qa.outlier', 'qa.range', 'qa.refintegrity', 'qa.regex',
+    'qa.schemavalidate', 'qa.unique',
+    'xf.join', 'xf.join.inner', 'xf.join.spatial', 'xf.lookup', 'xf.lookup.outer',
+    'xf.semi', 'xf.semi.join',
+    // REST family: onParentError = reject
+    'src.rest', 'src.github', 'src.gitlab', 'src.airtable', 'src.notion',
+    'src.hubspot', 'src.jira', 'src.stripe', 'src.sendgrid', 'src.mailchimp',
+    'src.pipedrive', 'src.segment', 'src.salesforce', 'src.xero', 'src.quickbooks',
+    'src.zendesk', 'src.shopify', 'src.intercom', 'src.couchdb', 'src.odata',
+    'src.sap', 'src.sap.rfc', 'src.soap', 'src.asana', 'src.trello', 'src.clickup',
+    'src.slack', 'src.discord', 'src.twilio', 'src.telegram', 'src.dhis2',
+]);
+
 export function portsForComponent(comp: ComponentDef): NodePorts {
+    const ports = portsForComponentRaw(comp);
+    if (FILLS_REJECT.has(comp.id) || comp.id.startsWith('ext.')) return ports;
+    const outputs = ports.outputs.filter(o => o.id !== 'reject');
+    return outputs.length === ports.outputs.length ? ports : { ...ports, outputs };
+}
+
+function portsForComponentRaw(comp: ComponentDef): NodePorts {
     const id = comp.id;
 
     // Mapper - 1 main input, up to 3 lookup inputs, main + reject outputs
@@ -612,14 +834,23 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
         id === 'xf.semi' ||
         id === 'xf.anti'
     ) {
+        // An anti join's MATCHED output already IS the unmatched rows, so a
+        // second port labelled "unmatched" would mean the opposite thing on the
+        // same node. A cross join has no predicate, so nothing is ever
+        // unmatched. Both advertised the port and nothing could fill it: wiring
+        // it failed the run with `Table with name <node>__reject does not
+        // exist`. Every other member of the family now fills it.
+        const hasUnmatched = id !== 'xf.anti' && id !== 'xf.join.cross';
         return {
             inputs: [
                 { id: 'main', label: 'driving', type: 'main' },
                 { id: 'lookup', label: 'lookup', type: 'lookup' },
             ],
             outputs: [
-                { id: 'main', label: 'matched', type: 'main' },
-                { id: 'reject', label: 'unmatched', type: 'reject', optional: true },
+                { id: 'main', label: id === 'xf.anti' ? 'unmatched' : 'matched', type: 'main' },
+                ...(hasUnmatched
+                    ? [{ id: 'reject', label: 'unmatched', type: 'reject' as const, optional: true }]
+                    : []),
             ],
         };
     }
@@ -826,7 +1057,13 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
     // always been. Only the generic component gets the port - the vendor
     // aliases keep their plain source shape.
     if (id === 'src.rest') {
-        return { inputs: [MAIN_IN], outputs: [MAIN_OUT, REJECT_OUT] };
+        // `optional` is load-bearing, and its absence is what made a plain REST
+        // source unrunnable from the canvas: validatePipeline treats any input
+        // without it as required, so an unconnected node was reported as "REST
+        // has no upstream connection." and blocked the run. The engine never
+        // required one - the same pipeline ran through MCP and the headless
+        // runner - so the port declaration was the only thing saying otherwise.
+        return { inputs: [{ ...MAIN_IN, optional: true }], outputs: [MAIN_OUT, REJECT_OUT] };
     }
 
     // Sources: outputs only
@@ -846,6 +1083,21 @@ export function portsForComponent(comp: ComponentDef): NodePorts {
         return {
             inputs: [MAIN_IN],
             outputs: [],
+        };
+    }
+
+    // An inline SQL node does not need an upstream: SQL that reads its own data
+    // (read_json_auto, read_csv, an ATTACHed database) is self-contained, and the
+    // engine already runs it - build_view_sql simply omits the `WITH input AS`
+    // prefix when there is no main input. Marking the port required flagged
+    // every such node as broken with no way to clear it, since the only other
+    // toggle that silenced it, Pure SQL, stops the node producing a relation at
+    // all. The genuine mistake - SQL that says `FROM input` with nothing wired -
+    // is caught precisely in validation.ts instead.
+    if (id === 'code.sql' || id === 'code.sqltemplate') {
+        return {
+            inputs: [{ ...MAIN_IN, optional: true }],
+            outputs: [MAIN_OUT, REJECT_OUT],
         };
     }
 
@@ -978,9 +1230,12 @@ function synthFileSource(comp: ComponentDef): ComponentManifest {
     };
     // src.spatial reads many geo formats via GDAL; surface the common
     // ones in the file picker rather than a useless ".spatial" filter.
+    // #241: geoparquet/parquet included - the engine reads those with
+    // read_parquet rather than ST_Read, which cannot open them at all, and a
+    // format the picker does not offer is one nobody discovers.
     const filters = comp.id === 'src.spatial'
         ? [
-            { name: 'Geospatial', extensions: ['geojson', 'json', 'shp', 'gpkg', 'kml', 'gpx', 'gml'] },
+            { name: 'Geospatial', extensions: ['geoparquet', 'parquet', 'geojson', 'json', 'shp', 'gpkg', 'kml', 'gpx', 'gml'] },
             { name: 'All files', extensions: ['*'] },
         ]
         : [
@@ -1008,7 +1263,9 @@ function synthFileSource(comp: ComponentDef): ComponentManifest {
                     key: 'path',
                     label: 'Path',
                     kind: 'file-path',
-                    required: true,
+                    // #282: src.pdf can take its documents from an upstream
+                    // artifact relation instead, so a path is not always needed.
+                    required: comp.id !== 'src.pdf',
                     filters,
                     ...(pathDescription ? { description: pathDescription } : {}),
                 },
@@ -1027,7 +1284,199 @@ function synthFileSource(comp: ComponentDef): ComponentManifest {
             ],
         },
         ...fileFormatSection(comp),
+        ...(comp.id === 'src.pdf' || comp.id === 'src.xml' || comp.id === 'src.html'
+            ? [artifactInputSection(), artifactAuthSection()]
+            : []),
+        // Each arm reads its own throughput knob and neither had a field.
+        ...(comp.id === 'src.pdf'
+            ? [{
+                  label: 'Throughput',
+                  fields: [{
+                      key: 'concurrency',
+                      label: 'Documents at once',
+                      kind: 'integer' as const,
+                      defaultValue: 1,
+                      description: 'How many documents are extracted in parallel. One at a time by default, which is the behaviour this source has always had.',
+                  }],
+              }]
+            : []),
+        ...(comp.id === 'src.xml'
+            ? [{
+                  label: 'Throughput',
+                  fields: [{
+                      key: 'batchRows',
+                      label: 'Rows per batch',
+                      kind: 'integer' as const,
+                      description: 'How many rows the streaming parser buffers before writing them out. Larger is faster and holds more in memory. Blank uses the engine default.',
+                  }],
+              }]
+            : []),
+        ...(comp.id === 'src.html'
+            ? [{
+                  label: 'Follow pagination',
+                  fields: [
+                      {
+                          key: 'nextPageSelector',
+                          label: 'Next-page link',
+                          kind: 'text' as const,
+                          placeholder: 'a.next',
+                          description: 'A CSS selector for the link to the next page. Duckle follows it, then the one that page names, until a page names none - so server-rendered pagination needs no loop. Relative links are resolved the way a browser does, against the page URL or a <base href> if the document sets one. Leave blank to read one page. Ignored when documents are wired in from upstream, since that list already names every page it wants.',
+                      },
+                      {
+                          key: 'nextPageAttribute',
+                          label: 'Link attribute',
+                          kind: 'text' as const,
+                          defaultValue: 'href',
+                          description: 'Which attribute of that element holds the URL.',
+                      },
+                      {
+                          key: 'maxPages',
+                          label: 'Max pages',
+                          kind: 'integer' as const,
+                          defaultValue: 100,
+                          description: 'A safety cap. A next link written by someone else can point back at page 1, which is a cycle rather than a long list; Duckle also stops on its own if a URL repeats.',
+                      },
+                  ],
+              }, {
+                  label: 'Keep the original page',
+                  fields: [{
+                      key: 'rawResponseDestination',
+                      label: 'Archive each page at',
+                      kind: 'text' as const,
+                      description: 'Where to write each page BEFORE it is parsed, so a later question about the source can be answered from the bytes rather than argued about. Put {sha256} in the path and the file is named after its own content, so a changed page becomes a new file and an unchanged one rewrites the same one. {date} is also substituted. An s3:// destination uses the object-storage connection above. Rows carry _response_uri and _response_sha256 naming what they were parsed from. Leave blank to archive nothing.',
+                  }],
+              }]
+            : []),
+        ...outputCacheSection(comp),
     ]);
+}
+
+// #252: reuse a stage's completed output when nothing that produced it has
+// changed. Only offered on components whose work is a pure function of their
+// inputs - anything that writes somewhere or reads a clock gives a different
+// answer the second time, and reusing the first one would be wrong, not fast.
+// The engine keeps its own allowlist; this only decides where the box appears.
+const CACHEABLE_COMPONENTS = ['src.pdf', 'src.xml', 'src.html', 'code.python', 'code.javascript', 'code.wasm'];
+
+function outputCacheSection(comp: ComponentDef): FormSection[] {
+    if (!CACHEABLE_COMPONENTS.includes(comp.id)) return [];
+    return [{
+        label: 'Reuse completed output',
+        fields: [
+            {
+                key: 'cacheOutput',
+                label: 'Skip this step when its inputs have not changed',
+                kind: 'bool',
+                defaultValue: false,
+                description: 'Keeps what this step produced and serves it again on the next run, as long as the settings above and the rows arriving from upstream are both identical. Change either and the step runs for real. Needs an upstream connection: without one there is nothing to compare, so the setting is ignored rather than guessed at. Cached output lives under the workspace cache folder and is safe to delete.',
+            },
+        ],
+    }];
+}
+
+// #282: read the documents an upstream artifact relation names, instead of a
+// configured path. Wiring something in is what turns it on - with nothing wired
+// in the node reads its path exactly as it always has.
+function artifactInputSection(): FormSection {
+    return {
+        label: 'Read from upstream artifacts',
+        fields: [
+            {
+                key: 'uriColumn',
+                label: 'URI column',
+                kind: 'column',
+                defaultValue: 'uri',
+                description:
+                    'Wire an artifact relation in and each row names a document to read. Changed?, Artifact and Copy Artifact all emit a uri column, so the default already lines up with them. With nothing wired in, the Path above is used and nothing changes.',
+            },
+            {
+                key: 'carryColumns',
+                label: 'Carry these columns onto every row',
+                kind: 'columns',
+                description: 'Upstream columns copied onto every row the parser emits. The business keys that say what a document IS - company_id, filing_id - live on the artifact row and are lost the moment pages come out instead, so carrying them is what lets a page be joined back to the thing it came from without a second lookup.',
+            },
+            {
+                key: 'shaColumn',
+                label: 'Hash column',
+                kind: 'column',
+                defaultValue: 'sha256',
+                description:
+                    'Carried onto every page as source_sha256, so the parsed rows point back at the exact bytes. Not recomputed: re-hashing would cost a second full read and would describe whatever is at that URI now rather than what was parsed.',
+            },
+            {
+                key: 'onError',
+                label: 'When a document cannot be read',
+                kind: 'select',
+                defaultValue: 'fail',
+                options: [
+                    { label: 'Fail the run', value: 'fail' },
+                    { label: 'Skip it and carry on', value: 'skip' },
+                ],
+                description:
+                    'Fail is the default, because silently dropping a document is how a load goes short without anyone noticing. Skip reports how many were skipped.',
+            },
+        ],
+    };
+}
+
+// Credentials for reaching a remote artifact. The same property names every
+// other artifact-aware node takes, so one saved connection drives all of them.
+function artifactAuthSection(): FormSection {
+    return {
+        label: 'Remote access (for s3://, https:// and sftp:// documents)',
+        fields: [
+            {
+                key: 'accessKey',
+                label: 'S3 access key',
+                kind: 'text',
+                description:
+                    'For s3:// documents. Pick a saved S3 connection instead and these fill from it at run time. A PDF has to be read as a FILE - its cross-reference table is at the end - so a remote document is fetched to a temporary file, one at a time, and removed as soon as it has been parsed.',
+            },
+            { key: 'secretKey', label: 'S3 secret key', kind: 'text', placeholder: 'secret' },
+            { key: 'sessionToken', label: 'S3 session token', kind: 'text', placeholder: 'token' },
+            { key: 'region', label: 'S3 region', kind: 'text', placeholder: 'us-east-1' },
+            {
+                key: 'endpoint',
+                label: 'S3 endpoint',
+                kind: 'text',
+                placeholder: 'https://s3.eu-central-003.backblazeb2.com',
+                description: 'For MinIO, Backblaze B2, Cloudflare R2 and other S3-compatible stores.',
+            },
+            {
+                key: 'urlStyle',
+                label: 'S3 URL style',
+                kind: 'select',
+                defaultValue: '',
+                options: [
+                    { label: 'Default', value: '' },
+                    { label: 'Path (host/bucket/key)', value: 'path' },
+                    { label: 'Virtual host (bucket.host/key)', value: 'vhost' },
+                ],
+            },
+            {
+                key: 'useSsl',
+                label: 'S3 use TLS',
+                kind: 'select',
+                defaultValue: '',
+                options: [
+                    { label: 'Default (from the endpoint scheme)', value: '' },
+                    { label: 'Yes', value: 'true' },
+                    { label: 'No (local MinIO)', value: 'false' },
+                ],
+            },
+            {
+                key: 'headers',
+                label: 'HTTP headers',
+                kind: 'key-value',
+                description: 'Sent when fetching an https:// document.',
+            },
+            { key: 'user', label: 'SFTP user', kind: 'text' },
+            { key: 'password', label: 'SFTP password', kind: 'text', placeholder: 'password' },
+            { key: 'privateKey', label: 'SFTP private key (PEM)', kind: 'expression', rows: 3 },
+            { key: 'keyPassphrase', label: 'SFTP key passphrase', kind: 'text', placeholder: 'passphrase' },
+            { key: 'hostFingerprint', label: 'SFTP host fingerprint', kind: 'text', placeholder: 'SHA256:...' },
+        ],
+    };
 }
 
 function partitionBySection(): FormSection {
@@ -1151,10 +1600,12 @@ function synthFileSink(comp: ComponentDef): ComponentManifest {
                     { key: 'privateKey', label: 'Private key (PEM)', kind: 'text',
                       placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----',
                       description: 'OpenSSH private key for SFTP key-based auth (instead of a password).' },
+                    { key: 'privateKeyPath', label: 'Private key file', kind: 'file-path',
+                      description: 'Name a key file instead of pasting it. Read when the paste above is empty.' },
                     { key: 'keyPassphrase', label: 'Key passphrase', kind: 'text', placeholder: '••••••••' },
                     { key: 'hostFingerprint', label: 'Host fingerprint', kind: 'text',
                       placeholder: 'SHA256:...',
-                      description: 'Optional SFTP host-key pin. If set, the connection is refused unless the server key matches this SHA256 fingerprint.' },
+                      description: 'Optional SFTP host-key pin. If set, the connection is refused unless the server key matches this SHA256 fingerprint. Leave empty and the first key seen for the host is recorded in <workspace>/.duckle/known_hosts, and a later connection offering a DIFFERENT key is refused - so a key change is noticed rather than accepted silently.' },
                 ],
             },
             {
@@ -1187,7 +1638,11 @@ function synthFileSink(comp: ComponentDef): ComponentManifest {
                         kind: 'save-path',
                         required: true,
                         filters: [
-                            { name: 'Geospatial', extensions: ['geojson', 'gpkg', 'shp', 'kml', 'gpx'] },
+                            // #241: GeoParquet is a driver here, so the save
+                            // dialog has to offer the extension - a format the
+                            // picker does not list is one nobody finds, which is
+                            // most of why the read side went unnoticed.
+                            { name: 'Geospatial', extensions: ['geoparquet', 'parquet', 'geojson', 'gpkg', 'shp', 'kml', 'gpx'] },
                             { name: 'All files', extensions: ['*'] },
                         ],
                     },
@@ -1204,6 +1659,56 @@ function synthFileSink(comp: ComponentDef): ComponentManifest {
                             { label: 'GPX', value: 'GPX' },
                             { label: 'GeoParquet', value: 'GeoParquet' },
                         ],
+                    },
+                    {
+                        // #328. A Shapefile's .dbf carries no encoding of its
+                        // own, so non-Latin attributes came back as `?????` -
+                        // GDAL wrote the platform default and the reader had
+                        // nothing to go on. Setting this also makes GDAL write
+                        // the `.cpg` sidecar, which is what makes the file
+                        // self-describing in QGIS and ArcGIS rather than merely
+                        // correct on the machine that wrote it.
+                        //
+                        // Only for Shapefile: GeoJSON, GeoPackage and KML are
+                        // UTF-8 by definition, and offering a choice there
+                        // would imply one exists.
+                        key: 'encoding',
+                        label: 'Attribute encoding',
+                        kind: 'select',
+                        allowCustom: true,
+                        defaultValue: 'UTF-8',
+                        visibleWhen: { key: 'driver', equals: 'ESRI Shapefile' },
+                        description:
+                            'How attribute text is written to the .dbf, and what the .cpg sidecar will say. UTF-8 unless a consumer needs the legacy code page.',
+                        options: [
+                            { label: 'UTF-8', value: 'UTF-8' },
+                            { label: 'ISO-8859-1 (Latin-1)', value: 'ISO-8859-1' },
+                            { label: 'Windows-1252  Western', value: 'CP1252' },
+                            { label: 'Windows-1256  Arabic', value: 'CP1256' },
+                            { label: 'Windows-1251  Cyrillic', value: 'CP1251' },
+                            { label: 'Windows-1254  Turkish', value: 'CP1254' },
+                            { label: 'Shift-JIS  Japanese', value: 'SHIFT_JIS' },
+                            { label: 'GBK  Simplified Chinese', value: 'GBK' },
+                        ],
+                    },
+                    {
+                        // #241 follow-up. #319 put this on the Parquet sink only,
+                        // so the sink someone reaches for when the work IS
+                        // geospatial was the one without the spatial optimisation.
+                        //
+                        // Only for GeoParquet: the option buys row-group pruning,
+                        // and the GDAL drivers have no row groups. Same single
+                        // field as the Parquet sink rather than a checkbox plus a
+                        // column, because a checkbox ticked with no column chosen
+                        // leaves the engine guessing which column holds the
+                        // geometry.
+                        key: 'hilbertColumn',
+                        label: 'Spatial sort (Hilbert)',
+                        kind: 'text',
+                        placeholder: 'geometry column, e.g. geom',
+                        visibleWhen: { key: 'driver', equals: 'GeoParquet' },
+                        description:
+                            'Name a GEOMETRY column to sort rows along a Hilbert curve before writing, so geometries that are close on the ground land in the same row group and a spatial filter can skip more of the file. The curve is scaled to this dataset’s own extent, which costs one extra pass over the data. Leave empty to write rows in the order they arrive.',
                     },
                 ],
             },
@@ -1227,7 +1732,13 @@ function synthFileSink(comp: ComponentDef): ComponentManifest {
                         ],
                     },
                     writeModeField(),
-                    encodingField(),
+                    // No encoding here. DuckDB refuses it on the way out -
+                    // "Option ENCODING is not supported for writing - only for
+                    // reading" - and no sink builder has ever read the property,
+                    // so the dropdown silently wrote UTF-8 whatever was picked.
+                    // A control that cannot do what it offers is worse than a
+                    // missing one, and widening it to the full encoding list
+                    // would only have made the promise bigger.
                     compressionField(),
                     ...(comp.id === 'snk.parquet' ? [directWriteField()] : []),
                 ],
@@ -1283,19 +1794,7 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                 label: 'Format',
                 fields: [
                     { key: 'hasHeader', label: 'Has header row', kind: 'bool', defaultValue: true },
-                    {
-                        key: 'delimiter',
-                        label: 'Delimiter',
-                        kind: 'select',
-                        defaultValue: id.endsWith('.tsv') ? '\t' : ',',
-                        options: [
-                            { label: 'Comma  ,', value: ',' },
-                            { label: 'Tab  \\t', value: '\t' },
-                            { label: 'Semicolon  ;', value: ';' },
-                            { label: 'Pipe  |', value: '|' },
-                            { label: 'Space', value: ' ' },
-                        ],
-                    },
+                    delimiterField(id.endsWith('.tsv') ? '\t' : ','),
                     {
                         key: 'quoteChar',
                         label: 'Quote character',
@@ -1380,6 +1879,14 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                     { key: 'flatten', label: 'Flatten nested objects', kind: 'bool', defaultValue: false, description: 'Expand nested objects into their own columns. With a records path set, the records are always expanded and this controls whether nesting inside them is expanded too (on unless you turn it off).' },
                     { key: 'keepParentNames', label: 'Keep parent names', kind: 'bool', defaultValue: false, description: 'Name a flattened column after the object it came from: owner.Id and account.Id rather than Id_1 and Id_2. Useful when the same key repeats at several levels.' },
                     {
+                        key: 'sampleSize',
+                        label: 'Rows to scan for the schema',
+                        kind: 'integer',
+                        defaultValue: -1,
+                        description:
+                            'How many records DuckDB reads before it decides what the columns ARE. -1 (the default here) scans everything. DuckDB own default is 20480, and on records that do not all carry the same keys that silently DROPS every column first appearing later: the read succeeds, the rows look right, and a field is simply missing with no error to notice. Scanning everything costs an extra pass over the file, which is the price of not losing columns. Set a number if you know your records are uniform and would rather have the speed.',
+                    },
+                    {
                         key: 'recordsPath',
                         label: 'Records path',
                         kind: 'text',
@@ -1396,8 +1903,47 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
             {
                 label: 'Format',
                 fields: [
-                    { key: 'sheet', label: 'Sheet name', kind: 'text', placeholder: 'Sheet1' },
-                    { key: 'range', label: 'Cell range', kind: 'text', placeholder: 'A1:F1000' },
+                    {
+                        key: 'allSheets',
+                        label: 'Read every sheet',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'Reads all sheets in the workbook and stacks them, matching columns by name so the sheets need not be in the same order.',
+                    },
+                    {
+                        key: 'sheet',
+                        label: 'Sheet name(s)',
+                        kind: 'text',
+                        placeholder: 'Sheet1, or January, February',
+                        description:
+                            'One name, or several separated by commas. Leave blank for the first sheet.',
+                        // The condition compares String(value), and allSheets
+                        // defaults to false, so an untouched node evaluates
+                        // this as 'false' and the field shows.
+                        visibleWhen: [{ key: 'allSheets', equals: ['false'] }],
+                    },
+                    {
+                        key: 'sheetColumn',
+                        label: 'Add sheet name column',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'Adds a `sheet_name` column so rows can be told apart after several sheets are stacked.',
+                    },
+                    {
+                        key: 'range',
+                        label: 'Cell range',
+                        kind: 'text',
+                        placeholder: 'A1:F1000',
+                        description:
+                            'Limits the read to a rectangle, for a sheet with a banner or notes around the table.',
+                    },
+                    // build_excel_source passes this straight to read_xlsx as
+                    // `header =`. It had no field, so a sheet whose first row
+                    // is data was read with that row consumed as the names.
+                    { key: 'hasHeader', label: 'Has header row', kind: 'bool', defaultValue: true,
+                      description: 'Off treats the first row as data and names the columns positionally.' },
                 ],
             },
         ];
@@ -1494,6 +2040,38 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                 ],
             },
         ];
+        if (id === 'src.xml') {
+            // #286: government and registry feeds publish an XSD beside the
+            // data. Retyping a deeply nested one into the Schema tab by hand is
+            // repetitive, and a typo in it is a silently mistyped column.
+            sections.push({
+                label: 'Schema from XSD (optional)',
+                fields: [
+                    {
+                        key: 'xsdPath',
+                        label: 'XSD file',
+                        kind: 'file-path',
+                        filters: [{ name: 'XML Schema', extensions: ['xsd'] }],
+                        description: 'A local path or an https:// URL to the published schema. The columns and their types are read from it, so the Schema tab does not have to be filled in by hand. Only used when the Schema tab is empty, so anything you declare there wins. Nothing is validated against the XSD at run time; it is read for types, not as a gate.',
+                    },
+                    {
+                        // #315: the schema set IS the parser, so a publisher
+                        // replacing the bytes behind an unchanged URL changes
+                        // how this feed is read without changing the pipeline.
+                        key: 'xsdChangePolicy',
+                        label: 'If the schema changes',
+                        kind: 'select',
+                        defaultValue: 'warn',
+                        options: [
+                            { label: 'Warn and accept', value: 'warn' },
+                            { label: 'Fail the run', value: 'fail' },
+                            { label: 'Ignore', value: 'allow' },
+                        ],
+                        description: 'The whole resolved schema set, including anything it imports, is remembered the first time it is read. If it later changes, the columns this feed is parsed into may change with it. Warn accepts the new set and says so once. Fail refuses the run until you accept the change by deleting the line from .duckle/xsd_contracts. Ignore does not look.',
+                    },
+                ],
+            });
+        }
         if (id.startsWith('src.')) {
             // src.xml streams the file, so the path may be a local file, an
             // http(s):// URL, or an sftp://user@host/path URL (both decompress
@@ -1521,7 +2099,7 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                         label: 'SFTP host fingerprint',
                         kind: 'text',
                         placeholder: 'SHA256:...',
-                        description: 'Optional SFTP host-key pin. If set, the connection is refused unless the server key matches this SHA256 fingerprint.',
+                        description: 'Optional SFTP host-key pin. If set, the connection is refused unless the server key matches this SHA256 fingerprint. Leave empty and the first key seen for the host is recorded in <workspace>/.duckle/known_hosts, and a later connection offering a DIFFERENT key is refused - so a key change is noticed rather than accepted silently.',
                     },
                 ],
             });
@@ -1561,7 +2139,17 @@ function fileFormatSection(comp: ComponentDef): FormSection[] {
                         label: 'Column widths',
                         kind: 'text',
                         placeholder: '10,20,8,30',
-                        description: 'Comma-separated character widths per column.',
+                        description:
+                            'Comma-separated character widths per column. Each column starts where the previous one ended. Names come from the Schema tab when it is filled in, otherwise col1, col2 and so on.',
+                    },
+                    {
+                        // Read by the builder since it was written; never
+                        // offered, so trimming could not be turned off.
+                        key: 'trim',
+                        label: 'Trim trailing spaces',
+                        kind: 'bool',
+                        defaultValue: true,
+                        description: 'Fixed-width fields are space-padded. Turn this off to keep the padding.',
                     },
                 ],
             },
@@ -1687,6 +2275,7 @@ function synthLakehouseSink(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'schemaName', label: 'Schema', kind: 'text', defaultValue: 'main' },
                     { key: 'tableName', label: 'Table', kind: 'text', required: true, placeholder: 'orders' },
+                    { key: 'publishGroup', label: 'Publish group', kind: 'text', placeholder: 'nightly', description: 'Give several DuckLake sinks the same group name and they commit together, as one snapshot: readers see all of their tables update at once, or none of them. Every member must write to the same catalog and run in the same run - the run is refused, naming the member, if one is disabled, sits inside a Parallelize branch, or is left out by a Run-from-here. Leave blank for the normal behaviour, where each sink commits on its own.' },
                     {
                         key: 'mode',
                         label: 'Write mode',
@@ -1728,6 +2317,994 @@ function synthLakehouseSink(comp: ComponentDef): ComponentManifest {
             ],
         },
     ], 'upstream');
+}
+
+/// Neo4j, Turso/libSQL and IBM DB2 forms.
+///
+/// Routed by id from dispatchManifest, ahead of the palette-group checks: the
+/// sinks live in the snk.databases / snk.nosql groups whose generic synths
+/// would otherwise win, and hand the user a form full of fields the engine
+/// never reads.
+// Components whose form belonged to another family entirely.
+//
+// Each of these ships in the palette, draws a plausible form, and could not
+// produce a node that plans: the engine's arm refuses on a required prop that
+// no field declared. The whole `*.streaming` group is the clearest case - the
+// declared key list was byte-identical across Kafka, Redpanda, RabbitMQ, NATS,
+// Pub/Sub and Kinesis, and only Kafka and Redpanda actually read `brokers` and
+// `topic`. Routed by id ahead of the group checks, the way src.couchdb and
+// src.synapse are, but with purpose-built field sets because no existing
+// synthesizer matches these contracts.
+//
+// Every field below is read by the component's arm in plan/mod.rs, and every
+// required prop that arm demands is present. `prop_contract`'s
+// `every_required_property_a_source_arm_reads_is_one_its_component_declares`
+// is what holds that true.
+function synthWrongFamilyForm(comp: ComponentDef): ComponentManifest | null {
+    const id = comp.id;
+
+    // snk.avro was drawn by the generic file-sink synth, so it offered mode
+    // and compression. AvroSinkSpec has neither - it is path, schema_json and
+    // record_name - so both controls were inert, and the two that work had no
+    // field. The schema one is named in the arm's own comment as the way to
+    // supply a schema, and there was no way to supply it.
+    if (comp.id === 'snk.avro') {
+        return base(comp, [
+            {
+                label: 'Avro',
+                fields: [
+                    { key: 'path', label: 'File path', kind: 'save-path', required: true, placeholder: 'out/rows.avro' },
+                    {
+                        key: 'schemaJson',
+                        label: 'Avro schema (JSON)',
+                        kind: 'textarea',
+                        rows: 6,
+                        monospace: true,
+                        placeholder: '{"type": "record", "name": "Row", "fields": [...]}',
+                        description: 'Written verbatim into the container file. Blank infers the schema from the first row: long for integers, double for floats, string for text, boolean for bool, and a [null, string] union where the first non-null example is text but other rows are null.',
+                    },
+                    {
+                        key: 'recordName',
+                        label: 'Record name',
+                        kind: 'text',
+                        defaultValue: 'Row',
+                        description: 'The record name in the inferred schema. Ignored when a schema is given above, which carries its own.',
+                    },
+                ],
+            },
+        ], 'upstream');
+    }
+    // snk.xml was drawn with the XML SOURCE's shape: rowPath, namespace, plus
+    // the generic file-sink mode and compression. XmlSinkSpec carries none of
+    // those - it has root_element and row_element and nothing else - so every
+    // control on the form was inert and the two that work had no field.
+    if (comp.id === 'snk.xml') {
+        return base(comp, [
+            {
+                label: 'XML',
+                fields: [
+                    { key: 'path', label: 'File path', kind: 'save-path', required: true, placeholder: 'out/rows.xml' },
+                    { key: 'rootElement', label: 'Root element', kind: 'text', defaultValue: 'root', description: 'The single element wrapping the whole document.' },
+                    { key: 'rowElement', label: 'Row element', kind: 'text', defaultValue: 'row', description: 'The element wrapping each row. Columns become child elements inside it.' },
+                ],
+            },
+        ], 'upstream');
+    }
+    // --- Messaging, source side -----------------------------------------
+    if (id === 'src.rabbit') {
+        return base(comp, [
+            {
+                label: 'RabbitMQ',
+                fields: [
+                    { key: 'url', label: 'Connection URL', kind: 'text', required: true, placeholder: 'amqp://user:pass@host:5672/%2f' },
+                    { key: 'queue', label: 'Queue', kind: 'text', required: true },
+                    { key: 'maxMessages', label: 'Max messages', kind: 'integer', defaultValue: 1000, description: 'How many messages to take in one run.' },
+                    { key: 'timeoutMs', label: 'Idle timeout (ms)', kind: 'integer', defaultValue: 5000, description: 'Stop waiting once the queue has been quiet this long.' },
+                ],
+            },
+        ]);
+    }
+    if (id === 'src.nats') {
+        return base(comp, [
+            {
+                label: 'NATS',
+                fields: [
+                    { key: 'urls', label: 'Servers', kind: 'text', required: true, placeholder: 'nats://localhost:4222,nats://host2:4222', description: 'Comma-separated. Also accepted as `servers` in a hand-written pipeline.' },
+                    { key: 'subject', label: 'Subject', kind: 'text', required: true, placeholder: 'orders.*' },
+                    { key: 'maxRecords', label: 'Max messages', kind: 'integer', defaultValue: 1000 },
+                    { key: 'timeoutMs', label: 'Idle timeout (ms)', kind: 'integer', defaultValue: 5000 },
+                ],
+            },
+        ]);
+    }
+    if (id === 'src.pubsub') {
+        return base(comp, [
+            {
+                label: 'Google Pub/Sub',
+                fields: [
+                    { key: 'project', label: 'Project ID', kind: 'text', required: true },
+                    { key: 'subscription', label: 'Subscription', kind: 'text', required: true },
+                    { key: 'accessToken', label: 'Access token', kind: 'text', required: true, secret: true, placeholder: '${ENV:GCP_TOKEN}', description: 'OAuth2 Bearer token. `gcloud auth print-access-token` mints one.' },
+                    { key: 'maxMessages', label: 'Max messages', kind: 'integer', defaultValue: 100 },
+                ],
+            },
+        ]);
+    }
+    if (id === 'src.kinesis') {
+        return base(comp, [
+            {
+                label: 'Kinesis stream',
+                fields: [
+                    { key: 'region', label: 'Region', kind: 'text', required: true, placeholder: 'us-east-1' },
+                    { key: 'streamName', label: 'Stream', kind: 'text', required: true },
+                    { key: 'accessKeyId', label: 'Access key ID', kind: 'text', required: true },
+                    { key: 'secretAccessKey', label: 'Secret access key', kind: 'text', required: true, secret: true, placeholder: '••••••••' },
+                    { key: 'sessionToken', label: 'Session token', kind: 'text', secret: true, description: 'Only for temporary STS credentials.' },
+                ],
+            },
+            {
+                label: 'Read',
+                fields: [
+                    { key: 'shardIndex', label: 'Shard index', kind: 'integer', defaultValue: 0 },
+                    {
+                        key: 'iteratorType',
+                        label: 'Start at',
+                        kind: 'select',
+                        defaultValue: 'TRIM_HORIZON',
+                        options: [
+                            { label: 'Oldest available (TRIM_HORIZON)', value: 'TRIM_HORIZON' },
+                            { label: 'Newest only (LATEST)', value: 'LATEST' },
+                        ],
+                    },
+                    { key: 'maxRecords', label: 'Max records', kind: 'integer', defaultValue: 1000 },
+                ],
+            },
+        ]);
+    }
+    if (id === 'src.dynamodb') {
+        return base(comp, [
+            {
+                label: 'DynamoDB table',
+                fields: [
+                    { key: 'region', label: 'Region', kind: 'text', required: true, placeholder: 'us-east-1' },
+                    { key: 'tableName', label: 'Table', kind: 'text', required: true },
+                    { key: 'accessKeyId', label: 'Access key ID', kind: 'text', required: true },
+                    { key: 'secretAccessKey', label: 'Secret access key', kind: 'text', required: true, secret: true, placeholder: '••••••••' },
+                    { key: 'sessionToken', label: 'Session token', kind: 'text', secret: true, description: 'Only for temporary STS credentials.' },
+                ],
+            },
+            {
+                label: 'Scan',
+                fields: [
+                    { key: 'limitPerPage', label: 'Items per page', kind: 'integer', defaultValue: 1000 },
+                    { key: 'maxPages', label: 'Max pages', kind: 'integer', defaultValue: 100 },
+                ],
+            },
+        ]);
+    }
+
+    // --- Messaging, sink side -------------------------------------------
+    if (id === 'snk.rabbit') {
+        return base(comp, [
+            {
+                label: 'RabbitMQ',
+                fields: [
+                    { key: 'url', label: 'Connection URL', kind: 'text', required: true, placeholder: 'amqp://user:pass@host:5672/%2f' },
+                    { key: 'routingKey', label: 'Routing key', kind: 'text', required: true, description: 'With no exchange set this is the queue name, via the default direct exchange.' },
+                    { key: 'exchange', label: 'Exchange', kind: 'text', placeholder: 'leave blank for the default exchange' },
+                    { key: 'batchSize', label: 'Batch size', kind: 'integer', defaultValue: 500 },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (id === 'snk.nats') {
+        return base(comp, [
+            {
+                label: 'NATS',
+                fields: [
+                    { key: 'urls', label: 'Servers', kind: 'text', required: true, placeholder: 'nats://localhost:4222,nats://host2:4222', description: 'Comma-separated. Also accepted as `servers` in a hand-written pipeline.' },
+                    { key: 'subject', label: 'Subject', kind: 'text', required: true, placeholder: 'orders.created' },
+                    { key: 'subjectSuffixColumn', label: 'Subject suffix from column', kind: 'column', description: 'Appended to the subject per row, so one sink can fan out across subjects.' },
+                    { key: 'batchSize', label: 'Batch size', kind: 'integer', defaultValue: 500 },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (id === 'snk.pubsub') {
+        return base(comp, [
+            {
+                label: 'Google Pub/Sub',
+                fields: [
+                    { key: 'project', label: 'Project ID', kind: 'text', required: true },
+                    { key: 'topic', label: 'Topic', kind: 'text', required: true },
+                    { key: 'accessToken', label: 'Access token', kind: 'text', required: true, secret: true, placeholder: '${ENV:GCP_TOKEN}', description: 'OAuth2 Bearer token. `gcloud auth print-access-token` mints one.' },
+                    { key: 'batchSize', label: 'Batch size', kind: 'integer', defaultValue: 100, description: 'Pub/Sub accepts at most 1000 messages per publish.' },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (id === 'snk.redis') {
+        return base(comp, [
+            {
+                label: 'Redis',
+                fields: [
+                    { key: 'connectionString', label: 'Connection URL', kind: 'text', required: true, placeholder: 'redis://localhost:6379' },
+                    { key: 'keyColumn', label: 'Key column', kind: 'column', required: true, description: 'The column whose value becomes each record key.' },
+                    { key: 'valueColumn', label: 'Value column', kind: 'column', description: 'Leave blank to store the whole row as JSON.' },
+                    { key: 'ttlSeconds', label: 'TTL (seconds)', kind: 'integer', defaultValue: 0, description: '0 sets no expiry.' },
+                    { key: 'batchSize', label: 'Batch size', kind: 'integer', defaultValue: 1000 },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (id === 'snk.email') {
+        return base(comp, [
+            {
+                label: 'SMTP server',
+                fields: [
+                    { key: 'host', label: 'SMTP host', kind: 'text', required: true, placeholder: 'smtp.example.com' },
+                    { key: 'port', label: 'Port', kind: 'integer', defaultValue: 587 },
+                    { key: 'user', label: 'Username', kind: 'text' },
+                    { key: 'password', label: 'Password', kind: 'text', secret: true, placeholder: '••••••••' },
+                    { key: 'fromAddress', label: 'From', kind: 'text', required: true, placeholder: 'duckle@example.com' },
+                ],
+            },
+            {
+                // With an input wired, one mail per row and the addresses come
+                // from columns. With nothing wired, the node is a notification
+                // and `to` / `subject` / `body` are the message itself.
+                label: 'One mail per row',
+                fields: [
+                    { key: 'toColumn', label: 'To column', kind: 'column', defaultValue: 'to' },
+                    { key: 'subjectColumn', label: 'Subject column', kind: 'column', defaultValue: 'subject' },
+                    { key: 'bodyColumn', label: 'Body column', kind: 'column', defaultValue: 'body' },
+                ],
+            },
+            {
+                label: 'Notification (no input wired)',
+                fields: [
+                    { key: 'to', label: 'To', kind: 'text', description: 'Required when nothing is connected to this sink: the node then sends one fixed message instead of one per row.' },
+                    { key: 'subject', label: 'Subject', kind: 'text' },
+                    { key: 'body', label: 'Body', kind: 'textarea', rows: 4 },
+                ],
+            },
+        ], 'upstream');
+    }
+
+    // --- Vector stores ---------------------------------------------------
+    if (id === 'src.qdrant') {
+        return base(comp, [
+            {
+                label: 'Qdrant',
+                fields: [
+                    // Kept from the form this replaces: a saved connection is
+                    // expanded into whatever fields the node's arm reads, so
+                    // dropping the picker would take away a capability it had.
+                    connectionRefField(connectionKindFor(comp.id)),
+                    { key: 'clusterUrl', label: 'Cluster URL', kind: 'text', required: true, placeholder: 'https://xyz.eu-central.aws.cloud.qdrant.io:6333' },
+                    { key: 'collection', label: 'Collection', kind: 'text', required: true },
+                    { key: 'apiKey', label: 'API key', kind: 'text', secret: true, placeholder: '••••••••' },
+                    { key: 'pageSize', label: 'Page size', kind: 'integer', defaultValue: 100 },
+                    { key: 'maxPages', label: 'Max pages', kind: 'integer', defaultValue: 100 },
+                    { key: 'withVector', label: 'Include the vector', kind: 'bool', defaultValue: false },
+                ],
+            },
+        ]);
+    }
+    if (id === 'src.weaviate') {
+        return base(comp, [
+            {
+                label: 'Weaviate',
+                fields: [
+                    // Kept from the form this replaces: a saved connection is
+                    // expanded into whatever fields the node's arm reads, so
+                    // dropping the picker would take away a capability it had.
+                    connectionRefField(connectionKindFor(comp.id)),
+                    { key: 'endpoint', label: 'Endpoint', kind: 'text', required: true, placeholder: 'https://my-cluster.weaviate.network' },
+                    { key: 'class', label: 'Class', kind: 'text', required: true, description: 'Weaviate calls a collection a class.' },
+                    { key: 'apiKey', label: 'API key', kind: 'text', secret: true, placeholder: '••••••••' },
+                    { key: 'pageSize', label: 'Page size', kind: 'integer', defaultValue: 100 },
+                    { key: 'maxPages', label: 'Max pages', kind: 'integer', defaultValue: 100 },
+                    { key: 'withVector', label: 'Include the vector', kind: 'bool', defaultValue: false },
+                ],
+            },
+        ]);
+    }
+
+    // --- Control -----------------------------------------------------------
+    if (id === 'ctl.file') {
+        return base(comp, [
+            {
+                label: 'File operation',
+                fields: [
+                    {
+                        key: 'op',
+                        label: 'Operation',
+                        kind: 'select',
+                        defaultValue: 'copy',
+                        options: [
+                            { label: 'Copy', value: 'copy' },
+                            { label: 'Move', value: 'move' },
+                            { label: 'Delete', value: 'delete' },
+                            { label: 'Archive', value: 'archive' },
+                        ],
+                    },
+                    { key: 'source', label: 'Source', kind: 'file-path', required: true },
+                    { key: 'destination', label: 'Destination', kind: 'text', description: 'Required for every operation except Delete.' },
+                    { key: 'overwrite', label: 'Overwrite an existing destination', kind: 'bool', defaultValue: true },
+                    { key: 'failOnError', label: 'Fail the run on error', kind: 'bool', defaultValue: false, description: 'Off by default: the operation is reported and the run continues.' },
+                ],
+            },
+        ]);
+    }
+    if (id === 'ctl.try') {
+        return base(comp, [
+            {
+                label: 'Fallback',
+                fields: [
+                    {
+                        key: 'fallbackPipelineRef',
+                        label: 'Run this if the try branch fails',
+                        kind: 'pipeline-ref',
+                        required: true,
+                        description: 'Also accepted as `fallbackPath` in a hand-written pipeline.',
+                    },
+                ],
+            },
+        ]);
+    }
+    return null;
+}
+
+function synthNewConnector(comp: ComponentDef): ComponentManifest | null {
+    // Manticore Search (#340). Routed by id so the search-engine group's
+    // generic form cannot claim it: Manticore names the table `table` (it
+    // was renamed from `index` in 6.0) and pages with limit/offset, so an
+    // Elasticsearch-shaped form would set keys the arm never reads.
+    if (comp.id === 'src.manticore' || comp.id === 'snk.manticore') {
+        const isSource = comp.id === 'src.manticore';
+        const connection: FormSection = {
+            label: 'Manticore',
+            fields: [
+                {
+                    key: 'endpoint',
+                    label: 'HTTP endpoint',
+                    kind: 'text',
+                    required: true,
+                    placeholder: 'http://localhost:9308',
+                    description: 'The HTTP JSON API, port 9308 by default - not the MySQL port 9306.',
+                },
+                { key: 'table', label: 'Table', kind: 'text', required: true, placeholder: 'products' },
+                {
+                    key: 'username',
+                    label: 'Username',
+                    kind: 'text',
+                    description: 'Only for a server started with auth = 1, or one behind a proxy that asks for HTTP Basic. Leave blank otherwise.',
+                },
+                { key: 'password', label: 'Password', kind: 'text', placeholder: '••••••••' },
+            ],
+        };
+        if (isSource) {
+            return base(comp, [
+                connection,
+                {
+                    label: 'Query',
+                    fields: [
+                        {
+                            key: 'query',
+                            label: 'Query (raw JSON)',
+                            kind: 'textarea',
+                            rows: 4,
+                            placeholder: '{"match": {"title": "bag"}}',
+                            description: 'Body of the `query` field in the /search request. Empty = {"match_all": {}}.',
+                        },
+                        {
+                            key: 'limit',
+                            label: 'Page size',
+                            kind: 'integer',
+                            defaultValue: 1000,
+                            description: 'Rows per request. A window reaching past 1000 raises max_matches to match, so paging deeper than the default result set works without changing the server.',
+                        },
+                        { key: 'maxPages', label: 'Max pages (safety cap)', kind: 'integer', defaultValue: 100 },
+                    ],
+                },
+            ]);
+        }
+        return base(comp, [
+            connection,
+            {
+                label: 'Write',
+                fields: [
+                    {
+                        key: 'writeMode',
+                        label: 'Write mode',
+                        kind: 'select',
+                        defaultValue: 'insert',
+                        options: [
+                            { label: 'Insert (fails on a duplicate id)', value: 'insert' },
+                            { label: 'Replace (upsert by id)', value: 'replace' },
+                        ],
+                        description: 'Manticore rejects an insert whose id already exists. Replace overwrites that document instead.',
+                    },
+                    {
+                        key: 'batchSize',
+                        label: 'Rows per request',
+                        kind: 'integer',
+                        defaultValue: 1000,
+                        description: 'Rows per /bulk call. Manticore reports a rejected batch as HTTP 200 with errors:true; the run fails on that, so a smaller batch narrows what a rejection covers.',
+                    },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (comp.id === 'xf.tumble') {
+        return base(comp, [
+            {
+                label: 'Tumbling window',
+                fields: [
+                    {
+                        key: 'timeColumn',
+                        label: 'Event time column',
+                        kind: 'column',
+                        required: true,
+                        description: 'Windows are cut on this column, never on arrival time. Replaying old data therefore produces the windows that data belongs to.',
+                    },
+                    {
+                        key: 'size',
+                        label: 'Window size',
+                        kind: 'text',
+                        required: true,
+                        defaultValue: '1 hour',
+                        placeholder: '1 hour',
+                        description: 'A DuckDB interval: 5 minutes, 1 hour, 1 day.',
+                    },
+                    {
+                        key: 'allowedLateness',
+                        label: 'Allowed lateness',
+                        kind: 'text',
+                        defaultValue: '0 seconds',
+                        placeholder: '0 seconds',
+                        description: 'How far past the end of a window the watermark must reach before it closes. Buys time for out-of-order arrivals, at the cost of that much extra latency. Anything arriving after its window was delivered is dropped and counted - emitting it would give downstream a second, partial copy of a window it already has.',
+                    },
+                ],
+            },
+        ]);
+    }
+    if (comp.id === 'qa.baseline') {
+        return base(comp, [
+            {
+                label: 'Baseline',
+                fields: [
+                    { key: 'history', label: 'Profiles to keep', kind: 'integer', defaultValue: 7,
+                      description: 'How many accepted profiles to keep and compare against. The comparison uses their MEDIAN, so one odd day does not drag the baseline towards itself. Only compact numbers are stored, never copies of the data.' },
+                    { key: 'columns', label: 'Columns to profile', kind: 'columns',
+                      description: 'Blank profiles every column. Naming a few keeps the stored profile small on a very wide table.' },
+                    {
+                        key: 'mode',
+                        label: 'On a finding',
+                        kind: 'select',
+                        defaultValue: 'gate',
+                        options: [
+                            { label: 'Gate - fail the run', value: 'gate' },
+                            { label: 'Report - emit the rows only', value: 'report' },
+                        ],
+                        description: 'Gate is the point of the component: an incomplete dataset that publishes successfully is worse than a crash. Report is for the first weeks, while the normal range is still being learned.',
+                    },
+                ],
+            },
+            {
+                label: 'Rules',
+                fields: [
+                    { key: 'rules', label: 'Rules', kind: 'expression', rows: 8,
+                      description: 'A JSON array. Each rule names a metric - row_count, null_pct, distinct_count, min, max or mean - optionally a column, and a limit: maxDecreasePct, maxIncreasePct, maxIncrease, maxDecrease or maxDifference. Absolute limits exist because a percentage says nothing about some metrics: a null rate going from 0 to 5 percent is an infinite percentage increase. Example: [{"metric":"row_count","maxDecreasePct":20},{"column":"postcode","metric":"null_pct","maxIncrease":0.10}]' },
+                ],
+            },
+            {
+                label: 'Groups',
+                fields: [
+                    { key: 'groupBy', label: 'Group by', kind: 'columns',
+                      description: 'Profile a row count per group as well as overall.' },
+                    { key: 'requireExistingGroups', label: 'Every known group must still be present', kind: 'bool', defaultValue: false,
+                      description: 'Catches a partition disappearing - a country that stops arriving - even when the total row count stays inside its normal range, which a dataset-level rule cannot see.' },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (comp.id === 'xf.archive.extract') {
+        return base(comp, [
+            {
+                label: 'What to extract',
+                fields: [
+                    { key: 'uriColumn', label: 'URI column', kind: 'column', defaultValue: 'uri',
+                      description: 'The upstream column naming each archive. Changed?, Artifact and Copy Artifact all emit a uri column.' },
+                    { key: 'destination', label: 'Destination', kind: 'text', required: true,
+                      placeholder: 's3://raw/unpacked/  or  /var/lake/unpacked',
+                      description: 'Where members land. A member path can never escape this prefix, however the archive names it.' },
+                    { key: 'include', label: 'Only these members', kind: 'text',
+                      placeholder: '*.xml, documents/*.pdf',
+                      description: 'Comma-separated globs. Blank takes every member.' },
+                    { key: 'exclude', label: 'Never these members', kind: 'text',
+                      placeholder: '__MACOSX/*, *.tmp',
+                      description: 'Applied after the include filter.' },
+                    {
+                        key: 'naming',
+                        label: 'Name each member',
+                        kind: 'select',
+                        defaultValue: 'preserve',
+                        options: [
+                            { label: 'Preserve its path inside the archive', value: 'preserve' },
+                            { label: 'File name only (flat)', value: 'flat' },
+                        ],
+                    },
+                    {
+                        key: 'ifExists',
+                        label: 'When a member is already there',
+                        kind: 'select',
+                        defaultValue: 'skip',
+                        options: [
+                            { label: 'Skip (leave the existing copy)', value: 'skip' },
+                            { label: 'Replace', value: 'replace' },
+                            { label: 'Fail the run', value: 'error' },
+                        ],
+                        description: 'Skip suits an immutable raw zone: re-running does not re-extract what already landed, and the row still comes out. It means "the destination already IS this member", so a member whose size differs from the file already there stops the run rather than leaving the older bytes in place under a name that now promises the newer ones - use Replace for a source that re-issues changed members under the same name.',
+                    },
+                    {
+                        key: 'onError',
+                        label: 'When an archive cannot be opened',
+                        kind: 'select',
+                        defaultValue: 'fail',
+                        options: [
+                            { label: 'Fail the run', value: 'fail' },
+                            { label: 'Skip it and carry on', value: 'skip' },
+                        ],
+                    },
+                ],
+            },
+            {
+                label: 'Limits',
+                fields: [
+                    { key: 'maxMembers', label: 'Max members per archive', kind: 'integer', defaultValue: 10000,
+                      description: 'Bounds one archive. Reaching it fails the run naming the member it stopped at, rather than extracting an arbitrary prefix of the archive.' },
+                    { key: 'maxUncompressedGb', label: 'Max expanded size (GB)', kind: 'integer', defaultValue: 50,
+                      description: 'An archive is a compression format, so a small one can expand to fill a volume - and an archive from an external publisher is untrusted input. The limit is applied WHILE reading, so it refuses rather than discovering it from a disk-full error.' },
+                    { key: 'partSizeMb', label: 'Part size (MB)', kind: 'integer', defaultValue: 8,
+                      description: 'Bytes held in memory per member while uploading to S3. Below 5 is raised to 5: S3 rejects a smaller non-final part.' },
+                ],
+            },
+            {
+                label: 'S3 / S3-compatible',
+                fields: [
+                    { key: 'accessKey', label: 'Access key', kind: 'text',
+                      description: 'Used for whichever side is s3://, the archive or the destination. Pick a saved S3 connection instead and these fill from it at run time.' },
+                    { key: 'secretKey', label: 'Secret key', kind: 'text', placeholder: 'secret' },
+                    { key: 'sessionToken', label: 'Session token', kind: 'text', placeholder: 'token' },
+                    { key: 'region', label: 'Region', kind: 'text', placeholder: 'us-east-1' },
+                    { key: 'endpoint', label: 'Endpoint', kind: 'text', placeholder: 'https://s3.eu-central-003.backblazeb2.com' },
+                    { key: 'urlStyle', label: 'URL style', kind: 'select', defaultValue: '',
+                      options: [
+                          { label: 'Default', value: '' },
+                          { label: 'Path (host/bucket/key)', value: 'path' },
+                          { label: 'Virtual host (bucket.host/key)', value: 'vhost' },
+                      ] },
+                    { key: 'useSsl', label: 'Use TLS', kind: 'select', defaultValue: '',
+                      options: [
+                          { label: 'Default (from the endpoint scheme)', value: '' },
+                          { label: 'Yes', value: 'true' },
+                          { label: 'No (local MinIO)', value: 'false' },
+                      ] },
+                    { key: 'headers', label: 'HTTP headers', kind: 'key-value',
+                      description: 'Sent when fetching an https:// archive.' },
+                    { key: 'user', label: 'SFTP user', kind: 'text' },
+                    { key: 'password', label: 'SFTP password', kind: 'text', placeholder: 'password' },
+                    { key: 'privateKey', label: 'SFTP private key (PEM)', kind: 'expression', rows: 3 },
+                    { key: 'keyPassphrase', label: 'SFTP key passphrase', kind: 'text', placeholder: 'passphrase' },
+                    { key: 'hostFingerprint', label: 'SFTP host fingerprint', kind: 'text', placeholder: 'SHA256:...' },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (comp.id === 'xf.artifact.copy') {
+        return base(comp, [
+            {
+                label: 'What to copy',
+                fields: [
+                    { key: 'uriColumn', label: 'URI column', kind: 'column', defaultValue: 'uri',
+                      description: 'The upstream column naming each artifact. src.changed and src.artifact both emit `uri`, so the default already lines up with them.' },
+                    { key: 'destination', label: 'Destination', kind: 'text', required: true,
+                      placeholder: 's3://raw/incoming/  or  /var/lake/raw',
+                      description: 'An s3:// prefix or a local directory. Everything copied lands under it, and a source name can never escape it.' },
+                    {
+                        key: 'naming',
+                        label: 'Name each copy',
+                        kind: 'select',
+                        defaultValue: 'keep',
+                        options: [
+                            { label: 'Keep the source file name', value: 'keep' },
+                            { label: 'Preserve the source path under the prefix', value: 'path' },
+                            { label: 'Content-addressed (sha256)', value: 'hash' },
+                        ],
+                        description: 'Content-addressed names make the store immutable and de-duplicating, at the cost of reading each source TWICE - the hash has to be known before the key is. Keep and path are one pass.',
+                    },
+                    {
+                        key: 'ifExists',
+                        label: 'When it is already there',
+                        kind: 'select',
+                        defaultValue: 'skip',
+                        options: [
+                            { label: 'Skip (leave the existing copy)', value: 'skip' },
+                            { label: 'Replace', value: 'replace' },
+                            { label: 'Fail the run', value: 'error' },
+                        ],
+                        description: 'Skip is what a raw zone wants: re-running a feed does not re-upload what already landed. The row still comes out, with copied = false.',
+                        // Content-addressed naming answers this question by
+                        // itself and the engine takes an earlier path for it:
+                        // a key that already exists holds the same bytes by
+                        // construction, so copy_one_artifact returns before it
+                        // ever reads ifExists. Left visible, "Fail the run" did
+                        // not fail and "Replace" did not replace - both quietly
+                        // skipped. The control is shown only where it acts.
+                        visibleWhen: [{ key: 'naming', equals: ['keep', 'path'] }],
+                    },
+                    { key: 'partSizeMb', label: 'Part size (MB)', kind: 'integer', defaultValue: 8,
+                      description: 'Bytes held in memory per object while uploading to S3, and the size of each multipart part. Below 5 MB is raised to 5: S3 rejects a smaller non-final part.' },
+                ],
+            },
+            {
+                label: 'Source access',
+                fields: [
+                    { key: 'headers', label: 'HTTP headers', kind: 'key-value',
+                      description: 'Sent when the source is https:// - an API key on a download endpoint, for example.' },
+                    { key: 'user', label: 'SFTP user', kind: 'text' },
+                    { key: 'password', label: 'SFTP password', kind: 'text', placeholder: '••••••••' },
+                    { key: 'privateKey', label: 'SFTP private key (PEM)', kind: 'expression', rows: 3 },
+                    { key: 'keyPassphrase', label: 'Key passphrase', kind: 'text', placeholder: '••••••••' },
+                    { key: 'hostFingerprint', label: 'SFTP host fingerprint', kind: 'text', placeholder: 'SHA256:...' },
+                ],
+            },
+            {
+                label: 'S3 / S3-compatible',
+                fields: [
+                    { key: 'accessKey', label: 'Access key', kind: 'text',
+                      description: 'Used for whichever side is s3://, source or destination. Pick a saved S3 connection instead and these fill from it at run time. One credential set: copying between two different S3 accounts is not supported here.' },
+                    { key: 'secretKey', label: 'Secret key', kind: 'text', placeholder: '••••••••' },
+                    { key: 'sessionToken', label: 'Session token', kind: 'text', placeholder: '••••••••' },
+                    { key: 'region', label: 'Region', kind: 'text', placeholder: 'us-east-1' },
+                    { key: 'endpoint', label: 'Endpoint', kind: 'text', placeholder: 'https://s3.eu-central-003.backblazeb2.com',
+                      description: 'For MinIO, Backblaze B2, Cloudflare R2 and other S3-compatible stores. Leave blank for AWS.' },
+                    { key: 'urlStyle', label: 'URL style', kind: 'select', defaultValue: '',
+                      options: [
+                          { label: 'Default', value: '' },
+                          { label: 'Path (host/bucket/key)', value: 'path' },
+                          { label: 'Virtual host (bucket.host/key)', value: 'vhost' },
+                      ] },
+                    { key: 'useSsl', label: 'Use TLS', kind: 'select', defaultValue: '',
+                      options: [
+                          { label: 'Default (from the endpoint scheme)', value: '' },
+                          { label: 'Yes', value: 'true' },
+                          { label: 'No (local MinIO)', value: 'false' },
+                      ] },
+                ],
+            },
+        ], 'upstream');
+    }
+    if (comp.id === 'src.ducklake.maintain') {
+        return base(comp, [
+            {
+                label: 'Catalog',
+                fields: [
+                    { key: 'path', label: 'Catalog path', kind: 'text', required: true, placeholder: '/var/lakes/catalog.ducklake',
+                      description: 'The DuckLake catalog to maintain. A .ducklake file, or a postgres: / mysql: / sqlite: DSN.' },
+                    { key: 'dataPath', label: 'Data path', kind: 'text', placeholder: 's3://bucket/lake/ or data_files/',
+                      description: 'Required when the catalog is a DSN and the lake does not exist yet; an existing lake reads its own stored path.' },
+                    { key: 'metadataSchema', label: 'Catalog schema', kind: 'text', placeholder: 'ducklake_catalog' },
+                    { key: 'attachOptions', label: 'Catalog parameters', kind: 'key-value',
+                      description: 'Anything else the catalog takes, passed to ATTACH as written - META_SECRET and the other META_* options.' },
+                ],
+            },
+            {
+                label: 'Operation',
+                fields: [
+                    {
+                        key: 'operation',
+                        label: 'Operation',
+                        kind: 'select',
+                        defaultValue: 'stats',
+                        options: [
+                            { label: 'Statistics (read-only)', value: 'stats' },
+                            { label: 'Compact small files', value: 'compact' },
+                            { label: 'Rewrite files heavy with deletes', value: 'rewrite' },
+                            { label: 'Expire snapshots', value: 'expireSnapshots' },
+                            { label: 'Clean up released files', value: 'cleanupFiles' },
+                            { label: 'Delete orphaned files', value: 'deleteOrphans' },
+                            { label: 'Flush inlined data', value: 'flushInlined' },
+                        ],
+                        description: 'Each one is a single DuckLake function, so what it does follows the installed DuckLake rather than anything Duckle decides. Its result rows become the output of this node, which is what lets a quality check or an alert read a compaction like any other relation.',
+                    },
+                    { key: 'dryRun', label: 'Dry run', kind: 'bool', defaultValue: false,
+                      description: 'Lists exactly what WOULD be removed and changes nothing. Available on expire snapshots, clean up released files and delete orphaned files - the three that delete. Ticking it on any other operation is refused rather than ignored, because an ignored dry run deletes while the operator believes nothing will happen.' },
+                    { key: 'schemaName', label: 'Schema', kind: 'text', placeholder: 'main',
+                      description: 'Scope compaction, rewrite or flush to one schema. Blank means the whole catalog.' },
+                    { key: 'tableName', label: 'Table', kind: 'text', placeholder: 'orders',
+                      description: 'Scope compaction, rewrite or flush to one table. Blank means every table.' },
+                ],
+            },
+            {
+                label: 'Retention',
+                fields: [
+                    { key: 'olderThan', label: 'Older than', kind: 'text', placeholder: '2026-01-01 or ${date-30d}',
+                      description: 'The retention boundary, as a timestamp VALUE rather than an expression: whatever is typed here is passed to DuckLake quoted, so `now() - INTERVAL 30 DAY` arrives as that text and not as the date it describes. For a rolling boundary use ${date-30d}, which the run substitutes to a real date before the call (offsets take d, h, m, s). DuckLake expires NOTHING without a boundary, so a scheduled job that forgot one does nothing rather than deleting history - that default is surfaced here, not replaced.' },
+                    { key: 'versions', label: 'Snapshot versions', kind: 'text', placeholder: '3, 4, 5',
+                      description: 'Expire these snapshot ids specifically, instead of everything older than a date.' },
+                    { key: 'cleanupAll', label: 'Include files still inside the retention window', kind: 'bool', defaultValue: false,
+                      description: 'For the two cleanup operations. Off is the safe reading of what is no longer referenced.' },
+                ],
+            },
+            {
+                label: 'Compaction tuning',
+                fields: [
+                    { key: 'minFileSize', label: 'Min file size (bytes)', kind: 'integer',
+                      description: 'Files smaller than this are candidates for merging.' },
+                    { key: 'maxFileSize', label: 'Max file size (bytes)', kind: 'integer',
+                      description: 'A merged file stops growing at this size.' },
+                    { key: 'maxCompactedFiles', label: 'Max files per run', kind: 'integer',
+                      description: 'Bounds how much work one scheduled compaction does.' },
+                    { key: 'deleteThreshold', label: 'Delete threshold', kind: 'text', placeholder: '0.5',
+                      description: 'For rewrite: the fraction of a file that must be deleted rows before it is worth rewriting.' },
+                ],
+            },
+        ]);
+    }
+    if (comp.id === 'src.changed') {
+        return base(comp, [
+            {
+                label: 'What to watch',
+                fields: [
+                    { key: 'uri', label: 'URI', kind: 'text', required: true,
+                      placeholder: 'https://host/feed.zip  or  s3://bucket/key  or  sftp://user@host/deltas',
+                      description: 'One object to watch, or - with listing on - a directory or prefix to watch. https:// is probed with a HEAD, s3:// with a HEAD against the object, sftp:// with a stat. None of them download the object, which is the point.' },
+                    { key: 'listing', label: 'Watch a directory of files', kind: 'bool', defaultValue: false,
+                      description: 'Off: watch one object and emit a row when its fingerprint moves. On: list the directory or prefix and emit the files that are new or changed since the last successful run. s3:// and sftp://; HTTP has no standard listing and is refused rather than guessed at.' },
+                    { key: 'suffix', label: 'Only names ending with', kind: 'text', placeholder: '.zip',
+                      description: 'Listing mode. Skips anything else in the directory.' },
+                    { key: 'maxEntries', label: 'Max files per run', kind: 'number', defaultValue: 1000,
+                      description: 'Bounds the first run against a directory holding years of drops. What is left over is taken by the next run, oldest first - only what was emitted is recorded as processed.' },
+                    { key: 'trackState', label: 'Remember what was processed', kind: 'bool', defaultValue: true,
+                      description: 'Advances only when the whole run succeeds, so a failure downstream re-offers the same files rather than losing them. Off means every run treats everything as changed.' },
+                ],
+            },
+            {
+                label: 'Access',
+                fields: [
+                    { key: 'user', label: 'User', kind: 'text', description: 'SFTP only; overrides a user in the URI.' },
+                    { key: 'password', label: 'Password', kind: 'text', placeholder: '••••••••' },
+                    { key: 'privateKey', label: 'Private key (PEM)', kind: 'expression', rows: 3 },
+                    { key: 'keyPassphrase', label: 'Key passphrase', kind: 'text', placeholder: '••••••••' },
+                    { key: 'hostFingerprint', label: 'Host fingerprint', kind: 'text', placeholder: 'SHA256:...',
+                      description: 'Optional SFTP host-key pin. Leave empty and the first key seen for the host is recorded in <workspace>/.duckle/known_hosts, and a later connection offering a DIFFERENT key is refused.' },
+                    { key: 'headers', label: 'HTTP headers', kind: 'key-value',
+                      description: 'Sent with the HEAD request - an API key on a metadata endpoint, for example.' },
+                ],
+            },
+            {
+                label: 'S3 / S3-compatible',
+                fields: [
+                    { key: 'accessKey', label: 'Access key', kind: 'text',
+                      description: 'For an s3:// URI. Pick a saved S3 connection instead and these are filled from it at run time, which keeps the credential out of the pipeline file.' },
+                    { key: 'secretKey', label: 'Secret key', kind: 'text', placeholder: '••••••••' },
+                    { key: 'sessionToken', label: 'Session token', kind: 'text', placeholder: '••••••••',
+                      description: 'For temporary STS credentials.' },
+                    { key: 'region', label: 'Region', kind: 'text', placeholder: 'us-east-1',
+                      description: 'Signed into every request. A wrong region is a redirect, which is reported with the right one rather than followed.' },
+                    { key: 'endpoint', label: 'Endpoint', kind: 'text', placeholder: 'https://s3.eu-central-003.backblazeb2.com',
+                      description: 'For MinIO, Backblaze B2, Cloudflare R2 and other S3-compatible stores. Leave blank for AWS. An http:// endpoint is dialled over plain HTTP unless the TLS setting below says otherwise.' },
+                    { key: 'urlStyle', label: 'URL style', kind: 'select', defaultValue: '',
+                      options: [
+                          { label: 'Default', value: '' },
+                          { label: 'Path (host/bucket/key)', value: 'path' },
+                          { label: 'Virtual host (bucket.host/key)', value: 'vhost' },
+                      ],
+                      description: 'Most S3-compatible stores need path style, and Default picks it whenever an endpoint is set. A bucket whose name contains a dot always uses path style: a dotted name cannot go in a hostname without failing TLS.' },
+                    { key: 'useSsl', label: 'Use TLS', kind: 'select', defaultValue: '',
+                      options: [
+                          { label: 'Default (from the endpoint scheme)', value: '' },
+                          { label: 'Yes', value: 'true' },
+                          { label: 'No (local MinIO)', value: 'false' },
+                      ] },
+                ],
+            },
+        ]);
+    }
+    if (comp.id === 'src.spool') {
+        return base(comp, [
+            {
+                label: 'Spool',
+                fields: [
+                    {
+                        key: 'path',
+                        label: 'Spool file',
+                        kind: 'text',
+                        required: true,
+                        placeholder: '${workspace}/spool/hooks.ndjson',
+                        description: 'The append-only NDJSON file to tail. This is the file `duckle-runner listen --spool` writes to.',
+                    },
+                    {
+                        key: 'trackOffset',
+                        label: 'Resume where the last run stopped',
+                        kind: 'bool',
+                        defaultValue: true,
+                        description: 'Remembers a byte offset per node. It advances only when the whole run succeeds, so a failed batch re-reads the same records instead of losing them. Uncheck to re-read the file from the start every run.',
+                    },
+                    {
+                        key: 'maxBytes',
+                        label: 'Max bytes per run',
+                        kind: 'number',
+                        defaultValue: 67108864,
+                        description: 'Caps one batch, so the first run after a long backlog does not try to load the whole spool at once. The rest is taken by the next run.',
+                    },
+                ],
+            },
+        ]);
+    }
+    if (comp.id === 'src.neo4j') {
+        return base(comp, [
+            {
+                label: 'Neo4j',
+                fields: [
+                    { key: 'endpoint', label: 'Endpoint', kind: 'text', required: true, placeholder: 'http://localhost:7474' },
+                    { key: 'database', label: 'Database', kind: 'text', defaultValue: 'neo4j', placeholder: 'neo4j' },
+                    { key: 'user', label: 'User', kind: 'text', placeholder: 'neo4j' },
+                    { key: 'password', label: 'Password', kind: 'text', placeholder: '••••••••' },
+                    {
+                        key: 'cypher',
+                        label: 'Cypher',
+                        kind: 'expression',
+                        rows: 5,
+                        required: true,
+                        placeholder: 'MATCH (p:Person) RETURN p.name AS name, p.age AS age',
+                        description: 'RETURN a column per field you want. Returning a whole node gives one struct column with all its properties.',
+                    },
+                    {
+                        key: 'parameters',
+                        label: 'Parameters (JSON, optional)',
+                        kind: 'expression',
+                        rows: 3,
+                        placeholder: '{ "minAge": 21 }',
+                        description: 'Bound as $name in the Cypher above, so values never need string-concatenating into the query.',
+                    },
+                ],
+            },
+        ]);
+    }
+    if (comp.id === 'snk.neo4j') {
+        return base(comp, [
+            {
+                label: 'Neo4j',
+                fields: [
+                    { key: 'endpoint', label: 'Endpoint', kind: 'text', required: true, placeholder: 'http://localhost:7474' },
+                    { key: 'database', label: 'Database', kind: 'text', defaultValue: 'neo4j', placeholder: 'neo4j' },
+                    { key: 'user', label: 'User', kind: 'text', placeholder: 'neo4j' },
+                    { key: 'password', label: 'Password', kind: 'text', placeholder: '••••••••' },
+                    { key: 'label', label: 'Node label', kind: 'text', required: true, placeholder: 'Person' },
+                    {
+                        key: 'mergeKeys',
+                        label: 'Merge on columns (optional)',
+                        kind: 'columns',
+                        description: 'Leave empty to CREATE a node per row. Set columns to MERGE on those properties instead, so re-running the pipeline updates the matched nodes rather than duplicating them.',
+                    },
+                    { key: 'batchSize', label: 'Batch size', kind: 'number', defaultValue: 1000 },
+                    {
+                        key: 'cypher',
+                        label: 'Custom Cypher (optional)',
+                        kind: 'expression',
+                        rows: 4,
+                        placeholder: 'UNWIND $rows AS row MERGE (n:Person {id: row.id}) SET n += row',
+                        description: 'Full override. Receives the batch as $rows; the node label and merge columns above are ignored.',
+                    },
+                ],
+            },
+        ]);
+    }
+    if (comp.id === 'src.turso' || comp.id === 'snk.turso') {
+        const isSource = comp.id === 'src.turso';
+        return base(comp, [
+            {
+                label: 'Turso / libSQL',
+                fields: [
+                    {
+                        key: 'url',
+                        label: 'Database URL',
+                        kind: 'text',
+                        required: true,
+                        placeholder: 'libsql://my-db-org.turso.io',
+                        description: 'The URL from the Turso dashboard. libsql:// is accepted and used over https.',
+                    },
+                    { key: 'authToken', label: 'Auth token', kind: 'text', placeholder: '••••••••' },
+                    ...(isSource
+                        ? ([
+                              { key: 'tableName', label: 'Table (for SELECT *)', kind: 'text', placeholder: 'events' },
+                              { key: 'query', label: 'Or custom SQL', kind: 'expression', rows: 4, placeholder: 'SELECT * FROM events WHERE ...' },
+                          ] as Field[])
+                        : ([
+                              { key: 'tableName', label: 'Table', kind: 'text', required: true, placeholder: 'events' },
+                              {
+                                  key: 'mode',
+                                  label: 'Write mode',
+                                  kind: 'select',
+                                  defaultValue: 'append',
+                                  options: [
+                                      { value: 'append', label: 'Append (create if missing)' },
+                                      { value: 'overwrite', label: 'Overwrite (clear first)' },
+                                  ],
+                              },
+                              { key: 'batchSize', label: 'Batch size', kind: 'number', defaultValue: 500 },
+                          ] as Field[])),
+                ],
+            },
+        ]);
+    }
+    if (comp.id === 'src.db2' || comp.id === 'snk.db2') {
+        const isSource = comp.id === 'src.db2';
+        return base(comp, [
+            {
+                label: 'IBM DB2 connection',
+                fields: [
+                    { key: 'host', label: 'Host', kind: 'text', placeholder: 'db2.example.com' },
+                    { key: 'port', label: 'Port', kind: 'number', defaultValue: 50000 },
+                    {
+                        key: 'database',
+                        label: 'Database',
+                        kind: 'text',
+                        placeholder: 'SAMPLE',
+                        description: 'Required with the friendly fields - DB2 selects the database when the connection is made.',
+                    },
+                    { key: 'user', label: 'User', kind: 'text' },
+                    { key: 'password', label: 'Password', kind: 'text', placeholder: '••••••••' },
+                    { key: 'useSsl', label: 'Use SSL', kind: 'bool', defaultValue: false },
+                    {
+                        key: 'driver',
+                        label: 'ODBC driver name',
+                        kind: 'text',
+                        defaultValue: 'IBM DB2 ODBC DRIVER',
+                        description: 'DB2 ships no DuckDB extension and no native Rust driver, so this connector goes through the IBM Data Server ODBC driver - install it first. This is the driver name as registered with your ODBC driver manager. Or skip these fields and use a DSN / full connection string below.',
+                    },
+                    { key: 'dsn', label: 'Or DSN', kind: 'text', placeholder: 'MYDB2' },
+                    {
+                        key: 'connectionString',
+                        label: 'Or full ODBC connection string',
+                        kind: 'expression',
+                        rows: 2,
+                        placeholder: 'DRIVER={IBM DB2 ODBC DRIVER};HOSTNAME=...;PORT=50000;DATABASE=SAMPLE;PROTOCOL=TCPIP;UID=...;PWD=...',
+                        description: 'Wins over every field above.',
+                    },
+                ],
+            },
+            {
+                label: isSource ? 'Read' : 'Write',
+                fields: isSource
+                    ? ([
+                          { key: 'schema', label: 'Schema (optional)', kind: 'text', placeholder: 'MYSCHEMA' },
+                          { key: 'tableName', label: 'Table (for SELECT *)', kind: 'text', placeholder: 'EMPLOYEE' },
+                          { key: 'query', label: 'Or custom SQL', kind: 'expression', rows: 4, placeholder: 'SELECT * FROM EMPLOYEE WHERE ...' },
+                          { key: 'batchSize', label: 'Fetch batch rows', kind: 'number', defaultValue: 5000 },
+                      ] as Field[])
+                    : ([
+                          { key: 'schema', label: 'Schema (optional)', kind: 'text', placeholder: 'MYSCHEMA' },
+                          { key: 'tableName', label: 'Table', kind: 'text', required: true, placeholder: 'EMPLOYEE' },
+                          {
+                              key: 'mode',
+                              label: 'Write mode',
+                              kind: 'select',
+                              defaultValue: 'append',
+                              options: [
+                                  { value: 'append', label: 'Append (create if missing)' },
+                                  { value: 'overwrite', label: 'Overwrite (clear first)' },
+                              ],
+                          },
+                      ] as Field[]),
+            },
+        ]);
+    }
+    return null;
 }
 
 function synthDbSource(comp: ComponentDef): ComponentManifest {
@@ -1776,7 +3353,7 @@ function synthDbSource(comp: ComponentDef): ComponentManifest {
                     {
                         key: 'oracleRuntimeNote',
                         label: 'Heads-up',
-                        kind: 'text',
+                        kind: 'note',
                         description: 'Oracle support is built into Duckle. Users only need Oracle Instant Client (libclntsh.so / OCI.dll / libclntsh.dylib) on the library path at runtime. If it is missing the executor surfaces a clear loader error.',
                     },
                 ],
@@ -1789,6 +3366,11 @@ function synthDbSource(comp: ComponentDef): ComponentManifest {
             {
                 label: `${vendor} connection`,
                 fields: [
+                    // resolve_connection_ref_props (duckle-secrets:313) expands a
+                    // saved connection on ANY node, and both hand-rolled TDS
+                    // blocks left the picker out that dbConnectionFields puts
+                    // first, so these were the only databases you had to retype.
+                    connectionRefField(connectionKindFor(comp.id)),
                     { key: 'host', label: 'Host', kind: 'text', required: true, placeholder: 'mssql.example.com' },
                     { key: 'port', label: 'Port', kind: 'integer', defaultValue: 1433 },
                     { key: 'user', label: 'User', kind: 'text', required: true },
@@ -1971,7 +3553,7 @@ function synthDbSink(comp: ComponentDef): ComponentManifest {
                     {
                         key: 'oracleRuntimeNote',
                         label: 'Heads-up',
-                        kind: 'text',
+                        kind: 'note',
                         description: 'Oracle support is built into Duckle. Users only need Oracle Instant Client (libclntsh.so / OCI.dll / libclntsh.dylib) on the library path at runtime. If it is missing the executor surfaces a clear loader error.',
                     },
                 ],
@@ -1984,6 +3566,11 @@ function synthDbSink(comp: ComponentDef): ComponentManifest {
             {
                 label: `${vendor} connection`,
                 fields: [
+                    // resolve_connection_ref_props (duckle-secrets:313) expands a
+                    // saved connection on ANY node, and both hand-rolled TDS
+                    // blocks left the picker out that dbConnectionFields puts
+                    // first, so these were the only databases you had to retype.
+                    connectionRefField(connectionKindFor(comp.id)),
                     { key: 'host', label: 'Host', kind: 'text', required: true, placeholder: 'mssql.example.com' },
                     { key: 'port', label: 'Port', kind: 'integer', defaultValue: 1433 },
                     { key: 'user', label: 'User', kind: 'text', required: true },
@@ -2022,11 +3609,32 @@ function synthDbSink(comp: ComponentDef): ComponentManifest {
             },
         ], 'upstream');
     }
+    // #332: this generic tail is shared by snk.postgres, snk.cockroach,
+    // snk.mysql, snk.mariadb and snk.jdbc, so anything added here lands on all
+    // five. `mysql_enable_transactions` is a MySQL-extension setting - Postgres
+    // exposes no equivalent - so the control is offered only where the engine
+    // can act on it.
+    const isMysql = comp.id === 'snk.mysql' || comp.id === 'snk.mariadb';
     return base(
         comp,
         [
             { label: 'Connection', fields: dbConnectionFields(comp.id) },
-            { label: 'Destination', fields: dbWriteFields() },
+            {
+                label: 'Destination',
+                fields: [
+                    ...dbWriteFields(),
+                    ...(isMysql
+                        ? ([{
+                              key: 'transactions',
+                              label: 'Wrap the write in a transaction',
+                              kind: 'bool',
+                              defaultValue: true,
+                              description:
+                                  'On, the whole write commits or rolls back as one transaction. A load of many millions of rows is then a single very large commit, which an InnoDB Cluster pays for in replication lag. Turn it off to let MySQL commit as it goes: faster and gentler on a cluster, but a failed run leaves the rows it already wrote.',
+                          }] as Field[])
+                        : []),
+                ],
+            },
         ],
         'upstream',
     );
@@ -2076,6 +3684,13 @@ function synthWarehouseSource(comp: ComponentDef): ComponentManifest {
                     { key: 'workspace', label: 'Workspace host', kind: 'text', required: true, placeholder: 'dbc-xxxxxxxx.cloud.databricks.com' },
                     { key: 'pat', label: 'Personal Access Token', kind: 'text', required: true, placeholder: '••••••••' },
                     { key: 'warehouseId', label: 'SQL warehouse ID', kind: 'text', required: true, placeholder: '0a1b2c3d4e5f6g7h' },
+                    // The runner builds the statements URL from the workspace
+                    // host unless this overrides it outright. Honoured all
+                    // along with no field, so a proxied or non-standard host
+                    // was not reachable from the editor.
+                    { key: 'endpoint', label: 'Statements API URL (override)', kind: 'text',
+                      placeholder: 'https://dbc-xxxxxxxx.cloud.databricks.com/api/2.0/sql/statements/',
+                      description: 'Replaces the URL built from the workspace host above. Leave blank unless you go through a proxy or a non-standard host.' },
                 ],
             },
             {
@@ -2202,6 +3817,13 @@ function synthWarehouseSink(comp: ComponentDef): ComponentManifest {
                     { key: 'workspace', label: 'Workspace host', kind: 'text', required: true, placeholder: 'dbc-xxxxxxxx.cloud.databricks.com' },
                     { key: 'pat', label: 'Personal Access Token', kind: 'text', required: true, placeholder: '••••••••' },
                     { key: 'warehouseId', label: 'SQL warehouse ID', kind: 'text', required: true, placeholder: '0a1b2c3d4e5f6g7h' },
+                    // The runner builds the statements URL from the workspace
+                    // host unless this overrides it outright. Honoured all
+                    // along with no field, so a proxied or non-standard host
+                    // was not reachable from the editor.
+                    { key: 'endpoint', label: 'Statements API URL (override)', kind: 'text',
+                      placeholder: 'https://dbc-xxxxxxxx.cloud.databricks.com/api/2.0/sql/statements/',
+                      description: 'Replaces the URL built from the workspace host above. Leave blank unless you go through a proxy or a non-standard host.' },
                 ],
             },
             {
@@ -2250,6 +3872,12 @@ function synthWarehouseSink(comp: ComponentDef): ComponentManifest {
                     { key: 'privateKeyPath', label: 'PEM private key path (JWT mode)', kind: 'file-path', description: 'Required when Auth type is JWT. Reads PKCS#8-encoded RSA private key from disk; the engine signs RS256 claims and computes the public-key fingerprint.' },
                     { key: 'warehouse', label: 'Warehouse', kind: 'text', placeholder: 'compute_wh' },
                     { key: 'role', label: 'Role', kind: 'text', placeholder: 'analyst' },
+                    // Overrides the URL built from the account above. Read all
+                    // along with no field, so a private-link or proxied host
+                    // was not reachable from the editor.
+                    { key: 'endpoint', label: 'API URL (override)', kind: 'text',
+                      placeholder: 'https://myorg-account.snowflakecomputing.com/api/v2/statements',
+                      description: 'Replaces the whole statements URL, which is otherwise built from the account above. Give the full path, not just the host. Leave blank unless you go through a proxy or a private-link host.' },
                 ],
             },
             {
@@ -2520,7 +4148,13 @@ function synthWarehouseSink(comp: ComponentDef): ComponentManifest {
                         options: [
                             { label: 'Create or replace', value: 'overwrite' },
                             { label: 'Append (insert)', value: 'append' },
-                            { label: 'Truncate + insert', value: 'truncate' },
+                            // Truncate was offered and the planner refuses it:
+                            // DuckDB cannot TRUNCATE a Quack table, which is a
+                            // streaming scan rather than a base table, so
+                            // picking it could only ever end in a config error.
+                            // The refusal stays for pipelines already saved
+                            // with it, and names overwrite as the way to
+                            // replace the contents.
                         ],
                     },
                 ],
@@ -2782,7 +4416,6 @@ function synthStreamingSource(comp: ComponentDef): ComponentManifest {
                     placeholder: 'broker1:9092,broker2:9092',
                 },
                 { key: 'topic', label: 'Topic', kind: 'text', required: true },
-                { key: 'groupId', label: 'Consumer group', kind: 'text', placeholder: 'duckle-group' },
                 {
                     key: 'offset',
                     // Default earliest: this is a batch ETL connector (capped by
@@ -2797,6 +4430,13 @@ function synthStreamingSource(comp: ComponentDef): ComponentManifest {
                         { label: 'Latest', value: 'latest' },
                         { label: 'Earliest', value: 'earliest' },
                     ],
+                },
+                {
+                    key: 'trackOffset',
+                    label: 'Resume where the last run stopped',
+                    kind: 'bool',
+                    defaultValue: false,
+                    description: 'Remember the offset reached and carry on from it next run, so a scheduled read becomes a continuous one. Without it, Earliest re-reads the whole backlog every run and Latest skips everything that arrived between runs. The position is saved only when the whole run succeeds, so a failure after the read re-delivers those records rather than losing them.',
                 },
             ],
         },
@@ -2815,7 +4455,18 @@ function synthStreamingSource(comp: ComponentDef): ComponentManifest {
                         { label: 'SASL_PLAINTEXT', value: 'sasl_plaintext' },
                     ],
                 },
-                { key: 'saslMechanism', label: 'SASL mechanism', kind: 'text' },
+                {
+                    key: 'saslMechanism',
+                    label: 'SASL mechanism',
+                    kind: 'select',
+                    defaultValue: 'PLAIN',
+                    options: [
+                        { label: 'PLAIN', value: 'PLAIN' },
+                        { label: 'SCRAM-SHA-256', value: 'SCRAM-SHA-256' },
+                        { label: 'SCRAM-SHA-512', value: 'SCRAM-SHA-512' },
+                    ],
+                    description: 'Only these three are implemented by the Kafka client Duckle uses. Anything else fails the run rather than connecting unauthenticated.',
+                },
                 { key: 'saslUsername', label: 'SASL username', kind: 'text' },
                 { key: 'saslPassword', label: 'SASL password', kind: 'text', placeholder: '••••••••' },
             ],
@@ -2830,12 +4481,41 @@ function synthStreamingSource(comp: ComponentDef): ComponentManifest {
                     defaultValue: 'json',
                     options: [
                         { label: 'JSON', value: 'json' },
-                        { label: 'Avro', value: 'avro' },
-                        { label: 'Protobuf', value: 'protobuf' },
+                        { label: 'Avro (Confluent Schema Registry)', value: 'avro' },
                         { label: 'Plain text', value: 'text' },
                     ],
+                    description: 'Avro decodes Confluent-framed messages against the registry below. JSON and Plain text both hand the message back as text for SQL to parse. Protobuf is not offered because it is not implemented - it would need the .proto descriptors, and picking it would have produced mangled text rather than an error.',
                 },
-                { key: 'schemaRegistryUrl', label: 'Schema Registry URL', kind: 'text' },
+                {
+                    key: 'schemaRegistryUrl',
+                    label: 'Schema Registry URL',
+                    kind: 'text',
+                    placeholder: 'https://schema-registry.internal:8081',
+                    description: 'Required when the format is Avro. The schema id carried by each message is looked up here, once per id per run. Credentials can be embedded in the URL.',
+                    visibleWhen: [{ key: 'format', equals: 'avro' }],
+                },
+                // Only the Kafka arm reads these, and it read both with no
+                // field to set either: the editor could only ever consume
+                // partition 0, and only the first 1000 messages of it, so a
+                // multi-partition topic came back silently short.
+                ...(comp.id === 'src.kafka' || comp.id === 'src.redpanda'
+                    ? ([
+                          {
+                              key: 'partitionId',
+                              label: 'Partition',
+                              kind: 'integer',
+                              defaultValue: 0,
+                              description: 'Which partition to read. This connector consumes one partition per node; point several nodes at a multi-partition topic and union them.',
+                          },
+                          {
+                              key: 'maxRecords',
+                              label: 'Max messages',
+                              kind: 'integer',
+                              defaultValue: 1000,
+                              description: 'The most messages one run will take. This is a batch connector, not a streaming pump.',
+                          },
+                      ] as Field[])
+                    : []),
             ],
         },
     ]);
@@ -2886,8 +4566,14 @@ function synthStreamingSink(comp: ComponentDef): ComponentManifest {
                         required: true,
                     },
                     { key: 'topic', label: 'Topic', kind: 'text', required: true },
-                    { key: 'acks', label: 'Acks', kind: 'select', defaultValue: 'all',
-                      options: [{label:'all',value:'all'},{label:'1',value:'1'},{label:'0',value:'0'}] },
+                    // An `Acks` select (all / 1 / 0) was here and nothing read
+                    // it. rskafka hardcodes acks=-1 in its produce request -
+                    // Kafka's "all" - and produce() takes only records and a
+                    // compression, so the two weaker settings could not be
+                    // asked for. Every write already gets the strongest
+                    // guarantee; the choice was the fiction. Stated in the
+                    // palette description instead, where it is a fact rather
+                    // than a control.
                 ],
             },
             {
@@ -2905,6 +4591,26 @@ function synthStreamingSink(comp: ComponentDef): ComponentManifest {
                         ],
                     },
                     { key: 'keyColumn', label: 'Message key column', kind: 'column' },
+                    // Read by the Kafka arm with no field, so every row went
+                    // to partition 0 whatever the topic's partition count.
+                    ...(comp.id === 'snk.kafka' || comp.id === 'snk.redpanda'
+                        ? ([
+                              {
+                                  key: 'partitionId',
+                                  label: 'Partition',
+                                  kind: 'integer',
+                                  defaultValue: 0,
+                                  description: 'Which partition to write to. Every row goes to this one partition.',
+                              },
+                              {
+                                  key: 'batchSize',
+                                  label: 'Batch size',
+                                  kind: 'integer',
+                                  defaultValue: 500,
+                                  description: 'How many records are sent per produce request.',
+                              },
+                          ] as Field[])
+                        : []),
                 ],
             },
         ],
@@ -3146,6 +4852,19 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
     // option + fields only surface on the Salesforce tile; every other REST alias
     // keeps the plain none / bearer / apikey auth.
     const isSalesforce = comp.id === 'src.salesforce';
+    // #330: src.http is drawn by this synthesizer but the ENGINE does not treat
+    // it as a REST source at all - it is in the cloud/object arm
+    // (plan/builders.rs, beside src.s3 / src.gcs), reading a URL as a file. It
+    // never reaches the code that substitutes a saved mark into a request, so
+    // the cursor boxes were a control that could not work, and they were what
+    // made the capability matrix claim src.http does incremental reads.
+    const carriesCursor = comp.id !== 'src.http';
+    // Same reason, same component: the REST arm is what reads how a response is
+    // parsed and how it pages, and src.http never reaches it. Both would be
+    // controls that do nothing.
+    const readsRestResponse = comp.id !== 'src.http';
+    const isGraphql =
+        comp.id === 'src.graphql' || comp.id === 'src.linear' || comp.id === 'src.monday';
     return base(comp, [
         ...(comp.id === 'src.sap'
             ? [
@@ -3177,23 +4896,19 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
               ]
             : []),
         {
-            label: 'Request',
+            label: isGraphql ? 'Endpoint' : 'Request',
             fields: [
-                { key: 'url', label: 'URL', kind: 'text', required: true, placeholder: 'https://api.example.com/v1/resource' },
                 {
-                    key: 'method',
-                    label: 'Method',
-                    kind: 'select',
-                    defaultValue: 'GET',
-                    options: [
-                        { label: 'GET', value: 'GET' },
-                        { label: 'POST', value: 'POST' },
-                        { label: 'PUT', value: 'PUT' },
-                        { label: 'DELETE', value: 'DELETE' },
-                    ],
+                    key: 'url',
+                    label: isGraphql ? 'GraphQL endpoint' : 'URL',
+                    kind: 'text',
+                    required: true,
+                    placeholder: isGraphql
+                        ? 'https://api.example.com/graphql'
+                        : 'https://api.example.com/v1/resource',
                 },
+                ...(isGraphql ? graphqlRequestFields() : restMethodAndBodyFields()),
                 { key: 'headers', label: 'Headers', kind: 'key-value' },
-                { key: 'body', label: 'Request body', kind: 'textarea', rows: 4 },
             ],
         },
         {
@@ -3254,6 +4969,15 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                     kind: 'text',
                     placeholder: 'X-API-Key',
                     description: 'Header name for API key auth (e.g. X-API-Key or X-Redmine-API-Key). Used only when Auth type is API key; leave blank to default to X-API-Key.',
+                    // Salesforce's Auth type offers bearer and OAuth client
+                    // credentials only, so this never shows there. The
+                    // condition is still the right one - "only under API-key
+                    // auth" - and it stays rather than the field being dropped,
+                    // because the property must remain DECLARED: the engine
+                    // honours it if a hand-authored pipeline sets
+                    // authType = apikey, and an undeclared property fails
+                    // `duckle-runner validate` with "does not read authHeader".
+                    // check-visible-when knows about this pair by name.
                     ...(isSalesforce
                         ? { visibleWhen: [whenNoConnection(), { key: 'authType', equals: 'apikey' }] }
                         : {}),
@@ -3291,6 +5015,39 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
         {
             label: 'Response',
             fields: [
+                ...(readsRestResponse && comp.id !== 'src.soap'
+                    ? ([{
+                          // The arm parses XML when this says so, or when the
+                          // source IS src.soap. With no field, a REST API that
+                          // answers in XML was parsed as JSON and found no rows.
+                          //
+                          // Not offered on src.soap, where the arm forces XML
+                          // whatever this holds: a control that cannot change
+                          // the outcome is worse than no control.
+                          key: 'responseFormat',
+                          label: 'Response format',
+                          kind: 'select',
+                          defaultValue: 'json',
+                          options: [
+                              { label: 'JSON', value: 'json' },
+                              { label: 'XML', value: 'xml' },
+                          ],
+                          description: 'Pick XML for an API that answers in XML rather than JSON.',
+                      }] as Field[])
+                    : []),
+                ...(comp.id === 'src.soap'
+                    ? ([{
+                          // Read only for SOAP. Settable through Headers as
+                          // well - the arm adds its own only when the headers
+                          // do not already carry one - but a SOAP call should
+                          // not need that to be known.
+                          key: 'soapAction',
+                          label: 'SOAPAction',
+                          kind: 'text',
+                          placeholder: 'urn:GetCustomer',
+                          description: 'Sent as the SOAPAction header, which SOAP 1.1 services usually require. Ignored if you set that header yourself above.',
+                      }] as Field[])
+                    : []),
                 {
                     key: 'responsePath',
                     label: 'Records JSON pointer',
@@ -3321,8 +5078,23 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                         { label: 'Offset / limit', value: 'offset' },
                         { label: 'Page number', value: 'page' },
                         { label: 'RFC 5988 Link header (rel="next")', value: 'link' },
+                        { label: 'Next-link in the response body (OData)', value: 'nextUrl' },
                     ],
                 },
+                ...(readsRestResponse
+                    ? ([{
+                          // The engine has always read this. Without it in the
+                          // list above, `nextUrl` was unreachable, and src.odata
+                          // and the SAP OData sources - which DEFAULT to it -
+                          // could not be put back once Style had been touched.
+                          key: 'nextUrlPath',
+                          label: 'Next-link JSON pointer (next-link style)',
+                          kind: 'text',
+                          placeholder: '/@odata.nextLink',
+                          description: 'RFC 6901 JSON pointer to the field holding the full URL of the next page. Blank uses /@odata.nextLink for OData sources, /d/__next for SAP OData v2, and /next otherwise.',
+                          visibleWhen: [{ key: 'paginationType', equals: 'nextUrl' }],
+                      }] as Field[])
+                    : []),
                 {
                     key: 'cursorNextPath',
                     label: 'Cursor JSON pointer (cursor style)',
@@ -3393,7 +5165,52 @@ function synthApiSource(comp: ComponentDef): ComponentManifest {
                     defaultValue: 1000,
                     description: 'How many upstream rows may each fire a request. The run fails rather than making more, so a careless upstream cannot become a request storm.',
                 },
-                    { key: 'responseMetadata', label: 'Add response metadata', kind: 'bool', defaultValue: false, description: 'Stamp every row with where it came from: _http_url (the exact URL fetched, per page), _http_status and _fetched_at. Parsed rows alone cannot tell you whether something changed because the source changed or because the parser did.' },
+                ...(carriesCursor
+                    ? [
+                {
+                    key: 'incrementalField',
+                    label: 'Incremental field',
+                    kind: 'text' as const,
+                    placeholder: 'updated_at',
+                    description: 'A field of each returned record (or a /pointer/into/it) whose highest value becomes the mark for the next run. Put {incremental} in the URL, a query parameter, the body or a header and the saved mark is substituted there before the request goes out. Filtering after the fetch is not incremental for an API - you still pay for the whole dataset every run - so the cursor has to reach the request. Set the response path to the record array, not the response envelope, or there is nothing to read the mark off. Leave blank for no incremental state.',
+                },
+                {
+                    key: 'incrementalInitial',
+                    label: 'Incremental starting value',
+                    kind: 'text' as const,
+                    placeholder: '1970-01-01',
+                    description: 'What {incremental} is on the very first run, before a mark has been saved. Blank is a real choice for an API that reads an empty cursor as "from the beginning". The mark is saved only when the whole pipeline succeeds, and only when it moved forward.',
+                },
+                      ]
+                    : []),
+                {
+                    key: 'concurrency',
+                    label: 'Requests in flight',
+                    kind: 'integer',
+                    defaultValue: 1,
+                    description: 'How many upstream rows are requested at the same time. 1 keeps the output in upstream order. Above 1 the rows arrive as their requests finish, so the ORDER IS NOT THE UPSTREAM ORDER - use Carry upstream column to keep each result traceable, and do not rely on a downstream LIMIT returning the same rows twice.',
+                },
+                {
+                    key: 'checkpoint',
+                    label: 'Remember completed rows',
+                    kind: 'bool',
+                    defaultValue: false,
+                    description: 'Each upstream row is recorded as its requests finish, so a rerun does not fetch it again - a fan-out that died at row 900,001 resumes without repeating the 900,000 that worked. Kept in the same place the AI steps keep theirs. Changing the URL, method, body or response path starts a fresh record, since those change the answer.',
+                },
+                {
+                    key: 'onParentError',
+                    label: 'When a row request fails',
+                    kind: 'select',
+                    defaultValue: 'fail',
+                    options: [
+                        { label: 'Stop the run', value: 'fail' },
+                        { label: 'Skip that row and carry on', value: 'skip' },
+                        { label: 'Send it to the reject output', value: 'reject' },
+                    ],
+                    description: 'One failure out of a million requests does not have to discard the 999,999 that worked. The reject output gives each failure a row with the carried key, the URL, the error and the time, so a run that half-failed leaves its failures somewhere you can query rather than only in a log.',
+                },
+                    { key: 'responseMetadata', label: 'Add response metadata', kind: 'bool', defaultValue: false, description: 'Stamp every row with where it came from: _http_url (the exact URL fetched, per page), _http_status, _fetched_at, _response_content_type, _response_etag, _response_last_modified, _response_sha256 and _page_number. Parsed rows alone cannot tell you whether something changed because the source changed or because the parser did - the response hash can.' },
+                    { key: 'rawResponseDestination', label: 'Keep the original response at', kind: 'text', description: 'A path to write each response body to BEFORE parsing - local, or s3:// using the object-storage connection on this node, so a later question about the source can be answered from the bytes rather than argued about. Put {sha256} in the path and the file is named after its own content: a changed body becomes a new file and an unchanged one rewrites the same file. Naming it after the URL instead would be unsafe, because a URL is a name that can be rebound - the old body would silently be kept when the resource changed. {date} is also substituted. Leave blank to capture nothing.' },
             ],
         },
     ]);
@@ -3586,6 +5403,20 @@ function synthApiSink(comp: ComponentDef): ComponentManifest {
                         description:
                             'JSON sends each row (or the batch) as JSON. Plain text renders each row through the template below and sends the rows newline-joined as one request (e.g. InfluxDB Line Protocol for QuestDB).',
                     },
+                    // The executor has always honoured this and no form offered
+                    // it, so an API needing a named wrapper could only be fed by
+                    // hand-editing the pipeline. Not snk.graphql, which shares
+                    // this form but hardcodes its wrapper to `variables`.
+                    ...(comp.id === 'snk.rest' || comp.id === 'snk.webhook'
+                        ? ([{
+                              key: 'bodyWrap',
+                              label: 'Wrap the batch in a key',
+                              kind: 'text',
+                              placeholder: 'records',
+                              description: 'Sends {"records": [ ...rows ]} instead of a bare array. Blank sends the array on its own. Only applies when batching.',
+                              visibleWhen: [{ key: 'batchMode', equals: 'array' }],
+                          }] as Field[])
+                        : []),
                     {
                         key: 'bodyTemplate',
                         label: 'Body template',
@@ -3708,6 +5539,36 @@ function synthNoSqlSource(comp: ComponentDef): ComponentManifest {
                     },
                     { key: 'size', label: 'Page size', kind: 'integer', defaultValue: 1000 },
                     { key: 'maxPages', label: 'Max pages (safety cap)', kind: 'integer', defaultValue: 100 },
+                ],
+            },
+            {
+                label: 'Paging',
+                fields: [
+                    // The arm has read these since search_after was added and
+                    // neither had a field, so every run used from/size - which
+                    // both engines refuse past index.max_result_window, 10,000
+                    // documents by default. Reading a larger index from the
+                    // editor was not possible.
+                    {
+                        key: 'paginationMode',
+                        label: 'Paging mode',
+                        kind: 'select',
+                        defaultValue: 'from_size',
+                        options: [
+                            { label: 'from / size', value: 'from_size' },
+                            { label: 'search_after (deep paging)', value: 'search_after' },
+                        ],
+                        description: `from / size is simplest but ${vendor} rejects it past index.max_result_window (10,000 documents by default). search_after pages without that ceiling.`,
+                    },
+                    {
+                        key: 'sort',
+                        label: 'Sort (raw JSON array)',
+                        kind: 'textarea',
+                        rows: 2,
+                        placeholder: '[{"@timestamp": "asc"}]',
+                        description: 'The sort that makes paging stable. Left blank it uses _shard_doc, the built-in shard-stable doc id, which needs no field of your own.',
+                        visibleWhen: [{ key: 'paginationMode', equals: 'search_after' }],
+                    },
                 ],
             },
         ]);
@@ -3835,7 +5696,7 @@ function synthNoSqlSink(comp: ComponentDef): ComponentManifest {
                         {
                             key: 'shapeHint',
                             label: 'Row shape',
-                            kind: 'text',
+                            kind: 'note',
                             description: `Each upstream row is sent as a doc, preceded by a {"index":{"_index":"<index>"}} action line. Content-Type is application/x-ndjson.`,
                         },
                     ],
@@ -3900,10 +5761,16 @@ function synthMiscSource(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'privateKeyPath', label: 'Private key file', kind: 'file-path',
                       description: 'OpenSSH private key for SFTP key-based auth (instead of a password).' },
+                    // The arm takes either a pasted PEM or a key file and only
+                    // the file had a field here, while snk.ftp offered only the
+                    // paste. Both sides now offer both.
+                    { key: 'privateKey', label: 'Private key (PEM)', kind: 'text',
+                      placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----',
+                      description: 'Paste the key instead of naming a file. Takes precedence over the file above.' },
                     { key: 'keyPassphrase', label: 'Key passphrase', kind: 'text', placeholder: '••••••••' },
                     { key: 'hostFingerprint', label: 'Host fingerprint', kind: 'text',
                       placeholder: 'SHA256:...',
-                      description: 'Optional SFTP host-key pin. If set, the connection is refused unless the server key matches this SHA256 fingerprint.' },
+                      description: 'Optional SFTP host-key pin. If set, the connection is refused unless the server key matches this SHA256 fingerprint. Leave empty and the first key seen for the host is recorded in <workspace>/.duckle/known_hosts, and a later connection offering a DIFFERENT key is refused - so a key change is noticed rather than accepted silently.' },
                 ],
             },
             {
@@ -3921,34 +5788,59 @@ function synthMiscSource(comp: ComponentDef): ComponentManifest {
         return synthApiSource(comp);
     }
     if (id === 'src.email') {
+        // The engine reads user / mailbox / maxMessages (plan/mod.rs, the
+        // src.email arm). This offered `username`, `folder` and a `filter` that
+        // nothing reads, so the node refused with "user required" and there was
+        // no field to answer it with.
         return base(comp, [
             {
                 label: 'IMAP',
                 fields: [
-                    { key: 'host', label: 'IMAP host', kind: 'text', required: true },
-                    { key: 'port', label: 'Port', kind: 'integer', defaultValue: 993 },
-                    { key: 'username', label: 'Username', kind: 'text', required: true },
-                    { key: 'password', label: 'Password', kind: 'text', placeholder: '••••••••' },
-                    { key: 'folder', label: 'Folder', kind: 'text', defaultValue: 'INBOX' },
+                    { key: 'host', label: 'IMAP host', kind: 'text', required: true, placeholder: 'imap.fastmail.com' },
+                    { key: 'port', label: 'Port', kind: 'integer', defaultValue: 993, description: 'Defaults to 993 (IMAPS).' },
+                    { key: 'user', label: 'Username', kind: 'text', required: true },
+                    { key: 'password', label: 'Password', kind: 'text', required: true, placeholder: '••••••••' },
+                    { key: 'mailbox', label: 'Mailbox', kind: 'text', defaultValue: 'INBOX' },
                     {
-                        key: 'filter',
-                        label: 'Search criteria',
-                        kind: 'text',
-                        placeholder: 'UNSEEN',
+                        key: 'maxMessages',
+                        label: 'Max messages',
+                        kind: 'integer',
+                        defaultValue: 50,
+                        description: 'How many messages to read from the mailbox in one run.',
                     },
                 ],
             },
         ]);
     }
     if (id === 'src.git') {
+        // Every field here was wrong. The reader shells out to the system `git`
+        // against a LOCAL CLONE (plan/mod.rs, the src.git arm: "repo required
+        // (path to local clone)"), so it never fetches and needs no token - and
+        // it reads revision / pathFilter / maxRows, not branch / path.
         return base(comp, [
             {
                 label: 'Repository',
                 fields: [
-                    { key: 'url', label: 'Repository URL', kind: 'text', required: true },
-                    { key: 'branch', label: 'Branch', kind: 'text', defaultValue: 'main' },
-                    { key: 'path', label: 'File path in repo', kind: 'text' },
-                    { key: 'authToken', label: 'Access token', kind: 'text', placeholder: '••••••••' },
+                    {
+                        key: 'repo',
+                        label: 'Local clone',
+                        kind: 'file-path',
+                        required: true,
+                        description: 'Path to a repository already on this machine. The reader runs the system `git` inside it; it does not clone or fetch, so a remote URL will not work here.',
+                    },
+                    {
+                        key: 'mode',
+                        label: 'Read',
+                        kind: 'select',
+                        defaultValue: 'log',
+                        options: [
+                            { label: 'Commits (git log)', value: 'log' },
+                            { label: 'Files at a revision (git ls-tree)', value: 'files' },
+                        ],
+                    },
+                    { key: 'revision', label: 'Revision', kind: 'text', defaultValue: 'HEAD', placeholder: 'HEAD, a branch, a tag or a SHA' },
+                    { key: 'pathFilter', label: 'Limit to path', kind: 'text', placeholder: 'src/' },
+                    { key: 'maxRows', label: 'Max rows', kind: 'integer', defaultValue: 1000 },
                 ],
             },
         ]);
@@ -3982,7 +5874,13 @@ function synthFieldsTransform(comp: ComponentDef): ComponentManifest {
                         description: 'Applied to any column above whose On error is left at Default.',
                         options: [
                             { label: 'Set to NULL', value: 'null' },
-                            { label: 'Reject row', value: 'reject' },
+                            // "Reject row" was offered here and could not reject:
+                            // the builder sends it to TRY_CAST exactly like null
+                            // (builders.rs, "row-level rejection isn't wired for
+                            // cast yet"), and xf.cast declares no reject output
+                            // port for a row to go to. A pipeline saved with the
+                            // old value still nulls, which is what it always did.
+                            // Use a qa.* gate upstream to route bad rows.
                             { label: 'Fail pipeline', value: 'fail' },
                         ],
                     },
@@ -4187,6 +6085,17 @@ function synthRowTransform(comp: ComponentDef): ComponentManifest {
                 label: id === 'xf.sample' ? 'Sample' : 'Limit',
                 fields: [
                     { key: 'count', label: id === 'xf.sample' ? 'Sample size' : 'Row count', kind: 'integer', defaultValue: 100 },
+                    {
+                        // Without an ordering, LIMIT/OFFSET take an arbitrary
+                        // slice that can differ run to run. The engine has
+                        // accepted this opt-in since that was found; the form
+                        // did not offer it, so the fix was unreachable.
+                        key: 'orderBy',
+                        label: 'Order by (optional)',
+                        kind: 'columns',
+                        description:
+                            'Makes the chosen rows the same on every run. Left empty, the rows kept or skipped are whichever ones happen to arrive first, which can change between runs even on identical input.',
+                    },
                 ],
             },
         ], 'upstream');
@@ -4310,27 +6219,30 @@ function synthJoinTransform(comp: ComponentDef): ComponentManifest {
     // The consolidated 'xf.join' node (#153) drives its kind purely from the
     // joinType dropdown, so it defaults to INNER; the legacy per-type ids
     // (xf.join.left, xf.semi, ...) still seed the dropdown from their suffix.
-    const joinType = comp.id === 'xf.join' ? 'inner' : (comp.id.split('.').pop() ?? 'inner');
-    // The plain Join node only implements inner/left/right/full via joinType;
-    // cross/semi/anti are distinct shapes kept as their own palette nodes, so
-    // only offer them on those legacy ids (avoids the misleading no-op options
-    // the reporter flagged in #153).
+    // #153 offered cross/semi/anti on the legacy ids on the reasoning that they
+    // ARE those shapes. Measured, that is backwards. xf.semi and xf.anti go to
+    // build_semi, which never mentions joinType; xf.join.cross goes to
+    // build_cross_join, which takes no props at all. On those three the
+    // dropdown is a no-op in all seven positions - their shape IS the
+    // component - so the control is gone rather than left pretending.
+    //
+    // xf.lookup does read it, through build_join, whose match covers exactly
+    // inner/left/right/full. cross/semi/anti fell to the default and silently
+    // became LEFT, so they are gone from its list too.
+    const FIXED_BY_COMPONENT = [
+        'xf.semi', 'xf.semi.join', 'xf.anti', 'xf.anti.join', 'xf.join.cross',
+    ];
+    const showsJoinType = !FIXED_BY_COMPONENT.includes(comp.id);
+    // Was `comp.id.split('.').pop()`, which handed xf.lookup a default of
+    // 'lookup' - a value absent from its own options, so the box showed
+    // something unselectable while the engine quietly used LEFT.
+    const joinType = comp.id === 'xf.join' ? 'inner' : 'left';
     const joinTypeOptions =
-        comp.id === 'xf.join'
-            ? [
+        [
                   { label: 'INNER', value: 'inner' },
                   { label: 'LEFT', value: 'left' },
                   { label: 'RIGHT', value: 'right' },
                   { label: 'FULL OUTER', value: 'full' },
-              ]
-            : [
-                  { label: 'INNER', value: 'inner' },
-                  { label: 'LEFT', value: 'left' },
-                  { label: 'RIGHT', value: 'right' },
-                  { label: 'FULL OUTER', value: 'full' },
-                  { label: 'CROSS', value: 'cross' },
-                  { label: 'SEMI', value: 'semi' },
-                  { label: 'ANTI', value: 'anti' },
               ];
     return base(comp, [
         {
@@ -4344,7 +6256,7 @@ function synthJoinTransform(comp: ComponentDef): ComponentManifest {
                 { key: 'multipleKeys', label: 'Multi-column key (left/right pairs)', kind: 'key-value' },
             ],
         },
-        {
+        ...(showsJoinType ? [{
             label: 'Join type',
             fields: [
                 {
@@ -4354,14 +6266,13 @@ function synthJoinTransform(comp: ComponentDef): ComponentManifest {
                     defaultValue: joinType,
                     options: joinTypeOptions,
                 },
-                {
-                    key: 'sendUnmatchedToReject',
-                    label: 'Send unmatched to reject port',
-                    kind: 'bool',
-                    defaultValue: false,
-                },
+                // `sendUnmatchedToReject` was here and nothing read it. Wiring
+                // the reject port IS the switch - build_reject_sql is only
+                // called when the port has a consumer, the same way src.csv and
+                // xf.filter work. A second control that has to agree with the
+                // wiring is how the two drift apart.
             ],
-        },
+        }] as FormSection[] : []),
     ], 'declared');
 }
 
@@ -4690,7 +6601,11 @@ function synthStringTransform(comp: ComponentDef): ComponentManifest {
                             { label: 'Family (4 or 6)', value: 'family' },
                             { label: 'Broadcast address', value: 'broadcast' },
                             { label: 'Netmask', value: 'netmask' },
-                            { label: 'Hostmask', value: 'hostmask' },
+                            // Hostmask was offered and could not run: DuckDB's
+                            // inet extension has no hostmask function, and it
+                            // is the one kind here with no clean derivation -
+                            // the bitwise complement of the netmask, across a
+                            // dotted quad and a v6 hex group both.
                             { label: 'Mask length (bits)', value: 'masklen' },
                             { label: 'Network (address & netmask)', value: 'network' },
                         ],
@@ -4737,12 +6652,23 @@ function synthStringTransform(comp: ComponentDef): ComponentManifest {
 }
 
 const TIME_UNITS = ['year', 'quarter', 'month', 'week', 'day', 'hour', 'minute', 'second', 'dayofweek', 'isodow', 'dayofyear', 'epoch'];
-const unitField = (label: string): Field => ({
+// The four that are parts of a date but not amounts of time. date_part and
+// date_trunc take them happily (checked against the pinned 1.5.4), so Extract,
+// Truncate and Diff keep all twelve. ADD cannot: it builds `INTERVAL 1 <unit>`,
+// and interval_unit maps anything it does not recognise to DAY - so "add 1
+// epoch" silently added a DAY rather than a second, wrong by 86,400x, and
+// dayofweek / isodow / dayofyear were meaningless as amounts and became a day
+// too. The SQL was always valid, which is why nothing caught it.
+const NOT_INTERVAL_UNITS = ['dayofweek', 'isodow', 'dayofyear', 'epoch'];
+const unitField = (label: string, addable = false): Field => ({
     key: 'unit',
     label,
     kind: 'select',
     defaultValue: 'day',
-    options: TIME_UNITS.map(u => ({ label: u, value: u })),
+    options: TIME_UNITS.filter(u => !addable || !NOT_INTERVAL_UNITS.includes(u)).map(u => ({
+        label: u,
+        value: u,
+    })),
 });
 const outColField = (placeholder = 'leave blank to replace the column'): Field => ({
     key: 'outputColumn',
@@ -4820,7 +6746,7 @@ function synthDateTimeTransform(comp: ComponentDef): ComponentManifest {
         return base(comp, [{ label: 'Date add', fields: [
             col,
             { key: 'amount', label: 'Amount (negative subtracts)', kind: 'integer', defaultValue: 1 },
-            unitField('Unit'),
+            unitField('Unit', true),
             outColField(),
         ] }], 'upstream');
     }
@@ -4975,8 +6901,11 @@ function synthJsonTransform(comp: ComponentDef): ComponentManifest {
     }
     if (id === 'xf.json.flatten') {
         return base(comp, [{ label: 'Flatten', fields: [
+            // #118: the other half of the pair. Someone reaching for Explode on
+            // a STRUCT lands here, so say so from this side too.
             { key: 'column', label: 'Struct column to flatten', kind: 'column', required: true,
-              description: "Expands the struct's fields into top-level columns." },
+              description: "Expands the struct's fields into top-level columns, keeping one row. For a LIST or ARRAY column use Explode / Unnest instead, which produces one row per element." },
+            ...unnestDepthFields('Nested structs are expanded all the way down, instead of one level.'),
         ] }], 'declared');
     }
     if (id === 'xf.json.merge') {
@@ -5064,8 +6993,13 @@ function synthArrayTransform(comp: ComponentDef): ComponentManifest {
     }
     if (id === 'xf.arr.explode') {
         return base(comp, [{ label: 'Explode / Unnest', fields: [
+            // #118: says LIST/ARRAY, and names the component that handles the
+            // other case. Pointed at a STRUCT this node fails with DuckDB's
+            // `length(STRUCT(...))` binder error, which names an internal guard
+            // rather than the choice the author actually got wrong.
             { key: 'column', label: 'Array column', kind: 'column', required: true,
-              description: 'One output row per element, other columns repeated.' },
+              description: 'A LIST or ARRAY column: one output row per element, other columns repeated. A NULL or empty array still yields one row, so the row is not lost. For a STRUCT column use Flatten instead, which expands its fields into columns and keeps one row.' },
+            ...unnestDepthFields('Elements that are themselves objects are expanded into columns as well, instead of arriving as a single struct column.'),
         ] }], 'declared');
     }
     if (id === 'xf.zip') {
@@ -5187,14 +7121,33 @@ function synthCdcTransform(comp: ComponentDef): ComponentManifest {
             ],
         },
         {
-            label: id.endsWith('.scd2') ? 'SCD Type 2 columns' : 'Behavior',
+            label: id.endsWith('.scd2')
+                ? 'SCD Type 2 columns'
+                : id.endsWith('.scd3')
+                  ? 'SCD Type 3 columns'
+                  : 'Behavior',
             fields: id.endsWith('.scd2')
                 ? [
                       { key: 'validFromColumn', label: 'Valid-from column', kind: 'text', defaultValue: 'valid_from' },
                       { key: 'validToColumn', label: 'Valid-to column', kind: 'text', defaultValue: 'valid_to' },
                       { key: 'isCurrentColumn', label: 'Is-current flag column', kind: 'text', defaultValue: 'is_current' },
                   ]
-                : [{ key: 'rejectUnchanged', label: 'Drop unchanged rows', kind: 'bool', defaultValue: true }],
+                : id.endsWith('.scd3')
+                  ? // SCD3 stamps an optional effective date and has no
+                    // unchanged-row behaviour to configure. It was previously
+                    // offered `rejectUnchanged`, which its builder never reads,
+                    // and not offered this, which its builder does read - so the
+                    // one control it has was unreachable from the editor.
+                    [
+                        {
+                            key: 'effectiveDateColumn',
+                            label: 'Effective-date column',
+                            kind: 'text',
+                            description:
+                                'Optional. When set, each row is stamped with the time the previous value was captured, in a column of this name.',
+                        },
+                    ]
+                  : [{ key: 'rejectUnchanged', label: 'Drop unchanged rows', kind: 'bool', defaultValue: true }],
         },
     ], 'declared');
 }
@@ -5210,7 +7163,8 @@ function synthRoutingControl(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'branches', label: 'Branch conditions', kind: 'key-value',
                       description: 'branch_name → boolean expression. Rows go down the first matching branch.' },
-                    { key: 'defaultBranch', label: 'Default branch name', kind: 'text', defaultValue: 'else' },
+                    // A `defaultBranch` name was here and build_switch hardcodes
+                    // the fallback relation, so renaming it changed nothing.
                 ],
             },
         ], 'upstream');
@@ -5277,6 +7231,49 @@ function synthRoutingControl(comp: ComponentDef): ComponentManifest {
                 description:
                     'Run here does the work in this process, bounded by this machine. Queue writes the rows to batches/<id>.ndjson and returns without running anything, so any number of duckle-runner workers can claim an item each and get through the batch together. Queued work does not start on its own: a worker has to pick it up.',
             });
+            // Only meaningful for a queued batch. An inline For Each runs each
+            // row once, in this run - there is no later pass for a retry to
+            // happen on, so these would be controls that do nothing.
+            fields.push({
+                key: 'maxAttempts',
+                label: 'Max attempts per item',
+                kind: 'integer',
+                defaultValue: 0,
+                visibleWhen: { key: 'dispatch', equals: 'queue' },
+                description:
+                    'How many times an item may be tried in total, the first try included. A permanently bad row - a 404 that will always be a 404 - otherwise stays claimable and takes a worker slot on every pass, forever. Past this count the item is left alone and reported as dead by `duckle-runner work status`; `work retry --dead` starts it over. 0 means unlimited, which is what queued batches did before this existed.',
+            });
+            fields.push({
+                key: 'retryBackoff',
+                label: 'Backoff',
+                kind: 'select',
+                defaultValue: 'fixed',
+                options: [
+                    { label: 'Fixed wait', value: 'fixed' },
+                    { label: 'Exponential (doubling)', value: 'exponential' },
+                ],
+                visibleWhen: { key: 'dispatch', equals: 'queue' },
+                description:
+                    'How long a worker waits before trying a failed item again. Fixed waits the same each time. Exponential doubles the wait per failure, up to the ceiling below, which suits a rate-limited API better than hammering it at a constant rate.',
+            });
+            fields.push({
+                key: 'retryInitialSeconds',
+                label: 'Wait before retry (seconds)',
+                kind: 'integer',
+                defaultValue: 0,
+                visibleWhen: { key: 'dispatch', equals: 'queue' },
+                description:
+                    'The wait after the first failure, and the whole wait when the backoff is fixed. The clock runs from the failed attempt, so a worker that has been down for an hour finds the backlog ready rather than waiting another hour. 0 retries immediately, as before.',
+            });
+            fields.push({
+                key: 'retryMaxSeconds',
+                label: 'Longest wait (seconds)',
+                kind: 'integer',
+                defaultValue: 0,
+                visibleWhen: { key: 'dispatch', equals: 'queue' },
+                description:
+                    'A ceiling on the exponential wait, so doubling does not run away to days between tries. 0 means no ceiling.',
+            });
         }
         return base(comp, [{ label: isIterate ? 'Iterate' : 'For each row', fields }], 'upstream');
     }
@@ -5290,7 +7287,8 @@ function synthTimingControl(comp: ComponentDef): ComponentManifest {
             {
                 label: 'Delay',
                 fields: [
-                    { key: 'duration', label: 'Duration', kind: 'integer', defaultValue: 1 },
+                    { key: 'duration', label: 'Duration', kind: 'integer', defaultValue: 0,
+                      description: 'An absent duration waits zero, which is what the node did while this box showed 1.' },
                     {
                         key: 'unit',
                         label: 'Unit',
@@ -5318,7 +7316,8 @@ function synthTimingControl(comp: ComponentDef): ComponentManifest {
             {
                 label: 'Throttle',
                 fields: [
-                    { key: 'rate', label: 'Rows per second', kind: 'integer', defaultValue: 100 },
+                    { key: 'rate', label: 'Rows per second', kind: 'integer', defaultValue: 0,
+                      description: 'The engine reads an absent or zero rate as no limit, so the box showed 100 while an untouched node throttled nothing.' },
                 ],
             },
         ], 'upstream');
@@ -5334,7 +7333,22 @@ function synthPipelineControl(comp: ComponentDef): ComponentManifest {
                 label: isJob ? 'Child job' : 'Pipeline',
                 fields: [
                     { key: 'pipelineRef', label: isJob ? 'Child job / pipeline' : 'Pipeline', kind: 'pipeline-ref', required: true, description: 'Pick a pipeline from this workspace.' },
-                    { key: 'waitForCompletion', label: 'Wait for completion', kind: 'bool', defaultValue: true },
+                    {
+                        // Was `waitForCompletion`, which nothing read. The arm
+                        // runs the child as a side effect before passing the
+                        // upstream view through, so the call is ALWAYS
+                        // synchronous and unticking the box changed nothing.
+                        //
+                        // `returnsRows` is the setting that does exist and had
+                        // no field: the parent names a handoff file, passes it
+                        // to the child as ${DUCKLE_RETURN}, and reads it once
+                        // the child has run.
+                        key: 'returnsRows',
+                        label: 'Take the rows the child returns',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description: 'Off, a child runs for its side effects and hands nothing back. On, the parent passes it a handoff file as ${DUCKLE_RETURN} and reads the rows the child writes there. The child always runs to completion either way.',
+                    },
                     {
                         key: isJob ? 'contextVariables' : 'parameters',
                         label: isJob ? 'Context variables' : 'Parameters',
@@ -5371,6 +7385,37 @@ function synthPipelineControl(comp: ComponentDef): ComponentManifest {
                     { key: 'glob', label: 'Pattern', kind: 'text', placeholder: '*.pdf', description: 'Which files to include. Everything, if left blank.' },
                     { key: 'recursive', label: 'Include sub-folders', kind: 'bool', defaultValue: false },
                     { key: 'hash', label: 'Compute sha256', kind: 'bool', defaultValue: false, description: 'Off by default because it reads every byte of every file, which is the one thing you do not want to do to a large model binary. Turn it on when you want a content hash for reproducibility or change detection.' },
+                ],
+            },
+        ], 'declared');
+    }
+    // src.filelist and src.inline sit in the ctl.pipeline palette group, so
+    // group-based synthesis drew them with the control form - a notes box and
+    // nothing else. Both builders read props, and neither degrades loudly
+    // without them: build_filelist_source with no directory globs '/*', which
+    // lists the filesystem root, and build_inline_source with no columns
+    // returns `SELECT NULL WHERE false`, zero rows and no error. Routed by id,
+    // like src.artifact directly above.
+    if (comp.id === 'src.filelist') {
+        return base(comp, [
+            {
+                label: 'Files',
+                fields: [
+                    { key: 'directory', label: 'Folder', kind: 'file-path', description: 'The folder to list. Every file in it becomes a row.' },
+                    { key: 'pattern', label: 'Pattern', kind: 'text', placeholder: '*', description: 'Which files to include. Everything, if left blank.' },
+                    { key: 'recursive', label: 'Include sub-folders', kind: 'bool', defaultValue: false },
+                    { key: 'path', label: 'Single file instead', kind: 'file-path', description: 'Naming one file yields one row if it exists and none if it does not, which makes this node a file-exists check. Takes precedence over the folder above.' },
+                ],
+            },
+        ], 'declared');
+    }
+    if (comp.id === 'src.inline') {
+        return base(comp, [
+            {
+                label: 'Rows',
+                fields: [
+                    { key: 'columns', label: 'Columns', kind: 'key-value', required: true, description: 'Each entry is one column: the name on the left, the value on the right. Values are written as text literals, never as SQL.' },
+                    { key: 'rowCount', label: 'Row count', kind: 'integer', defaultValue: 1, description: 'How many identical rows to emit.' },
                 ],
             },
         ], 'declared');
@@ -5418,22 +7463,14 @@ function synthPipelineControl(comp: ComponentDef): ComponentManifest {
 function synthErrorControl(comp: ComponentDef): ComponentManifest {
     const id = comp.id;
     if (id === 'ctl.retry') {
-        return base(comp, [
-            {
-                label: 'Retry',
-                fields: [
-                    { key: 'maxAttempts', label: 'Max attempts', kind: 'integer', defaultValue: 3 },
-                    { key: 'backoff', label: 'Backoff (ms)', kind: 'integer', defaultValue: 1000 },
-                    {
-                        key: 'strategy',
-                        label: 'Strategy',
-                        kind: 'select',
-                        defaultValue: 'exponential',
-                        options: [{label:'Linear',value:'linear'},{label:'Exponential',value:'exponential'},{label:'Constant',value:'constant'}],
-                    },
-                ],
-            },
-        ], 'upstream');
+        // Max attempts / Backoff / Strategy were here and nothing read any
+        // of them: the builder is `SELECT * FROM <upstream>` and never touches
+        // props, so a Retry node set to 3 attempts performed zero retries.
+        // This component's own palette entry already says per-stage retry lives
+        // on the Advanced tab and that no separate component is needed - the
+        // description was honest and the form contradicted it. The node keeps
+        // its Advanced tab, which is where retry actually is.
+        return base(comp, [], 'upstream');
     }
     if (id === 'ctl.deadletter') {
         return base(comp, [
@@ -5522,9 +7559,15 @@ function synthQualityValidation(comp: ComponentDef): ComponentManifest {
         defaultValue: 'reject',
         options: [
             { label: 'Send to reject port', value: 'reject' },
-            { label: 'Log warning, keep row', value: 'warn' },
+            // Was "Log warning, keep row", and it kept nothing - warn took the
+            // same filtered path as reject, so the rows it named were dropped.
+            // The row-keeping half now works; nothing is logged, because a view
+            // stage has no channel to log from, so the label no longer says so.
+            { label: 'Keep row (failures still reach the reject port)', value: 'warn' },
             { label: 'Fail pipeline', value: 'fail' },
         ],
+        description:
+            'The reject port carries the failing rows whatever this says. This chooses what the MAIN output does with them: drop them, keep them, or stop the run.',
     };
     if (id === 'qa.outlier') {
         return base(comp, [
@@ -5612,6 +7655,16 @@ function synthQualityValidation(comp: ComponentDef): ComponentManifest {
                 label: 'Uniqueness',
                 fields: [
                     { key: 'columns', label: 'Uniqueness key', kind: 'columns', required: true },
+                    {
+                        // Same story: the engine reads tieBreak, the form never
+                        // offered it, so "which duplicate survives" could not be
+                        // pinned down from the editor.
+                        key: 'tieBreak',
+                        label: 'Tie-break columns (optional)',
+                        kind: 'columns',
+                        description:
+                            'Which row of each duplicate group is kept. Left empty, the survivor is arbitrary and the same input can keep a different row on a later run. Row counts are unaffected either way.',
+                    },
                     onFail,
                 ],
             },
@@ -6155,6 +8208,63 @@ function synthCustomCode(comp: ComponentDef): ComponentManifest {
             },
         ], 'declared');
     }
+    // A compiled module is not source code, and the generic form below gave
+    // code.wasm a required "Source" textarea, a Language select and a routine
+    // picker that its arm reads none of - while offering the module as
+    // `wasmPath`, which is not the key the arm reads either. A node built from
+    // that form failed with "either wasmB64 or path required" and a filled-in
+    // file picker on screen.
+    if (id === 'code.wasm') {
+        return base(comp, [
+            {
+                label: 'Module',
+                fields: [
+                    {
+                        key: 'path',
+                        label: 'WASM file',
+                        kind: 'file-path',
+                        filters: [{ name: 'WebAssembly', extensions: ['wasm'] }],
+                        description: 'The compiled module. Supply this or the inline bytes below.',
+                    },
+                    {
+                        key: 'wasmB64',
+                        label: 'Inline module (base64)',
+                        kind: 'textarea',
+                        rows: 4,
+                        monospace: true,
+                        description: 'The module bytes, base64-encoded, kept in the pipeline itself. Used in preference to the file when both are set.',
+                    },
+                    {
+                        key: 'function',
+                        label: 'Exported function',
+                        kind: 'text',
+                        defaultValue: 'transform',
+                        description: 'Must take (i32, i32) and return an i64 packing (out_ptr << 32) | out_len. The module must also export its `memory`.',
+                    },
+                ],
+            },
+            {
+                label: 'Columns',
+                fields: [
+                    { key: 'inputColumn', label: 'Text column', kind: 'column', defaultValue: 'text' },
+                    { key: 'outputColumn', label: 'Write to', kind: 'text', defaultValue: 'result' },
+                ],
+            },
+            {
+                label: 'Execution',
+                fields: [
+                    {
+                        key: 'reuseInstance',
+                        label: 'Reuse the module instance across rows',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description: 'Faster, but module memory and state persist between rows. A fresh instance per row is the default for that reason.',
+                    },
+                ],
+            },
+            ...outputCacheSection(comp),
+        ], 'declared');
+    }
     const langDefault =
         id === 'code.python' ? 'python' :
         id === 'code.rust' ? 'rust' :
@@ -6186,38 +8296,128 @@ function synthCustomCode(comp: ComponentDef): ComponentManifest {
                     ],
                 },
                 { key: 'code', label: 'Source', kind: 'textarea', rows: 12, monospace: true, required: true,
-                  placeholder: id === 'code.python' ? 'def process(row):\n    return row' : '// custom code' },
-                ...(id === 'code.wasm' ? [{ key: 'wasmPath', label: 'WASM file', kind: 'file-path' as const,
-                    filters: [{ name: 'WebAssembly', extensions: ['wasm'] }] },
-                  { key: 'reuseInstance', label: 'Reuse module instance across rows', kind: 'bool' as const,
-                    defaultValue: false,
-                    placeholder: 'Faster, but module memory/state persists between rows (default: fresh instance per row)' }] : []),
+                  placeholder: id === 'code.python' ? 'def process(row):\n    return row' : '// custom code',
+                  description: id === 'code.python'
+                      ? 'Three entry points, and the one you define picks the mode. process(row): a dict in, a dict or None out, a row at a time. transform(table): the whole table at once as a pyarrow Table. transform_batches(batch): streamed a RecordBatch at a time, so a table larger than memory still runs. The last two need pyarrow, and both keep types that the row path would stringify. INPUT_PATH holds the Parquet file the rows arrive in, if you would rather scan it yourself.'
+                      : undefined },
             ],
         },
+        // The shell arm reads all three and the shared code form offered none,
+        // so a shell node always ran in the process's own working directory,
+        // through the platform default interpreter, with no time limit.
+        ...(id === 'code.shell'
+            ? ([{
+                  label: 'Shell',
+                  fields: [
+                      {
+                          key: 'workingDir',
+                          label: 'Working directory',
+                          kind: 'file-path',
+                          description: "Where the command runs. Left blank it inherits the engine's own working directory, which is not where a pipeline's files usually are.",
+                      },
+                      {
+                          key: 'shell',
+                          label: 'Interpreter',
+                          kind: 'text',
+                          placeholder: 'bash',
+                          description: 'The interpreter to run the command through. Blank uses the platform default: cmd on Windows, sh elsewhere.',
+                      },
+                      {
+                          key: 'timeoutMs',
+                          label: 'Timeout (ms)',
+                          kind: 'integer',
+                          description: 'Kill the command after this long. Blank means it runs until it exits, which a hung command never does.',
+                      },
+                  ],
+              }] as FormSection[])
+            : []),
+        ...outputCacheSection(comp),
     ], 'declared');
 }
 
+// #238: the JSON source has carried `recursive` / `keep_parent_names` since the
+// flatten fix; the transforms had not, so a pipeline that exploded an array and
+// then flattened it met `Id`, `Id_1`, `Id_2` again downstream - the naming the
+// source option exists to avoid. Shared so the two nodes cannot describe the
+// same DuckDB arguments differently.
+//
+// `Keep parent names` is gated on `recursive` because it does nothing without
+// it: at a single level DuckDB produces the same columns either way (measured
+// on 1.5.4), and a control that changes nothing is worse than an absent one.
+const unnestDepthFields = (recursiveHelp: string): Field[] => [
+    {
+        key: 'recursive',
+        label: 'Expand nested objects',
+        kind: 'bool',
+        defaultValue: false,
+        description: recursiveHelp,
+    },
+    {
+        key: 'keepParentNames',
+        label: 'Keep parent names',
+        kind: 'bool',
+        defaultValue: false,
+        // The condition compares String(value), and recursive defaults to
+        // false, so an untouched node evaluates this as 'false' and hides it.
+        visibleWhen: [{ key: 'recursive', equals: ['true'] }],
+        description:
+            'Name each expanded column after the object it came from - owner.Id and account.Id rather than Id, Id_1 and Id_2. Without this, several objects carrying the same field produce columns whose names say nothing about where they came from.',
+    },
+];
+
 // AI / Vector ----------------------------------------------------------
 
-const aiProviderField = (): Field => ({
-    key: 'provider',
-    label: 'Provider',
-    kind: 'select',
-    defaultValue: 'openai',
-    options: [
-        { label: 'OpenAI', value: 'openai' },
-        { label: 'Anthropic', value: 'anthropic' },
-        { label: 'Cohere', value: 'cohere' },
-        { label: 'Hugging Face', value: 'huggingface' },
-        { label: 'Local (Ollama)', value: 'ollama' },
-        { label: 'Custom (OpenAI-compatible)', value: 'custom' },
-    ],
-});
+// A Provider select (OpenAI / Anthropic / Cohere / HuggingFace / Ollama) lived
+// here and no engine arm read it - there is no `provider` literal anywhere in
+// crates/ or apps/. The control that does work is `baseUrl`, which every AI arm
+// honours, so pointing that at a provider is how a provider is chosen.
 
 // #258: the two knobs that decide how a batch-inference stage behaves at
 // scale. Parallel requests defaults to 1, which is exactly the sequential
 // behaviour these stages had before, so an existing pipeline does not change
 // until someone raises it.
+// #258: rate limiting controls how fast money leaves, not how much. Shared by
+// the three transforms that call an API, because a ceiling on one of them is
+// not a ceiling on the pipeline.
+const aiBudgetFields = (): Field[] => [
+    {
+        key: 'maxRequests',
+        label: 'Max requests',
+        kind: 'integer',
+        description: 'Stop this step once it has issued this many requests. Blank = no limit. This one works against any endpoint, including a self-hosted one with no price to quote.',
+    },
+    {
+        key: 'maxInputTokens',
+        label: 'Max input tokens',
+        kind: 'integer',
+        description: 'Stop once the provider has reported this many prompt tokens. Blank = no limit.',
+    },
+    {
+        key: 'maxOutputTokens',
+        label: 'Max output tokens',
+        kind: 'integer',
+        description: 'Stop once the provider has reported this many completion tokens. Blank = no limit.',
+    },
+    {
+        key: 'maxEstimatedCostUsd',
+        label: 'Max estimated cost (USD)',
+        kind: 'number',
+        description: 'Stop once the token counts multiplied by the prices below reach this. Needs at least one price: a cost ceiling with no prices could never be reached, so it is refused rather than accepted and never fired.',
+    },
+    {
+        key: 'inputUsdPerMillionTokens',
+        label: 'Input price per million tokens (USD)',
+        kind: 'number',
+        description: 'From your provider\'s price list. Only used for the cost ceiling.',
+    },
+    {
+        key: 'outputUsdPerMillionTokens',
+        label: 'Output price per million tokens (USD)',
+        kind: 'number',
+        description: 'From your provider\'s price list. Only used for the cost ceiling.',
+    },
+];
+
 const aiThroughputFields = (): Field[] => [
     {
         key: 'concurrency',
@@ -6226,6 +8426,28 @@ const aiThroughputFields = (): Field[] => [
         defaultValue: 1,
         description:
             'How many requests to keep in flight at once. 1 sends them one at a time. Output row order is the input row order either way.',
+    },
+    {
+        key: 'checkpoint',
+        label: 'Remember completed rows',
+        kind: 'bool',
+        defaultValue: false,
+        description:
+            'Store each row answer as it arrives, and reuse it on a later run instead of paying for it again. The failure this prevents: 399,999 successful paid calls, request 400,000 fails permanently, and a rerun buys all 399,999 a second time. A row is recorded the moment it succeeds, not when the stage finishes. Off by default, because a cache nobody knows is there is worse than paying twice.',
+    },
+    {
+        key: 'checkpointKey',
+        label: 'Row identity columns',
+        kind: 'columns',
+        description:
+            'The columns that say which row this IS - a company id, a document id. Identity is those columns AND the whole input row AND the model/prompt configuration, so a row whose text changed is recomputed rather than answered from the old text, and changing the prompt or model invalidates everything. Leave blank and the whole row is the key: a volatile column like a run id then costs reuse rather than causing a wrong answer, which is the safe direction.',
+    },
+    {
+        key: 'checkpointFingerprint',
+        label: 'Columns that decide the input changed',
+        kind: 'columns',
+        description:
+            'Which columns count as the work when deciding whether a stored answer still applies. Leave blank and the whole row decides, which never reuses a stale answer and also never reuses anything at all if one volatile column - a run id, an ingestion timestamp - moves every run. Name the columns that actually feed the request and the reuse comes back. Narrowing this is the one setting here that can cause a wrong answer: a column left out is a column whose change goes unnoticed.',
     },
     {
         key: 'maxRetries',
@@ -6301,7 +8523,7 @@ function synthVectorSink(comp: ComponentDef): ComponentManifest {
                     {
                         key: 'shapeHint',
                         label: 'Row shape',
-                        kind: 'text',
+                        kind: 'note',
                         description: 'Each upstream row should already have {id, values, metadata}. Use a Project / Add Column upstream to rename your embedding column to "values" and any extras into a "metadata" struct.',
                     },
                 ],
@@ -6389,7 +8611,7 @@ function synthVectorSink(comp: ComponentDef): ComponentManifest {
                     {
                         key: 'shapeHint',
                         label: 'Row shape',
-                        kind: 'text',
+                        kind: 'note',
                         description: 'Each upstream row should already have {id, vector, payload}. Use Project / Add Column upstream to reshape if needed.',
                     },
                 ],
@@ -6417,7 +8639,7 @@ function synthVectorSink(comp: ComponentDef): ComponentManifest {
                     {
                         key: 'shapeHint',
                         label: 'Row shape',
-                        kind: 'text',
+                        kind: 'note',
                         description: 'Each upstream row should already have {class, properties, vector}. The engine wraps the batch in {objects: [...]}.',
                     },
                 ],
@@ -6440,7 +8662,7 @@ function synthVectorSink(comp: ComponentDef): ComponentManifest {
                     {
                         key: 'shapeHint',
                         label: 'Row shape',
-                        kind: 'text',
+                        kind: 'note',
                         description: 'Each upstream row should have {id, vector, ...}. The engine wraps as {collectionName, data: [...]}.',
                     },
                 ],
@@ -6721,13 +8943,13 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                 label: 'Embeddings',
                 fields: [
                     { key: 'inputColumn', label: 'Text column', kind: 'column', required: true },
-                    aiProviderField(),
                     { key: 'model', label: 'Model', kind: 'text', defaultValue: 'text-embedding-3-small' },
                     { key: 'apiKey', label: 'API key', kind: 'text', placeholder: '••••••••' },
                     { key: 'outputColumn', label: 'Output column', kind: 'text', defaultValue: 'embedding' },
                     { key: 'dimension', label: 'Dimensions', kind: 'integer', defaultValue: 1536 },
-                    { key: 'batchSize', label: 'Batch size', kind: 'integer', defaultValue: 64 },
+                    { key: 'batchSize', label: 'Batch size', kind: 'integer', defaultValue: 100 },
                     ...aiThroughputFields(),
+                    ...aiBudgetFields(),
                     ...aiCustomEndpointFields(),
                 ],
             },
@@ -6738,7 +8960,6 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
             {
                 label: 'Model',
                 fields: [
-                    aiProviderField(),
                     { key: 'model', label: 'Model', kind: 'text', defaultValue: 'gpt-4o-mini' },
                     { key: 'apiKey', label: 'API key', kind: 'text', placeholder: '••••••••' },
                     ...aiCustomEndpointFields(),
@@ -6757,10 +8978,76 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                         placeholder: 'Clean and normalize this address:\n{address}',
                         description: 'Reference columns with {column_name}.',
                     },
+                    {
+                        // Sent as the system message on every request. The arm
+                        // has always read it and no field offered it, so the
+                        // one control that sets a model's standing instructions
+                        // was reachable only by hand-editing the pipeline.
+                        key: 'systemPrompt',
+                        label: 'System prompt',
+                        kind: 'textarea',
+                        rows: 3,
+                        placeholder: 'You are a data cleaning assistant. Answer with the value only.',
+                        description: 'Standing instructions sent with every row, separate from the per-row prompt above. Blank sends none.',
+                    },
                     { key: 'outputColumn', label: 'Output column', kind: 'text', required: true, defaultValue: 'ai_result' },
                     { key: 'temperature', label: 'Temperature', kind: 'number', defaultValue: 0 },
                     { key: 'maxTokens', label: 'Max tokens', kind: 'integer', defaultValue: 256 },
                     ...aiThroughputFields(),
+                    ...aiBudgetFields(),
+                ],
+            },
+            // #258: extraction wants columns, not a paragraph that happens to
+            // contain the answer.
+            {
+                label: 'Structured output',
+                fields: [
+                    {
+                        key: 'responseFormat',
+                        label: 'Reply shape',
+                        kind: 'select',
+                        defaultValue: 'text',
+                        options: [
+                            { label: 'Free text', value: 'text' },
+                            { label: 'Any JSON object', value: 'json_object' },
+                            { label: 'A JSON Schema you define', value: 'json_schema' },
+                        ],
+                        description: 'With a schema, the provider enforces the shape while it writes, and the reply is checked again here in case the endpoint accepted the setting and ignored it.',
+                    },
+                    {
+                        key: 'jsonSchema',
+                        label: 'JSON Schema',
+                        kind: 'textarea',
+                        rows: 10,
+                        monospace: true,
+                        placeholder: '{\n  "type": "object",\n  "properties": {\n    "vendor": { "type": "string" },\n    "total": { "type": "number" }\n  },\n  "required": ["vendor", "total"]\n}',
+                        description: 'Only used when the reply shape is a JSON Schema. Parsed before the first request, so a mistake here costs nothing.',
+                    },
+                    {
+                        key: 'schemaName',
+                        label: 'Schema name',
+                        kind: 'text',
+                        defaultValue: 'extraction',
+                        description: 'Sent alongside the schema; providers require one.',
+                    },
+                    {
+                        key: 'expandColumns',
+                        label: 'Turn the reply fields into columns',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description: 'Each top-level field of the reply becomes its own column instead of one JSON column downstream has to unpack. A field with the same name as an incoming column is refused before the run starts rather than overwriting it.',
+                    },
+                    {
+                        key: 'onInvalid',
+                        label: 'When a reply does not match',
+                        kind: 'select',
+                        defaultValue: 'fail',
+                        options: [
+                            { label: 'Stop the run', value: 'fail' },
+                            { label: 'Leave the row empty and carry on', value: 'null' },
+                        ],
+                        description: 'Stopping is the default: an extraction that quietly produced nulls for a tenth of its rows is worse than one that stopped.',
+                    },
                 ],
             },
         ], 'declared');
@@ -6771,21 +9058,29 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                 label: 'Chunking',
                 fields: [
                     { key: 'inputColumn', label: 'Text column', kind: 'column', required: true },
-                    {
-                        key: 'strategy',
-                        label: 'Strategy',
-                        kind: 'select',
-                        defaultValue: 'recursive',
-                        options: [
-                            { label: 'Fixed size', value: 'fixed' },
-                            { label: 'Sentence', value: 'sentence' },
-                            { label: 'Recursive', value: 'recursive' },
-                            { label: 'Semantic', value: 'semantic' },
-                        ],
-                    },
+                    // A `strategy` select (sentence / recursive / semantic) was here.
+                    // AiChunkSpec has no strategy member and the arm never looks for
+                    // one - the splitter is fixed-size only.
                     { key: 'chunkSize', label: 'Chunk size (tokens)', kind: 'integer', defaultValue: 512 },
-                    { key: 'overlap', label: 'Overlap (tokens)', kind: 'integer', defaultValue: 64 },
+                    // The engine reads `chunkOverlap`, which is also the name used
+                    // everywhere else; `overlap` reached nothing.
+                    { key: 'chunkOverlap', label: 'Overlap (tokens)', kind: 'integer', defaultValue: 64 },
                     { key: 'outputColumn', label: 'Output column', kind: 'text', defaultValue: 'chunk' },
+                    // The arm reads `mode` and it decides the SHAPE of the
+                    // output, which every downstream node has to match. With
+                    // no field it was always explode, and the array form was
+                    // reachable only by hand-editing the pipeline.
+                    {
+                        key: 'mode',
+                        label: 'Output shape',
+                        kind: 'select',
+                        defaultValue: 'explode',
+                        options: [
+                            { label: 'One row per chunk', value: 'explode' },
+                            { label: 'One row per input, chunks as a JSON array', value: 'array' },
+                        ],
+                        description: 'One row per chunk also carries chunk_index and chunk_count alongside the rest of the source row. The array form keeps one row per input and puts the chunks in the output column.',
+                    },
                 ],
             },
         ], 'declared');
@@ -6793,21 +9088,40 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
     if (id === 'xf.ai.pii') {
         return base(comp, [
             {
+                // Every field here used to be a different name than the arm
+                // reads. It wrote `columns`, `entities` and `action`; the arm
+                // reads `inputColumn`, `outputColumn` and `types`, and has no
+                // action concept - redaction is always replacement with
+                // [REDACTED-X].
+                //
+                // The one that mattered: `entities` never reached `types`, so
+                // `types` stayed empty, and empty means ALL in pii_patterns.
+                // A narrower selection silently over-redacted, and the
+                // placeholder advertised `name`, which the redactor cannot
+                // detect at all - so free text redacted in the belief that
+                // names were masked went out with the names in it.
                 label: 'PII redaction',
                 fields: [
-                    { key: 'columns', label: 'Columns to scan', kind: 'columns', required: true },
-                    { key: 'entities', label: 'Entity types', kind: 'text', placeholder: 'email, phone, ssn, name, credit_card', description: 'Comma-separated PII types to detect.' },
                     {
-                        key: 'action',
-                        label: 'Action',
-                        kind: 'select',
-                        defaultValue: 'mask',
-                        options: [
-                            { label: 'Mask (****)', value: 'mask' },
-                            { label: 'Hash', value: 'hash' },
-                            { label: 'Redact (remove)', value: 'redact' },
-                            { label: 'Tokenize', value: 'tokenize' },
-                        ],
+                        key: 'inputColumn',
+                        label: 'Text column',
+                        kind: 'column',
+                        required: true,
+                        description: 'The column whose text is scanned. One column per node.',
+                    },
+                    {
+                        key: 'outputColumn',
+                        label: 'Write to',
+                        kind: 'text',
+                        placeholder: 'leave blank to redact in place',
+                        description: 'Blank overwrites the text column with its redacted form.',
+                    },
+                    {
+                        key: 'types',
+                        label: 'Types to redact',
+                        kind: 'text',
+                        placeholder: 'leave blank for all four',
+                        description: 'Comma-separated, from exactly: email, phone, ssn, credit_card. Blank redacts all four. These are regex shapes, deliberately conservative - a name, an address or a date of birth has no reliable shape and is NOT detected, so do not rely on this to remove them.',
                     },
                 ],
             },
@@ -6820,12 +9134,12 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'inputColumn', label: 'Text column', kind: 'column', required: true },
                     { key: 'categories', label: 'Labels', kind: 'text', required: true, placeholder: 'positive, neutral, negative', description: 'Comma-separated candidate labels.' },
-                    aiProviderField(),
                     { key: 'model', label: 'Model', kind: 'text', defaultValue: 'gpt-4o-mini' },
                     { key: 'apiKey', label: 'API key', kind: 'text', placeholder: '••••••••' },
-                    { key: 'outputColumn', label: 'Output column', kind: 'text', defaultValue: 'label' },
+                    { key: 'outputColumn', label: 'Output column', kind: 'text', defaultValue: 'category' },
                     ...aiCustomEndpointFields(),
                     ...aiThroughputFields(),
+                    ...aiBudgetFields(),
                 ],
             },
         ], 'declared');
@@ -6837,7 +9151,7 @@ function synthAiTransform(comp: ComponentDef): ComponentManifest {
                 fields: [
                     { key: 'embeddingColumn', label: 'Embedding column', kind: 'column', description: 'Vector column to compare.' },
                     { key: 'textColumn', label: 'Or text column', kind: 'column', description: 'Embedded on the fly if no vector column.' },
-                    { key: 'threshold', label: 'Similarity threshold', kind: 'number', defaultValue: 0.92, description: '0.0-1.0; higher keeps only very-close rows as duplicates.' },
+                    { key: 'threshold', label: 'Similarity threshold', kind: 'number', defaultValue: 0.95, description: '0.0-1.0; higher keeps only very-close rows as duplicates.' },
                     distanceMetricField(),
                     {
                         key: 'keep',
@@ -7251,6 +9565,9 @@ export function synthesizeManifest(componentId: string): ComponentManifest | und
     // Cross-cutting: Postgres wire-family components gain a collapsible advanced
     // TLS/libpq section (issue #161), regardless of which synth path built them.
     if (manifest && PG_ADVANCED_IDS.has(componentId)) injectPgAdvancedSection(manifest);
+    // Cross-cutting: every HTTP-backed source gains the shared transport section
+    // (issue #256), so a proxy or timeout is reachable without hand-editing JSON.
+    if (manifest && HTTP_TRANSPORT_IDS.has(componentId)) injectHttpTransportSection(manifest);
     return manifest;
 }
 
@@ -7341,12 +9658,83 @@ function dispatchManifest(componentId: string): ComponentManifest | undefined {
     // source (it drives the Bulk API 2.0 query-job lifecycle with the
     // sink-shaped auth keys); route by id ahead of the group checks.
     if (comp.id === 'src.salesforce.bulk') return synthSalesforceBulkSource(comp);
+    // Neo4j / Turso / DB2: their sinks sit in groups whose generic synth would
+    // otherwise claim them, so they are routed by id ahead of the group checks.
+    {
+        // src.spool sits in the files group, whose generic file-source synth
+        // would otherwise claim it and offer a path picker with no offset
+        // fields. Routed by id, like the connectors above.
+        const m = synthNewConnector(comp);
+        if (m) return m;
+    }
+    {
+        // #330 follow-up: components drawn by another family's synthesizer,
+        // which could not produce a node that plans. Same by-id routing.
+        const m = synthWrongFamilyForm(comp);
+        if (m) return m;
+    }
     if (comp.id === 'src.model') return synthModelSource(comp);
     if (comp.id === 'snk.model') return synthModelSink(comp);
     if (groupId === 'src.files') return synthFileSource(comp);
     if (groupId === 'src.lakehouse') return synthLakehouseSource(comp);
     if (groupId === 'snk.lakehouse') return synthLakehouseSink(comp);
     if (groupId === 'src.databases') return synthDbSource(comp);
+    // Synapse is a TDS database wearing a warehouse label; see the note by
+    // the snk.synapse route below. Ahead of the src.warehouses group check.
+    if (comp.id === 'src.synapse') return synthDbSource(comp);
+    // #330: src.couchdb is a REST source to the engine - it is in the arm that
+    // builds a RestSourceSpec, and the engine has no couchdb-specific handling
+    // whatsoever, so it needs url / responsePath / auth. The palette entry says
+    // as much ("Rides src.rest - Basic auth, responsePath /rows"), but the
+    // component sits in the src.nosql group and was drawn with the MongoDB
+    // form: connectionString, collection, filter, projection. Not one of those
+    // is read for it, and not one of the fields it does need could be set.
+    if (comp.id === 'src.couchdb') return synthApiSource(comp);
+    // src.milvus reads endpoint / collection / outputFields / apiKey / filter /
+    // pageSize / maxPages and nothing else. The shared vector form offered it a
+    // Mode select with "Similarity search" and a Query text box, and the arm has
+    // no search path at all: Milvus search wants a query VECTOR and there is no
+    // embedding step here, so "search by text" could never have been honoured.
+    if (comp.id === 'src.milvus') {
+        return base(comp, [
+            {
+                label: 'Milvus',
+                fields: [
+                    // Kept from the form this replaces: a saved connection is
+                    // expanded into whatever fields the node's arm reads.
+                    connectionRefField(connectionKindFor(comp.id)),
+                    { key: 'endpoint', label: 'Endpoint', kind: 'text', required: true, placeholder: 'https://in03-xxxx.api.gcp-us-west1.zillizcloud.com' },
+                    { key: 'collection', label: 'Collection', kind: 'text', required: true },
+                    { key: 'apiKey', label: 'API key', kind: 'text', secret: true, placeholder: '••••••••' },
+                ],
+            },
+            {
+                label: 'Query',
+                fields: [
+                    { key: 'outputFields', label: 'Fields to return', kind: 'text', placeholder: 'id, title, source', description: 'Comma-separated. Blank returns the collection default.' },
+                    { key: 'filter', label: 'Filter expression', kind: 'text', placeholder: 'id > 0', description: "Milvus boolean expression. Blank uses 'id > 0', which matches everything." },
+                    { key: 'pageSize', label: 'Page size', kind: 'integer', defaultValue: 100 },
+                    { key: 'maxPages', label: 'Max pages', kind: 'integer', defaultValue: 100 },
+                ],
+            },
+        ]);
+    }
+    // src.redis is a key scan, not a document store: the arm reads url (or
+    // connectionString), keyPattern and limit. The NoSQL group synth drew it the
+    // MongoDB form - queryMode, collection, database, projection - none of which
+    // it reads.
+    if (comp.id === 'src.redis') {
+        return base(comp, [
+            {
+                label: 'Redis',
+                fields: [
+                    { key: 'connectionString', label: 'Connection URL', kind: 'text', required: true, placeholder: 'redis://default:pass@host:6379/0' },
+                    { key: 'keyPattern', label: 'Key pattern', kind: 'text', defaultValue: '*', description: 'SCAN match pattern. * reads every key.' },
+                    { key: 'limit', label: 'Max keys', kind: 'integer', defaultValue: 10000 },
+                ],
+            },
+        ]);
+    }
     if (groupId === 'src.warehouses') return synthWarehouseSource(comp);
     if (groupId === 'src.storage') return synthStorageSource(comp);
     if (groupId === 'src.streaming') return synthStreamingSource(comp);
@@ -7363,6 +9751,13 @@ function dispatchManifest(componentId: string): ComponentManifest | undefined {
     // synthWarehouseSink. Route by id so a new group member never falls through
     // to the generic "Notes" panel.
     if (comp.id === 'snk.salesforce' || comp.id === 'snk.salesforce.bulk') return synthWarehouseSink(comp);
+    // Azure Synapse rides the SQL Server TDS wire (specs.rs:1476/1507: host,
+    // port, user, trustCert, encrypt), and synthDbSource / synthDbSink each
+    // carry a `sqlserver || synapse` branch written for it. Both were dead
+    // code: Synapse sits in the *.warehouses palette group, so it was drawn
+    // with the Snowflake form instead - account / warehouse / role, and no
+    // field for a host. Routed by id for the same reason snk.salesforce is.
+    if (comp.id === 'snk.synapse') return synthDbSink(comp);
     if (groupId === 'snk.databases') return synthDbSink(comp);
     if (groupId === 'snk.warehouses') return synthWarehouseSink(comp);
     if (groupId === 'snk.storage') return synthStorageSink(comp);

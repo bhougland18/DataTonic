@@ -1,0 +1,427 @@
+//! #289: named admission pools, so one heavy join does not have to serialise
+//! eight cheap HTTP jobs.
+//!
+//! A single `DUCKLE_MAX_CONCURRENT_RUNS` forces a choice nobody wants to make:
+//! set it to 1 and eight lightweight API ingestions run one at a time; set it
+//! to 8 and two 24GB joins can start together. Pools let those coexist by
+//! naming the kind of work rather than counting runs.
+//!
+//! ## Admission only
+//!
+//! A pool answers "may this run start now". What a run may then USE - threads,
+//! memory, temp disk - is the existing per-pipeline `resources` block and is
+//! untouched. Conflating the two would let a pipeline widen its own memory
+//! limit by choosing a different pool.
+//!
+//! ## One definition, two gates
+//!
+//! The runner gates with a condvar and the scheduler with a tokio semaphore,
+//! because one is sync and the other async. That is fine as long as they agree
+//! on the NUMBERS, which is why the numbers live here and not in either of
+//! them - two limiters each parsing their own config is how the two schedulers
+//! came to disagree about time zones.
+//!
+//! ## A pipeline may choose a pool, never widen one
+//!
+//! When a server names the authoritative pools, a workspace can select among
+//! them and its own limits are clamped to the server's. Otherwise a pipeline
+//! could declare a pool of 999 and opt itself out of the protection pools
+//! exist to provide.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// The pool a pipeline gets when it does not ask for one. Sized from
+/// `DUCKLE_MAX_CONCURRENT_RUNS`, so a workspace that never mentions pools
+/// behaves exactly as it did before.
+pub const DEFAULT: &str = "default";
+
+/// What a server or workspace declares for one pool.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolSpec {
+    pub max_concurrent_runs: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(transparent)]
+pub struct PoolFile {
+    pub pools: BTreeMap<String, PoolSpec>,
+}
+
+/// The resolved pools for a workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pools {
+    limits: BTreeMap<String, usize>,
+    /// True when a server file decided the set, so an unknown name is a
+    /// refusal rather than a new pool.
+    authoritative: bool,
+}
+
+pub fn env_default() -> usize {
+    std::env::var("DUCKLE_MAX_CONCURRENT_RUNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+pub fn workspace_path(workspace: &Path) -> PathBuf {
+    workspace.join(".duckle").join("pools.json")
+}
+
+fn read(path: &Path) -> Option<BTreeMap<String, usize>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let parsed: PoolFile = serde_json::from_str(&text).ok()?;
+    Some(parsed.pools.into_iter().map(|(k, v)| (k, v.max_concurrent_runs.max(1))).collect())
+}
+
+impl Pools {
+    /// Resolve the pools for a workspace, applying any server ceiling.
+    pub fn load(workspace: &Path) -> Pools {
+        let server = std::env::var("DUCKLE_POOLS_FILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|p| read(Path::new(&p)));
+        let declared = read(&workspace_path(workspace)).unwrap_or_default();
+        let mut limits: BTreeMap<String, usize> = BTreeMap::new();
+
+        match &server {
+            // The server decides which pools exist and how big each may be. A
+            // workspace may ask for LESS - a team that knows its own jobs are
+            // heavy can throttle itself further - and never for more.
+            Some(ceiling) => {
+                for (name, cap) in ceiling {
+                    let asked = declared.get(name).copied().unwrap_or(*cap);
+                    limits.insert(name.clone(), asked.min(*cap));
+                }
+            }
+            None => limits.extend(declared),
+        }
+        limits.entry(DEFAULT.to_string()).or_insert_with(env_default);
+        Pools { limits, authoritative: server.is_some() }
+    }
+
+    /// Build from explicit numbers, for tests and for callers that already hold
+    /// the configuration.
+    pub fn from_limits(limits: BTreeMap<String, usize>) -> Pools {
+        let mut limits = limits;
+        limits.entry(DEFAULT.to_string()).or_insert_with(env_default);
+        Pools { limits, authoritative: false }
+    }
+
+    /// The pool a request should actually be admitted to.
+    ///
+    /// A name nobody declared falls back to `default` rather than becoming a
+    /// new unbounded pool. That is the point of the server ceiling: a pipeline
+    /// naming an undefined pool must not thereby create one.
+    pub fn resolve(&self, asked: &str) -> String {
+        let asked = asked.trim();
+        match !asked.is_empty() && self.limits.contains_key(asked) {
+            true => asked.to_string(),
+            false => DEFAULT.to_string(),
+        }
+    }
+
+    pub fn limit(&self, name: &str) -> usize {
+        self.limits
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| self.limits.get(DEFAULT).copied().unwrap_or_else(env_default))
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.limits.keys()
+    }
+
+    pub fn is_authoritative(&self) -> bool {
+        self.authoritative
+    }
+
+    pub fn as_map(&self) -> &BTreeMap<String, usize> {
+        &self.limits
+    }
+}
+
+/// A counting gate over one pool's permits.
+///
+/// Lives here rather than in a caller so every in-process admission uses one
+/// implementation as well as one set of numbers. The console had its own and a
+/// backfill nearly got a second: two gates drift the way two schedulers drifted
+/// over time zones, and the second one is always the one that forgets a rule.
+pub struct Gate {
+    free: std::sync::Mutex<usize>,
+    total: usize,
+    ready: std::sync::Condvar,
+}
+
+impl Gate {
+    pub fn new(permits: usize) -> Gate {
+        let permits = permits.max(1);
+        Gate { free: std::sync::Mutex::new(permits), total: permits, ready: std::sync::Condvar::new() }
+    }
+
+    /// Free and total, without blocking - a gauge for metrics.
+    pub fn permits(&self) -> (usize, usize) {
+        let free = *self.free.lock().unwrap_or_else(|p| p.into_inner());
+        (free, self.total)
+    }
+
+    /// Block until a permit is free, then hold it until the guard drops.
+    pub fn acquire(&self) -> Permit<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|p| p.into_inner());
+        while *free == 0 {
+            free = self.ready.wait(free).unwrap_or_else(|p| p.into_inner());
+        }
+        *free -= 1;
+        Permit { gate: self }
+    }
+}
+
+pub struct Permit<'a> {
+    gate: &'a Gate,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut free = self.gate.free.lock().unwrap_or_else(|p| p.into_inner());
+        *free += 1;
+        // One waiter, because one permit came back.
+        self.gate.ready.notify_one();
+    }
+}
+
+/// A gate per pool, built once from the resolved pools.
+pub struct Gates {
+    by_pool: std::collections::HashMap<String, Gate>,
+    pools: Pools,
+}
+
+impl Gates {
+    pub fn new(pools: Pools) -> Gates {
+        let by_pool = pools
+            .as_map()
+            .iter()
+            .map(|(name, limit)| (name.clone(), Gate::new(*limit)))
+            .collect();
+        Gates { by_pool, pools }
+    }
+
+    pub fn load(workspace: &Path) -> Gates {
+        Gates::new(Pools::load(workspace))
+    }
+
+    /// The pool a request resolves to, without waiting for it.
+    pub fn pool_for(&self, asked: &str) -> String {
+        self.pools.resolve(asked)
+    }
+
+    pub fn is_saturated(&self, pool: &str) -> bool {
+        self.by_pool.get(pool).map(|g| g.permits().0 == 0).unwrap_or(false)
+    }
+
+    /// Wait for a permit in the pool this pipeline asked for.
+    ///
+    /// Returns the pool it was admitted to and how long it waited.
+    pub fn acquire(&self, asked: &str) -> (Permit<'_>, String, u64) {
+        let pool = self.pools.resolve(asked);
+        let gate = self.by_pool.get(&pool).unwrap_or_else(|| {
+            self.by_pool.get(DEFAULT).expect("the default pool always exists")
+        });
+        let queued = std::time::Instant::now();
+        let permit = gate.acquire();
+        (permit, pool, queued.elapsed().as_millis() as u64)
+    }
+
+    /// Free and total per pool, sorted, for metrics.
+    pub fn permits(&self) -> Vec<(String, usize, usize)> {
+        let mut out: Vec<(String, usize, usize)> = self
+            .by_pool
+            .iter()
+            .map(|(name, gate)| {
+                let (free, total) = gate.permits();
+                (name.clone(), free, total)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
+/// The pool a pipeline document asks for, if any.
+///
+/// Read off the raw JSON so a document written by an older build, or one
+/// carrying the key at the top level as the issue spells it, is understood
+/// either way.
+pub fn requested(doc: &serde_json::Value) -> String {
+    doc.get("resourcePool")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ws(body: Option<&str>) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        if let Some(b) = body {
+            std::fs::create_dir_all(tmp.path().join(".duckle")).unwrap();
+            std::fs::write(workspace_path(tmp.path()), b).unwrap();
+        }
+        tmp
+    }
+
+    /// Serialises every test that reads or writes `DUCKLE_POOLS_FILE`.
+    ///
+    /// `set_var` is process-wide and cargo runs tests as threads in ONE
+    /// process, so a test holding the variable leaks it into any test that
+    /// expects it unset - which is not theoretical: it failed
+    /// `a_workspace_that_never_mentions_pools_behaves_as_before` on CI with
+    /// `names().count()` of 3, the 3 being default plus another test's heavy
+    /// and network, and reddened an unrelated pull request.
+    ///
+    /// Every `Pools::load` in these tests goes through [`load`] for that
+    /// reason. Taking the lock only in `with_server` would order the writers
+    /// against each other and still leave the readers exposed.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the lock and guarantees the variable is gone before it is
+    /// released - including when the closure panics, which would otherwise
+    /// leave the variable set for whichever test ran next.
+    struct EnvLock(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for EnvLock {
+        fn drop(&mut self) {
+            std::env::remove_var("DUCKLE_POOLS_FILE");
+        }
+    }
+
+    fn lock() -> EnvLock {
+        EnvLock(ENV.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// `DUCKLE_POOLS_FILE` set for the duration of one closure.
+    fn with_server(path: &str, f: impl FnOnce()) {
+        let _env = lock();
+        std::env::set_var("DUCKLE_POOLS_FILE", path);
+        f();
+    }
+
+    /// `Pools::load` with no server file in the environment, whoever else is
+    /// running.
+    fn load(ws: &std::path::Path) -> Pools {
+        let _env = lock();
+        Pools::load(ws)
+    }
+
+    #[test]
+    fn a_workspace_that_never_mentions_pools_behaves_as_before() {
+        let tmp = ws(None);
+        let p = load(tmp.path());
+        assert_eq!(p.resolve(""), DEFAULT);
+        assert_eq!(p.limit(DEFAULT), env_default());
+        assert_eq!(p.names().count(), 1);
+    }
+
+    #[test]
+    fn a_declared_pool_gets_its_own_limit() {
+        let tmp = ws(Some(r#"{"heavy":{"maxConcurrentRuns":1},"network":{"maxConcurrentRuns":8}}"#));
+        let p = load(tmp.path());
+        assert_eq!(p.limit("heavy"), 1);
+        assert_eq!(p.limit("network"), 8);
+        assert_eq!(p.resolve("network"), "network");
+        assert_eq!(p.resolve("unnamed"), DEFAULT);
+    }
+
+    #[test]
+    fn an_undeclared_pool_falls_back_rather_than_becoming_unbounded() {
+        // A pipeline naming a pool nobody defined must not thereby create one -
+        // that would be an opt-out from the protection pools exist to provide.
+        let tmp = ws(Some(r#"{"heavy":{"maxConcurrentRuns":1}}"#));
+        let p = load(tmp.path());
+        assert_eq!(p.resolve("unlimited"), DEFAULT);
+        assert_eq!(p.limit("unlimited"), p.limit(DEFAULT));
+    }
+
+    #[test]
+    fn a_workspace_may_ask_for_less_than_the_server_allows_and_never_more() {
+        let server = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            server.path(),
+            r#"{"heavy":{"maxConcurrentRuns":1},"network":{"maxConcurrentRuns":8}}"#,
+        )
+        .unwrap();
+        let tmp = ws(Some(
+            r#"{"heavy":{"maxConcurrentRuns":2},"network":{"maxConcurrentRuns":99},
+                "mine":{"maxConcurrentRuns":50}}"#,
+        ));
+        with_server(&server.path().display().to_string(), || {
+            let p = Pools::load(tmp.path());
+            assert_eq!(p.limit("network"), 8, "a workspace cannot widen a server pool");
+            assert_eq!(p.limit("heavy"), 1, "nor exceed it by asking for more");
+            assert_eq!(p.resolve("mine"), DEFAULT, "nor invent one the server does not have");
+            assert!(p.is_authoritative());
+        });
+    }
+
+    #[test]
+    fn a_workspace_can_throttle_itself_further_than_the_server() {
+        let server = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(server.path(), r#"{"network":{"maxConcurrentRuns":8}}"#).unwrap();
+        let tmp = ws(Some(r#"{"network":{"maxConcurrentRuns":2}}"#));
+        with_server(&server.path().display().to_string(), || {
+            assert_eq!(Pools::load(tmp.path()).limit("network"), 2);
+        });
+    }
+
+    #[test]
+    fn a_pool_of_zero_is_one_rather_than_a_deadlock() {
+        let tmp = ws(Some(r#"{"stuck":{"maxConcurrentRuns":0}}"#));
+        assert_eq!(load(tmp.path()).limit("stuck"), 1);
+    }
+
+    #[test]
+    fn an_unreadable_pool_file_leaves_the_default_intact() {
+        // Pools are an optimisation; a broken file must not stop a workspace
+        // from running anything at all.
+        let tmp = ws(Some("{ not json"));
+        assert_eq!(load(tmp.path()).limit(DEFAULT), env_default());
+    }
+
+    #[test]
+    fn a_gate_admits_exactly_its_permits_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut limits = BTreeMap::new();
+        limits.insert("heavy".to_string(), 1usize);
+        limits.insert("network".to_string(), 4usize);
+        let gates = std::sync::Arc::new(Gates::new(Pools::from_limits(limits)));
+        for (pool, cap) in [("heavy", 1usize), ("network", 4usize)] {
+            let peak = std::sync::Arc::new(AtomicUsize::new(0));
+            let live = std::sync::Arc::new(AtomicUsize::new(0));
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    let (gates, peak, live) = (gates.clone(), peak.clone(), live.clone());
+                    s.spawn(move || {
+                        let (_permit, got, _) = gates.acquire(pool);
+                        assert_eq!(got, pool);
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+            assert_eq!(peak.load(Ordering::SeqCst), cap, "pool {pool}");
+        }
+    }
+
+    #[test]
+    fn the_requested_pool_is_read_off_the_document() {
+        let doc = serde_json::json!({ "resourcePool": " heavy ", "nodes": [] });
+        assert_eq!(requested(&doc), "heavy");
+        assert_eq!(requested(&serde_json::json!({ "nodes": [] })), "");
+    }
+}

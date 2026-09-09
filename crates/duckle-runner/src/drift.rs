@@ -74,6 +74,11 @@ pub fn run() -> Result<i32, String> {
         .or_else(|| pipeline.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     let env_file = workspace.join("secrets.env");
+    // A saved connection is part of "the same way a headless run does": the CLI
+    // run path expands these BEFORE the env pass, so a connection field stored
+    // as ${ENV:...} still resolves below. Without it a drift check against a
+    // source behind a saved connection had no host to connect to.
+    duckle_secrets::resolve_connection_refs(&workspace, &mut doc.nodes)?;
     crate::apply_env_pass(&mut doc, &workspace, &env_file)?;
     context::apply_time_builtins(&mut doc);
     context::apply_workspace_context(&mut doc, &workspace);

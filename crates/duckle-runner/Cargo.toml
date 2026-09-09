@@ -14,6 +14,12 @@ name = "duckle-runner"
 path = "src/main.rs"
 
 [dependencies]
+# `follow` checks a stop flag between batches so Ctrl-C finishes the batch in
+# hand rather than leaving a sink half-written. Correctness does not depend on
+# it - a killed batch never advances the saved position - so this is purely
+# about not truncating output on the way out.
+ctrlc = "3"
+
 duckle-duckdb-engine = { workspace = true }
 duckle-secrets = { workspace = true }
 serde = { workspace = true }
@@ -27,7 +33,7 @@ aes-gcm = "0.11"
 sha2 = "0.11"
 # Console account tokens. A token can be chosen by a person, so it is hashed
 # as a password rather than as key material. Already in the workspace lock.
-argon2 = "0.5"
+argon2 = "0.6"
 # Console accounts, sessions and API keys. SQLite rather than a JSON file: the
 # stores are read on every request and written concurrently by `serve` and
 # `web`, which is what a transactional store is for. rusqlite (bundled) is
@@ -40,6 +46,12 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tokio = { workspace = true, features = ["net"] }
 base64 = "0.23"
 getrandom = "0.4"
+# #310: OIDC ID-token verification (RS256 over a JWKS key). Already in the tree
+# via the engine's Snowflake JWT signing, so no new dependency to the graph.
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
+# The shared HTTP transport lives in the engine and hands back a ureq Agent, so
+# the type has to be nameable here.
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
 ed25519-dalek = "3"
 # Self-extracting artifact payload (single-file build output). deflate-only
 # (drops aes/zstd/bzip2/lzma/xz); pulls flate2 rust_backend already in the lock.
@@ -52,7 +64,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # dynamic ODBC driver manager at runtime anyway. The engine returns a clear
 # "compiled without teradata" error on those targets.
 [target.'cfg(all(not(target_os = "macos"), not(target_env = "musl")))'.dependencies]
-duckle-duckdb-engine = { workspace = true, features = ["teradata"] }
+duckle-duckdb-engine = { workspace = true, features = ["teradata", "db2"] }
 
 # On gnu Linux, additionally link unixODBC statically so the per-OS runner
 # bundled in the desktop app needs no system libodbc.so.2 at runtime (issue
@@ -62,3 +74,19 @@ duckle-duckdb-engine = { workspace = true, features = ["teradata-static"] }
 
 [dev-dependencies]
 tempfile = "3"
+# #303: retention tests need files with a chosen mtime; already in the tree via
+# notify, so this adds no new dependency to the graph.
+filetime = "0.2"
+# #311 follow-up: the console has TWO request paths, a hand-rolled one and an
+# axum Router, and a bug that lives only in the router (a method fallback) is
+# invisible to every test that goes through the hand-rolled one - which is how
+# `DELETE /api/session` came to answer 405 with the whole suite green. `oneshot`
+# drives the real Router. Already in the tree via axum, so no new dependency.
+tower = { version = "0.5", features = ["util"] }
+
+
+# GHSA-58g9-237h-ch2g: geteuid, to tell an artifact cache directory this user
+# made from one somebody else planted. Windows has no uid to compare, so this is
+# unix-only. Already in the tree, and declared the same way by duckdb-engine.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

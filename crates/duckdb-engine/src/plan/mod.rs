@@ -15,11 +15,41 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Pipeline payload sent from the frontend. Just the nodes + edges
 /// directly - no wrapping metadata required for a run.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineDoc {
+    /// #299: which format this document is in. 0, the default, is every
+    /// pipeline written before the marker existed and is perfectly readable.
+    ///
+    /// It is carried on the struct rather than checked only at the file reader
+    /// because a document reaches the engine from six places, and a version
+    /// checked at five of them is worse than one checked nowhere - it reads as
+    /// covered.
+    #[serde(default, rename = "formatVersion", skip_serializing_if = "is_zero")]
+    pub format_version: u32,
     pub nodes: Vec<PipelineNode>,
     #[serde(default)]
     pub edges: Vec<PipelineEdge>,
+    /// #289: which admission pool this pipeline is queued in.
+    ///
+    /// A typed field rather than something each caller digs out of the raw
+    /// JSON, because a pool checked at four entry points out of five is worse
+    /// than one checked nowhere - an agent or an API call would bypass exactly
+    /// the protection scheduled runs get, which is the hole the issue names.
+    ///
+    /// Empty is the default pool, which is sized as it always was.
+    #[serde(default, rename = "resourcePool", skip_serializing_if = "String::is_empty")]
+    pub resource_pool: String,
+    /// #317: the typed parameter contract, when the pipeline declares one.
+    ///
+    /// Empty means the #127 behaviour is unchanged: any unresolved `${name}`
+    /// is prompted for as a string. Declared, it is validated once before
+    /// compilation and every surface gets the same answer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: crate::params::Schema,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Debug)]
@@ -32,6 +62,13 @@ pub struct Stage {
     /// For sinks: the upstream object name they read from, so the
     /// executor can report a row count.
     pub from: Option<String>,
+    /// Sinks in the same publish group become visible together or not at all.
+    ///
+    /// Scoped deliberately: one pipeline, one DuckLake catalog. There is no
+    /// honest two-phase commit across a lake and a Postgres, and a guarantee
+    /// that only sometimes holds is worse than none - so a combination that
+    /// cannot be honoured is REFUSED rather than quietly downgraded.
+    pub publish_group: Option<String>,
     /// For sinks: the output path + write mode, so the executor can
     /// enforce "error if exists" before writing.
     pub sink_path: Option<String>,
@@ -87,6 +124,17 @@ pub struct Stage {
     /// skips the per-stage count + preview (and the batched count marker) for
     /// these, the same way it does for nodes that never create a plain relation.
     pub no_output_relation: bool,
+    /// #252: this stage asked for its completed output to be reused when
+    /// nothing that produced it has changed. Opt-in, and only honoured for the
+    /// components in [`CACHEABLE_COMPONENTS`].
+    pub cache_output: bool,
+    /// The relation whose contents the cache key is taken from. `None` means
+    /// the stage has no upstream this pipeline can checksum, and caching is
+    /// refused rather than keyed on configuration alone.
+    pub cache_input_view: Option<String>,
+    /// Everything about the node, other than its input, that could change the
+    /// answer. Fixed at plan time.
+    pub cache_config_fp: String,
 }
 
 impl Stage {
@@ -110,6 +158,72 @@ impl Stage {
 /// The relation a run variable's value is kept in.
 ///
 /// Prefixed so it cannot be mistaken for, or collide with, a node's own relation.
+/// Kafka transport security from a node's props.
+///
+/// `security` names the protocol the way the Kafka ecosystem does; credentials
+/// come from the sasl* fields. Returns (tls, sasl). Both halves of the form
+/// were read by nothing before this, so a node configured for SASL_SSL
+/// connected in plaintext with no credentials and said nothing about it.
+/// #252 slice 1: the components whose completed output may be reused.
+///
+/// An allowlist rather than a denylist on purpose. Anything that writes
+/// somewhere, reads a clock, or talks to a queue produces a different answer
+/// the second time even with identical inputs, and a cache that returned the
+/// first answer would be wrong rather than fast. Adding a component here is a
+/// claim that it is a pure function of its inputs.
+const CACHEABLE_COMPONENTS: &[&str] = &[
+    "src.pdf",
+    "src.xml",
+    "src.html",
+    "code.python",
+    "code.javascript",
+    "code.wasm",
+];
+
+/// A column list the GUI may hand over either as an array or as the
+/// comma-separated string a hand-written pipeline uses.
+fn column_list(props: &JsonValue, key: &str) -> Vec<String> {
+    props
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .or_else(|| {
+            string_prop(props, key).map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn kafka_security(props: &JsonValue) -> (bool, Option<KafkaSasl>) {
+    let protocol = string_prop(props, "security")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let tls = matches!(protocol.as_str(), "ssl" | "sasl_ssl");
+    let user = string_prop(props, "saslUsername").filter(|s| !s.trim().is_empty());
+    // Credentials drive SASL, not the dropdown: someone who fills them in and
+    // leaves the protocol alone meant to authenticate.
+    let sasl = user.map(|username| KafkaSasl {
+        mechanism: string_prop(props, "saslMechanism")
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "PLAIN".to_string()),
+        username,
+        password: string_prop(props, "saslPassword").unwrap_or_default(),
+    });
+    (tls, sasl)
+}
+
 pub(crate) fn run_var_relation(name: &str) -> String {
     format!("duckle_var__{name}")
 }
@@ -229,6 +343,9 @@ pub enum RuntimeSpec {
         concurrency: usize,
         item_key: Option<String>,
         queue: bool,
+        /// Written into each queued item, so workers know how long to keep
+        /// retrying it without having to read the pipeline that queued it.
+        retry: Option<crate::batch::RetryPolicy>,
     },
     Parallelize(ParallelizeSpec),
     /// ctl.log / ctl.warn: emit a log line at `level` ("info" / "warn")
@@ -264,6 +381,8 @@ pub enum RuntimeSpec {
     DatabricksSource(DatabricksSourceSpec),
     RestSource(RestSourceSpec),
     ElasticSource(ElasticSourceSpec),
+    ManticoreSource(ManticoreSourceSpec),
+    ManticoreSink(ManticoreSinkSpec),
     MongoSink(MongoSinkSpec),
     HuggingFaceSink(HuggingFaceSinkSpec),
     MongoSource(MongoSourceSpec),
@@ -286,6 +405,19 @@ pub enum RuntimeSpec {
     AdbcSink(AdbcSinkSpec),
     TeradataSource(TeradataSourceSpec),
     TeradataSink(TeradataSinkSpec),
+    SpoolSource(SpoolSourceSpec),
+    ChangedSource(ChangedSourceSpec),
+    ArtifactCopy(ArtifactCopySpec),
+    ArchiveExtract(ArchiveExtractSpec),
+    Baseline(BaselineSpec),
+    DuckLakeMaintain(DuckLakeMaintainSpec),
+    Tumble(TumbleSpec),
+    Neo4jSource(Neo4jSourceSpec),
+    Neo4jSink(Neo4jSinkSpec),
+    TursoSource(TursoSourceSpec),
+    TursoSink(TursoSinkSpec),
+    Db2Source(Db2SourceSpec),
+    Db2Sink(Db2SinkSpec),
     AttachParquetSource(AttachParquetSourceSpec),
     /// materialize = "duckdb"/"duckdbfile": persist the stage into a DuckDB file.
     MaterializeDuckDb(MaterializeDuckDbSpec),
@@ -346,6 +478,7 @@ pub enum RuntimeSpec {
     Wasm(WasmSpec),
     Javascript(JavaScriptSpec),
     Python(PythonSpec),
+    Plugin(PluginSpec),
     AiChunk(AiChunkSpec),
     AiPii(AiPiiSpec),
     AiLlm(AiLlmSpec),
@@ -428,6 +561,66 @@ fn read_paths(sql: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// #305: replace a stage's work with a durable output somebody already made.
+///
+/// The retry case: `normalize` failed, `parse` succeeded and its output was
+/// recorded and verified, so this run reads that parquet as `parse` rather than
+/// re-deriving it - and `download`, which only `parse` read, is never staged at
+/// all.
+///
+/// Modelled on [`apply_stage_cache_in`], and for its stated reason: the stage
+/// keeps its own relation name, so nothing downstream can tell a bound output
+/// from a computed one. No edge, no consumer and no other stage is touched.
+///
+/// Three things are cleared along with the SQL, and each would otherwise make
+/// the stage do the work anyway:
+///
+/// - `runtime`, or the executor takes the runtime branch and ignores `sql`
+///   entirely;
+/// - `attach_view`, or it tries to ATTACH a source database this run never
+///   opened;
+/// - `from`, because a sink's row count reads it, and a bound stage is not a
+///   sink.
+///
+/// A sink is never bound. Its effect is outside the run and reading a file back
+/// does not repeat or undo it, so binding one would silently skip the write it
+/// exists to do.
+pub fn apply_output_bindings(stages: &mut [Stage], bindings: &std::collections::BTreeMap<String, String>) {
+    if bindings.is_empty() {
+        return;
+    }
+    for stage in stages.iter_mut() {
+        let Some(uri) = bindings.get(&stage.node_id) else { continue };
+        if stage.kind == StageKind::Sink || stage.no_output_relation {
+            continue;
+        }
+        stage.sql = format!(
+            "CREATE OR REPLACE VIEW {} AS SELECT * FROM read_parquet('{}')",
+            quote_ident(&stage.node_id),
+            uri.replace(char::from(92), "/").replace('\'', "''")
+        );
+        stage.runtime = None;
+        stage.attach_view = false;
+    }
+}
+
+/// #305: drop stages this run does not have to do at all.
+///
+/// A skipped node's consumers are all bound from files, so nothing in the plan
+/// reads its relation - that is the invariant the retry planner establishes by
+/// walking backwards from the ends and stopping at every binding. Without this,
+/// `skip` is a line in a report and the stage runs anyway, which is the gap
+/// between a plan and a run that this whole feature exists to close.
+///
+/// A sink is never dropped. It is an end, so the walk always reaches it, and
+/// dropping one would silently skip the write it exists to do.
+pub fn drop_stages(stages: &mut Vec<Stage>, skip: &std::collections::BTreeSet<String>) {
+    if skip.is_empty() {
+        return;
+    }
+    stages.retain(|s| s.kind == StageKind::Sink || !skip.contains(&s.node_id));
 }
 
 /// Materialise the stages that asked to be cached, and read back the ones already done.
@@ -567,7 +760,7 @@ fn apply_full_materialize(doc: &PipelineDoc) -> Option<PipelineDoc> {
         })
         .collect();
     let edges = doc.edges.iter().cloned().collect();
-    Some(PipelineDoc { nodes, edges })
+    Some(PipelineDoc { nodes, edges, ..doc.clone() })
 }
 
 pub fn compile_partial(
@@ -593,6 +786,13 @@ pub fn compile_partial(
         }
     }
     let filtered = PipelineDoc {
+        // Carried, not defaulted: a subgraph of a document is in the same
+        // format as the document.
+        format_version: pipeline.format_version,
+        // Carried for the same reason: a subgraph of a pipeline is queued in
+        // the pool the pipeline chose, not in the default one.
+        resource_pool: pipeline.resource_pool.clone(),
+        parameters: Default::default(),
         nodes: pipeline
             .nodes
             .iter()
@@ -606,6 +806,33 @@ pub fn compile_partial(
             .cloned()
             .collect(),
     };
+    // A publish group has to be checked against the WHOLE document, before the
+    // filtering above hides the members this run does not reach. Inside
+    // compile_impl the dropped members simply do not exist, so the group looks
+    // complete and would publish the half a backward walk happened to include.
+    let mut split: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
+    for n in &pipeline.nodes {
+        if n.data.component_id.as_deref() != Some("snk.ducklake") {
+            continue;
+        }
+        let props = n.data.properties.clone().unwrap_or(JsonValue::Null);
+        if let Some(g) = string_prop(&props, "publishGroup").filter(|g| !g.trim().is_empty()) {
+            let e = split.entry(g.trim().to_string()).or_insert((false, Vec::new()));
+            if keep.contains(&n.id) {
+                e.0 = true;
+            } else {
+                e.1.push(n.data.label.clone());
+            }
+        }
+    }
+    if let Some((group, (_, missing))) = split.iter().find(|(_, (kept, m))| *kept && !m.is_empty()) {
+        return Err(EngineError::Config(format!(
+            "publish group '{}' cannot be honoured: '{}' is a member but it is not part of this run - a partial run that contains only some of a group cannot publish the group. Run the whole pipeline, or take that sink out of the group.",
+            group,
+            missing.join("', '")
+        )));
+    }
+
     // SE-10: force upstream tables for a full-materialize Working DB (see helper).
     let filtered = apply_full_materialize(&filtered).unwrap_or(filtered);
     // Partial runs never batch (the executor only batches when target.is_none()),
@@ -635,6 +862,71 @@ const ATTACH_PARQUET_SOURCES: &[&str] = &[
     "src.delta",
 ];
 
+/// The GraphQL sources: one arm, one request shape.
+///
+/// Named rather than spelled out at each use so the planner, the capability
+/// registry and anything else asking the question cannot answer it differently.
+/// Linear and Monday are GraphQL-only APIs and get their own tiles; the engine
+/// treats all three identically.
+pub fn is_graphql_source(component_id: &str) -> bool {
+    matches!(component_id, "src.graphql" | "src.linear" | "src.monday")
+}
+
+/// Whether the engine performs an incremental (cursor) read for this component.
+///
+/// #330: the capability registry used to answer this by asking the MANIFEST -
+/// "it declares an incrementalColumn field, so it does incremental reads" -
+/// and published `Incremental = yes` for eight sources that cannot do it: four
+/// that errored on every run, and four that accepted a cursor and dropped it.
+/// This is the same list the planner branches on, so the registry and the
+/// executor cannot disagree about it again.
+///
+/// These are the generic REST source and its thin vendor aliases. They share
+/// one spec and one executor, which substitutes the saved mark into the
+/// request and writes the next one only after the run succeeds.
+pub fn reads_incremental(component_id: &str) -> bool {
+    matches!(
+        component_id,
+        // GraphQL and its two aliases ride the same spec and executor. The
+        // cursor goes into the serialized body, which for GraphQL is the query
+        // and its variables.
+        "src.graphql"
+            | "src.linear"
+            | "src.monday"
+            | "src.rest"
+            | "src.github"
+            | "src.gitlab"
+            | "src.airtable"
+            | "src.notion"
+            | "src.hubspot"
+            | "src.jira"
+            | "src.stripe"
+            | "src.sendgrid"
+            | "src.mailchimp"
+            | "src.pipedrive"
+            | "src.segment"
+            | "src.salesforce"
+            | "src.xero"
+            | "src.quickbooks"
+            | "src.zendesk"
+            | "src.shopify"
+            | "src.intercom"
+            | "src.couchdb"
+            | "src.odata"
+            | "src.sap"
+            | "src.sap.rfc"
+            | "src.soap"
+            | "src.asana"
+            | "src.trello"
+            | "src.clickup"
+            | "src.slack"
+            | "src.discord"
+            | "src.twilio"
+            | "src.telegram"
+            | "src.dhis2"
+    )
+}
+
 pub fn compile(pipeline: &PipelineDoc) -> Result<CompiledPipeline, EngineError> {
     // SE-10: force upstream tables for a full-materialize Working DB (see helper).
     match apply_full_materialize(pipeline) {
@@ -650,6 +942,21 @@ pub fn compile(pipeline: &PipelineDoc) -> Result<CompiledPipeline, EngineError> 
 /// in the source stage's process, would not exist when the next stage runs in
 /// its own process, giving `Catalog "duckle_src_..." does not exist` (#87).
 fn compile_impl(pipeline: &PipelineDoc, allow_view_upgrade: bool) -> Result<CompiledPipeline, EngineError> {
+    // #285: the environment's policy, enforced HERE rather than in a validation
+    // step. An agent that can write the pipeline can also invoke a path that
+    // skips validation, so the check belongs where a pipeline becomes something
+    // executable: a denied capability then has nowhere to run, instead of
+    // merely having failed a check somebody could route around.
+    //
+    // Read every time rather than cached. A cached security policy is a policy
+    // that can be stale, and the file is small next to the work a compile does.
+    let workspace = std::env::var("DUCKLE_WORKSPACE")
+        .ok()
+        .filter(|w| !w.is_empty())
+        .map(std::path::PathBuf::from);
+    let policy = crate::policy::load(workspace.as_deref())?;
+    crate::policy::enforce(&policy, pipeline)?;
+
     let node_index: HashMap<&str, &PipelineNode> = pipeline
         .nodes
         .iter()
@@ -1201,11 +1508,133 @@ fn compile_impl(pipeline: &PipelineDoc, allow_view_upgrade: bool) -> Result<Comp
 
     apply_stage_cache(pipeline, &mut stages);
 
+    prepare_publish_groups(pipeline, &mut stages, &excluded)?;
+
     Ok(CompiledPipeline { stages, leaves })
+}
+
+/// A publish group promises its sinks become visible together or not at all.
+///
+/// Three things quietly shrink a group - a disabled node, a member pulled into a
+/// `ctl.parallelize` branch, a "run from here" that starts below one of them -
+/// and a shrunken group is worse than no group, because the promise is still
+/// being made while a table silently drops out of it. So each of those REFUSES
+/// the run and says which member went missing and why. Refusing is loud and
+/// recoverable; publishing four of five tables and reporting success is not.
+fn prepare_publish_groups(
+    pipeline: &PipelineDoc,
+    stages: &mut [Stage],
+    excluded: &HashSet<String>,
+) -> Result<(), EngineError> {
+    // Declared in the document, whether or not it survived into the plan.
+    let mut declared: BTreeMap<String, Vec<&PipelineNode>> = BTreeMap::new();
+    for node in &pipeline.nodes {
+        if node.data.component_id.as_deref() != Some("snk.ducklake") {
+            continue;
+        }
+        let props = node.data.properties.clone().unwrap_or(JsonValue::Null);
+        if let Some(g) = string_prop(&props, "publishGroup").filter(|g| !g.trim().is_empty()) {
+            declared.entry(g.trim().to_string()).or_default().push(node);
+        }
+    }
+    if declared.is_empty() {
+        return Ok(());
+    }
+
+    let planned: HashSet<String> = stages
+        .iter()
+        .filter(|s| s.publish_group.is_some())
+        .map(|s| s.node_id.clone())
+        .collect();
+
+    for (group, members) in &declared {
+        for node in members {
+            if planned.contains(&node.id) {
+                continue;
+            }
+            let why = if node.data.disabled.unwrap_or(false) {
+                "it is disabled"
+            } else if excluded.contains(&node.id) {
+                "it was pulled into a ctl.parallelize branch, which runs as its own sub-pipeline and cannot share this run's transaction"
+            } else {
+                "it is not part of this run - a partial run that contains only some of a group cannot publish the group"
+            };
+            return Err(EngineError::Config(format!(
+                "publish group '{}' cannot be honoured: '{}' is a member but {}. Either include it or take it out of the group - publishing the rest would claim an atomicity that no longer holds.",
+                group,
+                node.data.label,
+                why
+            )));
+        }
+        // One transaction reaches one catalog. Two lakes are two commits, and
+        // no ordering of them makes both land or neither.
+        let mut lakes: Vec<(String, String)> = Vec::new();
+        for node in members {
+            let props = node.data.properties.clone().unwrap_or(JsonValue::Null);
+            let path = string_prop(&props, "path").unwrap_or_default();
+            let who = node.data.label.clone();
+            lakes.push((path, who));
+        }
+        if let Some((first, _)) = lakes.first().cloned() {
+            if let Some((other, who)) = lakes.iter().find(|(p, _)| *p != first) {
+                return Err(EngineError::Config(format!(
+                    "publish group '{}' spans two DuckLake catalogs ('{}' and '{}', the second on '{}'). One transaction commits to one catalog; two catalogs are two commits and cannot be made atomic together.",
+                    group, first, other, who
+                )));
+            }
+        }
+
+        // Every sink normally attaches the lake, writes, and detaches again. Inside
+        // a shared transaction that is wrong twice over: the second ATTACH collides
+        // on the alias, and a DETACH with the transaction's writes still uncommitted
+        // discards them. So the group attaches ONCE, on its first member, and the
+        // attachment stays open until the COMMIT the executor emits after the last.
+        //
+        // One attachment also keeps the whole group inside a single transaction
+        // participant, which is what makes the commit one snapshot rather than a
+        // race between two handles on the same catalog.
+        let props = members[0].data.properties.clone().unwrap_or(JsonValue::Null);
+        let prelude = builders::ducklake_attach(&props, false);
+        let detach = "DETACH duckle_dst;";
+        let mut seen_first = false;
+        for st in stages.iter_mut() {
+            if st.publish_group.as_deref() != Some(group.as_str()) {
+                continue;
+            }
+            let trimmed = st.sql.trim_end();
+            if let Some(rest) = trimmed.strip_suffix(detach) {
+                st.sql = rest.trim_end().to_string();
+            }
+            if seen_first {
+                if let Some(rest) = st.sql.strip_prefix(prelude.as_str()) {
+                    st.sql = rest.to_string();
+                }
+            }
+            seen_first = true;
+        }
+    }
+
+    // DuckDB allows one transaction to write to exactly ONE attached database.
+    // Stages between two group members create their relations in the run
+    // database, so a transaction spanning them dies with "a single transaction
+    // can only write to a single attached database" - verified, it is a hard
+    // error and not a warning.
+    //
+    // So the group's sinks are moved to the end, contiguously, keeping their
+    // relative order. That is safe for every plan that can reach this point: a
+    // group is only honoured on the batched path, the batched path requires
+    // every stage to be pure SQL, and a pure-SQL stage that is not a sink is a
+    // view definition - nothing after the group is waiting on it. The sort is
+    // stable, so the stages that move keep the order the planner gave them.
+    stages.sort_by_key(|s| s.publish_group.is_some());
+    Ok(())
 }
 
 mod graph;
 use graph::*;
+// #307: an external component publishes its rejects on the same contract
+// every built-in uses, so the connector layer needs the suffix by name.
+pub use graph::REJECT_SUFFIX;
 
 /// Key columns for a sink's "upsert" write mode, or empty for plain insert.
 /// Driver sinks (SQL Server / Oracle / Snowflake / Databricks) MERGE on these
@@ -1276,7 +1705,7 @@ fn snowflake_truncate_first(props: &JsonValue, component_id: &str) -> Result<boo
         Some("overwrite") | Some("replace") => {
             if !upsert_keys_from(props, component_id)?.is_empty() {
                 return Err(EngineError::Config(format!(
-                    "{}: writeMode overwrite empties the table, and upsert keys merge into                      what is already there. Choose one.",
+                    "{}: writeMode overwrite empties the table, and upsert keys merge into what is already there. Choose one.",
                     component_id
                 )));
             }
@@ -1368,6 +1797,66 @@ fn teradata_conn_string(props: &JsonValue) -> Result<String, EngineError> {
     Ok(parts.join(";"))
 }
 
+/// Build an IBM DB2 ODBC connection string from a node's props. Same
+/// precedence as Teradata: an explicit `connectionString` wins, otherwise a
+/// `dsn`, otherwise the friendly `driver` + `host` + `port` + `database`
+/// fields. DB2 needs DATABASE at connect time - unlike Teradata, where it only
+/// sets the default schema - so it is required in the friendly form. The
+/// result carries the password, so callers must never log it.
+fn db2_conn_string(props: &JsonValue) -> Result<String, EngineError> {
+    if let Some(cs) = string_prop(props, "connectionString").filter(|s| !s.is_empty()) {
+        return Ok(cs);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(dsn) = string_prop(props, "dsn").filter(|s| !s.is_empty()) {
+        parts.push(format!("DSN={}", dsn));
+    } else {
+        let driver = string_prop(props, "driver")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "IBM DB2 ODBC DRIVER".to_string());
+        let host = string_prop(props, "host")
+            .or_else(|| string_prop(props, "hostname"))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(
+                    "db2: host, or a dsn / connectionString, is required".into(),
+                )
+            })?;
+        let database = string_prop(props, "database")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(
+                    "db2: database is required (DB2 selects the database at connect time)".into(),
+                )
+            })?;
+        let port = props
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .or_else(|| string_prop(props, "port").and_then(|s| s.parse().ok()))
+            .unwrap_or(50000);
+        parts.push(format!("DRIVER={{{}}}", driver));
+        parts.push(format!("HOSTNAME={}", host));
+        parts.push(format!("PORT={}", port));
+        parts.push(format!("DATABASE={}", database));
+        // Without PROTOCOL the IBM driver assumes a local catalogued alias
+        // rather than a TCP connection, which fails with SQL1013N.
+        parts.push("PROTOCOL=TCPIP".to_string());
+    }
+    if let Some(u) = string_prop(props, "user")
+        .or_else(|| string_prop(props, "username"))
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!("UID={}", u));
+    }
+    if let Some(pw) = string_prop(props, "password").filter(|s| !s.is_empty()) {
+        parts.push(format!("PWD={}", pw));
+    }
+    if props.get("useSsl").and_then(|v| v.as_bool()).unwrap_or(false) {
+        parts.push("SECURITY=SSL".to_string());
+    }
+    Ok(parts.join(";"))
+}
+
 /// Sanitize a node id into a SQL-identifier-safe alias suffix (#76 per-source
 /// aliases). Non-alphanumeric chars become `_`; the `duckle_src_` prefix the
 /// caller prepends guarantees it never starts with a digit.
@@ -1407,6 +1896,60 @@ fn rename_token(sql: &str, from: &str, to: &str) -> String {
     out
 }
 
+/// The credentials a node needs to reach an artifact URI.
+///
+/// One reader for every node that can open one, so `src.pdf`, `src.xml` and
+/// `xf.artifact.copy` all take the same property names. Three readers would be
+/// three conventions that agree until one of them is changed.
+fn artifact_auth_from_props(props: &JsonValue) -> ArtifactAuth {
+    ArtifactAuth {
+        s3: crate::s3::S3Config::from_props(props),
+        headers: builders::headers_from_props(props),
+        user: string_prop(props, "user").filter(|s| !s.is_empty()),
+        password: string_prop(props, "password").filter(|s| !s.is_empty()),
+        private_key: string_prop(props, "privateKey").filter(|s| !s.is_empty()),
+        key_passphrase: string_prop(props, "keyPassphrase").filter(|s| !s.is_empty()),
+        host_fingerprint: string_prop(props, "hostFingerprint").filter(|s| !s.is_empty()),
+    }
+}
+
+/// A parser's optional artifact input.
+///
+/// `from_view` is None when nothing is wired in, which is what keeps every
+/// existing path-configured pipeline working unchanged.
+fn artifact_input_from_props(props: &JsonValue, from_view: Option<&str>) -> ArtifactInput {
+    ArtifactInput {
+        from_view: from_view.map(str::to_string),
+        uri_column: string_prop(props, "uriColumn")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "uri".to_string()),
+        sha_column: string_prop(props, "shaColumn")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "sha256".to_string()),
+        carry: props
+            .get("carryColumns")
+            .and_then(JsonValue::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .or_else(|| {
+                string_prop(props, "carryColumns").map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+            })
+            .unwrap_or_default(),
+        auth: artifact_auth_from_props(props),
+    }
+}
+
 fn build_stage(
     node: &PipelineNode,
     component_id: &str,
@@ -1437,6 +1980,7 @@ fn build_stage(
     let mut foreach_concurrency: usize = 1;
     let mut foreach_item_key: Option<String> = None;
     let mut foreach_queue = false;
+    let mut foreach_retry: Option<crate::batch::RetryPolicy> = None;
     // (level, message) for ctl.log / ctl.warn; (message, condition) for ctl.die.
     let mut log_spec: Option<(String, String)> = None;
     let mut die_spec: Option<(String, String)> = None;
@@ -1453,6 +1997,8 @@ fn build_stage(
     let mut databricks_source: Option<DatabricksSourceSpec> = None;
     let mut rest_source: Option<RestSourceSpec> = None;
     let mut elastic_source: Option<ElasticSourceSpec> = None;
+    let mut manticore_source: Option<ManticoreSourceSpec> = None;
+    let mut manticore_sink: Option<ManticoreSinkSpec> = None;
     let mut mongo_sink: Option<MongoSinkSpec> = None;
     let mut huggingface_sink: Option<HuggingFaceSinkSpec> = None;
     let mut mongo_source: Option<MongoSourceSpec> = None;
@@ -1474,6 +2020,19 @@ fn build_stage(
     let mut adbc_sink: Option<AdbcSinkSpec> = None;
     let mut teradata_source: Option<TeradataSourceSpec> = None;
     let mut teradata_sink: Option<TeradataSinkSpec> = None;
+    let mut spool_source: Option<SpoolSourceSpec> = None;
+    let mut changed_source: Option<ChangedSourceSpec> = None;
+    let mut artifact_copy: Option<ArtifactCopySpec> = None;
+    let mut archive_extract: Option<ArchiveExtractSpec> = None;
+    let mut baseline: Option<BaselineSpec> = None;
+    let mut ducklake_maintain: Option<DuckLakeMaintainSpec> = None;
+    let mut tumble: Option<TumbleSpec> = None;
+    let mut neo4j_source: Option<Neo4jSourceSpec> = None;
+    let mut neo4j_sink: Option<Neo4jSinkSpec> = None;
+    let mut turso_source: Option<TursoSourceSpec> = None;
+    let mut turso_sink: Option<TursoSinkSpec> = None;
+    let mut db2_source: Option<Db2SourceSpec> = None;
+    let mut db2_sink: Option<Db2SinkSpec> = None;
     let mut attach_parquet_source: Option<AttachParquetSourceSpec> = None;
     let mut materialize_duckdb: Option<MaterializeDuckDbSpec> = None;
     let mut redis_sink: Option<RedisSinkSpec> = None;
@@ -1525,6 +2084,7 @@ fn build_stage(
     let mut javascript: Option<JavaScriptSpec> = None;
     let mut jq: Option<JqSpec> = None;
     let mut python: Option<PythonSpec> = None;
+    let mut plugin: Option<PluginSpec> = None;
     let mut ai_chunk: Option<AiChunkSpec> = None;
     let mut ai_pii: Option<AiPiiSpec> = None;
     let mut ai_llm: Option<AiLlmSpec> = None;
@@ -2641,6 +3201,38 @@ fn build_stage(
             declared_schema: node.data.schema.clone(),
         });
         (String::new(), StageKind::View, None)
+    } else if component_id == "snk.manticore" {
+        // Manticore Search /bulk. NDJSON like Elasticsearch's, but the
+        // document rides INSIDE the action line, so it cannot reuse the
+        // webhook sink's ndjson_bulk shape - and Manticore reports a
+        // rejected batch as HTTP 200 with errors:true, which that shape
+        // would read as success. MUST come before the starts_with("snk.")
+        // catch-all below.
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let endpoint = string_prop(&props, "endpoint")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: endpoint required", component_id)))?;
+        let table = string_prop(&props, "table")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: table required", component_id)))?;
+        let action = match string_prop(&props, "writeMode").as_deref() {
+            Some("replace") => "replace",
+            _ => "insert",
+        };
+        manticore_sink = Some(ManticoreSinkSpec {
+            from_view: from_view.to_string(),
+            endpoint,
+            table,
+            action: action.to_string(),
+            batch_size: props
+                .get("batchSize")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1000) as usize,
+            username: string_prop(&props, "username").filter(|s| !s.is_empty()),
+            password: string_prop(&props, "password").filter(|s| !s.is_empty()),
+        });
+        (String::new(), StageKind::Sink, Some(from_view.to_string()))
     } else if component_id == "snk.elastic" || component_id == "snk.opensearch" {
         // Elasticsearch / OpenSearch bulk API:
         //   POST {host}/{index}/_bulk
@@ -2907,7 +3499,7 @@ fn build_stage(
         gizmosql_sink = Some(GizmoSqlSinkSpec {
             from_view: from_view.to_string(),
             host,
-            port: string_prop(&props, "port").and_then(|s| s.parse().ok()).unwrap_or(31337),
+            port: port_prop(&props, "port").unwrap_or(31337),
             username: string_prop(&props, "username").unwrap_or_default(),
             password: string_prop(&props, "password").unwrap_or_default(),
             tls: props.get("tls").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -2974,6 +3566,8 @@ fn build_stage(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| EngineError::Config(format!("{}: topic required", component_id)))?;
         kafka_sink = Some(KafkaSinkSpec {
+            tls: kafka_security(&props).0,
+            sasl: kafka_security(&props).1,
             from_view: from_view.to_string(),
             bootstrap_servers: bootstrap,
             topic,
@@ -3098,6 +3692,94 @@ fn build_stage(
             name,
         });
         (String::new(), StageKind::View, None)
+    // These three sinks MUST come before the starts_with("snk.") catch-all
+    // below. Placed after it they are unreachable, and the run fails with
+    // "not yet implemented" for a component the palette offers.
+    } else if component_id == "snk.neo4j" {
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let endpoint = string_prop(&props, "endpoint")
+            .or_else(|| string_prop(&props, "url"))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "{}: endpoint required (e.g. 'http://localhost:7474')",
+                    component_id
+                ))
+            })?;
+        let cypher = string_prop(&props, "cypher").filter(|s| !s.trim().is_empty());
+        // A label names the nodes being written, so it is required unless the
+        // user supplied their own Cypher that decides what to write.
+        let label = match string_prop(&props, "label").filter(|s| !s.is_empty()) {
+            Some(l) => l,
+            None if cypher.is_some() => String::new(),
+            None => {
+                return Err(EngineError::Config(format!(
+                    "{}: label required (or supply your own cypher)",
+                    component_id
+                )))
+            }
+        };
+        neo4j_sink = Some(Neo4jSinkSpec {
+            from_view: from_view.to_string(),
+            endpoint,
+            database: string_prop(&props, "database")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "neo4j".to_string()),
+            user: string_prop(&props, "user").filter(|s| !s.is_empty()),
+            password: string_prop(&props, "password").filter(|s| !s.is_empty()),
+            label,
+            merge_keys: columns_list(&props, "mergeKeys"),
+            cypher,
+            batch_size: props
+                .get("batchSize")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1000) as usize,
+        });
+        (String::new(), StageKind::Sink, Some(from_view.to_string()))
+    } else if component_id == "snk.turso" {
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let url = string_prop(&props, "url")
+            .or_else(|| string_prop(&props, "endpoint"))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: url required", component_id)))?;
+        let table = string_prop(&props, "tableName")
+            .or_else(|| string_prop(&props, "table"))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: tableName required", component_id)))?;
+        turso_sink = Some(TursoSinkSpec {
+            from_view: from_view.to_string(),
+            url,
+            auth_token: string_prop(&props, "authToken")
+                .or_else(|| string_prop(&props, "token"))
+                .filter(|s| !s.is_empty()),
+            table,
+            mode: string_prop(&props, "mode")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "append".to_string()),
+            batch_size: props
+                .get("batchSize")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(500) as usize,
+        });
+        (String::new(), StageKind::Sink, Some(from_view.to_string()))
+    } else if component_id == "snk.db2" {
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let table = string_prop(&props, "tableName")
+            .or_else(|| string_prop(&props, "table"))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: tableName required", component_id)))?;
+        db2_sink = Some(Db2SinkSpec {
+            from_view: from_view.to_string(),
+            conn_str: db2_conn_string(&props)?,
+            schema: string_prop(&props, "schema").filter(|s| !s.is_empty()),
+            table,
+            mode: string_prop(&props, "mode")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "append".to_string()),
+        });
+        (String::new(), StageKind::Sink, Some(from_view.to_string()))
     } else if component_id.starts_with("snk.") {
         let from_view = inputs
             .main()
@@ -3236,6 +3918,30 @@ fn build_stage(
             })
             .unwrap_or(1)
             .max(1) as usize;
+        // How long a queued item keeps being retried. Only meaningful for
+        // dispatch "queue" - an inline foreach runs each row once, in this run,
+        // and there is no later pass for a retry to happen on.
+        let num = |key: &str| -> u64 {
+            props
+                .get(key)
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                })
+                .unwrap_or(0)
+        };
+        let max_attempts = num("maxAttempts") as u32;
+        let initial_seconds = num("retryInitialSeconds");
+        if foreach_queue && (max_attempts > 0 || initial_seconds > 0) {
+            foreach_retry = Some(crate::batch::RetryPolicy {
+                max_attempts,
+                backoff: string_prop(&props, "retryBackoff")
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "fixed".into()),
+                initial_seconds,
+                max_seconds: num("retryMaxSeconds"),
+            });
+        }
         let sql = passthrough_view_sql(&node.id, from_view);
         (sql, StageKind::View, Some(from_view.to_string()))
     } else if component_id == "src.runevents" {
@@ -3626,6 +4332,36 @@ fn build_stage(
             ),
         };
         (copy, StageKind::Sink, Some(from_view.to_string()))
+    } else if component_id == "src.manticore" {
+        // Manticore Search /search. Elasticsearch's response shape, its own
+        // request shape: `table` in the body (not `index` in the path) and
+        // limit/offset (not size/from). Form: endpoint, table, query,
+        // limit, maxPages, username, password.
+        let endpoint = string_prop(&props, "endpoint")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: endpoint required", component_id)))?;
+        let table = string_prop(&props, "table")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: table required", component_id)))?;
+        manticore_source = Some(ManticoreSourceSpec {
+            node_id: node.id.clone(),
+            endpoint,
+            table,
+            query: string_prop(&props, "query").filter(|s| !s.trim().is_empty()),
+            limit: props
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1000),
+            max_pages: props
+                .get("maxPages")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(100),
+            username: string_prop(&props, "username").filter(|s| !s.is_empty()),
+            password: string_prop(&props, "password").filter(|s| !s.is_empty()),
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id == "src.elastic" || component_id == "src.opensearch" {
         // Elasticsearch / OpenSearch _search source. Form: endpoint,
         // index, apiKey, query (raw JSON DSL), size.
@@ -3833,7 +4569,27 @@ fn build_stage(
         let topic = string_prop(&props, "topic")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| EngineError::Config(format!("{}: topic required", component_id)))?;
+        // Avro decoding needs somewhere to fetch the schema from. Saying the
+        // messages are Avro and giving nowhere to look it up cannot work, so it
+        // fails here rather than handing back UTF-8 mangled bytes at run time.
+        let kafka_registry =
+            string_prop(&props, "schemaRegistryUrl").filter(|s| !s.trim().is_empty());
+        if string_prop(&props, "format").as_deref() == Some("avro") && kafka_registry.is_none() {
+            return Err(EngineError::Config(format!(
+                "{}: message format is Avro, so a Schema Registry URL is required to decode it",
+                component_id
+            )));
+        }
         kafka_source = Some(KafkaSourceSpec {
+            schema_registry_url: kafka_registry,
+            tls: kafka_security(&props).0,
+            sasl: kafka_security(&props).1,
+            // Off by default: turning it on changes where a run starts reading,
+            // which is not a decision to make on someone's behalf.
+            track_offset: props
+                .get("trackOffset")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
             node_id: node.id.clone(),
             bootstrap_servers: bootstrap,
             topic,
@@ -4209,26 +4965,60 @@ fn build_stage(
     } else if component_id == "src.pdf" {
         // #248: pages out of a document. Not SQL - DuckDB cannot open a PDF -
         // so this is a runtime hook that materialises the relation itself.
-        let path = string_prop(&props, "path")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| EngineError::Config(format!("{}: path required (a .pdf file, or a folder of them)", component_id)))?;
+        //
+        // #282: with something wired in, the documents are whatever the upstream
+        // rows name and `path` is not required. With nothing wired in it reads
+        // its configured path exactly as it always has, so every existing
+        // pipeline is untouched.
+        let upstream = inputs.main();
+        let path = string_prop(&props, "path").filter(|s| !s.is_empty());
+        if path.is_none() && upstream.is_none() {
+            return Err(EngineError::Config(format!(
+                "{}: needs either a path (a .pdf file, or a folder of them) or an upstream relation naming the documents to read",
+                component_id
+            )));
+        }
         pdf_source = Some(PdfSourceSpec {
             node_id: node.id.clone(),
-            path,
+            path: path.unwrap_or_default(),
+            input: artifact_input_from_props(&props, upstream),
+            concurrency: props
+                .get("concurrency")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                })
+                .unwrap_or(1)
+                .max(1) as usize,
+            on_error: string_prop(&props, "onError")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "fail".to_string()),
             recursive: props
                 .get("recursive")
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false),
             declared_schema: node.data.schema.clone(),
         });
+        // `from` stays None even with an input wired in: this node MATERIALISES
+        // its own relation, and `from` names the relation a stage READS. Setting
+        // it to the upstream made the downstream sink count - and write - the
+        // artifact rows instead of the pages.
         (String::new(), StageKind::View, None)
     } else if component_id == "src.html" {
         // #255: rows out of an HTML page. Not SQL - DuckDB cannot parse HTML -
         // so this is a runtime hook that materialises the relation itself, the
         // same shape as src.xml below.
-        let path = string_prop(&props, "path")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| EngineError::Config(format!("{}: path required (a file, or an http(s) URL)", component_id)))?;
+        // #282: with an upstream relation wired in the pages are whatever it
+        // names, so `path` is not required. With nothing wired in it reads its
+        // configured path exactly as it always has.
+        let upstream = inputs.main();
+        let path = string_prop(&props, "path").filter(|s| !s.is_empty());
+        if path.is_none() && upstream.is_none() {
+            return Err(EngineError::Config(format!(
+                "{}: needs either a path (a file, or an http(s) URL) or an upstream relation naming the pages to read",
+                component_id
+            )));
+        }
         let row_selector = string_prop(&props, "rowSelector")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -4288,9 +5078,28 @@ fn build_stage(
         let mut headers = headers_from_props(&props);
         push_rest_auth(&mut headers, &props);
         html_source = Some(HtmlSourceSpec {
+            next_page_selector: string_prop(&props, "nextPageSelector")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
+            next_page_attribute: string_prop(&props, "nextPageAttribute")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "href".to_string()),
+            max_pages: props
+                .get("maxPages")
+                .and_then(JsonValue::as_u64)
+                .filter(|n| *n > 0)
+                .unwrap_or(100),
+            raw_response_destination: string_prop(&props, "rawResponseDestination")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
+            input: artifact_input_from_props(&props, upstream),
+            on_error: string_prop(&props, "onError")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "fail".to_string()),
             transport: http_transport_from_props(&props),
             node_id: node.id.clone(),
-            path,
+            path: path.unwrap_or_default(),
             row_selector,
             columns,
             headers,
@@ -4302,12 +5111,40 @@ fn build_stage(
         // walk from the root (e.g. "library/books/book"). Each match
         // becomes a JSON object with attributes prefixed '@', text in
         // '_text', and child elements nested.
-        let path = string_prop(&props, "path")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| EngineError::Config(format!("{}: path required", component_id)))?;
+        // #282: with an upstream relation wired in, the documents are whatever
+        // that relation names and `path` is not required. With nothing wired in
+        // it reads its configured path exactly as it always has, so every
+        // existing pipeline is untouched.
+        let upstream = inputs.main();
+        let path = string_prop(&props, "path").filter(|s| !s.is_empty());
+        if path.is_none() && upstream.is_none() {
+            return Err(EngineError::Config(format!(
+                "{}: needs either a path or an upstream relation naming the documents to read",
+                component_id
+            )));
+        }
         xml_source = Some(XmlSourceSpec {
+                xsd_path: string_prop(&props, "xsdPath").unwrap_or_default(),
+            xsd_change_policy: string_prop(&props, "xsdChangePolicy")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "warn".to_string()),
+            input: artifact_input_from_props(&props, upstream),
+            on_error: string_prop(&props, "onError")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "fail".to_string()),
+            // 250k rows per part: big enough that the per-part DuckDB call is
+            // noise against the parse, small enough that the uncompressed
+            // intermediate stays bounded.
+            batch_rows: props
+                .get("batchRows")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                })
+                .filter(|n| *n > 0)
+                .unwrap_or(250_000) as usize,
             node_id: node.id.clone(),
-            path,
+            path: path.unwrap_or_default(),
             // The GUI historically wrote this under `rootPath` while the engine
             // only ever read `rowPath`, so GUI-configured XML never picked up
             // the path. The manifest now writes `rowPath`; accept `rootPath` as
@@ -4372,7 +5209,7 @@ fn build_stage(
         gizmosql_source = Some(GizmoSqlSourceSpec {
             node_id: node.id.clone(),
             host,
-            port: string_prop(&props, "port").and_then(|s| s.parse().ok()).unwrap_or(31337),
+            port: port_prop(&props, "port").unwrap_or(31337),
             username: string_prop(&props, "username").unwrap_or_default(),
             password: string_prop(&props, "password").unwrap_or_default(),
             tls: props.get("tls").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -4540,6 +5377,437 @@ fn build_stage(
             encrypt: props.get("encrypt").and_then(|v| v.as_bool()).unwrap_or(true),
         });
         (String::new(), StageKind::View, None)
+    } else if component_id == "src.ducklake.maintain" {
+        // #279: a thin surface over DuckLake's own maintenance functions. The
+        // options are that function's options - nothing here invents storage
+        // semantics, and an operation this build's DuckLake does not have fails
+        // with DuckDB's own message rather than a guess of ours.
+        let operation = string_prop(&props, "operation")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "stats".to_string());
+        const OPERATIONS: &[&str] = &[
+            "compact",
+            "rewrite",
+            "expireSnapshots",
+            "cleanupFiles",
+            "deleteOrphans",
+            "flushInlined",
+            "stats",
+        ];
+        if !OPERATIONS.contains(&operation.as_str()) {
+            return Err(EngineError::Config(format!(
+                "{}: unknown operation '{}' - expected one of {}",
+                component_id,
+                operation,
+                OPERATIONS.join(", ")
+            )));
+        }
+        let dry_run = props.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+        // DuckLake offers dry_run on the three destructive operations only.
+        // Accepting it elsewhere would let someone tick "dry run" on a
+        // compaction and have it rewrite their files anyway.
+        const DRY_RUNNABLE: &[&str] = &["expireSnapshots", "cleanupFiles", "deleteOrphans"];
+        if dry_run && !DRY_RUNNABLE.contains(&operation.as_str()) {
+            return Err(EngineError::Config(format!(
+                "{}: '{}' has no dry run in DuckLake, so ticking it would be ignored and the operation would happen anyway. Dry run is available on: {}",
+                component_id,
+                operation,
+                DRY_RUNNABLE.join(", ")
+            )));
+        }
+        let num = |key: &str| -> Option<u64> {
+            props.get(key).and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            })
+        };
+        let attach = builders::ducklake_attach(&props, false);
+        if attach.is_empty() {
+            return Err(EngineError::Config(format!(
+                "{}: path required - the DuckLake catalog to maintain",
+                component_id
+            )));
+        }
+        ducklake_maintain = Some(DuckLakeMaintainSpec {
+            node_id: node.id.clone(),
+            attach,
+            catalog_path: string_prop(&props, "path").unwrap_or_default(),
+            operation,
+            schema_name: string_prop(&props, "schemaName").filter(|s| !s.trim().is_empty()),
+            table_name: string_prop(&props, "tableName").filter(|s| !s.trim().is_empty()),
+            dry_run,
+            older_than: string_prop(&props, "olderThan").filter(|s| !s.trim().is_empty()),
+            versions: string_prop(&props, "versions").filter(|s| !s.trim().is_empty()),
+            cleanup_all: props
+                .get("cleanupAll")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            min_file_size: num("minFileSize"),
+            max_file_size: num("maxFileSize"),
+            max_compacted_files: num("maxCompactedFiles"),
+            delete_threshold: props.get("deleteThreshold").and_then(|v| {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+            }),
+        });
+        (String::new(), StageKind::View, None)
+    } else if component_id == "qa.baseline" {
+        // #281: the failure that stays green. Every row can be structurally
+        // valid while the dataset is nothing like what normally arrives, and
+        // that publishes successfully.
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let list = |key: &str| -> Vec<String> {
+            props
+                .get(key)
+                .and_then(JsonValue::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .or_else(|| {
+                    string_prop(&props, key).map(|s| {
+                        s.split(',')
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                })
+                .unwrap_or_default()
+        };
+        let rules: Vec<BaselineRule> = props
+            .get("rules")
+            .and_then(JsonValue::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let num = |k: &str| -> Option<f64> {
+                            r.get(k).and_then(|v| {
+                                v.as_f64()
+                                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                            })
+                        };
+                        Some(BaselineRule {
+                            metric: r
+                                .get("metric")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("row_count")
+                                .to_string(),
+                            column: r
+                                .get("column")
+                                .and_then(JsonValue::as_str)
+                                .map(str::to_string)
+                                .filter(|c| !c.trim().is_empty()),
+                            max_decrease_pct: num("maxDecreasePct"),
+                            max_increase_pct: num("maxIncreasePct"),
+                            max_increase: num("maxIncrease"),
+                            max_decrease: num("maxDecrease"),
+                            max_difference: num("maxDifference"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        baseline = Some(BaselineSpec {
+            node_id: node.id.clone(),
+            from_view: from_view.to_string(),
+            history: props
+                .get("history")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                })
+                .filter(|n| *n > 0)
+                .unwrap_or(7) as usize,
+            columns: list("columns"),
+            group_by: list("groupBy"),
+            require_existing_groups: props
+                .get("requireExistingGroups")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            rules,
+            mode: string_prop(&props, "mode")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "gate".to_string()),
+        });
+        (String::new(), StageKind::View, Some(from_view.to_string()))
+    } else if component_id == "xf.archive.extract" {
+        // #284: one artifact in, one artifact per member out. Generic on
+        // purpose - a ZIP of CSVs and a TAR of JSON differ only in how the
+        // members are found, and each member then flows into whichever parser
+        // suits it.
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        let globs = |key: &str| -> Vec<String> {
+            props
+                .get(key)
+                .and_then(JsonValue::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .or_else(|| {
+                    string_prop(&props, key).map(|s| {
+                        s.split(',')
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                })
+                .unwrap_or_default()
+        };
+        let num = |key: &str| -> Option<u64> {
+            props.get(key).and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            })
+        };
+        archive_extract = Some(ArchiveExtractSpec {
+            node_id: node.id.clone(),
+            input: artifact_input_from_props(&props, Some(from_view)),
+            destination: string_prop(&props, "destination")
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    EngineError::Config(format!(
+                        "{}: destination required - an s3:// prefix or a local directory",
+                        component_id
+                    ))
+                })?,
+            naming: string_prop(&props, "naming")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "preserve".to_string()),
+            if_exists: string_prop(&props, "ifExists")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "skip".to_string()),
+            part_size_bytes: num("partSizeMb")
+                .filter(|n| *n > 0)
+                .map(|n| (n as usize) * 1024 * 1024)
+                .unwrap_or(8 * 1024 * 1024)
+                .max(5 * 1024 * 1024),
+            include: globs("include"),
+            exclude: globs("exclude"),
+            max_members: num("maxMembers").filter(|n| *n > 0).unwrap_or(10_000) as usize,
+            // 50 GiB. Generous for real data and still a bound: without one, a
+            // 1 MB archive can fill the volume, and an archive from an external
+            // publisher is untrusted input.
+            max_uncompressed_bytes: num("maxUncompressedGb")
+                .filter(|n| *n > 0)
+                .map(|n| n * 1024 * 1024 * 1024)
+                .unwrap_or(50 * 1024 * 1024 * 1024),
+            on_error: string_prop(&props, "onError")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "fail".to_string()),
+        });
+        (String::new(), StageKind::View, Some(from_view.to_string()))
+    } else if component_id == "xf.artifact.copy" {
+        // #247: land the BYTES of the artifacts named upstream somewhere durable
+        // and emit a row per landed copy, so a change feed becomes a raw zone
+        // without a shell stage in the middle.
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        artifact_copy = Some(ArtifactCopySpec {
+            node_id: node.id.clone(),
+            from_view: from_view.to_string(),
+            uri_column: string_prop(&props, "uriColumn")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "uri".to_string()),
+            destination: string_prop(&props, "destination")
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    EngineError::Config(format!(
+                        "{}: destination required - an s3:// prefix or a local directory",
+                        component_id
+                    ))
+                })?,
+            naming: string_prop(&props, "naming")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "keep".to_string()),
+            if_exists: string_prop(&props, "ifExists")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "skip".to_string()),
+            // 8 MiB: above S3's 5 MiB floor for a non-final part, and the
+            // ceiling on how much of any one object is ever in memory.
+            part_size_bytes: props
+                .get("partSizeMb")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .map(|n| (n as usize) * 1024 * 1024)
+                .unwrap_or(8 * 1024 * 1024)
+                .max(5 * 1024 * 1024),
+            auth: artifact_auth_from_props(&props),
+        });
+        (String::new(), StageKind::View, Some(from_view.to_string()))
+    } else if component_id == "xf.tumble" {
+        let from_view = inputs.main().ok_or_else(|| missing_input(node, "main"))?;
+        tumble = Some(TumbleSpec {
+            node_id: node.id.clone(),
+            from_view: from_view.to_string(),
+            time_column: string_prop(&props, "timeColumn")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    EngineError::Config(format!("{}: timeColumn required", component_id))
+                })?,
+            size: string_prop(&props, "size")
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    EngineError::Config(format!(
+                        "{}: size required, as a DuckDB interval like \"1 hour\"",
+                        component_id
+                    ))
+                })?,
+            allowed_lateness: string_prop(&props, "allowedLateness")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "0 seconds".to_string()),
+        });
+        (String::new(), StageKind::View, None)
+    } else if component_id == "src.changed" {
+        // Metadata-only poll. The point is not to pay for the object to find
+        // out whether it was needed.
+        let uri = string_prop(&props, "uri")
+            .or_else(|| string_prop(&props, "url"))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: uri required", component_id)))?;
+        changed_source = Some(ChangedSourceSpec {
+            node_id: node.id.clone(),
+            uri,
+            listing: props
+                .get("listing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            suffix: string_prop(&props, "suffix").filter(|s| !s.is_empty()),
+            max_entries: props
+                .get("maxEntries")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(1000) as usize,
+            track_state: props
+                .get("trackState")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            user: string_prop(&props, "user").filter(|s| !s.is_empty()),
+            password: string_prop(&props, "password").filter(|s| !s.is_empty()),
+            private_key: string_prop(&props, "privateKey").filter(|s| !s.is_empty()),
+            key_passphrase: string_prop(&props, "keyPassphrase").filter(|s| !s.is_empty()),
+            host_fingerprint: string_prop(&props, "hostFingerprint").filter(|s| !s.is_empty()),
+            headers: headers_from_props(&props),
+            // A saved connection has already been merged onto these props by
+            // resolve_connection_refs, so picking a stored S3 connection and
+            // typing the keys in by hand reach here identically.
+            s3: crate::s3::S3Config::from_props(&props),
+        });
+        (String::new(), StageKind::View, None)
+    } else if component_id == "src.spool" {
+        // Append-only NDJSON tailer. Pairs with `duckle-runner listen`, which
+        // keeps a webhook or WebSocket listener up and writes here, so nothing
+        // is lost between pipeline runs.
+        spool_source = Some(SpoolSourceSpec {
+            node_id: node.id.clone(),
+            path: string_prop(&props, "path")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| EngineError::Config(format!("{}: path required", component_id)))?,
+            track_offset: props
+                .get("trackOffset")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            max_bytes: props
+                .get("maxBytes")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(64 * 1024 * 1024),
+        });
+        (String::new(), StageKind::View, None)
+    } else if component_id == "src.neo4j" {
+        // Neo4j read over the HTTP Query API. Bolt would need a driver crate
+        // and a second wire protocol; the Query API returns the whole result
+        // set as JSON, which is what materializing a relation needs.
+        let endpoint = string_prop(&props, "endpoint")
+            .or_else(|| string_prop(&props, "url"))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: endpoint required", component_id)))?;
+        let cypher = string_prop(&props, "cypher")
+            .or_else(|| string_prop(&props, "query"))
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: cypher required", component_id)))?;
+        // Parameters may arrive as a JSON object or as a JSON string typed
+        // into a textarea; accept both rather than silently ignoring the text.
+        let parameters = match props.get("parameters") {
+            Some(JsonValue::Object(o)) => Some(JsonValue::Object(o.clone())),
+            Some(JsonValue::String(s)) if !s.trim().is_empty() => Some(
+                serde_json::from_str(s).map_err(|e| {
+                    EngineError::Config(format!("{}: parameters is not valid JSON: {}", component_id, e))
+                })?,
+            ),
+            _ => None,
+        };
+        neo4j_source = Some(Neo4jSourceSpec {
+            node_id: node.id.clone(),
+            endpoint,
+            database: string_prop(&props, "database")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "neo4j".to_string()),
+            user: string_prop(&props, "user").filter(|s| !s.is_empty()),
+            password: string_prop(&props, "password").filter(|s| !s.is_empty()),
+            cypher,
+            parameters,
+        });
+        (String::new(), StageKind::View, None)
+    } else if component_id == "src.turso" {
+        let url = string_prop(&props, "url")
+            .or_else(|| string_prop(&props, "endpoint"))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Config(format!("{}: url required", component_id)))?;
+        let query = string_prop(&props, "query")
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let table = string_prop(&props, "tableName")
+                    .or_else(|| string_prop(&props, "table"))
+                    .filter(|s| !s.is_empty())?;
+                Some(format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+            })
+            .ok_or_else(|| {
+                EngineError::Config(format!("{}: query or tableName required", component_id))
+            })?;
+        turso_source = Some(TursoSourceSpec {
+            node_id: node.id.clone(),
+            url,
+            auth_token: string_prop(&props, "authToken")
+                .or_else(|| string_prop(&props, "token"))
+                .filter(|s| !s.is_empty()),
+            query,
+        });
+        (String::new(), StageKind::View, None)
+    } else if component_id == "src.db2" {
+        let query = string_prop(&props, "query")
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let table = string_prop(&props, "tableName")
+                    .or_else(|| string_prop(&props, "table"))
+                    .filter(|s| !s.is_empty())?;
+                let qualified = match string_prop(&props, "schema").filter(|s| !s.is_empty()) {
+                    Some(sch) => format!("{}.{}", sch, table),
+                    None => table,
+                };
+                Some(format!("SELECT * FROM {}", qualified))
+            })
+            .ok_or_else(|| {
+                EngineError::Config(format!("{}: query or tableName required", component_id))
+            })?;
+        db2_source = Some(Db2SourceSpec {
+            node_id: node.id.clone(),
+            conn_str: db2_conn_string(&props)?,
+            query,
+            batch_rows: props
+                .get("batchSize")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(5000) as usize,
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id == "src.clickhouse" {
         let endpoint = string_prop(&props, "endpoint")
             .filter(|s| !s.is_empty())
@@ -4632,7 +5900,7 @@ fn build_stage(
             path,
         });
         (String::new(), StageKind::View, None)
-    } else if matches!(component_id, "src.graphql" | "src.linear" | "src.monday") {
+    } else if is_graphql_source(component_id) {
         // GraphQL source + Linear alias: POST {query, variables} to
         // the endpoint, walk the response data path. Rides
         // RestSourceSpec. Linear's API is exclusively GraphQL so the
@@ -4664,8 +5932,33 @@ fn build_stage(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "/data".into());
         rest_source = Some(RestSourceSpec {
+            raw_auth: artifact_auth_from_props(&props),
+            // This is the fixed-endpoint form (a vendor alias), which never
+            // fans out, so there is nothing to run in parallel and no parent
+            // that could fail on its own.
+            checkpoint: false,
+            // #330: these were hardcoded away, and the form offers both -
+            // synthApiSource draws src.graphql, src.linear and src.monday, so
+            // the box was there, the value was accepted, and no cursor ever
+            // reached the wire. Every run re-fetched everything and nothing
+            // said so. They ride the same RestSourceSpec and the same executor
+            // as src.rest, which substitutes {incremental} into the serialized
+            // body - and a GraphQL request IS a body, so the placeholder works
+            // inside the query text or a variables value.
+            //
+            // As with src.rest, the mark only advances if responsePath points
+            // at the record array rather than at the response envelope.
+            incremental_field: string_prop(&props, "incrementalField")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            incremental_initial: string_prop(&props, "incrementalInitial").unwrap_or_default(),
+            concurrency: 1,
+            on_parent_error: "fail".to_string(),
             transport: http_transport_from_props(&props),
             node_id: node.id.clone(),
+            raw_response_destination: string_prop(&props, "rawResponseDestination")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
             response_metadata: props
                 .get("responseMetadata")
                 .and_then(JsonValue::as_bool)
@@ -4795,42 +6088,16 @@ fn build_stage(
             parent_key_column: None,
             max_requests: 1000,
             infor_generic: true,
+            raw_auth: artifact_auth_from_props(&props),
+            checkpoint: false,
+            incremental_field: None,
+            incremental_initial: String::new(),
+            concurrency: 1,
+            on_parent_error: "fail".to_string(),
+            raw_response_destination: String::new(),
         });
         (String::new(), StageKind::View, None)
-    } else if matches!(
-        component_id,
-        "src.rest"
-            | "src.github"
-            | "src.gitlab"
-            | "src.airtable"
-            | "src.notion"
-            | "src.hubspot"
-            | "src.jira"
-            | "src.stripe"
-            | "src.sendgrid"
-            | "src.mailchimp"
-            | "src.pipedrive"
-            | "src.segment"
-            | "src.salesforce"
-            | "src.xero"
-            | "src.quickbooks"
-            | "src.zendesk"
-            | "src.shopify"
-            | "src.intercom"
-            | "src.couchdb"
-            | "src.odata"
-            | "src.sap"
-            | "src.sap.rfc"
-            | "src.soap"
-            | "src.asana"
-            | "src.trello"
-            | "src.clickup"
-            | "src.slack"
-            | "src.discord"
-            | "src.twilio"
-            | "src.telegram"
-            | "src.dhis2"
-    ) {
+    } else if reads_incremental(component_id) {
         // Generic REST source + thin vendor aliases. Vendors share
         // the same plumbing - the palette/form pre-fills url, auth
         // scheme, and pagination for the well-known APIs so users
@@ -5032,6 +6299,9 @@ fn build_stage(
             None
         };
         rest_source = Some(RestSourceSpec {
+            raw_response_destination: string_prop(&props, "rawResponseDestination")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
             transport: http_transport_from_props(&props),
             node_id: node.id.clone(),
             response_metadata: props
@@ -5054,6 +6324,24 @@ fn build_stage(
             from_view: rest_from_view,
             url_template: rest_url_template,
             parent_key_column: string_prop(&props, "parentKeyColumn").filter(|s| !s.is_empty()),
+            raw_auth: artifact_auth_from_props(&props),
+            checkpoint: props
+                .get("checkpoint")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            incremental_field: string_prop(&props, "incrementalField")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            incremental_initial: string_prop(&props, "incrementalInitial").unwrap_or_default(),
+            concurrency: props
+                .get("concurrency")
+                .and_then(JsonValue::as_u64)
+                .map(|v| v.clamp(1, 64) as usize)
+                .unwrap_or(1),
+            on_parent_error: string_prop(&props, "onParentError")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "fail".to_string()),
             max_requests: props
                 .get("maxRequests")
                 .and_then(|v| v.as_u64())
@@ -5223,6 +6511,18 @@ fn build_stage(
                 .unwrap_or_else(|| "fail".into()),
         });
         (String::new(), StageKind::View, None)
+    } else if component_id.starts_with("ext.") {
+        // #307: an external component. Its ports and properties come from its
+        // manifest, which the catalog already merged, so nothing here needs to
+        // know what the component does - only how to hand it its input and take
+        // its output back.
+        plugin = Some(PluginSpec {
+            node_id: node.id.clone(),
+            component_id: component_id.to_string(),
+            from_view: inputs.main().map(|v| v.to_string()),
+            properties: props.clone(),
+        });
+        (String::new(), StageKind::View, None)
     } else if component_id == "code.python" {
         // Per-row Python transform. Script must define process(row) -> dict.
         // The scripts-group manifest stores the body under `code`; accept `script`
@@ -5382,6 +6682,13 @@ fn build_stage(
             )));
         }
         ai_classify = Some(AiClassifySpec {
+            budget: AiBudgetSpec::read(&props),
+            checkpoint: props
+                .get("checkpoint")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            checkpoint_key: column_list(&props, "checkpointKey"),
+            checkpoint_fingerprint: column_list(&props, "checkpointFingerprint"),
             node_id: node.id.clone(),
             from_view: from_view.to_string(),
             input_column: string_prop(&props, "inputColumn")
@@ -5426,7 +6733,14 @@ fn build_stage(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| EngineError::Config(format!("{}: apiKey required", component_id)))?;
         ai_llm = Some(AiLlmSpec {
+            budget: AiBudgetSpec::read(&props),
             node_id: node.id.clone(),
+            checkpoint: props
+                .get("checkpoint")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            checkpoint_key: column_list(&props, "checkpointKey"),
+            checkpoint_fingerprint: column_list(&props, "checkpointFingerprint"),
             from_view: from_view.to_string(),
             input_column: string_prop(&props, "inputColumn")
                 .filter(|s| !s.is_empty())
@@ -5468,6 +6782,27 @@ fn build_stage(
                 .unwrap_or(3) as u32,
             // #258: only sent when the user actually set it, so a pipeline
             // that never touched the field still sends no max_tokens.
+            response_format: match string_prop(&props, "responseFormat")
+                .unwrap_or_default()
+                .trim()
+            {
+                "json_object" => AiResponseFormat::JsonObject,
+                "json_schema" => AiResponseFormat::JsonSchema,
+                _ => AiResponseFormat::Text,
+            },
+            json_schema: string_prop(&props, "jsonSchema").unwrap_or_default(),
+            schema_name: string_prop(&props, "schemaName")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "extraction".to_string()),
+            expand_columns: props
+                .get("expandColumns")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            on_invalid: match string_prop(&props, "onInvalid").unwrap_or_default().trim() {
+                "null" => AiOnInvalid::Null,
+                _ => AiOnInvalid::Fail,
+            },
             max_tokens: props
                 .get("maxTokens")
                 .and_then(|v| v.as_u64())
@@ -5487,6 +6822,13 @@ fn build_stage(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| EngineError::Config(format!("{}: apiKey required (OpenAI / compatible)", component_id)))?;
         ai_embed = Some(AiEmbedSpec {
+            budget: AiBudgetSpec::read(&props),
+            checkpoint: props
+                .get("checkpoint")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            checkpoint_key: column_list(&props, "checkpointKey"),
+            checkpoint_fingerprint: column_list(&props, "checkpointFingerprint"),
             node_id: node.id.clone(),
             from_view: from_view.to_string(),
             input_column: string_prop(&props, "inputColumn")
@@ -5852,6 +7194,7 @@ fn build_stage(
                 concurrency: foreach_concurrency,
                 item_key: foreach_item_key.clone(),
                 queue: foreach_queue,
+                retry: foreach_retry.clone(),
             }))
         .or_else(|| log_spec.map(|(level, message)| RuntimeSpec::Log { level, message }))
         .or_else(|| die_spec.map(|(message, condition)| RuntimeSpec::Die { message, condition }))
@@ -5870,6 +7213,8 @@ fn build_stage(
         .or_else(|| databricks_source.map(RuntimeSpec::DatabricksSource))
         .or_else(|| rest_source.map(RuntimeSpec::RestSource))
         .or_else(|| elastic_source.map(RuntimeSpec::ElasticSource))
+        .or_else(|| manticore_source.map(RuntimeSpec::ManticoreSource))
+        .or_else(|| manticore_sink.map(RuntimeSpec::ManticoreSink))
         .or_else(|| mongo_sink.map(RuntimeSpec::MongoSink))
         .or_else(|| huggingface_sink.map(RuntimeSpec::HuggingFaceSink))
         .or_else(|| mongo_source.map(RuntimeSpec::MongoSource))
@@ -5891,6 +7236,19 @@ fn build_stage(
         .or_else(|| adbc_sink.map(RuntimeSpec::AdbcSink))
         .or_else(|| teradata_source.map(RuntimeSpec::TeradataSource))
         .or_else(|| teradata_sink.map(RuntimeSpec::TeradataSink))
+        .or_else(|| spool_source.map(RuntimeSpec::SpoolSource))
+        .or_else(|| changed_source.map(RuntimeSpec::ChangedSource))
+        .or_else(|| artifact_copy.map(RuntimeSpec::ArtifactCopy))
+        .or_else(|| archive_extract.map(RuntimeSpec::ArchiveExtract))
+        .or_else(|| baseline.map(RuntimeSpec::Baseline))
+        .or_else(|| ducklake_maintain.map(RuntimeSpec::DuckLakeMaintain))
+        .or_else(|| tumble.map(RuntimeSpec::Tumble))
+        .or_else(|| neo4j_source.map(RuntimeSpec::Neo4jSource))
+        .or_else(|| neo4j_sink.map(RuntimeSpec::Neo4jSink))
+        .or_else(|| turso_source.map(RuntimeSpec::TursoSource))
+        .or_else(|| turso_sink.map(RuntimeSpec::TursoSink))
+        .or_else(|| db2_source.map(RuntimeSpec::Db2Source))
+        .or_else(|| db2_sink.map(RuntimeSpec::Db2Sink))
         .or_else(|| attach_parquet_source.map(RuntimeSpec::AttachParquetSource))
         .or_else(|| materialize_duckdb.map(RuntimeSpec::MaterializeDuckDb))
         .or_else(|| redis_sink.map(RuntimeSpec::RedisSink))
@@ -5941,6 +7299,7 @@ fn build_stage(
         .or_else(|| wasm.map(RuntimeSpec::Wasm))
         .or_else(|| javascript.map(RuntimeSpec::Javascript))
         .or_else(|| python.map(RuntimeSpec::Python))
+        .or_else(|| plugin.map(RuntimeSpec::Plugin))
         .or_else(|| ai_chunk.map(RuntimeSpec::AiChunk))
         .or_else(|| ai_pii.map(RuntimeSpec::AiPii))
         .or_else(|| ai_llm.map(RuntimeSpec::AiLlm))
@@ -5978,13 +7337,69 @@ fn build_stage(
             sql = format!("{}{}DETACH {};", trimmed, sep, effective);
         }
     }
+    // #258: a cost ceiling with no prices could never be reached, so it is a
+    // configuration mistake rather than a setting. Caught HERE, at compile
+    // time, so `duckle validate` reports it before a run rather than a run
+    // discovering it after the first stage has already started spending.
+    if matches!(component_id, "xf.ai.llm" | "xf.ai.classify" | "xf.ai.embed") {
+        AiBudgetSpec::read(&props).build()?;
+    }
+
+    // #252 slice 1: opt-in reuse of this stage's completed output.
+    //
+    // Restricted to components whose work is deterministic given their inputs
+    // and whose inputs are a relation this pipeline can checksum. A stage that
+    // reads the outside world has no input identity the pipeline can see, so it
+    // is refused rather than keyed on configuration alone - which would return
+    // last week's parse of a file that has since changed.
+    let cache_output = props
+        .get("cacheOutput")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+        && CACHEABLE_COMPONENTS.contains(&component_id);
+    let cache_input_view = if cache_output {
+        inputs.main().map(str::to_string)
+    } else {
+        None
+    };
+    // Everything about the node that could change the answer, minus the parts
+    // that cannot: the cache flag itself is not an input, and a secret is not
+    // part of the result.
+    let cache_config_fp = if cache_output {
+        let mut cfg = props.clone();
+        if let Some(o) = cfg.as_object_mut() {
+            o.remove("cacheOutput");
+            o.retain(|k, _| {
+                let l = k.to_ascii_lowercase();
+                !(l.contains("password")
+                    || l.contains("secret")
+                    || l.contains("apikey")
+                    || l.contains("token"))
+            });
+        }
+        crate::checkpoint::fingerprint(&serde_json::json!({
+            "component": component_id,
+            "props": cfg,
+            "schema": node.data.schema,
+        }))
+    } else {
+        String::new()
+    };
     Ok(Stage {
+        cache_output,
+        cache_input_view,
+        cache_config_fp,
         node_id: node.id.clone(),
         component_id: component_id.to_string(),
         label: node.data.label.clone(),
         sql,
         kind,
         from,
+        publish_group: if component_id == "snk.ducklake" {
+            string_prop(&props, "publishGroup").filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        },
         sink_path,
         sink_mode,
         sink_compression,
@@ -6014,6 +7429,15 @@ fn build_stage(
 }
 
 mod builders;
+// #306: the chunk layer constrains a source by rewriting its read, and it must
+// use the SAME two functions the compiler does. A second opinion about what a
+// source reads is a second opinion about what the extract contains.
+pub(crate) use builders::{build_view_sql, relational_pushdown_on};
+// Only the #327 guard asks this, and only in a test: the inspect prelude is
+// derived from attach_prelude now, so nothing in a release build needs it.
+#[cfg(test)]
+pub(crate) use builders::references_spatial;
+pub(crate) use graph::NodeInputs;
 pub(crate) use builders::*;
 
 #[cfg(test)]

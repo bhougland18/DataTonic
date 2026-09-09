@@ -1,0 +1,85 @@
+# Maintainer: Sourav Roy <souravroy7864@gmail.com>
+#
+# The desktop application. Tauri, so it links the system WebKitGTK rather than
+# bundling a browser - which is why this package has real dependencies and the
+# runner package has none.
+#
+# The release publishes a BARE BINARY, not a bundle: the release workflow runs
+# `cargo build --release`, so the Tauri bundler never runs and there is no .deb
+# to unpack, no generated .desktop and no installed icons. This package
+# provides all three itself.
+
+pkgname=duckle-bin
+pkgver=0.7.2
+pkgrel=1
+pkgdesc="Local-first ETL/ELT and streaming platform with a visual pipeline editor"
+arch=('x86_64' 'aarch64')
+url="https://github.com/slothflowlabs/duckle"
+license=('MIT OR Apache-2.0')
+# Taken from what namcap read out of the released binary, not from Tauri's
+# documentation. The libraries actually referenced are libwebkit2gtk-4.1 and
+# libjavascriptcoregtk-4.1 (webkit2gtk-4.1), libgtk-3, libgdk-3 and
+# libgdk_pixbuf-2.0 (gtk3), and libsoup-3.0 (libsoup3); namcap additionally
+# names glib2, cairo and dbus, and hicolor-icon-theme because this package
+# installs into that theme.
+#
+# libayatana-appindicator was in this list and is gone: it is what Tauri's docs
+# name for tray support, the binary does not reference it, and Duckle has no
+# tray - no TrayIcon in the source and no trayIcon in tauri.conf.json.
+#
+# glibc and libgcc are also reported by namcap and deliberately omitted: both
+# are in `base`, which Arch's guidelines say need not be declared.
+#
+# unixodbc is absent too - the release workflow refuses to publish a Linux
+# binary that requires libodbc.so, so ODBC is linked statically.
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'glib2' 'cairo' 'dbus'
+         'hicolor-icon-theme')
+makedepends=('imagemagick')
+optdepends=('duckle-runner-bin: run pipelines headlessly from the command line')
+provides=('duckle')
+conflicts=('duckle')
+options=('!strip')
+
+# A full hicolor set, so a launcher renders Duckle crisply at whatever size it
+# asks for instead of rescaling one PNG. Derived at build time from the 512px
+# master rather than fetched size by size: the master is the only icon
+# guaranteed to exist at every tag, and generating from it cannot drift from it.
+_icon_sizes=(16 32 48 64 128 256 512)
+
+source_x86_64=("duckle-${pkgver}-x86_64::${url}/releases/download/v${pkgver}/Duckle-linux-x64")
+source_aarch64=("duckle-${pkgver}-aarch64::${url}/releases/download/v${pkgver}/Duckle-linux-arm64")
+# duckle.desktop is a LOCAL file, committed beside this PKGBUILD, not fetched
+# from the tag. Packaging metadata that is only needed here should not have to
+# wait for a release to exist: fetching it from v${pkgver} 404s for every
+# version released before the file was written, which is exactly what happened.
+source=("duckle.desktop"
+        "duckle-${pkgver}-icon.png::${url}/raw/v${pkgver}/apps/desktop/icons/icon.png"
+        "LICENSE-MIT-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-MIT"
+        "LICENSE-APACHE-${pkgver}::https://raw.githubusercontent.com/slothflowlabs/duckle/v${pkgver}/LICENSE-APACHE")
+
+# Maintained by packaging/arch/bump.py, which the release workflow runs when a
+# release is published. The binary's value is the one the release itself
+# publishes in SHA256SUMS.txt, not one computed separately here.
+sha256sums_x86_64=('afd644be64859e3baefccdfca77a732c05756d8a83c123b8c78093c76349bdf9')
+sha256sums_aarch64=('054c2a49bc25429d2d70f4874fcd9659c35caf7789668157120a88f101cc9bbf')
+sha256sums=('34a473a360487e3210fc4a9227b739a25cbccc8419a4117b40a05ef8095b3c81'
+            '8dccc57fbe4f2474d01b2e4d15d93a4b27cf3f75c498be5d8e906d961c4b26f8'
+            '95935915cc360fbaf736ecbe22229671c404fc0bc53dab63663a58a9352fcea9'
+            '1e7e1bc923e0f439d5aefb15b19be5082079f2929f86da51ae1339d1db5bce2b')
+
+package() {
+  install -Dm755 "${srcdir}/duckle-${pkgver}-${CARCH}" "${pkgdir}/usr/bin/duckle"
+  install -Dm644 "${srcdir}/duckle.desktop" \
+    "${pkgdir}/usr/share/applications/duckle.desktop"
+
+  for size in "${_icon_sizes[@]}"; do
+    install -d "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps"
+    magick "${srcdir}/duckle-${pkgver}-icon.png" -resize "${size}x${size}" \
+      "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/duckle.png"
+  done
+
+  install -Dm644 "${srcdir}/LICENSE-MIT-${pkgver}" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+  install -Dm644 "${srcdir}/LICENSE-APACHE-${pkgver}" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
+}

@@ -49,6 +49,13 @@ pub enum Event {
     Recovery,
     /// The run succeeded. Rarely wanted; off unless asked for.
     Success,
+    /// #304: an asset passed its declared freshness limit. Not about a run at
+    /// all - nothing failed, which is exactly why failure alerting cannot see
+    /// it: a schedule switched off, a server down, a source that stopped
+    /// publishing.
+    Stale,
+    /// That asset was written again. The all-clear for `stale`.
+    Refreshed,
 }
 
 impl Event {
@@ -57,7 +64,17 @@ impl Event {
             Event::Failure => "failure",
             Event::Recovery => "recovery",
             Event::Success => "success",
+            Event::Stale => "stale",
+            Event::Refreshed => "refreshed",
         }
+    }
+
+    /// Whether this event ends an outage rather than starting one.
+    ///
+    /// An all-clear is never held back by a cooldown: suppressing it leaves
+    /// people believing an outage is still running long after it ended.
+    fn is_all_clear(self) -> bool {
+        matches!(self, Event::Recovery | Event::Refreshed)
     }
 }
 
@@ -120,8 +137,50 @@ pub struct AlertRule {
     /// Recovery ignores this: an all-clear that arrives late is useless.
     #[serde(default = "default_cooldown")]
     pub cooldown_minutes: u64,
+    /// #304: route by who owns the subject, not only by what it is called.
+    ///
+    /// Assets are named by path and owned by team, and the two do not line up -
+    /// one team's datasets live under three prefixes and one prefix holds two
+    /// teams' datasets. A glob cannot express that; the ownership rule already
+    /// knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Route by tag. ANY of them matches, not all: a routing list is the set of
+    /// things this channel cares about, not a condition to satisfy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(flatten)]
     pub channel: Channel,
+}
+
+/// What is known about an alert's subject beyond its name, for routing.
+///
+/// Empty for a pipeline, which has no owner of its own; an asset carries the
+/// ownership rule's answer.
+#[derive(Debug, Default, Clone)]
+pub struct Routing {
+    pub owner: Option<String>,
+    pub tags: Vec<String>,
+}
+
+impl AlertRule {
+    /// Whether this rule wants this subject. Name, then owner, then tags - each
+    /// one only narrows, so a rule that names none of them still matches
+    /// everything its glob does.
+    fn routes(&self, subject: &str, r: &Routing) -> bool {
+        if !glob::Pattern::new(&self.pattern).map(|p| p.matches(subject)).unwrap_or(false) {
+            return false;
+        }
+        if let Some(want) = &self.owner {
+            if r.owner.as_deref() != Some(want.as_str()) {
+                return false;
+            }
+        }
+        if !self.tags.is_empty() && !self.tags.iter().any(|t| r.tags.contains(t)) {
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -310,6 +369,12 @@ fn build_message(event: Event, pipeline: &str, result: &RunResult) -> Message {
             format!("Duckle: {pipeline} recovered, succeeded in {seconds:.1}s")
         }
         Event::Success => format!("Duckle: {pipeline} succeeded in {seconds:.1}s"),
+        // Not reachable through this function - a freshness alert has no run to
+        // describe and builds its own message - but spelled out rather than
+        // wildcarded, so adding a third non-run event is a compile error here
+        // instead of a sentence about a run that did not happen.
+        Event::Stale => format!("Duckle: {pipeline} is stale"),
+        Event::Refreshed => format!("Duckle: {pipeline} was written again"),
     };
     Message {
         event: event.as_str().to_string(),
@@ -333,6 +398,92 @@ fn classify(result: &RunResult, previous: Option<&str>) -> Event {
         Some(prev) if prev != "ok" => Event::Recovery,
         _ => Event::Success,
     }
+}
+
+/// Raise an alert about something that is not a run.
+///
+/// #304: an asset going stale has no run to classify - that is the whole point,
+/// nothing failed. So the event is supplied rather than derived, and everything
+/// downstream is the code a run's alert takes: the same rule matching, the same
+/// per-rule cooldown key, the same all-clear exemption, the same channels and
+/// the same redacted transport error. A second delivery path would be a second
+/// place for a webhook url to leak out of.
+///
+/// `subject` takes the slot a pipeline id takes, so an `alerts.json` pattern
+/// matches an asset path the same way it matches a pipeline name.
+pub fn notify_subject(
+    workspace: &Path,
+    subject: &str,
+    event: Event,
+    text: &str,
+    routing: &Routing,
+) -> usize {
+    let rules = match load(workspace) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("duckle: {e}");
+            return 0;
+        }
+    };
+    if rules.is_empty() {
+        return 0;
+    }
+    let state = load_state(workspace);
+    let now = Utc::now();
+    let mut sent = 0usize;
+    let mut delivered: Vec<String> = Vec::new();
+    for rule in &rules.rules {
+        if !rule.routes(subject, routing) {
+            continue;
+        }
+        if !rule.on.contains(&event) {
+            continue;
+        }
+        let key = format!(
+            "{subject}|{}|{}|{}",
+            event.as_str(),
+            rule.pattern,
+            channel_id(&rule.channel)
+        );
+        if !event.is_all_clear() {
+            if let Some(last) = state.last_sent.get(&key) {
+                if now.signed_duration_since(*last)
+                    < chrono::Duration::minutes(rule.cooldown_minutes as i64)
+                {
+                    continue;
+                }
+            }
+        }
+        let message = Message {
+            event: event.as_str().to_string(),
+            pipeline: subject.to_string(),
+            status: event.as_str().to_string(),
+            // There is no run behind this, so there is no duration and no
+            // error. Zero rather than a made-up number, and None rather than a
+            // sentence, so a consumer reading the JSON is not told about a run
+            // that did not happen.
+            duration_ms: 0,
+            error: None,
+            category: None,
+            text: text.to_string(),
+        };
+        match deliver(&rule.channel, &message) {
+            Ok(()) => {
+                delivered.push(key);
+                sent += 1;
+            }
+            Err(e) => eprintln!(
+                "duckle: alert for {subject} could not be sent: {}",
+                redact_secrets(&e, &rule.channel)
+            ),
+        }
+    }
+    update_state(workspace, move |s| {
+        for key in delivered {
+            s.last_sent.insert(key, now);
+        }
+    });
+    sent
 }
 
 /// Tell whoever asked to be told about this run.
@@ -378,7 +529,7 @@ pub fn notify(workspace: &Path, pipeline_id: &str, result: &RunResult) -> usize 
         let key = format!("{pipeline_id}|{}|{}|{}", event.as_str(), rule.pattern, channel_id(&rule.channel));
         // An all-clear always goes out. Suppressing it would leave people
         // believing an outage is still running long after it ended.
-        if event != Event::Recovery {
+        if !event.is_all_clear() {
             if let Some(last) = state.last_sent.get(&key) {
                 let elapsed = now.signed_duration_since(*last);
                 if elapsed < chrono::Duration::minutes(rule.cooldown_minutes as i64) {
@@ -502,12 +653,18 @@ mod tests {
 
     fn result(status: &str, error: Option<&str>) -> RunResult {
         RunResult {
+            cache_keys: Default::default(),
             status: status.into(),
             duration_ms: 1234,
             nodes: Default::default(),
             preview: Vec::new(),
             error: error.map(str::to_string),
             category: None,
+            unchanged: false,
+            incomplete: false,
+            incomplete_reason: None,
+            artifacts: Vec::new(),
+            artifacts_truncated: false,
         }
     }
 
@@ -854,5 +1011,74 @@ mod tests {
             0,
             "the alert state was observably absent during a write"
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn rule(pattern: &str, owner: Option<&str>, tags: &[&str]) -> AlertRule {
+        AlertRule {
+            pattern: pattern.into(),
+            on: default_events(),
+            cooldown_minutes: default_cooldown(),
+            owner: owner.map(str::to_string),
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            // Routing is decided before any channel is touched, so which one
+            // this is does not matter to these tests.
+            channel: Channel::Webhook {
+                url: "https://example.invalid/hook".into(),
+                headers: Default::default(),
+            },
+        }
+    }
+
+    fn subject(owner: Option<&str>, tags: &[&str]) -> Routing {
+        Routing {
+            owner: owner.map(str::to_string),
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+        }
+    }
+
+    /// #304: assets are named by path and owned by team, and the two do not
+    /// line up. One team's datasets live under several prefixes; one prefix
+    /// holds several teams'. A glob cannot express that.
+    #[test]
+    fn a_rule_can_route_on_who_owns_the_subject() {
+        let r = rule("*", Some("data-eng"), &[]);
+        assert!(r.routes("/lake/orders", &subject(Some("data-eng"), &[])));
+        assert!(!r.routes("/lake/orders", &subject(Some("platform"), &[])), "wrong team was paged");
+        assert!(!r.routes("/lake/orders", &subject(None, &[])), "an unowned asset matched an owner rule");
+    }
+
+    /// ANY tag, not all: a routing list is the set of things a channel cares
+    /// about, not a condition to satisfy.
+    #[test]
+    fn tags_route_on_any_not_all() {
+        let r = rule("*", None, &["pii", "finance"]);
+        assert!(r.routes("/lake/a", &subject(None, &["pii"])));
+        assert!(r.routes("/lake/a", &subject(None, &["finance", "daily"])));
+        assert!(!r.routes("/lake/a", &subject(None, &["daily"])));
+    }
+
+    /// Each filter only NARROWS, so a rule that names neither still matches
+    /// everything its glob does - existing alerts.json files keep working.
+    #[test]
+    fn a_rule_without_owner_or_tags_is_unchanged() {
+        let r = rule("/lake/*", None, &[]);
+        assert!(r.routes("/lake/orders", &Routing::default()));
+        assert!(r.routes("/lake/orders", &subject(Some("anyone"), &["any"])));
+        assert!(!r.routes("/other/orders", &Routing::default()), "the glob stopped applying");
+    }
+
+    /// And they compose: owner AND tag both have to be satisfied when both are
+    /// named, because two filters on one rule are two conditions on one route.
+    #[test]
+    fn owner_and_tags_both_apply_when_both_are_named() {
+        let r = rule("*", Some("data-eng"), &["pii"]);
+        assert!(r.routes("/lake/a", &subject(Some("data-eng"), &["pii"])));
+        assert!(!r.routes("/lake/a", &subject(Some("data-eng"), &["daily"])));
+        assert!(!r.routes("/lake/a", &subject(Some("platform"), &["pii"])));
     }
 }

@@ -1,5 +1,5 @@
 import { Component, useContext } from 'react';
-import type { Field, Aggregation, Cast } from './types';
+import type { Field, Aggregation, Cast, SortKey } from './types';
 import {
     BoolField,
     IntegerField,
@@ -8,11 +8,13 @@ import {
     TextField,
     TextareaField,
 } from './PrimitiveFields';
+import SqlField from './SqlField';
 import { FilePathField } from './FilePathField';
 import { ExpressionField } from './ExpressionField';
 import { ColumnField, ColumnsField } from './ColumnField';
 import { AggregationsField } from './AggregationsField';
 import { CastsField } from './CastsField';
+import { SortKeysField } from './SortKeysField';
 import { KeyValueField } from './KeyValueField';
 import { RenameColumnsField } from './RenameColumnsField';
 import { FilterBuilderField } from './FilterBuilderField';
@@ -23,6 +25,9 @@ import { PipelineRefField } from './PipelineRefField';
 import { FieldContext } from './FieldContext';
 import { buildContextVars, builtinVars } from '../../run-resolve';
 import type { ContextPayload } from '../../repo-types';
+
+/** Fields whose text is SQL, and therefore worth completing (#314). */
+const SQL_KEYS = new Set(['sql', 'query', 'code']);
 
 type Props = {
     field: Field;
@@ -214,7 +219,18 @@ function renderInput(field: Field, value: unknown, onChange: (v: unknown) => voi
         case 'text':
             return <TextField field={field} value={value as string | undefined} onChange={onChange} />;
         case 'textarea':
-            return (
+            // #314: the SQL-bearing keys get completion; every other textarea
+            // is unchanged. Keyed on the field rather than on the component so
+            // a new SQL-carrying component gets it without being listed here.
+            return SQL_KEYS.has(field.key) ? (
+                <SqlField
+                    value={(value as string | undefined) ?? ''}
+                    onChange={onChange as (v: string) => void}
+                    placeholder={field.placeholder}
+                    rows={field.rows ?? 6}
+                    mono={field.monospace}
+                />
+            ) : (
                 <TextareaField field={field} value={value as string | undefined} onChange={onChange} />
             );
         case 'number':
@@ -312,5 +328,25 @@ function renderInput(field: Field, value: unknown, onChange: (v: unknown) => voi
                     onChange={onChange}
                 />
             );
+        case 'sort-keys':
+            return <SortKeysField value={value as SortKey[] | undefined} onChange={onChange} />;
+        case 'note':
+            // No input: a note is something the component wants you to know,
+            // and these were previously `text` fields, so a fact about the
+            // connector looked like a setting with an empty value.
+            return <div className="field-note">{field.description}</div>;
+        default: {
+            // The switch had no default and returns React.ReactNode, which
+            // includes undefined - so adding a kind to the union and forgetting
+            // the case compiled clean, exported into the catalog, and rendered
+            // a labelled blank in both editors. This turns that into a compile
+            // error, and into something visible if one ever ships anyway.
+            const unhandled: never = field.kind;
+            return (
+                <div className="field-input field-warning">
+                    Unsupported field kind: {String(unhandled)}
+                </div>
+            );
+        }
     }
 }

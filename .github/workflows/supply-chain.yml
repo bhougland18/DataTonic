@@ -1,0 +1,88 @@
+name: Supply chain
+
+# Dependency advisories and a software bill of materials, kept out of ci.yml so
+# the weekly schedule does not drag the whole build - including the live
+# connector suites - along with it.
+#
+# The schedule is the point of this workflow. A vulnerability is usually
+# published against a dependency that is ALREADY shipping, long after the commit
+# that introduced it, so a scan that only runs on push finds nothing until
+# someone happens to touch the tree.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Neither of these builds the workspace: cargo-audit reads Cargo.lock and npm
+  # audit reads package-lock.json. So this job needs no system libraries, and it
+  # reports in about a minute rather than waiting on a full compile.
+  advisories:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Accepted advisories live in .cargo/audit.toml, each one pointing at a
+      # section of docs/security/reference/dependency-advisories.md that records
+      # why it is accepted and what would let it be removed. Anything NOT listed
+      # there fails this step.
+      - name: Rust dependency advisories
+        run: cargo audit
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend dependency advisories
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+  sbom:
+    name: Software bill of materials
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # CycloneDX over the whole repository, so the Rust workspace and the
+      # frontend are both in one document. Released builds attach the same
+      # artifact to the release; this run is what keeps it buildable.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          format: cyclonedx-json
+          output-file: duckle-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Check the SBOM is not empty
+        run: |
+          set -e
+          components=$(python3 -c "import json;print(len(json.load(open('duckle-sbom.cdx.json')).get('components',[])))")
+          echo "components: $components"
+          # A generator that silently produces an empty document would leave a
+          # green check on a file that proves nothing.
+          if [ "$components" -lt 50 ]; then
+            echo "SBOM has $components components, which is too few to be real" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sbom-cyclonedx
+          path: duckle-sbom.cdx.json

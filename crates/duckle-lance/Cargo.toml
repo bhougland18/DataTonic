@@ -18,6 +18,29 @@ path = "src/main.rs"
 lancedb = { version = "0.30", default-features = false, features = ["remote", "aws", "gcs", "azure"] }
 # Vortex columnar file format (#111). Uses arrow 58 too (unifies with lancedb +
 # the parquet bridge), needs no protoc, pulls no DataFusion in its file-IO path.
+#
+# These four and lancedb move TOGETHER or not at all, and not simply to the
+# newest release. lancedb 0.38 declares arrow-array 58.0.0 and vortex 0.85
+# declares 58.3, so raising arrow and parquet to 59 on their own puts two arrow
+# majors in one binary and the RecordBatches handed between lancedb and this
+# crate stop being the same type. A grouped dependabot bump did exactly that.
+#
+# vortex is held at 0.75 for a second, separate reason: 0.85 compiles after
+# repointing the arrow bridge from `vortex::array::arrow` to `vortex::arrow`,
+# and then FAILS AT RUNTIME. Measured on a 1000-row Parquet file of bigint,
+# varchar, double, boolean, date and a nullable bigint - 0.75 round-trips it
+# through write-vortex/read-vortex with zero rows differing, while 0.85 refuses
+# to write it:
+#
+#   with a date column:    Extension DType vortex.date not permitted by
+#                          enabled editions
+#   without a date column: struct column writer finished before all chunks
+#                          were sent
+#
+# 0.85 introduced editions and reworked the write path; adopting it is a
+# migration with a live round-trip to prove, not a version bump. Nothing forces
+# it - there is no advisory here - so it waits for someone to do that work.
+# There is no test to catch this: the crate has none, and CI only compiles it.
 vortex = { version = "0.75", features = ["tokio"] }
 arrow-array = "58"
 arrow-schema = "58"

@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Edge, Node } from '@xyflow/react';
-import { CheckCircle2, ChevronLeft, ChevronRight, MousePointer2, Workflow, FlaskConical, Database, Regex } from 'lucide-react';
-import { resolveUpstreamSchema, resolveUpstreamSampleRows, resolveOutputSchema } from '../schema-resolve';
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, MousePointer2, Workflow, FlaskConical, Database, Regex } from 'lucide-react';
+import { resolveUpstreamSchema, resolveUpstreamSampleRows, resolveOutputSchema, deriveSchemaFromEngine, diagnosticsFor } from '../schema-resolve';
+import { analyzeNodeSql } from '../tauri-bridge';
+import { setSqlContext } from './fields/sql-context';
 import { buildContextVars, builtinVars, substituteDeep } from '../run-resolve';
 import type { Column, DuckleNodeData } from '../pipeline-types';
 import type {
@@ -52,6 +54,20 @@ const ADVANCED_FIELDS: Field[] = [
         kind: 'integer',
         defaultValue: 0,
         description: "PRAGMA memory_limit for this stage only. 0 = no override. NOTE: setting a per-stage limit forces slower per-stage execution (disables batching). For a pipeline-wide cap, set the DUCKLE_MEMORY_LIMIT workspace variable (e.g. 4GB) instead.",
+    },
+    {
+        key: 'continueOnFailure',
+        label: 'Carry on if this step fails',
+        kind: 'bool',
+        defaultValue: false,
+        description: 'Treat a failure here as something to carry past rather than the end of the run. The engine has read this for every node since it was added and no panel offered it. NOTE: it also forces the slower per-stage execution path, because a stage that may fail on its own cannot be batched with its neighbours.',
+    },
+    {
+        key: 'contracts.allowPii',
+        label: 'Allow PII to reach this sink',
+        kind: 'bool',
+        defaultValue: false,
+        description: 'A column tagged PII reaching a sink refuses to compile, and the refusal tells you to set contracts.allowPii=true - which, until now, nothing in the interface could do. Prefer a qa.mask upstream; this is the deliberate exception when the destination is allowed to hold it.',
     },
     {
         key: 'logRowCount',
@@ -184,9 +200,58 @@ export default function PropertiesPanel({
     // Rename node's Schema tab keeps showing the old names while the Preview and
     // every downstream node already see the renamed ones. resolveOutputSchema is
     // the same per-component derivation downstream nodes already rely on.
+    // #226: the per-component rules above cannot see a transform that adds
+    // several columns, removes one, or adds a column that is not text - and
+    // there are far more components than rules. Ask the engine what this node
+    // really produces, then re-render so the tab shows the answer rather than
+    // the guess. Reads nothing, so it is safe to do on every selection.
+    const [derivedTick, setDerivedTick] = useState(0);
+    useEffect(() => {
+        if (!selected) return;
+        let live = true;
+        void deriveSchemaFromEngine(selected.id, allNodes, edges, analyzeNodeSql).then(changed => {
+            if (live && changed) setDerivedTick(t => t + 1);
+        });
+        return () => {
+            live = false;
+        };
+    }, [selected, allNodes, edges]);
+
+    // #314: what a SQL field in this panel can be completed against. Published
+    // when the selection changes, so the field asks about the node the author
+    // is actually editing.
+    useEffect(() => {
+        if (!selected) {
+            setSqlContext(null);
+            return;
+        }
+        setSqlContext({
+            nodes: allNodes,
+            edges,
+            nodeId: selected.id,
+            inputs: edges
+                .filter(e => e.target === selected.id)
+                .map(e => [e.source, resolveOutputSchema(e.source, allNodes, edges)] as [string, Column[]])
+                .filter(([, cols]) => cols.length > 0),
+        });
+        return () => setSqlContext(null);
+    }, [selected, allNodes, edges, derivedTick]);
+
+    // #314: what DuckDB objected to about this node's SQL, if anything. Read
+    // from the same cache the columns come from, so it lands on the same
+    // re-render rather than a second round trip.
+    const diagnostics = useMemo(
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        () => (selected ? diagnosticsFor(selected.id) : []),
+        [selected, derivedTick],
+    );
+
     const outputSchema = useMemo<Column[]>(
         () => (selected ? resolveOutputSchema(selected.id, allNodes, edges) : []),
-        [selected, edges, allNodes],
+        // derivedTick is a dependency on purpose: the engine's answer lands in
+        // a cache the resolver reads, so the memo has to be told it changed.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [selected, edges, allNodes, derivedTick],
     );
 
     const upstreamSampleRows = useMemo<Record<string, unknown>[]>(
@@ -302,8 +367,49 @@ export default function PropertiesPanel({
     ];
 
     const setLabel = (label: string) => onUpdate(selected.id, { label });
-    const setProperty = (key: string, value: unknown) =>
-        onUpdate(selected.id, { properties: { ...props, [key]: value } });
+    // A dotted key writes a NESTED property, so a field can reach something the
+    // engine reads under a namespace. `contracts.allowPii` is the case that
+    // forced it: the engine refuses a run when a PII-tagged column reaches a
+    // sink and tells the operator to "set contracts.allowPii=true", which no
+    // panel could do - a flat key would have written the literal string
+    // "contracts.allowPii" and the engine reads props.contracts.allowPii.
+    //
+    // One level only, because that is what exists and a general path setter
+    // would be machinery for a case nobody has. No field key contained a dot
+    // before this, so nothing changes for any existing field.
+    // `undefined` is a field saying it has no value, so drop the key rather
+    // than storing it. A key present with an empty value is not the same
+    // thing to the engine, which reads an absent key as "use the default".
+    const withKey = (
+        obj: Record<string, unknown>,
+        key: string,
+        value: unknown,
+    ): Record<string, unknown> => {
+        if (value !== undefined) return { ...obj, [key]: value };
+        const { [key]: _dropped, ...rest } = obj;
+        return rest;
+    };
+    const setProperty = (key: string, value: unknown) => {
+        const dot = key.indexOf('.');
+        if (dot < 0) {
+            onUpdate(selected.id, { properties: withKey(props, key, value) });
+            return;
+        }
+        const [outer, inner] = [key.slice(0, dot), key.slice(dot + 1)];
+        const existing = (props[outer] ?? {}) as Record<string, unknown>;
+        onUpdate(selected.id, {
+            properties: { ...props, [outer]: withKey(existing, inner, value) },
+        });
+    };
+    // The read side of the same key, so a nested field shows the value it just
+    // wrote instead of reverting to its default on the next render.
+    const getProperty = (key: string): unknown => {
+        const dot = key.indexOf('.');
+        if (dot < 0) return props[key];
+        const outer = props[key.slice(0, dot)];
+        if (!outer || typeof outer !== 'object') return undefined;
+        return (outer as Record<string, unknown>)[key.slice(dot + 1)];
+    };
     const setSchema = (columns: Column[]) => onUpdate(selected.id, { schema: columns });
 
     const runAutodetect = async () => {
@@ -575,6 +681,32 @@ export default function PropertiesPanel({
                                     })}
                                 </button>
                             ) : null}
+                            {/* #314: what DuckDB said about this node's SQL.
+                                Above the form rather than below it, because it
+                                is about the field the author is editing and a
+                                message under a long form is a message nobody
+                                sees. */}
+                            {diagnostics.length > 0 ? (
+                                <div className="properties-sql-diagnostics" role="status">
+                                    {diagnostics.map((d, i) => (
+                                        <div key={i} className="properties-sql-diagnostic">
+                                            <AlertTriangle size={13} aria-hidden />
+                                            <span>
+                                                {d.line && d.column ? (
+                                                    <code>{`${d.line}:${d.column}`}</code>
+                                                ) : null}{' '}
+                                                {d.message}
+                                                {d.candidates?.length ? (
+                                                    <em>
+                                                        {' '}
+                                                        did you mean {d.candidates.join(', ')}?
+                                                    </em>
+                                                ) : null}
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : null}
                             {manifest ? (
                                 manifest.sections.map(section => {
                                     // visibleWhen (#166 follow-up): drop fields whose
@@ -762,13 +894,22 @@ export default function PropertiesPanel({
                         <div className="properties-section">
                             <div className="form-section">
                                 <div className="form-section-label">{t('properties.reliability')}</div>
-                                {ADVANCED_FIELDS.map(field => (
+                                {ADVANCED_FIELDS.filter(
+                                    field =>
+                                        // The PII contract is only ever consulted
+                                        // at a sink (plan/mod.rs:1102 guards on
+                                        // `cid.starts_with("snk.")`), so offering
+                                        // it anywhere else would be a control that
+                                        // does nothing.
+                                        field.key !== 'contracts.allowPii' ||
+                                        (data.componentId ?? '').startsWith('snk.'),
+                                ).map(field => (
                                     <FieldRenderer
                                         key={field.key}
                                         field={field}
                                         value={
-                                            props[field.key] !== undefined
-                                                ? props[field.key]
+                                            getProperty(field.key) !== undefined
+                                                ? getProperty(field.key)
                                                 : field.defaultValue
                                         }
                                         onChange={v => setProperty(field.key, v)}

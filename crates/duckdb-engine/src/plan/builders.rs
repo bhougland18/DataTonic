@@ -16,18 +16,18 @@ pub fn source_select_for_format(format: &str, props: &JsonValue) -> Option<Strin
         "tsv" => build_tsv_source(props, None),
         "parquet" => build_parquet_source(props),
         "json" | "jsonl" | "ndjson" => build_json_source(props),
-        "sqlite" => build_sqlite_source(props),
-        "duckdb" => build_duckdb_source(props),
+        "sqlite" => return build_sqlite_source(props).ok(),
+        "duckdb" => return build_duckdb_source(props).ok(),
         "excel" => build_excel_source(props, None),
         "avro" => build_avro_source(props),
         "inline" => build_inline_source(props),
-        "filelist" => build_filelist_source(props),
+        "filelist" => return build_filelist_source(props).ok(),
         "iceberg" => build_iceberg_source(props),
         "delta" => build_delta_source(props),
         "spatial" => build_spatial_source(props),
         "gdb" => build_gdb_source(props),
         "huggingface" => build_huggingface_source(props),
-        "fixedwidth" => return build_fixedwidth_source(props).ok(),
+        "fixedwidth" => return build_fixedwidth_source(props, None).ok(),
         // DuckLake is DuckDB-backed; the catalog is ATTACHed as duckle_src by
         // the inspect prelude (see source_prelude), so the SELECT is identical
         // to the run path.
@@ -204,8 +204,8 @@ pub(crate) fn build_view_sql(
         }),
         "src.parquet" => Ok(build_parquet_source(props)),
         "src.json" | "src.jsonl" => Ok(build_json_source(props)),
-        "src.sqlite" => Ok(build_sqlite_source(props)),
-        "src.duckdb" => Ok(build_duckdb_source(props)),
+        "src.sqlite" => build_sqlite_source(props),
+        "src.duckdb" => build_duckdb_source(props),
         "src.ducklake.diff" => Ok(build_ducklake_diff(props)),
         "src.s3" | "src.gcs" | "src.azureblob" | "src.http"
         | "src.minio" | "src.r2" | "src.b2" => {
@@ -222,14 +222,14 @@ pub(crate) fn build_view_sql(
         "src.avro" => Ok(build_avro_source(props)),
         "src.excel" => Ok(build_excel_source(props, declared)),
         "src.inline" => Ok(build_inline_source(props)),
-        "src.filelist" => Ok(build_filelist_source(props)),
+        "src.filelist" => build_filelist_source(props),
         "src.artifact" => Ok(build_artifact_source(props)),
         "src.iceberg" => Ok(build_iceberg_source(props)),
         "src.delta" => Ok(build_delta_source(props)),
         "src.spatial" => Ok(build_spatial_source(props)),
         "src.gdb" => Ok(build_gdb_source(props)),
         "src.huggingface" => Ok(build_huggingface_source(props)),
-        "src.fixedwidth" => build_fixedwidth_source(props),
+        "src.fixedwidth" => build_fixedwidth_source(props, declared),
         // Pass-through transforms
         "xf.filter" => build_filter(inputs, props),
         // Log Rows - pass data through unchanged; its rows surface in the
@@ -245,10 +245,10 @@ pub(crate) fn build_view_sql(
         "xf.rollup" => build_aggregate(inputs, props, GroupMode::Rollup),
         "xf.cube" => build_aggregate(inputs, props, GroupMode::Cube),
         "xf.aggwin" => build_window_aggregate(inputs, props),
-        "xf.union" => build_union(inputs, true),
-        "xf.unionall" => build_union(inputs, false),
-        "xf.intersect" => build_setop(inputs, "INTERSECT"),
-        "xf.except" => build_setop(inputs, "EXCEPT"),
+        "xf.union" => build_union(inputs, true, props),
+        "xf.unionall" => build_union(inputs, false, props),
+        "xf.intersect" => build_setop(inputs, "INTERSECT", props),
+        "xf.except" => build_setop(inputs, "EXCEPT", props),
         "xf.addcol" | "xf.coalesce" => build_addcol(inputs, props),
         "xf.pyexpr" => build_pyexpr(inputs, props),
         "xf.rownum" | "xf.rank" | "xf.denserank" | "xf.lead" | "xf.lag" | "xf.first"
@@ -407,7 +407,7 @@ pub(crate) fn build_view_sql(
             let upstream = inputs.main().ok_or_else(|| missing_input_msg("ctl.replicate"))?;
             Ok(format!("SELECT * FROM {}", quote_ident(upstream)))
         }
-        "ctl.merge" => build_union(inputs, false),
+        "ctl.merge" => build_union(inputs, false, props),
         // Retry wrapper: passthrough view. Retries are read off the
         // form's Advanced tab as retry_attempts/retry_backoff_ms on
         // THIS stage. Useful as an explicit marker in the DAG saying
@@ -779,53 +779,139 @@ pub(crate) fn build_distinct(inputs: &NodeInputs, props: &JsonValue) -> Result<S
     }
 }
 
+/// One ORDER BY key, assembled the same way whichever form it came from.
+///
+/// `nulls` is deliberately an Option and NOT defaulted: an existing pipeline
+/// using `orderBy` emits no NULLS clause today, so inventing one on upgrade
+/// would change the row order of a run that never asked. The single-column
+/// form keeps its own `unwrap_or(true)` default, which is what it has always
+/// emitted.
+fn sort_key(col: &str, dir: Option<&str>, nulls: Option<bool>) -> String {
+    // Allowlist the direction: an unexpected token spliced raw would make a
+    // malformed ORDER BY / parser error (audit B5). Trimmed and lowercased,
+    // because "DESC" is what a hand-written pipeline, an import or an SDK
+    // writes, and matching "desc" exactly meant it sorted ASCENDING in silence.
+    let dir_kw = match dir.unwrap_or("asc").trim().to_ascii_lowercase().as_str() {
+        "desc" => "DESC",
+        _ => "ASC",
+    };
+    let nulls_kw = match nulls {
+        Some(true) => " NULLS LAST",
+        Some(false) => " NULLS FIRST",
+        None => "",
+    };
+    format!("{} {}{}", quote_ident(col.trim()), dir_kw, nulls_kw)
+}
+
+/// `"amount DESC NULLS FIRST"` -> `("amount", Some("desc"), Some(false))`.
+///
+/// A trailing direction inside the string is how multi-column sort was
+/// expressed before the editor could express it at all, so it has to keep
+/// working - which is why the whole string cannot simply be quoted as a column
+/// name. What remains once the trailing keywords are taken off IS the column,
+/// and it is then quoted, so a name with a space in it finally sorts instead of
+/// producing a parse error.
+///
+/// A column literally named `amount DESC` cannot be written this way. The
+/// object form is the unambiguous one and the editor writes it.
+fn parse_sort_string(s: &str) -> Option<(String, Option<String>, Option<bool>)> {
+    let mut toks: Vec<&str> = s.split_whitespace().collect();
+    let mut nulls = None;
+    if toks.len() >= 3 {
+        let last = toks[toks.len() - 1].to_ascii_lowercase();
+        let prev = toks[toks.len() - 2].to_ascii_lowercase();
+        if prev == "nulls" && (last == "first" || last == "last") {
+            nulls = Some(last == "last");
+            toks.truncate(toks.len() - 2);
+        }
+    }
+    let mut dir = None;
+    if toks.len() >= 2 {
+        let last = toks[toks.len() - 1].to_ascii_lowercase();
+        if last == "asc" || last == "desc" {
+            dir = Some(last);
+            toks.truncate(toks.len() - 1);
+        }
+    }
+    if toks.is_empty() {
+        return None;
+    }
+    Some((toks.join(" "), dir, nulls))
+}
+
+/// Every column an `xf.sort` node will actually order by, in whichever form it
+/// is written.
+///
+/// Shared with the validator (plan/graph.rs) so that a key which COMPILES is a
+/// key which VALIDATES. The two halves had drifted: the validator checked each
+/// string entry whole, so `orderBy: ["amount DESC"]` - the documented way to
+/// express multi-column sort before the editor could - was refused as
+/// "column 'amount DESC' not found" before build_sort ever saw it. It also
+/// checked neither the bare-string form nor the legacy `sortColumn`, so a typo
+/// in the editor's own Column field reached DuckDB and failed there instead.
+pub(crate) fn sort_columns(props: &JsonValue) -> Vec<String> {
+    let of = |v: &JsonValue| -> Option<String> {
+        if let Some(s) = v.as_str() {
+            parse_sort_string(s).map(|(col, _, _)| col)
+        } else {
+            v.get("column").and_then(JsonValue::as_str).map(str::to_string)
+        }
+    };
+    let mut out: Vec<String> = match props.get("orderBy") {
+        Some(JsonValue::Array(arr)) => arr.iter().filter_map(of).collect(),
+        Some(JsonValue::String(s)) => {
+            s.split(',').filter_map(parse_sort_string).map(|(col, _, _)| col).collect()
+        }
+        _ => Vec::new(),
+    };
+    if out.is_empty() {
+        if let Some(col) = string_prop(props, "sortColumn").filter(|s| !s.is_empty()) {
+            out.push(col);
+        }
+    }
+    out
+}
+
 pub(crate) fn build_sort(inputs: &NodeInputs, props: &JsonValue) -> Result<String, String> {
     let upstream = inputs.main().ok_or_else(|| "missing main input".to_string())?;
-    let sort_keys: Vec<String> = props
-        .get("orderBy")
-        .and_then(JsonValue::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| {
-                    if let Some(s) = v.as_str() {
-                        Some(s.to_string())
-                    } else if let Some(obj) = v.as_object() {
-                        let col = obj.get("column").and_then(JsonValue::as_str)?;
-                        let dir = obj
-                            .get("direction")
-                            .and_then(JsonValue::as_str)
-                            .unwrap_or("asc");
-                        // Allowlist the direction: an unexpected token spliced
-                        // raw would make a malformed ORDER BY / parser error
-                        // (audit B5). Map asc/desc explicitly; anything else
-                        // falls back to ASC, matching the single-column branch.
-                        let dir_kw = match dir.trim().to_ascii_lowercase().as_str() {
-                            "desc" => "DESC",
-                            _ => "ASC",
-                        };
-                        Some(format!("{} {}", quote_ident(col), dir_kw))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut sort_keys = sort_keys;
-    // The Sort form writes a single sortColumn + direction + nullsLast.
+    let one = |v: &JsonValue| -> Option<String> {
+        if let Some(s) = v.as_str() {
+            let (col, dir, nulls) = parse_sort_string(s)?;
+            Some(sort_key(&col, dir.as_deref(), nulls))
+        } else if let Some(obj) = v.as_object() {
+            let col = obj.get("column").and_then(JsonValue::as_str)?;
+            Some(sort_key(
+                col,
+                obj.get("direction").and_then(JsonValue::as_str),
+                obj.get("nullsLast").and_then(JsonValue::as_bool),
+            ))
+        } else {
+            None
+        }
+    };
+    let mut sort_keys: Vec<String> = match props.get("orderBy") {
+        Some(JsonValue::Array(arr)) => arr.iter().filter_map(one).collect(),
+        // A bare string, read as the caller plainly meant it - the same
+        // forgiveness columns_list already extends, and for the same reason:
+        // writing "amount" instead of ["amount"] silently produced a node with
+        // no ORDER BY at all, and an unordered result is not a visible failure.
+        Some(JsonValue::String(s)) => s
+            .split(',')
+            .filter_map(parse_sort_string)
+            .map(|(col, dir, nulls)| sort_key(&col, dir.as_deref(), nulls))
+            .collect(),
+        _ => Vec::new(),
+    };
+    // The legacy single-key form. The editor now writes `orderBy`, but a saved
+    // pipeline, the desktop assistant's prompt (apps/desktop/src/llama_chat.rs)
+    // and the Talend importer all still write these, so the read stays.
     if sort_keys.is_empty() {
         if let Some(col) = string_prop(props, "sortColumn").filter(|s| !s.is_empty()) {
-            let dir = if string_prop(props, "direction").as_deref() == Some("desc") {
-                "DESC"
-            } else {
-                "ASC"
-            };
-            let nulls = if props.get("nullsLast").and_then(JsonValue::as_bool).unwrap_or(true) {
-                " NULLS LAST"
-            } else {
-                " NULLS FIRST"
-            };
-            sort_keys.push(format!("{} {}{}", quote_ident(&col), dir, nulls));
+            sort_keys.push(sort_key(
+                &col,
+                string_prop(props, "direction").as_deref(),
+                Some(props.get("nullsLast").and_then(JsonValue::as_bool).unwrap_or(true)),
+            ));
         }
     }
     if sort_keys.is_empty() {
@@ -861,7 +947,18 @@ pub(crate) fn build_aggregate(
         .unwrap_or_default();
     let mut select_terms: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
     for agg in &aggregations {
-        let column = agg.get("column").and_then(JsonValue::as_str).unwrap_or("*");
+        // Empty means the same as absent: COUNT(*). The panel's aggregation
+        // row offers "- column -" as an option and writes `column: ""` for it,
+        // which is PRESENT, so `unwrap_or` never fired and the empty string
+        // went on to be quoted - emitting COUNT("") and failing the run on a
+        // quoted empty identifier. Trimmed as well, because a column picked and
+        // then cleared can leave whitespace behind.
+        let column = agg
+            .get("column")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or("*");
         // The UI's AggregationsField stores { column, func, output };
         // accept the function/alias spellings too for robustness.
         let func = match agg
@@ -982,10 +1079,44 @@ pub(crate) fn build_date_diff(inputs: &NodeInputs, props: &JsonValue) -> Result<
     ))
 }
 
+/// The `recursive` / `keep_parent_names` arguments an unnest was asked for.
+///
+/// #238: the JSON source has carried these since 1639cd3, and the transforms had
+/// not - so a pipeline that exploded an array and then flattened it met `Id`,
+/// `Id_1`, `Id_2` again downstream, which is the naming the source option exists
+/// to avoid. Measured on DuckDB 1.5.4: `recursive := true` on its own produces
+/// several columns all called `Id`, and only `keep_parent_names := true` turns
+/// them into `Id`, `owner.Id`, `account.Id`.
+///
+/// Empty unless `recursive` is asked for. `keep_parent_names` alone changes
+/// nothing at a single level - measured - so it is not offered on its own.
+fn unnest_args(props: &JsonValue) -> String {
+    if props.get("recursive").and_then(JsonValue::as_bool) != Some(true) {
+        return String::new();
+    }
+    match props.get("keepParentNames").and_then(JsonValue::as_bool) {
+        Some(true) => ", recursive := true, keep_parent_names := true".to_string(),
+        _ => ", recursive := true".to_string(),
+    }
+}
+
 pub(crate) fn build_json_flatten(inputs: &NodeInputs, props: &JsonValue) -> Result<String, String> {
     let upstream = inputs.main().ok_or_else(|| missing_input_msg("xf.json.flatten"))?;
     let column = require_column(props)?;
     let col = quote_ident(&column);
+    let args = unnest_args(props);
+    if !args.is_empty() {
+        // `col.*` expands one level only. unnest() is what takes the arguments,
+        // so a recursive flatten is a different statement rather than a longer
+        // one.
+        return Ok(format!(
+            "SELECT unnest({}{}), * EXCLUDE ({}) FROM {}",
+            col,
+            args,
+            col,
+            quote_ident(upstream)
+        ));
+    }
     // Expand a STRUCT column's fields to top-level columns.
     Ok(format!(
         "SELECT * EXCLUDE ({}), {}.* FROM {}",
@@ -1121,7 +1252,24 @@ pub(crate) fn build_arr_contains(inputs: &NodeInputs, props: &JsonValue) -> Resu
     ))
 }
 
-pub(crate) fn build_union(inputs: &NodeInputs, distinct: bool) -> Result<String, String> {
+/// Whether the form asked for positional column matching.
+///
+/// The four set operations declare a `matchBy` select and neither builder took
+/// props, so "By position" silently produced a by-name result: inputs that are
+/// positionally aligned but differently NAMED were padded with NULLs into a
+/// wider table instead of stacked. By name stays the default, which is what an
+/// untouched node has always done.
+fn matches_by_position(props: &JsonValue) -> bool {
+    string_prop(props, "matchBy")
+        .map(|v| v.trim().eq_ignore_ascii_case("position"))
+        .unwrap_or(false)
+}
+
+pub(crate) fn build_union(
+    inputs: &NodeInputs,
+    distinct: bool,
+    props: &JsonValue,
+) -> Result<String, String> {
     let mains = inputs.all_main_ports();
     if mains.is_empty() {
         return Err("Union needs at least one input".into());
@@ -1133,10 +1281,11 @@ pub(crate) fn build_union(inputs: &NodeInputs, distinct: bool) -> Result<String,
     // or one input has an extra column. ETL users almost always expect
     // by-name semantics; legacy positional behavior is still reachable
     // by reordering / projecting columns upstream.
-    let op = if distinct {
-        " UNION BY NAME "
-    } else {
-        " UNION ALL BY NAME "
+    let op = match (distinct, matches_by_position(props)) {
+        (true, false) => " UNION BY NAME ",
+        (false, false) => " UNION ALL BY NAME ",
+        (true, true) => " UNION ",
+        (false, true) => " UNION ALL ",
     };
     Ok(mains
         .iter()
@@ -1145,10 +1294,23 @@ pub(crate) fn build_union(inputs: &NodeInputs, distinct: bool) -> Result<String,
         .join(op))
 }
 
-pub(crate) fn build_setop(inputs: &NodeInputs, op: &str) -> Result<String, String> {
+pub(crate) fn build_setop(
+    inputs: &NodeInputs,
+    op: &str,
+    props: &JsonValue,
+) -> Result<String, String> {
     let mains = inputs.all_main_ports();
     if mains.len() < 2 {
         return Err(format!("{} needs two inputs", op));
+    }
+    // By position there is nothing to realign: the legs are compared as they
+    // stand, which is what positional set semantics mean.
+    if matches_by_position(props) {
+        return Ok(mains
+            .iter()
+            .map(|id| format!("SELECT * FROM {}", quote_ident(id)))
+            .collect::<Vec<_>>()
+            .join(&format!(" {} ", op)));
     }
     // Match by column NAME, not position - otherwise INTERSECT/EXCEPT silently
     // compare the wrong columns when the inputs have a different column order.
@@ -1565,9 +1727,17 @@ pub(crate) fn build_array(inputs: &NodeInputs, props: &JsonValue, component_id: 
         // data loss for sparse arrays. The CASE injects a single NULL
         // element so the row survives; untyped [NULL] unifies with any
         // array element type.
+        // #238: a recursive unnest yields SEVERAL columns, so it cannot carry
+        // the `AS {c}` alias a single-column one does. The NULL/empty guard is
+        // unaffected either way - measured - so a sparse array still keeps its
+        // row.
+        let args = unnest_args(props);
+        let alias = if args.is_empty() { format!(" AS {col}") } else { String::new() };
         return Ok(format!(
-            "SELECT unnest(CASE WHEN {c} IS NULL OR length({c}) = 0 THEN [NULL] ELSE {c} END) AS {c}, * EXCLUDE ({c}) FROM {up}",
+            "SELECT unnest(CASE WHEN {c} IS NULL OR length({c}) = 0 THEN [NULL] ELSE {c} END{a}){al}, * EXCLUDE ({c}) FROM {up}",
             c = col,
+            a = args,
+            al = alias,
             up = quote_ident(upstream)
         ));
     }
@@ -2975,13 +3145,29 @@ pub(crate) fn build_scd3(inputs: &NodeInputs, props: &JsonValue) -> Result<Strin
     let prev = inputs.first_lookup().ok_or_else(|| {
         "SCD3 needs a 'previous' input on the lookup port (the prior snapshot)".to_string()
     })?;
-    let keys = columns_list(props, "keyColumns");
+    // The form writes `naturalKey` / `compareColumns`, which is also what every
+    // other CDC builder reads. This one read `keyColumns` / `trackColumns` and
+    // nothing else, so a node configured in the editor failed with "SCD3 needs
+    // key columns" while its Natural key field was filled in, and there was no
+    // way to fix that from the UI: the field the error asked for is not on the
+    // form. The engine's older spelling stays accepted so a hand-written
+    // pipeline that used it keeps working.
+    let mut keys = columns_list(props, "naturalKey");
     if keys.is_empty() {
-        return Err("SCD3 needs key columns".to_string());
+        keys = columns_list(props, "keyColumns");
     }
-    let tracked = columns_list(props, "trackColumns");
+    if keys.is_empty() {
+        return Err("SCD3 needs key columns (naturalKey)".to_string());
+    }
+    let mut tracked = columns_list(props, "compareColumns");
     if tracked.is_empty() {
-        return Err("SCD3 needs at least one column to track a previous value for".to_string());
+        tracked = columns_list(props, "trackColumns");
+    }
+    if tracked.is_empty() {
+        return Err(
+            "SCD3 needs at least one column to track a previous value for (compareColumns)"
+                .to_string(),
+        );
     }
     let key_eq = keys.iter().map(|k| { let q = quote_ident(k); format!("p.{q} = c.{q}") }).collect::<Vec<_>>().join(" AND ");
     let prev_cols = tracked.iter()
@@ -3026,10 +3212,22 @@ pub(crate) fn build_outlier(inputs: &NodeInputs, props: &JsonValue, reject: bool
         ),
     };
     let exclude = if method == "zscore" { "__dq_mean, __dq_sd" } else { "__dq_q1, __dq_q3" };
-    let guard = if reject { "NOT COALESCE" } else { "COALESCE" };
-    Ok(format!(
-        "SELECT * EXCLUDE ({exclude}) FROM (SELECT *, {helpers} FROM {up}) WHERE {guard}(({inlier}), TRUE)",
-        up = quote_ident(upstream)
+    let sql = |guard: &str| {
+        format!(
+            "SELECT * EXCLUDE ({exclude}) FROM (SELECT *, {helpers} FROM {up}) WHERE {guard}(({inlier}), TRUE)",
+            up = quote_ident(upstream)
+        )
+    };
+    if reject {
+        return Ok(sql("NOT COALESCE"));
+    }
+    // The outliers are what "failed", so they are the reject side.
+    Ok(apply_on_fail(
+        "qa.outlier",
+        props,
+        upstream,
+        sql("COALESCE"),
+        &sql("NOT COALESCE"),
     ))
 }
 
@@ -3240,7 +3438,21 @@ pub(crate) fn build_standardize(inputs: &NodeInputs, props: &JsonValue) -> Resul
             expr = match case.as_str() {
                 "upper" => format!("UPPER({})", expr),
                 "lower" => format!("LOWER({})", expr),
-                "title" => format!("INITCAP({})", expr),
+                // DuckDB has no INITCAP, and no title-case function under any
+                // other name - the pinned 1.5.4 answers "Catalog Error: Scalar
+                // Function with name initcap does not exist!", so picking
+                // "Title Case" could never run. Built from functions it does
+                // have: split on spaces, upper the first character of each word
+                // and lower the rest, join back with the same separator.
+                //
+                // `lambda w:` rather than the `->` arrow, which 1.5.4 warns is
+                // deprecated and drops in the next release. Verified against
+                // 1.5.4 for empty strings, NULL, single characters, repeated
+                // spaces (preserved) and already-uppercase input.
+                "title" => format!(
+                    "array_to_string(list_transform(string_split({}, ' '),                      lambda w: upper(w[1]) || lower(w[2:])), ' ')",
+                    expr
+                ),
                 _ => expr,
             };
             if collapse {
@@ -3325,6 +3537,47 @@ pub(crate) fn build_record_match(inputs: &NodeInputs, props: &JsonValue) -> Resu
     ))
 }
 
+/// "On failure" applied wherever a gate produces its PASS rows.
+///
+/// In one place because it has now been missed twice. Both branches used to
+/// live inside build_quality's PREDICATE path, and two gates never reach it:
+/// qa.unique returns early from its own branch at the top of that function,
+/// and qa.outlier is a separate builder. Both declared the field and honoured
+/// none of it - a gate set to `fail` let the load through and reported
+/// success, and `warn`, labelled "Keep row", dropped the row anyway.
+///
+/// `fail` is expressed over the gate's OWN reject SQL rather than a
+/// per-component predicate, so any gate can be wired to it without knowing how
+/// that gate decides what failed.
+pub(crate) fn apply_on_fail(
+    component_id: &str,
+    props: &JsonValue,
+    from_view: &str,
+    pass_sql: String,
+    reject_sql: &str,
+) -> String {
+    match string_prop(props, "onFail")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        // Everything continues down main. The failing rows are still on the
+        // reject port, which carries them whatever this says.
+        "warn" => format!("SELECT * FROM {}", quote_ident(from_view)),
+        "fail" => {
+            let msg =
+                format!("{component_id}: a row failed the check and On failure is set to fail");
+            format!(
+                "SELECT * FROM ({pass_sql}) WHERE CASE WHEN \
+                 (SELECT count(*) FROM ({reject_sql})) > 0 THEN error('{}') ELSE TRUE END",
+                sql_escape(&msg)
+            )
+        }
+        // reject, and anything unset, is what the gate already did.
+        _ => pass_sql,
+    }
+}
+
 /// Data-quality validators. `reject = false` yields the passing rows;
 /// `reject = true` yields the failing rows for the node's reject port.
 pub(crate) fn build_quality(
@@ -3359,10 +3612,17 @@ pub(crate) fn build_quality(
             let ob = order.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
             format!("ROW_NUMBER() OVER (PARTITION BY {} ORDER BY {})", partition, ob)
         };
-        return Ok(format!(
-            "SELECT * EXCLUDE (__dq_rn) FROM (SELECT *, {} AS __dq_rn FROM {}) WHERE __dq_rn {} 1",
-            window, from, cmp
-        ));
+        let sql = |op: &str| {
+            format!(
+                "SELECT * EXCLUDE (__dq_rn) FROM (SELECT *, {} AS __dq_rn FROM {}) WHERE __dq_rn {} 1",
+                window, from, op
+            )
+        };
+        if reject {
+            return Ok(sql(cmp));
+        }
+        // The duplicates are what "failed", so they are the reject side.
+        return Ok(apply_on_fail(component_id, props, upstream, sql("="), &sql(">")));
     }
     let predicate = quality_pass_predicate(component_id, props)?;
     if reject {
@@ -3380,14 +3640,25 @@ pub(crate) fn build_quality(
     // is the worst of the three, so `fail` now raises where the rows are counted.
     //
     // reject stays exactly what it was, which is also what an unset value does, so
-    // nothing saved changes. warn does not stop the run, so it does not raise either.
-    let stop = string_prop(props, "onFail")
+    // nothing saved changes.
+    let on_fail = string_prop(props, "onFail")
         .map(|s| s.trim().to_ascii_lowercase())
-        .is_some_and(|s| s == "fail");
+        .unwrap_or_default();
+    // warn is labelled "keep row" in the editor and kept nothing: it took this
+    // same filtered path as reject, so the rows it promised to keep were dropped
+    // and the run reported success. Measured at three rows in, two out.
+    //
+    // The failing rows are still on the reject port, which carries them whatever
+    // this setting says, so warn is "everything continues down main, and the
+    // failures are also available to branch on".
+    if on_fail == "warn" {
+        return Ok(format!("SELECT * FROM {}", from));
+    }
+    let stop = on_fail == "fail";
     if stop {
         let msg = format!("{component_id}: a row failed the check and On failure is set to fail");
         return Ok(format!(
-            "SELECT * FROM {from} WHERE COALESCE(({predicate}), FALSE)              AND CASE WHEN (SELECT count(*) FROM {from} WHERE NOT COALESCE(({predicate}), FALSE)) > 0              THEN error('{}') ELSE TRUE END",
+            "SELECT * FROM {from} WHERE COALESCE(({predicate}), FALSE) AND CASE WHEN (SELECT count(*) FROM {from} WHERE NOT COALESCE(({predicate}), FALSE)) > 0 THEN error('{}') ELSE TRUE END",
             sql_escape(&msg)
         ));
     }
@@ -3411,7 +3682,16 @@ pub(crate) fn quality_pass_predicate(component_id: &str, props: &JsonValue) -> R
             };
             let cols = columns_list(props, key);
             if cols.is_empty() {
-                return Ok("TRUE".into());
+                // Refuse, rather than evaluate to a tautology. This returned
+                // "TRUE", so a gate with no columns passed every row and the
+                // run reported ok - and a run with a quality gate in it is a
+                // run someone believes is checked. Every sibling already
+                // refuses when unconfigured, qa.range below included.
+                return Err(if component_id == "qa.schemavalidate" {
+                    "Schema Validate needs at least one expected column".to_string()
+                } else {
+                    "Not Null check needs at least one column".to_string()
+                });
             }
             Ok(cols
                 .iter()
@@ -3433,7 +3713,13 @@ pub(crate) fn quality_pass_predicate(component_id: &str, props: &JsonValue) -> R
             if let Some(max) = num_prop(props, "max") {
                 parts.push(format!("{} {} {}", c, le, max));
             }
-            Ok(if parts.is_empty() { "TRUE".into() } else { parts.join(" AND ") })
+            // A column with no bound to compare it against checks nothing. It
+            // already refuses a missing column; a missing range is the same
+            // omission one field along.
+            if parts.is_empty() {
+                return Err("Range check needs a min, a max, or both".to_string());
+            }
+            Ok(parts.join(" AND "))
         }
         "qa.regex" => {
             let col = string_prop(props, "column")
@@ -3464,6 +3750,69 @@ pub(crate) fn build_reject_sql(
         // declared column type, kept as raw text for review (issue #15).
         "src.csv" => Ok(build_csv_reject_sql(props, declared, false)),
         "src.tsv" => Ok(build_csv_reject_sql(props, declared, true)),
+        // The join family's unmatched LEFT rows. These components declare a
+        // `reject` output port and nothing filled it, so wiring the port failed
+        // the whole run with `Table with name <node>__reject does not exist` -
+        // an internal name, for a port the editor offers.
+        //
+        // An inner join and a semi join DROP these rows, and the port is wired
+        // precisely to find out which ones went. A lookup is a LEFT join, so it
+        // emits them too (padded with NULLs); there the reject stream is the
+        // diagnostic "which rows found nothing", which is what the form's
+        // `sendUnmatchedToReject` promised by name.
+        //
+        // NOT EXISTS rather than NOT IN, for the reason build_semi gives: one
+        // NULL on the right makes NOT IN return UNKNOWN, which would silently
+        // reject every row - the last place to reintroduce that gotcha is the
+        // stream someone is using to account for missing data.
+        // Unmatched features: the same anti-join, with the spatial predicate
+        // in place of key equality. xf.anti and xf.join.cross are deliberately
+        // absent - an anti join's MAIN output already IS the unmatched rows,
+        // and a cross join has no predicate, so neither can have a meaningful
+        // reject stream. Their ports are removed rather than filled.
+        "xf.join.spatial" => {
+            let left = inputs
+                .main()
+                .ok_or_else(|| "spatial join reject: missing main input".to_string())?;
+            let right = inputs
+                .first_lookup()
+                .ok_or_else(|| "spatial join reject: missing lookup input".to_string())?;
+            let left_col = string_prop(props, "leftGeomColumn")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "spatial join reject: leftGeomColumn required".to_string())?;
+            let right_col = string_prop(props, "rightGeomColumn")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "spatial join reject: rightGeomColumn required".to_string())?;
+            Ok(Some(format!(
+                "SELECT * FROM {l} m WHERE NOT EXISTS (SELECT 1 FROM {r} r WHERE {f}(m.{lc}, r.{rc}))",
+                l = quote_ident(left),
+                r = quote_ident(right),
+                f = spatial_relation_fn(props),
+                lc = quote_ident(&left_col),
+                rc = quote_ident(&right_col),
+            )))
+        }
+        "xf.join" | "xf.join.inner" | "xf.lookup" | "xf.lookup.outer" | "xf.semi"
+        | "xf.semi.join" => {
+            let left = inputs
+                .main()
+                .ok_or_else(|| "join reject: missing main input".to_string())?;
+            let right = inputs
+                .first_lookup()
+                .ok_or_else(|| "join reject: missing lookup input".to_string())?;
+            let (left_keys, right_keys) = join_key_pairs(props)?;
+            let on = left_keys
+                .iter()
+                .zip(right_keys.iter())
+                .map(|(l, r)| format!("m.{} = r.{}", quote_ident(l), quote_ident(r)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            Ok(Some(format!(
+                "SELECT * FROM {l} m WHERE NOT EXISTS (SELECT 1 FROM {r} r WHERE {on})",
+                l = quote_ident(left),
+                r = quote_ident(right),
+            )))
+        }
         "xf.filter" => {
             let upstream = inputs.main().ok_or_else(|| "filter: missing main input".to_string())?;
             let predicate = filter_predicate_sql(props.get("predicate")).unwrap_or_default();
@@ -4079,19 +4428,33 @@ pub(crate) struct MapLookup {
     kind: &'static str,
 }
 
+/// Wrap a mapper output in the type its author declared (#114).
+///
+/// Applied after `strip_port_prefixes` / `qualify_port_refs` rather than before,
+/// so those keep rewriting the expression the author wrote rather than a `CAST`
+/// wrapped around it.
+fn cast_to(expr: &str, ty: Option<&str>) -> String {
+    match ty {
+        Some(t) => format!("CAST({expr} AS {t})"),
+        None => expr.to_string(),
+    }
+}
+
 pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<String, String> {
     let upstream = inputs.main().ok_or_else(|| "mapper: missing main input".to_string())?;
 
-    // Collect the output (name, raw expression) pairs. The Map form writes
-    // either `expressions` (key-value: out name -> SQL) or a structured
-    // `mapper.outputs` array ({name, expression}). Both are accepted.
-    let mut outputs: Vec<(String, String)> = Vec::new();
+    // Collect the output (name, raw expression, declared SQL type) triples. The
+    // Map form writes either `expressions` (key-value: out name -> SQL) or a
+    // structured `mapper.outputs` array ({name, expression, type}). Both are
+    // accepted; only the structured form carries a type, so the key-value
+    // spellings stay byte-for-byte what they were.
+    let mut outputs: Vec<(String, String, Option<&'static str>)> = Vec::new();
     if let Some(pairs) = props.get("expressions").and_then(JsonValue::as_array) {
         for kv in pairs {
             let name = kv.get("key").and_then(JsonValue::as_str).unwrap_or("").trim();
             let expr = kv.get("value").and_then(JsonValue::as_str).unwrap_or("").trim();
             if !name.is_empty() && !expr.is_empty() {
-                outputs.push((name.to_string(), expr.to_string()));
+                outputs.push((name.to_string(), expr.to_string(), None));
             }
         }
     }
@@ -4104,7 +4467,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
         for (name, expr) in map {
             let expr = expr.as_str().unwrap_or("").trim();
             if !name.trim().is_empty() && !expr.is_empty() {
-                outputs.push((name.trim().to_string(), expr.to_string()));
+                outputs.push((name.trim().to_string(), expr.to_string(), None));
             }
         }
     }
@@ -4118,8 +4481,23 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
                     .and_then(JsonValue::as_str)
                     .unwrap_or("")
                     .trim();
+                // #114: the Visual Mapper's Type column, which was written here
+                // by the form and read by nothing - so choosing DATE changed
+                // nothing, and the node's declared schema disagreed with the
+                // data it actually produced. An unrecognised or absent type
+                // casts nothing, which is what a hand-authored mapper has.
+                let ty = o
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .and_then(|s| {
+                        serde_json::from_value::<duckle_metadata::DataType>(JsonValue::String(
+                            s.trim().to_string(),
+                        ))
+                        .ok()
+                    })
+                    .map(|d| data_type_to_duckdb_sql(&d));
                 if !name.is_empty() && !expr.is_empty() {
-                    outputs.push((name.to_string(), expr.to_string()));
+                    outputs.push((name.to_string(), expr.to_string(), ty));
                 }
             }
         }
@@ -4192,7 +4570,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
     let configured: std::collections::BTreeSet<&str> =
         lookups.iter().map(|l| l.port.as_str()).collect();
     let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (_, expr) in &outputs {
+    for (_, expr, _) in &outputs {
         referenced.extend(referenced_lookup_ports(expr));
     }
     if let Some(f) = &filter {
@@ -4224,12 +4602,12 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
             let inner: Vec<String> = outputs
                 .iter()
                 .enumerate()
-                .map(|(i, (_, expr))| format!("{} AS \"__m{}\"", strip_port_prefixes(expr), i))
+                .map(|(i, (_, expr, ty))| format!("{} AS \"__m{}\"", cast_to(&strip_port_prefixes(expr), *ty), i))
                 .collect();
             let outer: Vec<String> = outputs
                 .iter()
                 .enumerate()
-                .map(|(i, (name, _))| format!("\"__m{}\" AS {}", i, quote_ident(name)))
+                .map(|(i, (name, _, _))| format!("\"__m{}\" AS {}", i, quote_ident(name)))
                 .collect();
             let mut inner_sql =
                 format!("SELECT {} FROM {}", inner.join(", "), quote_ident(upstream));
@@ -4241,7 +4619,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
         }
         let terms: Vec<String> = outputs
             .iter()
-            .map(|(name, expr)| format!("{} AS {}", strip_port_prefixes(expr), quote_ident(name)))
+            .map(|(name, expr, ty)| format!("{} AS {}", cast_to(&strip_port_prefixes(expr), *ty), quote_ident(name)))
             .collect();
         let mut sql = format!("SELECT {} FROM {}", terms.join(", "), quote_ident(upstream));
         if let Some(predicate) = &filter {
@@ -4264,7 +4642,7 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
     }
     let terms: Vec<String> = outputs
         .iter()
-        .map(|(name, expr)| format!("{} AS {}", qualify_port_refs(expr, &aliases), quote_ident(name)))
+        .map(|(name, expr, ty)| format!("{} AS {}", cast_to(&qualify_port_refs(expr, &aliases), *ty), quote_ident(name)))
         .collect();
 
     // FROM main JOIN lookup_1 ON main.k = lookup_1.k [AND ...] JOIN ...
@@ -4305,10 +4683,10 @@ pub(crate) fn build_mapper(inputs: &NodeInputs, props: &JsonValue) -> Result<Str
 ///
 /// Only then does the naming have to be moved out of the way; leaving every other mapper
 /// as it was keeps the SQL it emits, and the tests that read it, unchanged.
-fn shadows_an_input(outputs: &[(String, String)]) -> bool {
+fn shadows_an_input(outputs: &[(String, String, Option<&'static str>)]) -> bool {
     let names: std::collections::BTreeSet<&str> =
-        outputs.iter().map(|(n, _)| n.as_str()).collect();
-    outputs.iter().any(|(_, expr)| {
+        outputs.iter().map(|(n, _, _)| n.as_str()).collect();
+    outputs.iter().any(|(_, expr, _)| {
         let mut in_string = false;
         let mut word = String::new();
         let mut hit = false;
@@ -5253,6 +5631,28 @@ fn json_read_extra_args(props: &JsonValue) -> String {
     {
         extra.push_str(", ignore_errors=true");
     }
+    // How many rows DuckDB reads before it decides what the columns ARE.
+    //
+    // Its default is 20480, and on a document whose records do not all carry the
+    // same keys that silently DROPS every column that first appears later - the
+    // read succeeds, the rows look right, and a field is simply missing. There
+    // is no error and nothing to notice, which makes it the worst shape of bug
+    // this reader can have.
+    //
+    // So the default here is -1: scan everything, and know the real schema. That
+    // costs an extra pass over the file, which is the honest price of not losing
+    // columns; a caller who knows their records are uniform can set a number and
+    // get the old behaviour back. The engine already made this exact call for
+    // its own intermediate NDJSON for the same reason (#141).
+    let sample = props
+        .get("sampleSize")
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        })
+        .filter(|n| *n != 0)
+        .unwrap_or(-1);
+    extra.push_str(&format!(", sample_size={}", sample));
     extra
 }
 
@@ -5346,37 +5746,57 @@ pub(crate) fn build_json_source(props: &JsonValue) -> String {
     }
 }
 
-pub(crate) fn build_sqlite_source(props: &JsonValue) -> String {
+pub(crate) fn build_sqlite_source(props: &JsonValue) -> Result<String, String> {
     let database = string_prop(props, "database").unwrap_or_default();
-    let table = string_prop(props, "tableName").unwrap_or_default();
-    let sql = string_prop(props, "sql");
-    let from_arg = sql
-        .filter(|s| !s.is_empty())
-        .unwrap_or(table);
-    format!(
+    // A query wins over a table name, which is what this always did. What it
+    // also did was accept NEITHER: `tableName` defaulted to "" and went
+    // straight into sqlite_scan, so DuckDB answered with an internal assertion
+    // about a table named "" (#335). Either field satisfies the node, which is
+    // why the form requires neither - but "neither" is not a third option, and
+    // saying so here covers the GUI, MCP, a hand-written file and the headless
+    // runner at once. It also reaches `validate`, which compiles without
+    // running, so the mistake is caught before a connection is opened.
+    let trimmed = |k: &str| string_prop(props, k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let from_arg = trimmed("sql").or_else(|| trimmed("tableName")).ok_or_else(|| {
+        "SQLite source: set a table name, or a SQL query to run against the database".to_string()
+    })?;
+    Ok(format!(
         "SELECT * FROM sqlite_scan('{}', '{}')",
         sql_escape(&database),
         sql_escape(&from_arg)
-    )
+    ))
 }
 
-pub(crate) fn build_duckdb_source(props: &JsonValue) -> String {
+pub(crate) fn build_duckdb_source(props: &JsonValue) -> Result<String, String> {
     // The DuckDB file is ATTACHed as `duckle_src` (READ_ONLY) by the
     // stage / inspect prelude; we read from it qualified by that alias.
-    if let Some(table) = string_prop(props, "tableName").filter(|s| !s.is_empty()) {
-        match string_prop(props, "schema").filter(|s| !s.is_empty()) {
+    // Trimmed, not just non-empty: a box touched and cleared can hold spaces,
+    // and `"  "` quoted as an identifier is a table that cannot exist.
+    let trimmed = |k: &str| {
+        string_prop(props, k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    if let Some(table) = trimmed("tableName") {
+        Ok(match trimmed("schema") {
             Some(schema) => format!(
                 "SELECT * FROM duckle_src.{}.{}",
                 quote_ident(&schema),
                 quote_ident(&table)
             ),
             None => format!("SELECT * FROM duckle_src.{}", quote_ident(&table)),
-        }
+        })
     } else if let Some(sql) = string_prop(props, "sql").filter(|s| !s.trim().is_empty()) {
         // Advanced: a custom query. Reference tables as duckle_src.<table>.
-        format!("({})", sql)
+        Ok(format!("({})", sql))
     } else {
-        "SELECT 1 AS placeholder LIMIT 0".into()
+        // Was `SELECT 1 AS placeholder LIMIT 0`, which meant a node nobody had
+        // finished configuring RAN, reported ok, and wrote a file whose only
+        // column was named `placeholder`. A green run that produces the wrong
+        // schema is worse than a failure, because nothing asks about it.
+        //
+        // The rest of the family already refuses - build_relational_source
+        // answers "table name is required" for ducklake / motherduck / quack -
+        // so this was the outlier rather than a policy.
+        Err("DuckDB source: set a table name, or a SQL query to run against the database".into())
     }
 }
 
@@ -5422,7 +5842,7 @@ fn parse_extension_names(v: Option<&JsonValue>) -> Vec<String> {
     out
 }
 
-fn references_spatial(sql: &str) -> bool {
+pub(crate) fn references_spatial(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut i = 0;
@@ -5774,9 +6194,28 @@ pub(crate) fn db_attach(props: &JsonValue, extension: &str, default_port: u64, r
         );
     let mode = if attach_read_only { ", READ_ONLY" } else { "" };
     let type_name = extension.to_uppercase();
+    // #332: a MySQL write is one `INSERT INTO ... SELECT`, and DuckDB wraps it
+    // in a single transaction - which an InnoDB Cluster feels as one enormous
+    // commit, with the replication cost that implies. `mysql_enable_transactions`
+    // turns that off ("Whether to run 'START TRANSACTION'/'COMMIT'/'ROLLBACK' on
+    // MySQL connections", default true in the pinned 1.5.4).
+    //
+    // Emitted after LOAD and before ATTACH, which is where the SQL Server path
+    // already puts `SET mssql_insert_batch_size`. MySQL only: Postgres exposes
+    // no equivalent, so emitting it there would be an unrecognized-parameter
+    // error. Sinks only: a source attaches READ_ONLY and writes nothing.
+    let transactions = if extension == "mysql"
+        && !is_source
+        && matches!(props.get("transactions"), Some(JsonValue::Bool(false)))
+    {
+        "SET mysql_enable_transactions = false; "
+    } else {
+        ""
+    };
     format!(
-        "LOAD {ext}; ATTACH '{conn}' AS {alias} (TYPE {type_name}{mode}); ",
+        "LOAD {ext}; {tx}ATTACH '{conn}' AS {alias} (TYPE {type_name}{mode}); ",
         ext = extension,
+        tx = transactions,
         conn = sql_escape(&connstr),
         alias = alias,
         type_name = type_name,
@@ -5852,7 +6291,7 @@ fn pushdown_query_fn(component_id: &str) -> Option<&'static str> {
 }
 
 /// Whether the `pushdown` toggle is on (bool true or a truthy string).
-fn relational_pushdown_on(props: &JsonValue) -> bool {
+pub(crate) fn relational_pushdown_on(props: &JsonValue) -> bool {
     props.get("pushdown").and_then(JsonValue::as_bool).unwrap_or(false)
         || matches!(
             string_prop(props, "pushdown")
@@ -6430,17 +6869,51 @@ pub(crate) fn build_spatial_sink(props: &JsonValue, from_view: &str) -> String {
     // key and the geometry keeps its CRS. So the option sits where it is looked for and
     // goes out through the writer that works.
     if driver.eq_ignore_ascii_case("geoparquet") || driver.eq_ignore_ascii_case("parquet") {
-        return format!(
-            "COPY (SELECT * FROM {}) TO '{}' (FORMAT PARQUET)",
-            quote_ident(from_view),
-            sql_escape(&path)
-        );
+        // #241 follow-up: the Hilbert option (#319) was only on snk.parquet, so the
+        // sink someone reaches for when the work IS geospatial was the one without
+        // the spatial optimisation. Same helper as the Parquet sink rather than a
+        // second copy of the clause, so the two cannot drift.
+        //
+        // Only on this branch: Hilbert ordering earns its keep through row-group
+        // pruning, and the GDAL drivers below have no row groups.
+        return match hilbert_order(props, from_view) {
+            None => format!(
+                "COPY (SELECT * FROM {}) TO '{}' (FORMAT PARQUET)",
+                quote_ident(from_view),
+                sql_escape(&path)
+            ),
+            Some(order_by) => format!(
+                // Spatial is loaded here for the same reason build_parquet_sink
+                // loads it: a GEOMETRY read back from a plain Parquet file does not
+                // taint this stage, and ST_Hilbert would then fail at write time,
+                // after the whole pipeline had already run.
+                "INSTALL spatial; LOAD spatial; COPY (SELECT * FROM {} {}) TO '{}' (FORMAT PARQUET)",
+                quote_ident(from_view),
+                order_by,
+                sql_escape(&path)
+            ),
+        };
     }
+    // #328: a Shapefile's .dbf carries no encoding of its own, so GDAL writes
+    // the platform default and a reader has nothing to go on - Arabic place
+    // names came back as `?????`. Declaring it makes GDAL write the bytes as
+    // asked AND drop a `.cpg` sidecar naming the encoding, which is what makes
+    // the file self-describing rather than merely correct on the machine that
+    // wrote it.
+    //
+    // Passed as a layer-creation option because that is where a GDAL driver
+    // takes it; a plain `ENCODING` on the COPY is not an option DuckDB knows.
+    let encoding = string_prop(props, "encoding").filter(|s| !s.trim().is_empty());
+    let layer_options = match &encoding {
+        Some(e) => format!(", LAYER_CREATION_OPTIONS 'ENCODING={}'", sql_escape(e)),
+        None => String::new(),
+    };
     format!(
-        "COPY (SELECT * FROM {}) TO '{}' (FORMAT GDAL, DRIVER '{}')",
+        "COPY (SELECT * FROM {}) TO '{}' (FORMAT GDAL, DRIVER '{}'{})",
         quote_ident(from_view),
         sql_escape(&path),
-        sql_escape(&driver)
+        sql_escape(&driver),
+        layer_options
     )
 }
 
@@ -7904,6 +8377,28 @@ pub(crate) fn build_text_similarity(inputs: &NodeInputs, props: &JsonValue) -> R
 /// against a fixed target. The classic "orders inside delivery zone"
 /// example is `left=orders.point JOIN right=zones.polygon ON
 /// ST_Within(orders.point, zones.polygon)`.
+/// The DuckDB spatial function a `relation` names.
+///
+/// Shared by the join and by its reject stream, so the two halves cannot
+/// disagree about what "matched" meant - including the fallback, which an
+/// unrecognised relation lands on.
+fn spatial_relation_fn(props: &JsonValue) -> &'static str {
+    match string_prop(props, "relation").unwrap_or_default().as_str() {
+        "contains" => "ST_Contains",
+        "within" => "ST_Within",
+        "touches" => "ST_Touches",
+        "crosses" => "ST_Crosses",
+        "overlaps" => "ST_Overlaps",
+        "equals" => "ST_Equals",
+        // #220: Covers / CoveredBy differ from Contains / Within at the
+        // boundary - a geometry covers another that touches its edge, which
+        // Contains rejects. That distinction is why GIS tools expose both.
+        "covers" => "ST_Covers",
+        "coveredby" => "ST_CoveredBy",
+        _ => "ST_Intersects",
+    }
+}
+
 pub(crate) fn build_spatial_join(inputs: &NodeInputs, props: &JsonValue) -> Result<String, String> {
     let left = inputs
         .main()
@@ -7917,21 +8412,7 @@ pub(crate) fn build_spatial_join(inputs: &NodeInputs, props: &JsonValue) -> Resu
     let right_col = string_prop(props, "rightGeomColumn")
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "Spatial Join needs rightGeomColumn".to_string())?;
-    let relation = string_prop(props, "relation").unwrap_or_else(|| "intersects".into());
-    let fn_name = match relation.as_str() {
-        "contains" => "ST_Contains",
-        "within" => "ST_Within",
-        "touches" => "ST_Touches",
-        "crosses" => "ST_Crosses",
-        "overlaps" => "ST_Overlaps",
-        "equals" => "ST_Equals",
-        // #220: Covers / CoveredBy differ from Contains / Within at the
-        // boundary - a geometry covers another that touches its edge, which
-        // Contains rejects. That distinction is why GIS tools expose both.
-        "covers" => "ST_Covers",
-        "coveredby" => "ST_CoveredBy",
-        _ => "ST_Intersects",
-    };
+    let fn_name = spatial_relation_fn(props);
     let kind = match string_prop(props, "joinType").as_deref() {
         Some("left") => "LEFT",
         _ => "INNER",
@@ -8235,21 +8716,42 @@ pub(crate) fn build_ip_parse(inputs: &NodeInputs, props: &JsonValue) -> Result<S
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "IP Parse needs an input column".to_string())?;
     let kind = string_prop(props, "kind").unwrap_or_else(|| "host".into());
+    // DuckDB's inet extension provides exactly five of these: host, family,
+    // netmask, network, broadcast. `hostmask` and `masklen` were emitted as if
+    // they existed too, and picking either failed the run with "Catalog Error:
+    // Scalar Function with name masklen does not exist!".
+    //
+    // masklen is derived instead. An explicit prefix wins; an address written
+    // without one takes the full width for its family, which is the answer
+    // PostgreSQL's masklen gives as well. `CASE family(..) WHEN` rather than an
+    // ELSE, so a NULL address stays NULL instead of being called a /32.
+    //
+    // hostmask has no such derivation - it is the bitwise complement of the
+    // netmask, and doing that in SQL across both a dotted quad and a v6 hex
+    // group is not worth what it would cost to read. The option is gone from
+    // the form rather than left pretending, and an old pipeline naming it now
+    // gets `host` like any other unrecognised kind.
     let fn_name = match kind.as_str() {
         "family" => "family",
         "broadcast" => "broadcast",
         "netmask" => "netmask",
-        "hostmask" => "hostmask",
-        "masklen" => "masklen",
         "network" => "network",
+        "masklen" => "masklen",
         _ => "host",
     };
     let output = string_prop(props, "outputColumn")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{}_{}", column, fn_name));
+    let col = quote_ident(&column);
+    let expr = if fn_name == "masklen" {
+        format!(
+            "COALESCE(TRY_CAST(NULLIF(split_part(CAST(CAST({col} AS INET) AS VARCHAR), '/', 2), '')              AS INTEGER), CASE family(CAST({col} AS INET)) WHEN 6 THEN 128 WHEN 4 THEN 32 END)"
+        )
+    } else {
+        format!("{fn_name}(CAST({col} AS INET))")
+    };
     Ok(format!(
-        "SELECT *, {fn_name}(CAST({col} AS INET)) AS {out} FROM {up}",
-        col = quote_ident(&column),
+        "SELECT *, {expr} AS {out} FROM {up}",
         out = quote_ident(&output),
         up = quote_ident(upstream)
     ))
@@ -8333,7 +8835,27 @@ pub(crate) fn build_vector_search(inputs: &NodeInputs, props: &JsonValue) -> Res
 /// transforms (e.g. ST_AsText) can convert it.
 pub(crate) fn build_spatial_source(props: &JsonValue) -> String {
     let path = string_prop(props, "path").unwrap_or_default();
+    // #241: GeoParquet is not something ST_Read can open. ST_Read is
+    // GDAL-backed, and the spatial extension DuckDB ships does not carry
+    // GDAL's Parquet driver, so a .geoparquet path fails with "Could not open
+    // GDAL dataset" - the file is perfectly readable, just not by that
+    // function. `read_parquet` reads it natively and returns a real GEOMETRY
+    // with its CRS intact, which is what the rest of the geo components
+    // expect.
+    if is_parquet_path(&path) {
+        return format!("SELECT * FROM read_parquet('{}')", sql_escape(&path));
+    }
     format!("SELECT * FROM ST_Read('{}')", sql_escape(&path))
+}
+
+/// Whether a path names a Parquet file, including a glob or a remote URL.
+///
+/// By extension rather than by sniffing, because the decision is made while
+/// compiling and the file may not be reachable yet - and because a wrong guess
+/// here is a confusing failure at run time rather than a wrong answer.
+fn is_parquet_path(path: &str) -> bool {
+    let p = path.split(['?', '#']).next().unwrap_or(path).trim().to_ascii_lowercase();
+    p.ends_with(".parquet") || p.ends_with(".geoparquet") || p.ends_with(".pq")
 }
 
 /// Esri File Geodatabase (.gdb) source via the spatial extension (#205).
@@ -8387,16 +8909,53 @@ pub(crate) fn build_huggingface_source(props: &JsonValue) -> String {
 /// every line becomes a single string the SUBSTR projections can chew.
 /// Trims trailing whitespace by default (the standard for fixed-width
 /// dumps where every field is padded to its column width).
-pub(crate) fn build_fixedwidth_source(props: &JsonValue) -> Result<String, String> {
+pub(crate) fn build_fixedwidth_source(
+    props: &JsonValue,
+    declared: Option<&[duckle_metadata::Column]>,
+) -> Result<String, String> {
     let path = string_prop(props, "path")
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "Fixed-width source: path required".to_string())?;
-    let cols = props
-        .get("columns")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            "Fixed-width source: columns array required ({name, start, width} each)".to_string()
-        })?;
+    // The form offers `columnWidths` ("10,20,8") and this required `columns`
+    // as an array of {name,start,width}, so a node configured in the editor
+    // failed outright and no field on the form could satisfy it. Widths are
+    // cumulative - the Nth column starts after the ones before it - and the
+    // names come from the declared schema when there is one, which is the same
+    // rule a headerless CSV already follows.
+    let widths_form: Option<Vec<JsonValue>> = string_prop(props, "columnWidths")
+        .filter(|s| !s.trim().is_empty())
+        .map(|spec| {
+            let mut at: i64 = 1;
+            let mut out = Vec::new();
+            for (i, piece) in spec.split(',').enumerate() {
+                let w: i64 = match piece.trim().parse() {
+                    Ok(w) if w > 0 => w,
+                    _ => continue,
+                };
+                let name = declared
+                    .and_then(|d| d.get(i))
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| format!("col{}", i + 1));
+                out.push(serde_json::json!({ "name": name, "start": at, "width": w }));
+                at += w;
+            }
+            out
+        })
+        .filter(|v: &Vec<JsonValue>| !v.is_empty());
+    let owned;
+    let cols: &Vec<JsonValue> = match props.get("columns").and_then(|v| v.as_array()) {
+        Some(c) => c,
+        None => match widths_form {
+            Some(w) => {
+                owned = w;
+                &owned
+            }
+            None => {
+                return Err("Fixed-width source: set columnWidths (e.g. 10,20,8), or a columns                             array of {name, start, width} each"
+                    .to_string())
+            }
+        },
+    };
     if cols.is_empty() {
         return Err("Fixed-width source: at least one column required".into());
     }
@@ -8514,22 +9073,31 @@ pub(crate) fn build_artifact_source(props: &JsonValue) -> String {
         "CAST(NULL AS VARCHAR) AS sha256"
     };
     format!(
-        "SELECT filename AS uri, parse_filename(filename) AS name, {media} AS media_type,          size AS size_bytes, {sha}, last_modified AS modified_at          FROM read_blob('{}')",
+        "SELECT filename AS uri, parse_filename(filename) AS name, {media} AS media_type, size AS size_bytes, {sha}, last_modified AS modified_at FROM read_blob('{}')",
         sql_escape(&target)
     )
 }
 
-pub(crate) fn build_filelist_source(props: &JsonValue) -> String {
+pub(crate) fn build_filelist_source(props: &JsonValue) -> Result<String, String> {
     // An explicit `path` is used verbatim, which makes the component double as
     // an existence test: pointed at one file it yields one row, or none. That
     // is what a job's file-exists check needs, and it needs no second component.
     if let Some(path) = string_prop(props, "path").filter(|s| !s.trim().is_empty()) {
-        return format!(
+        return Ok(format!(
             "SELECT file, parse_filename(file) AS filename FROM glob('{}')",
             sql_escape(path.trim())
-        );
+        ));
     }
-    let dir = string_prop(props, "directory").unwrap_or_default();
+    // Either field will do, so the form requires neither - and NEITHER built
+    // `glob('/*')`, the filesystem root. On Windows that returns nothing, so
+    // the run reported ok with an empty result and no reason; elsewhere the
+    // root is not empty. Same hole as src.sqlite (#335) and src.duckdb.
+    let dir = string_prop(props, "directory")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "File list: set a folder to list, or a single file path".to_string()
+        })?;
     let pattern = string_prop(props, "pattern")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "*".into());
@@ -8545,10 +9113,10 @@ pub(crate) fn build_filelist_source(props: &JsonValue) -> String {
     };
     // parse_filename rather than a regex: the separator differs per platform,
     // and the glob above may have been written with either.
-    format!(
+    Ok(format!(
         "SELECT file, parse_filename(file) AS filename FROM glob('{}')",
         sql_escape(&glob)
-    )
+    ))
 }
 
 /// Iceberg source via the DuckDB iceberg extension's `iceberg_scan`.
@@ -8563,6 +9131,77 @@ pub(crate) fn build_iceberg_source(props: &JsonValue) -> String {
 pub(crate) fn build_delta_source(props: &JsonValue) -> String {
     let path = string_prop(props, "path").unwrap_or_default();
     format!("SELECT * FROM delta_scan('{}')", sql_escape(&path))
+}
+
+/// The sheet names in an `.xlsx`, in workbook order.
+///
+/// "Read every sheet" has to know the names before it can build the reads, and
+/// DuckDB cannot supply them: the excel extension exposes `read_xlsx` and
+/// nothing else, so there is no sheet catalogue to query. An `.xlsx` is a zip
+/// whose `xl/workbook.xml` names them, and both the zip reader and the XML
+/// reader are already dependencies here.
+///
+/// Returns empty for anything it cannot read - a missing file, a `.xls` that is
+/// not a zip, a workbook part that is absent. The caller then falls back to the
+/// single-sheet read, so a bad path still fails exactly where it failed before
+/// rather than turning into a confusing error about sheets.
+pub(crate) fn excel_sheet_names(path: &str) -> Vec<String> {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return Vec::new();
+    };
+    let mut xml = String::new();
+    {
+        let Ok(mut entry) = zip.by_name("xl/workbook.xml") else {
+            return Vec::new();
+        };
+        if entry.read_to_string(&mut xml).is_err() {
+            return Vec::new();
+        }
+    }
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut names = Vec::new();
+    let mut in_sheets = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) if e.local_name().as_ref() == "sheets" => {
+                in_sheets = true;
+            }
+            Ok(quick_xml::events::Event::End(e)) if e.local_name().as_ref() == "sheets" => {
+                break;
+            }
+            // A sheet element is normally empty, but accept a start tag too
+            // rather than depend on how the writer chose to spell it.
+            Ok(quick_xml::events::Event::Empty(e)) | Ok(quick_xml::events::Event::Start(e))
+                if in_sheets && e.local_name().as_ref() == "sheet" =>
+            {
+                for attr in e.attributes().flatten() {
+                    if attr.key.local_name().as_ref() == "name" {
+                        // Unescaped through quick-xml: a sheet legitimately
+                        // named "R&D" is stored as "R&amp;D", and asking
+                        // read_xlsx for the raw spelling would not match it.
+                        //
+                        // `Implicit1_0` rather than a guess: the deprecated
+                        // `unescape_value()` this replaces was defined as
+                        // `normalized_value_with(Implicit1_0, 1,
+                        // resolve_predefined_entity)`, so this is the same call
+                        // with the version named instead of assumed. We do not
+                        // read the document's XML declaration, and 1.0 is what
+                        // the specification assumes when it is not consulted.
+                        if let Ok(v) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
+                            names.push(v.into_owned());
+                        }
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    names
 }
 
 /// Excel (.xlsx) source via DuckDB v1.2+ `read_xlsx`. Supports an
@@ -8581,36 +9220,83 @@ pub(crate) fn build_excel_source(
     // no declared schema the read is unchanged (auto-infer, all columns).
     let typed = declared.filter(|c| !c.is_empty());
 
-    // Extra read_xlsx options (sheet / header) are shared by every file.
+    // Extra read_xlsx options shared by every file and sheet. The sheet is NOT
+    // here: it varies per read once more than one sheet is in play.
     let mut opts: Vec<String> = Vec::new();
-    if let Some(sheet) = string_prop(props, "sheet").filter(|s| !s.is_empty()) {
-        opts.push(format!("sheet = '{}'", sql_escape(&sheet)));
-    }
     if let Some(has_header) = props.get("hasHeader").and_then(JsonValue::as_bool) {
         opts.push(format!("header = {}", has_header));
+    }
+    // The Cell range field existed and was never passed, so a sheet with a
+    // banner above the table could not be trimmed from the form at all.
+    // read_xlsx takes it directly.
+    if let Some(range) = string_prop(props, "range").filter(|s| !s.is_empty()) {
+        opts.push(format!("range = '{}'", sql_escape(&range)));
     }
     if typed.is_some() {
         opts.push("all_varchar = true".to_string());
     }
-    let one = |p: &str| {
+    // Name the sheet a row came from. Unioning sheets otherwise discards the
+    // one piece of information the split carried, and it cannot be recovered
+    // afterwards. Mirrors the CSV reader's filename column.
+    let name_column = props
+        .get("sheetColumn")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let one = |p: &str, sheet: Option<&str>| {
         let mut args = vec![format!("'{}'", sql_escape(p))];
+        if let Some(s) = sheet {
+            args.push(format!("sheet = '{}'", sql_escape(s)));
+        }
         args.extend(opts.iter().cloned());
-        format!("SELECT * FROM read_xlsx({})", args.join(", "))
+        let select = match (name_column, sheet) {
+            (true, Some(s)) => format!("SELECT *, '{}' AS sheet_name", sql_escape(s)),
+            // Without a named sheet read_xlsx takes the first one, and its name
+            // is not something this query knows.
+            (true, None) => "SELECT *, NULL AS sheet_name".to_string(),
+            _ => "SELECT *".to_string(),
+        };
+        format!("{} FROM read_xlsx({})", select, args.join(", "))
     };
+
+    // Which sheets. Blank is the first sheet, as it always was.
+    let all_sheets = props
+        .get("allSheets")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    // A comma-separated list, so one name behaves exactly as it did before.
+    let named: Vec<String> = string_prop(props, "sheet")
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
 
     // DuckDB's excel reader can't glob (duckdb-excel#30): a wildcard or a
     // directory would silently read only the first file. Expand it ourselves
     // and UNION the per-file reads (BY NAME tolerates column-order drift).
     let files = expand_excel_paths(&path);
-    let base = match files.len() {
-        0 => one(&path), // nothing matched (or no fs access) - let DuckDB report it
-        1 => one(&files[0]),
-        _ => files
-            .iter()
-            .map(|f| one(f))
-            .collect::<Vec<_>>()
-            .join(" UNION ALL BY NAME "),
-    };
+    let targets: Vec<String> = if files.is_empty() { vec![path.clone()] } else { files };
+
+    let mut reads: Vec<String> = Vec::new();
+    for f in &targets {
+        // Every sheet means asking the file which sheets it has - DuckDB
+        // cannot say, so `excel_sheet_names` reads the workbook itself. Per
+        // file, because two workbooks need not agree on their sheet names.
+        let sheets: Vec<String> = if all_sheets {
+            excel_sheet_names(f)
+        } else {
+            named.clone()
+        };
+        match sheets.len() {
+            0 => reads.push(one(f, None)),
+            _ => reads.extend(sheets.iter().map(|s| one(f, Some(s)))),
+        }
+    }
+    let base = reads.join(" UNION ALL BY NAME ");
 
     let Some(cols) = typed else {
         return base;
@@ -8886,6 +9572,37 @@ fn dead_letter_prelude(
     Ok((valid, prelude))
 }
 
+/// A file sink writes with `COPY ... TO`, which only ever REPLACES.
+///
+/// The forms offered "Append" (snk.parquet) and "Error if exists" (csv, json,
+/// jsonl, excel, parquet) and none of these builders reads `mode` at all - an
+/// unrecognised mode is not an error in a COPY, it is the default, and the
+/// default is replace. Measured before this guard existed: rows 1,2 written,
+/// a second run with mode=append writing 3,4, and the file afterwards held ONLY
+/// 3,4. Someone asking to add to a dataset destroyed it, with no error.
+///
+/// The options are gone from the forms. This is for the pipelines already
+/// carrying one, which would otherwise keep silently replacing: refuse, and say
+/// what would have happened.
+fn refuse_unimplemented_file_mode(
+    component_id: &str,
+    props: &JsonValue,
+) -> Result<(), EngineError> {
+    let mode = string_prop(props, "mode").unwrap_or_default();
+    let mode = mode.trim();
+    if mode.is_empty() || mode.eq_ignore_ascii_case("overwrite") {
+        return Ok(());
+    }
+    Err(EngineError::Unsupported(format!(
+        "{component_id}: write mode '{mode}' is not implemented for a file sink - it writes with          COPY, which always replaces the file. Running this would have REPLACED the existing data          rather than {}. Remove the mode, or write to a database sink, which does implement it.",
+        if mode.eq_ignore_ascii_case("append") {
+            "adding to it"
+        } else {
+            "refusing"
+        }
+    )))
+}
+
 pub(crate) fn build_sink_sql(
     component_id: &str,
     props: &JsonValue,
@@ -8894,7 +9611,10 @@ pub(crate) fn build_sink_sql(
     schema: Option<&[duckle_metadata::Column]>,
 ) -> Result<String, EngineError> {
     match component_id {
-        "snk.csv" => Ok(build_csv_sink(props, from_view)),
+        "snk.csv" => {
+            refuse_unimplemented_file_mode(component_id, props)?;
+            Ok(build_csv_sink(props, from_view))
+        }
         "snk.tsv" => {
             let mut p = props.clone();
             if let Some(obj) = p.as_object_mut() {
@@ -8902,8 +9622,14 @@ pub(crate) fn build_sink_sql(
             }
             Ok(build_csv_sink(&p, from_view))
         }
-        "snk.parquet" => Ok(build_parquet_sink(props, from_view)),
-        "snk.json" | "snk.jsonl" => Ok(build_json_sink(props, from_view)),
+        "snk.parquet" => {
+            refuse_unimplemented_file_mode(component_id, props)?;
+            Ok(build_parquet_sink(props, from_view))
+        }
+        "snk.json" | "snk.jsonl" => {
+            refuse_unimplemented_file_mode(component_id, props)?;
+            Ok(build_json_sink(props, from_view))
+        }
         "snk.s3" | "snk.gcs" | "snk.azureblob"
         | "snk.minio" | "snk.r2" | "snk.b2" => {
             // MinIO / R2 / B2 are S3-compatible; the endpoint lives in the
@@ -8926,7 +9652,10 @@ pub(crate) fn build_sink_sql(
             let (eff_from, prelude) = dead_letter_prelude(props, schema, from_view)?;
             Ok(format!("{}{}", prelude, build_relational_sink(component_id, props, &eff_from, cols)?))
         }
-        "snk.excel" => Ok(build_excel_sink(props, from_view)),
+        "snk.excel" => {
+            refuse_unimplemented_file_mode(component_id, props)?;
+            Ok(build_excel_sink(props, from_view))
+        }
         "snk.spatial" => Ok(build_spatial_sink(props, from_view)),
         "snk.iceberg" => Ok(build_iceberg_sink(props, from_view)),
         other => Err(EngineError::Unsupported(format!(
@@ -9169,12 +9898,51 @@ pub(crate) fn build_parquet_sink(props: &JsonValue, from_view: &str) -> String {
         // leave untouched siblings alone).
         options.push("OVERWRITE_OR_IGNORE".to_string());
     }
-    format!(
-        "COPY ({}) TO '{}' ({})",
-        partition_guarded_source(props, from_view, &partition),
-        sql_escape(&path),
-        options.join(", ")
-    )
+    let source = partition_guarded_source(props, from_view, &partition);
+    // #319: optional Hilbert spatial ordering, so geometries that are close on
+    // the ground land close in the file and row-group pruning can skip more.
+    match hilbert_order(props, from_view) {
+        None => format!("COPY ({}) TO '{}' ({})", source, sql_escape(&path), options.join(", ")),
+        Some(order_by) => format!(
+            // The spatial extension is loaded here rather than relied upon:
+            // geometry usually arrives from a source that already loaded it and
+            // taints this stage, but a GEOMETRY read back from a plain Parquet
+            // file does not, and ST_Hilbert would then fail at write time -
+            // after the whole pipeline had already run.
+            "INSTALL spatial; LOAD spatial; COPY (SELECT * FROM ({}) {}) TO '{}' ({})",
+            source,
+            order_by,
+            sql_escape(&path),
+            options.join(", ")
+        ),
+    }
+}
+
+/// The `ORDER BY ST_Hilbert(...)` clause for a Parquet write, when one is asked
+/// for (#319).
+///
+/// **Bounds relative to the data**, not the default global extent: the curve is
+/// scaled to what is actually being written, which is what makes neighbouring
+/// geometries land in the same row group. It costs one extra scan to find the
+/// extent, which is the trade the feature exists to make.
+///
+/// A scalar subquery rather than the `CROSS JOIN bounds` the issue proposes,
+/// because `SELECT *` across that join writes the bbox out as a **column of the
+/// exported file**. Verified against DuckDB 1.5.4, where the issue's
+/// `ST_Extent_Agg(geom)::BOX_2D` is also rejected outright ("Unimplemented type
+/// for cast (GEOMETRY -> BOX_2D)"); `ST_Extent(ST_Extent_Agg(geom))` is the
+/// form that works.
+///
+/// One property rather than a checkbox and a column: a checkbox ticked with no
+/// column chosen is a state the engine would have to guess at, and guessing
+/// which column holds the geometry is how the wrong one gets sorted on.
+fn hilbert_order(props: &JsonValue, from_view: &str) -> Option<String> {
+    let column = string_prop(props, "hilbertColumn").filter(|c| !c.trim().is_empty())?;
+    let col = quote_ident(column.trim());
+    Some(format!(
+        "ORDER BY ST_Hilbert({col}, (SELECT ST_Extent(ST_Extent_Agg({col})) FROM {}))",
+        quote_ident(from_view)
+    ))
 }
 
 pub(crate) fn build_json_sink(props: &JsonValue, from_view: &str) -> String {
@@ -9201,6 +9969,24 @@ pub(crate) fn columns_from_props(props: &JsonValue, key: &str) -> Option<Vec<Str
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect::<Vec<_>>()
         })
+}
+
+/// A port a person typed, whether the GUI stored it as a number or as text.
+///
+/// The GUI's integer field writes a JSON NUMBER (`PrimitiveFields.tsx`
+/// `IntegerField` calls `onChange(n)`), and `string_prop` is `as_str()` only -
+/// so reading a port with `string_prop(..).parse()` got `None` for every value
+/// the panel produced and fell through to the default. A GizmoSQL port typed
+/// into the panel was silently discarded and the connection went to 31337.
+///
+/// Text is still accepted, because a hand-written pipeline file and an older
+/// saved one both spell it that way.
+pub(crate) fn port_prop(props: &JsonValue, key: &str) -> Option<u16> {
+    let v = props.get(key)?;
+    if let Some(n) = v.as_u64() {
+        return u16::try_from(n).ok();
+    }
+    v.as_str()?.trim().parse().ok()
 }
 
 pub(crate) fn string_prop(props: &JsonValue, key: &str) -> Option<String> {

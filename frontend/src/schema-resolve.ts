@@ -1,3 +1,4 @@
+import type { NodeAnalysis, SqlDiagnostic } from './tauri-bridge';
 import type { Edge, Node } from '@xyflow/react';
 import type { Column, DataType, DuckleNodeData } from './pipeline-types';
 import { getManifest } from './workflow-ui/fields/component-manifests';
@@ -17,6 +18,125 @@ function aggOutputType(func: string, sourceCol: Column | undefined): DataType {
         return 'float64';
     }
     return sourceCol?.type ?? 'string';
+}
+
+/**
+ * #226: schemas DuckDB worked out, for nodes this file does not model.
+ *
+ * The per-component rules below cover the common transforms exactly, and
+ * everything else falls back to a guess: keep the upstream columns and, if the
+ * node names an `outputColumn`, append it as text. That guess is wrong in three
+ * ways it cannot detect - a transform that adds SEVERAL columns, one that
+ * REMOVES a column (Text to Columns with dropSource), and any added column that
+ * is not text (`xf.length` produces a BIGINT).
+ *
+ * Rather than add a rule per component for ever, the engine can be asked what a
+ * node really produces: it runs that node's own compiled SQL against a zero-row
+ * typed stub of its inputs and reports what came out. That reads nothing - no
+ * file, no credential, no network - so it is cheap enough for an editor.
+ *
+ * It is asynchronous, and this resolver is called synchronously from four
+ * places during render. So the answer is CACHED here: the resolver returns its
+ * best synchronous guess immediately, and uses the engine's answer on the next
+ * render once `deriveSchemaFromEngine` has filled it in.
+ */
+const derived = new Map<string, Column[]>();
+
+/**
+ * #314: what DuckDB objected to, per node.
+ *
+ * Kept beside the columns rather than thrown away. The bind has always caught a
+ * typo; the message, its position and the column DuckDB suggests instead were
+ * being discarded, so the editor could say only that the node did not resolve -
+ * which is the least useful true thing it could say.
+ */
+const problems = new Map<string, SqlDiagnostic[]>();
+
+export function diagnosticsFor(nodeId: string): SqlDiagnostic[] {
+    return problems.get(nodeId) ?? [];
+}
+
+/** What makes one derivation different from another. */
+function derivedKey(nodeId: string, componentId: string, props: unknown, upstream: Column[]): string {
+    return JSON.stringify([
+        nodeId,
+        componentId,
+        props,
+        upstream.map(c => [c.name, c.type]),
+    ]);
+}
+
+/**
+ * Ask the engine what a node produces and remember it.
+ *
+ * Returns true when the cache changed, so a caller can re-render. Failures are
+ * swallowed on purpose: this is an improvement on a guess that already exists,
+ * and an editor must not show an error because a schema could not be refined.
+ */
+export async function deriveSchemaFromEngine(
+    nodeId: string,
+    nodes: Node<DuckleNodeData>[],
+    edges: Edge[],
+    analyze: (
+        nodes: Node<DuckleNodeData>[],
+        edges: Edge[],
+        nodeId: string,
+        inputs: Array<[string, Column[]]>,
+    ) => Promise<NodeAnalysis | null>,
+): Promise<boolean> {
+    const node = nodes.find(n => n.id === nodeId);
+    const componentId = node?.data.componentId;
+    if (!node || !componentId) return false;
+
+    const inputs = edges
+        .filter(e => e.target === nodeId)
+        .map(e => [e.source, resolveOutputSchema(e.source, nodes, edges)] as const)
+        .filter(([, cols]) => cols.length > 0);
+    // A remote source has no upstream by definition, and is exactly the node
+    // whose SQL Duckle cannot bind - so it is also the node the dialect-neutral
+    // hints (#314) are for. The condition mirrors the engine's own `remote`
+    // test (`src.` + authored SQL), so lifting the guard here cannot start
+    // showing bind errors for an unconnected transform: the engine returns
+    // early for these and never runs anything.
+    const props = node.data.properties as Record<string, unknown> | undefined;
+    const authoredSql = ['sql', 'query'].some(
+        k => typeof props?.[k] === 'string' && (props[k] as string).trim() !== '',
+    );
+    const remoteSource = componentId.startsWith('src.') && authoredSql;
+    if (inputs.length === 0 && !remoteSource) return false;
+
+    const key = derivedKey(nodeId, componentId, node.data.properties, inputs.flatMap(([, c]) => c));
+    if (derived.has(key)) return false;
+
+    try {
+        const analysis = await analyze(
+            nodes,
+            edges,
+            nodeId,
+            inputs.map(([id, cols]) => [id, cols] as [string, Column[]]),
+        );
+        if (!analysis) return false;
+
+        const found = analysis.diagnostics ?? [];
+        const had = problems.get(nodeId) ?? [];
+        // Replaced rather than merged, and CLEARED when the node now binds: a
+        // stale error under a line the author has already fixed is worse than
+        // no error at all.
+        if (found.length > 0) problems.set(nodeId, found);
+        else problems.delete(nodeId);
+        const changed = found.length !== had.length
+            || found.some((d, i) => d.message !== had[i]?.message);
+
+        const cols = analysis.columns ?? [];
+        if (cols.length === 0) return changed;
+        derived.set(key, cols);
+        return true;
+    } catch {
+        // A node that cannot be analysed at all - an unfinished configuration,
+        // no engine - keeps the guess and reports nothing. Nothing is worse
+        // than before, which is the bar for a background refinement.
+        return false;
+    }
 }
 
 /**
@@ -125,6 +245,36 @@ function computeNodeSchema(
         return [...up, { name, type, nullable: true }];
     }
 
+    // #226: Text to Columns appends its parts and, with dropSource, removes the
+    // column it split. Without this the node fell through to "schema unchanged",
+    // so the new columns never reached the Schema or Preview tabs and the
+    // dropped one stayed listed - showing as a column with no values, which is
+    // exactly what it looks like when a schema describes a relation that does
+    // not have it.
+    //
+    // The engine emits `SELECT *, nullif(split_part(...), '') AS name` - or
+    // `SELECT * EXCLUDE (col), ...` when dropping - so the parts are text and
+    // the source really is gone.
+    if (id === 'xf.text.tocolumns') {
+        const source = props.column as string | undefined;
+        // The engine reads either name; the GUI writes outputColumns.
+        const raw = (props.outputColumns ?? props.columns) as string | undefined;
+        const names = String(raw ?? '')
+            .split(',')
+            .map(n => n.trim())
+            .filter(Boolean);
+        let up = upstream();
+        if (!source || names.length === 0) return up;
+        if (props.dropSource === true) {
+            up = up.filter(c => c.name !== source);
+        }
+        const have = new Set(up.map(c => c.name));
+        const added = names
+            .filter(n => !have.has(n))
+            .map(n => ({ name: n, type: 'string' as DataType, nullable: true }));
+        return [...up, ...added];
+    }
+
     if (id === 'xf.reorder') {
         const ordered = (props.columns as string[] | undefined) ?? [];
         const up = upstream();
@@ -223,6 +373,11 @@ function computeNodeSchema(
         (id?.startsWith('xf.') && id.split('.').length === 2)
     ) {
         const up = upstream();
+        // #226: DuckDB's own answer, if it has been asked for this node yet.
+        // It beats the guess below, which cannot see a transform that adds
+        // several columns, removes one, or adds a column that is not text.
+        const known = derived.get(derivedKey(node.id, id!, props, up));
+        if (known) return known;
         const outputName = props.outputColumn as string | undefined;
         if (outputName && !up.some(c => c.name === outputName)) {
             return [...up, { name: outputName, type: 'string', nullable: true }];

@@ -61,6 +61,39 @@ pub struct Schedule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
     pub kind: ScheduleKind,
+    /// #318: the IANA zone a cron expression is read in, e.g. "Europe/Brussels".
+    ///
+    /// Absent means the machine's own zone, which is what #194 settled on and
+    /// what every schedule written before this means, so an existing store
+    /// keeps its behaviour untouched. Set, it makes "03:00" mean 03:00 there
+    /// regardless of where the runner is deployed - which is the point, since a
+    /// container is usually UTC and the person who wrote the schedule is not.
+    ///
+    /// Only meaningful for cron schedules. An interval is an elapsed duration
+    /// and a zone must not quietly turn "every 24 hours" into "the same clock
+    /// time tomorrow".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// #296: days this schedule must not fire on - a maintenance window.
+    ///
+    /// Civil dates in the schedule's own zone, so "2026-12-25" is Christmas
+    /// where the schedule lives rather than a UTC window clipping two local
+    /// days. Empty by default, which is every schedule written before this.
+    #[serde(default, skip_serializing_if = "crate::cronzone::Exclusions::is_empty")]
+    pub exclude: crate::cronzone::Exclusions,
+    /// #296: what to do about occurrences that came due while nobody was
+    /// listening - the server down, the machine asleep.
+    ///
+    /// `skip` is the default and is exactly today's behaviour, so no existing
+    /// schedule changes when this ships (AC5). What changes for everyone is
+    /// that a skipped occurrence is now RECORDED rather than silently absent.
+    #[serde(default)]
+    pub misfire: crate::occurrences::Misfire,
+    /// #296: how far a catch-up may go. Only consulted when `misfire` is not
+    /// `skip`, and never optional in effect: `all` without a bound is the
+    /// difference between a catch-up and an outage.
+    #[serde(default)]
+    pub catchup: crate::occurrences::Bounds,
     #[serde(default)]
     pub last_run_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
@@ -146,6 +179,10 @@ mod tests {
 
     fn interval(pipeline: &str, seconds: u64) -> Schedule {
         Schedule {
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             id: format!("id-{pipeline}"),
             pipeline_id: pipeline.into(),
             plan_id: None,

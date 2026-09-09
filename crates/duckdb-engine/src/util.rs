@@ -20,8 +20,40 @@ pub fn is_secret_prop_key(key: &str) -> bool {
     if k == "pat" {
         return true;
     }
+    // The same trap from the other side. `pat` was rescued from `path`; these
+    // are the keys the remaining needles swallow, and each is declared by real
+    // components:
+    //
+    //   tokenUrl        the endpoint a token is fetched FROM   (37 fields)
+    //   saslMechanism   "PLAIN" / "SCRAM-SHA-256"              (4)
+    //   saslUsername    a username                             (4)
+    //   max*Tokens, *UsdPerMillionTokens - a count of tokens is not a token
+    //
+    // `privateKeyPath` and `credentialsPath` are NOT here, deliberately.
+    // `path_like_keys_are_not_treated_as_secrets` asserts they keep matching:
+    // a pipeline whose credential comes from a local file path is one that
+    // should not be deployed, because the path will not exist on the server.
+    //
+    // This is not cosmetic: `literal_secrets` is what `duckle-runner build` and
+    // the desktop deploy path REFUSE on, so a false positive blocks packaging
+    // and deploying and tells the author to replace a public URL with
+    // ${ENV:NAME}. Matched as whole keys, because the needle list cannot
+    // express "token but not tokenUrl".
+    const NAMES_SOMETHING_PUBLIC: [&str; 8] = [
+        "tokenurl",
+        "saslmechanism",
+        "saslusername",
+        "maxtokens",
+        "maxinputtokens",
+        "maxoutputtokens",
+        "inputusdpermilliontokens",
+        "outputusdpermilliontokens",
+    ];
+    if NAMES_SOMETHING_PUBLIC.contains(&k.as_str()) {
+        return false;
+    }
     [
-        "password", "passwd", "secret", "token", "apikey", "api_key",
+        "password", "passwd", "passphrase", "secret", "token", "apikey", "api_key",
         "privatekey", "private_key", "accesskey", "access_key",
         "clientsecret", "client_secret", "connectionstring", "connection_string",
         "sas", "credential",
@@ -113,8 +145,69 @@ pub(crate) fn secret_placeholder(key: &str) -> String {
 /// are handled at replace time by [`replace_delimited`], not by dropping the
 /// secret. Sorted longest-value-first so a value that contains another is
 /// replaced first.
-pub(crate) fn collect_secrets(doc: &PipelineDoc) -> Vec<Secret> {
+/// The plaintext values of every workspace context variable marked
+/// `secret: true`.
+///
+/// Collected by ORIGIN rather than by the name of the property they end up in.
+/// `collect_secrets` recognises a credential by its key - `password`, `token`
+/// and friends - which is right for a value the author typed into a secret
+/// field and wrong for one that arrived through `${...}`. A context variable
+/// marked secret and substituted into an ordinary property such as `url` was in
+/// no redaction set at all, so a connector error carrying the resolved URL
+/// persisted the plaintext into run history and the NDJSON log, both of which a
+/// viewer can read.
+///
+/// Best-effort, exactly like the loader it mirrors: a missing or unparseable
+/// context file yields nothing rather than failing the run. A secret that
+/// cannot be read cannot leak through substitution either, because it was never
+/// substituted.
+pub(crate) fn secret_context_values(workspace: &std::path::Path) -> Vec<String> {
+    let repo: JsonValue = std::fs::read_to_string(workspace.join("repository.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(JsonValue::Array(Vec::new()));
+    let mut out = Vec::new();
+    for it in repo.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        if it.get("type").and_then(|v| v.as_str()) != Some("context") {
+            continue;
+        }
+        let Some(id) = it.get("id").and_then(|v| v.as_str()) else { continue };
+        let payload: JsonValue = match std::fs::read_to_string(
+            workspace.join("contexts").join(format!("{id}.json")),
+        )
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        for v in payload.get("variables").and_then(|v| v.as_array()).unwrap_or(&Vec::new()) {
+            if v.get("secret").and_then(|s| s.as_bool()) != Some(true) {
+                continue;
+            }
+            if let Some(val) = v.get("value").and_then(|x| x.as_str()) {
+                // Same two exclusions the property scan makes: an empty value
+                // would splice the placeholder across everything, and a `${...}`
+                // is a reference rather than the secret itself.
+                let t = val.trim();
+                if !t.is_empty() && !t.starts_with("${") {
+                    out.push(val.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn collect_secrets(doc: &PipelineDoc, workspace: Option<&std::path::Path>) -> Vec<Secret> {
     let mut out: Vec<Secret> = Vec::new();
+    // Values that are secret because of where they CAME FROM, not because of
+    // the property they landed in.
+    if let Some(ws) = workspace {
+        for value in secret_context_values(ws) {
+            out.push(Secret { value, placeholder: "DUCKLE_CONTEXT_SECRET".to_string() });
+        }
+    }
     for node in &doc.nodes {
         if let Some(JsonValue::Object(props)) = node.data.properties.as_ref() {
             for (key, val) in props {
@@ -287,6 +380,31 @@ pub(crate) fn procedural_note(s: &plan::Stage) -> String {
     format!("/* {} */", body)
 }
 
+/// Resolve a general entity reference into the text it stands for.
+///
+/// quick-xml 0.42 split `&amp;`, `&#60;` and friends out of `Event::Text` into
+/// their own `Event::GeneralRef`. Code that matches only Text and CData
+/// therefore drops every entity in element content silently - `Ben &amp; Jerry`
+/// arrives as `Ben  Jerry` - which is why both parsers below handle it.
+///
+/// An entity that cannot be resolved (one declared in a DTD) is kept verbatim
+/// as `&name;` rather than dropped. Losing it silently is the failure this
+/// exists to prevent, and a literal is at least visible.
+pub(crate) fn xml_entity_text(e: &quick_xml::events::BytesRef) -> String {
+    match e.resolve_char_ref() {
+        Ok(Some(c)) => return c.to_string(),
+        // A malformed numeric reference (&#xZZ;) is content we cannot read;
+        // keep it literal rather than guess.
+        Ok(None) => {}
+        Err(_) => return format!("&{};", e.borrow().into_inner()),
+    }
+    let name = e.borrow().into_inner();
+    match quick_xml::escape::resolve_predefined_entity(&name) {
+        Some(t) => t.to_string(),
+        None => format!("&{};", name),
+    }
+}
+
 /// Finalize an XML element being popped from the stack: convert it
 /// to a JSON value, push to rows if its path matches row_path, and
 /// merge it into its parent (multiple same-named children collapse
@@ -381,7 +499,11 @@ pub(crate) fn walk_xml_to_rows(
     use quick_xml::reader::Reader;
 
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // NOT trim_text(true). It trims every Text event individually, and since
+    // quick-xml 0.42 splits an entity out of the run of text around it, that
+    // eats the spaces beside it: `Ben &amp; Jerry` arrives as `Ben&Jerry`.
+    // Whitespace between pretty-printed tags is discarded anyway, because
+    // xml_element_value trims the text accumulated for the whole element.
     let row_path_parts: Vec<String> = row_path
         .trim_matches('/')
         .split('/')
@@ -401,21 +523,21 @@ pub(crate) fn walk_xml_to_rows(
         match event {
             Event::Eof => break,
             Event::Start(e) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_string();
                 let mut builder = serde_json::Map::new();
                 for attr in e.attributes().flatten() {
-                    let k = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
-                    let v = String::from_utf8_lossy(&attr.value).to_string();
+                    let k = format!("@{}", attr.key.as_ref());
+                    let v = attr.value.to_string();
                     builder.insert(k, JsonValue::String(v));
                 }
                 stack.push((name, builder, String::new()));
             }
             Event::Empty(e) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_string();
                 let mut builder = serde_json::Map::new();
                 for attr in e.attributes().flatten() {
-                    let k = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
-                    let v = String::from_utf8_lossy(&attr.value).to_string();
+                    let k = format!("@{}", attr.key.as_ref());
+                    let v = attr.value.to_string();
                     builder.insert(k, JsonValue::String(v));
                 }
                 xml_close_element(
@@ -428,15 +550,18 @@ pub(crate) fn walk_xml_to_rows(
                 );
             }
             Event::Text(e) => {
-                let text = String::from_utf8_lossy(
-                    e.xml_content(quick_xml::XmlVersion::Implicit1_0)
-                        .unwrap_or_default()
-                        .as_ref()
-                        .as_bytes(),
-                )
-                .to_string();
+                // quick-xml 0.42 decodes and unescapes to a Cow<str>, so this
+                // no longer round-trips through bytes.
+                let text = e
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .to_string();
                 if let Some(last) = stack.last_mut() {
                     last.2.push_str(&text);
+                }
+            }
+            Event::GeneralRef(e) => {
+                if let Some(last) = stack.last_mut() {
+                    last.2.push_str(&xml_entity_text(&e));
                 }
             }
             Event::CData(e) => {
@@ -444,7 +569,7 @@ pub(crate) fn walk_xml_to_rows(
                 // writes complex / JSON-encoded cell values inside CDATA, and an
                 // author may wrap any value this way, so capture it like Text -
                 // otherwise the content is silently dropped (issue #33).
-                let text = String::from_utf8_lossy(e.into_inner().as_ref()).to_string();
+                let text = e.into_inner().as_ref().to_string();
                 if let Some(last) = stack.last_mut() {
                     last.2.push_str(&text);
                 }
@@ -511,7 +636,11 @@ pub(crate) fn stream_xml_rows<R: std::io::BufRead>(
     use quick_xml::reader::Reader;
 
     let mut xr = Reader::from_reader(reader);
-    xr.config_mut().trim_text(true);
+    // NOT trim_text(true). It trims every Text event individually, and since
+    // quick-xml 0.42 splits an entity out of the run of text around it, that
+    // eats the spaces beside it: `Ben &amp; Jerry` arrives as `Ben&Jerry`.
+    // Whitespace between pretty-printed tags is discarded anyway, because
+    // xml_element_value trims the text accumulated for the whole element.
     let row_path_parts: Vec<String> = row_path
         .trim_matches('/')
         .split('/')
@@ -530,21 +659,21 @@ pub(crate) fn stream_xml_rows<R: std::io::BufRead>(
         match event {
             Event::Eof => break,
             Event::Start(e) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_string();
                 let mut builder = serde_json::Map::new();
                 for attr in e.attributes().flatten() {
-                    let k = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
-                    let v = String::from_utf8_lossy(&attr.value).to_string();
+                    let k = format!("@{}", attr.key.as_ref());
+                    let v = attr.value.to_string();
                     builder.insert(k, JsonValue::String(v));
                 }
                 stack.push((name, builder, String::new()));
             }
             Event::Empty(e) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_string();
                 let mut builder = serde_json::Map::new();
                 for attr in e.attributes().flatten() {
-                    let k = format!("@{}", String::from_utf8_lossy(attr.key.as_ref()));
-                    let v = String::from_utf8_lossy(&attr.value).to_string();
+                    let k = format!("@{}", attr.key.as_ref());
+                    let v = attr.value.to_string();
                     builder.insert(k, JsonValue::String(v));
                 }
                 xml_close_element_streaming(
@@ -557,19 +686,22 @@ pub(crate) fn stream_xml_rows<R: std::io::BufRead>(
                 )?;
             }
             Event::Text(e) => {
-                let text = String::from_utf8_lossy(
-                    e.xml_content(quick_xml::XmlVersion::Implicit1_0)
-                        .unwrap_or_default()
-                        .as_ref()
-                        .as_bytes(),
-                )
-                .to_string();
+                // quick-xml 0.42 decodes and unescapes to a Cow<str>, so this
+                // no longer round-trips through bytes.
+                let text = e
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .to_string();
                 if let Some(last) = stack.last_mut() {
                     last.2.push_str(&text);
                 }
             }
+            Event::GeneralRef(e) => {
+                if let Some(last) = stack.last_mut() {
+                    last.2.push_str(&xml_entity_text(&e));
+                }
+            }
             Event::CData(e) => {
-                let text = String::from_utf8_lossy(e.into_inner().as_ref()).to_string();
+                let text = e.into_inner().as_ref().to_string();
                 if let Some(last) = stack.last_mut() {
                     last.2.push_str(&text);
                 }
@@ -1248,6 +1380,71 @@ mod tests {
         assert_eq!(found, ["Postgres / password"], "found: {found:?}");
     }
 
+    /// A key can contain a credential needle and still name something public.
+    ///
+    /// This is not cosmetic. `literal_secrets` is what `duckle-runner build`
+    /// and the desktop deploy path use to REFUSE, so a false positive does not
+    /// merely warn - it blocks packaging and deploying, and tells the author to
+    /// replace a public value with ${ENV:NAME}.
+    ///
+    /// Every key below is one a real component declares:
+    ///   tokenUrl        37 fields - the endpoint a token is fetched FROM
+    ///   saslMechanism    4 fields - "PLAIN" / "SCRAM-SHA-256"
+    ///   saslUsername     4 fields - a username
+    ///
+    /// The same trap the `pat` special case above already documents: a needle
+    /// that is a substring of an innocent word. `pat` was fixed for `path`;
+    /// `token` and `sas` were not.
+    ///
+    /// `privateKeyPath` and `credentialsPath` stay secret on purpose - see
+    /// `path_like_keys_are_not_treated_as_secrets`, which asserts it.
+    #[test]
+    fn a_key_that_names_an_endpoint_or_a_path_is_not_a_credential() {
+        for key in [
+            "tokenUrl",
+            "saslMechanism",
+            "saslUsername",
+            // Numeric in every manifest that declares them, so `as_str()`
+            // spares them today - but nothing says they must stay numeric,
+            // and a count of tokens is not a token.
+            "maxTokens",
+            "maxInputTokens",
+            "maxOutputTokens",
+            "inputUsdPerMillionTokens",
+            "outputUsdPerMillionTokens",
+        ] {
+            assert!(!is_secret_prop_key(key), "{key} is not a credential");
+        }
+
+        // And the credentials those keys are near are still caught.
+        for key in [
+            "authToken", "sessionToken", "accessToken", "token",
+            "saslPassword", "privateKey", "clientSecret", "apiKey",
+        ] {
+            assert!(is_secret_prop_key(key), "{key} IS a credential");
+        }
+    }
+
+    /// The refusal path, end to end on a document: a pipeline whose only
+    /// "credentials" are an endpoint and a mechanism must package and deploy.
+    #[test]
+    fn a_pipeline_carrying_only_public_values_is_not_refused() {
+        let doc = serde_json::json!({
+            "nodes": [
+                { "id": "n1", "data": { "label": "REST", "properties": {
+                    "url": "https://api.example.com/v1/rows",
+                    "tokenUrl": "https://login.example.com/oauth2/token" } } },
+                { "id": "n2", "data": { "label": "Kafka", "properties": {
+                    "saslMechanism": "SCRAM-SHA-256", "saslUsername": "svc_reader" } } }
+            ]
+        });
+        assert!(
+            literal_secrets(&doc).is_empty(),
+            "refused a pipeline with no credential in it: {:?}",
+            literal_secrets(&doc)
+        );
+    }
+
     /// The shapes that must not panic or report: no nodes, no data, no properties.
     #[test]
     fn a_pipeline_with_nothing_to_scan_reports_nothing() {
@@ -1346,7 +1543,32 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+        /// Element text is decoded, not passed through raw. This is the exact
+    /// behaviour that moved in quick-xml 0.42: `xml_content` went from a
+    /// fallible byte-ish result to an infallible `Cow<str>` that decodes and
+    /// unescapes for us, and the migration deleted the decoding this code used
+    /// to do itself. If that were wrong, `&amp;` would reach a column as the
+    /// five literal characters instead of one ampersand.
     #[test]
+    fn xml_entities_in_element_text_are_decoded() {
+        let xml = "<r><row><name>Ben &amp; Jerry&apos;s</name>                   <note>a &lt; b &gt; c</note></row></r>";
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rows = walk_xml_to_rows(xml, "row", &cancel).expect("parses");
+        assert_eq!(rows.len(), 1);
+        let o = rows[0].as_object().expect("object");
+        assert_eq!(
+            o.get("name").and_then(|v| v.as_str()),
+            Some("Ben & Jerry's"),
+            "&amp; and &apos; must arrive decoded"
+        );
+        assert_eq!(
+            o.get("note").and_then(|v| v.as_str()),
+            Some("a < b > c"),
+            "&lt; and &gt; must arrive decoded"
+        );
+    }
+
+#[test]
     fn xml_cdata_text_is_captured_not_dropped() {
         // issue #33: a value wrapped in <![CDATA[...]]> (how snk.xml writes
         // complex/JSON cells) was skipped on read, so the column came back empty.
@@ -1501,5 +1723,257 @@ mod redaction_tests {
         assert!(got.contains("shopping_cart"), "identifier was corrupted: {got}");
         assert!(!got.contains("password=shop"), "credential survived: {got}");
         assert_eq!(got.matches("${DUCKLE_PASSWORD}").count(), 2, "{got}");
+    }
+}
+
+/// Serialises every test in this crate that sets `DUCKLE_WORKSPACE`, which is
+/// process-global while `cargo test` runs tests in parallel.
+///
+/// It has to be ONE lock. Two test modules with a `Mutex` each do not
+/// serialize against one another, and the symptom is the confusing one: each
+/// module passes when run alone and fails in the full suite.
+#[cfg(test)]
+pub(crate) fn workspace_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// #255: resolve a link found in a page against the page it came from.
+///
+/// Server-rendered pagination puts a relative href in the markup - `?page=2`,
+/// `/companies?p=2`, `../next` - and following it means joining it to the
+/// current URL the way a browser would. Getting this wrong does not error, it
+/// fetches the WRONG page, so each shape is spelled out and tested rather than
+/// approximated with string concatenation.
+///
+/// `None` when there is nothing usable, which the caller treats as "no next
+/// page" rather than as a failure.
+pub(crate) fn resolve_url(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() {
+        return None;
+    }
+    // Already absolute: a scheme is `letter *( letter / digit / + / - / . ) :`.
+    if let Some(i) = href.find(':') {
+        let scheme = &href[..i];
+        if !scheme.is_empty()
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        {
+            return Some(href.to_string());
+        }
+    }
+    let (scheme, rest) = base.split_once("://")?;
+    // Protocol-relative: keep the page's own scheme.
+    if let Some(hostpath) = href.strip_prefix("//") {
+        return Some(format!("{scheme}://{hostpath}"));
+    }
+    let (authority, base_path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    // The base path without its query or fragment - a link is resolved against
+    // the document, not against the query that produced it.
+    let base_path = base_path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/");
+    let root = format!("{scheme}://{authority}");
+
+    if let Some(frag) = href.strip_prefix('#') {
+        return Some(format!("{root}{base_path}#{frag}"));
+    }
+    if href.starts_with('?') {
+        return Some(format!("{root}{base_path}{href}"));
+    }
+    if href.starts_with('/') {
+        return Some(format!("{root}{}", normalize_path(href)));
+    }
+    // Relative to the DIRECTORY of the current document, so `next` beside
+    // `/a/b/page.html` is `/a/b/next`, not `/a/b/page.html/next`.
+    let dir = match base_path.rfind('/') {
+        Some(i) => &base_path[..=i],
+        None => "/",
+    };
+    Some(format!("{root}{}", normalize_path(&format!("{dir}{href}"))))
+}
+
+/// Collapse `.` and `..` in a path, the way a browser does before requesting.
+///
+/// A `..` that would climb past the root is dropped rather than kept: no server
+/// can serve it, and keeping it would send a request that is certain to fail.
+fn normalize_path(path: &str) -> String {
+    let (path, tail) = match path.find(['?', '#']) {
+        Some(i) => (&path[..i], &path[i..]),
+        None => (path, ""),
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    let trailing = path.ends_with('/') && !out.is_empty();
+    let mut s = String::from("/");
+    s.push_str(&out.join("/"));
+    if trailing {
+        s.push('/');
+    }
+    s.push_str(tail);
+    s
+}
+
+#[cfg(test)]
+mod url_resolve_tests {
+    use super::resolve_url;
+
+    const PAGE: &str = "https://example.com/a/b/list.html?p=1";
+
+    #[test]
+    fn an_absolute_link_is_left_alone() {
+        assert_eq!(
+            resolve_url(PAGE, "https://other.test/x").as_deref(),
+            Some("https://other.test/x")
+        );
+    }
+
+    #[test]
+    fn a_protocol_relative_link_keeps_the_pages_scheme() {
+        assert_eq!(
+            resolve_url(PAGE, "//cdn.test/x").as_deref(),
+            Some("https://cdn.test/x")
+        );
+    }
+
+    #[test]
+    fn a_root_relative_link_replaces_the_whole_path() {
+        assert_eq!(
+            resolve_url(PAGE, "/companies?p=2").as_deref(),
+            Some("https://example.com/companies?p=2")
+        );
+    }
+
+    /// The commonest shape in server-rendered pagination, and the one string
+    /// concatenation gets wrong: it belongs to the DIRECTORY, not to the file.
+    #[test]
+    fn a_relative_link_resolves_against_the_directory() {
+        assert_eq!(
+            resolve_url(PAGE, "page2.html").as_deref(),
+            Some("https://example.com/a/b/page2.html")
+        );
+    }
+
+    #[test]
+    fn a_query_only_link_keeps_the_path_and_replaces_the_query() {
+        assert_eq!(
+            resolve_url(PAGE, "?p=2").as_deref(),
+            Some("https://example.com/a/b/list.html?p=2")
+        );
+    }
+
+    #[test]
+    fn dot_segments_are_collapsed() {
+        assert_eq!(
+            resolve_url(PAGE, "../c/page2.html").as_deref(),
+            Some("https://example.com/a/c/page2.html")
+        );
+        assert_eq!(
+            resolve_url(PAGE, "./page2.html").as_deref(),
+            Some("https://example.com/a/b/page2.html")
+        );
+    }
+
+    /// Climbing past the root is not a URL any server can serve, so it is
+    /// clamped rather than sent.
+    #[test]
+    fn climbing_past_the_root_is_clamped() {
+        assert_eq!(
+            resolve_url(PAGE, "../../../../x").as_deref(),
+            Some("https://example.com/x")
+        );
+    }
+
+    #[test]
+    fn nothing_usable_is_none_rather_than_an_error() {
+        assert_eq!(resolve_url(PAGE, "   "), None);
+        assert_eq!(resolve_url("not a url", "x"), None);
+    }
+}
+
+#[cfg(test)]
+mod context_secret_redaction_tests {
+    use super::*;
+
+    /// A context variable marked `secret: true` must be redacted wherever it was
+    /// substituted, not only where the property name looks like a credential.
+    ///
+    /// `collect_secrets` recognised a secret by its KEY - `password`, `token`
+    /// and friends - which is right for a value typed into a secret field and
+    /// wrong for one that arrived through `${...}`. Substituted into an ordinary
+    /// property such as `url`, the value was in no redaction set, so a connector
+    /// error carrying the resolved URL persisted the plaintext into run history
+    /// and the NDJSON log - both readable by the lowest-privilege role.
+    #[test]
+    fn a_secret_context_value_is_redacted_wherever_it_was_substituted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::write(
+            ws.join("repository.json"),
+            r#"[{"type":"context","id":"prod","name":"Prod"}]"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join("contexts")).unwrap();
+        std::fs::write(
+            ws.join("contexts").join("prod.json"),
+            r#"{"variables":[
+                 {"key":"apiKey","value":"s3cr3t-token-value","secret":true},
+                 {"key":"region","value":"eu-west-1","secret":false},
+                 {"key":"blank","value":"","secret":true},
+                 {"key":"ref","value":"${ENV:SOMETHING}","secret":true}
+               ]}"#,
+        )
+        .unwrap();
+
+        let values = secret_context_values(ws);
+        assert!(
+            values.contains(&"s3cr3t-token-value".to_string()),
+            "a secret context value was not collected: {values:?}"
+        );
+        assert!(
+            !values.contains(&"eu-west-1".to_string()),
+            "a NON-secret context value must not be redacted, or ordinary values \
+             disappear from errors: {values:?}"
+        );
+        // Same two exclusions the property scan makes.
+        assert!(!values.iter().any(|v| v.trim().is_empty()), "{values:?}");
+        assert!(!values.iter().any(|v| v.starts_with("${")), "{values:?}");
+
+        // And the whole point: the value reaches the redaction set even though
+        // it was substituted into `url`, which is not a secret-looking key.
+        let doc: PipelineDoc = serde_json::from_str(
+            r#"{"nodes":[{"id":"r","position":{"x":0,"y":0},"data":{"label":"R",
+               "componentId":"src.rest",
+               "properties":{"url":"https://api.example.com/v1?key=s3cr3t-token-value"}}}],
+               "edges":[]}"#,
+        )
+        .unwrap();
+        assert!(
+            collect_secrets(&doc, None)
+                .iter()
+                .all(|s| s.value != "s3cr3t-token-value"),
+            "without the workspace there is nothing to learn the secret from"
+        );
+        assert!(
+            collect_secrets(&doc, Some(ws))
+                .iter()
+                .any(|s| s.value == "s3cr3t-token-value"),
+            "the secret was substituted into `url` and never entered the redaction set"
+        );
     }
 }

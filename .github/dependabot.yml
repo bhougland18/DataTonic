@@ -16,6 +16,25 @@ updates:
     schedule:
       interval: "monthly"
     open-pull-requests-limit: 3
+    # lopdf is not ours to choose. src.pdf parses each document TWICE - our
+    # lopdf reads the page tree and the Info dictionary, then pdf-extract reads
+    # the text - and connectors.rs joins the two results POSITIONALLY, by index.
+    # That is sound only while both sides are the same parser, which they are
+    # because pdf-extract pins lopdf 0.42 and so do we. Bumping our copy alone
+    # puts two versions of a PDF parser in the binary and makes that positional
+    # join a cross-version one, where a disagreement about the page tree
+    # silently attaches a page's text to a different page.
+    #
+    # There is nothing to gain from it either: lopdf's only advisory
+    # (RUSTSEC-2026-0187, unbounded recursion) is patched in >= 0.42.0, and
+    # 0.44's decompression-bomb limit is opt-in by its author's own decision,
+    # so it does nothing unless called.
+    #
+    # Drop this entry when pdf-extract moves - then bump both together. Until
+    # then a future lopdf advisory reaches us through the cargo-audit job
+    # rather than through a dependabot PR.
+    ignore:
+      - dependency-name: "lopdf"
     groups:
       cargo-safe:
         patterns: ["*"]

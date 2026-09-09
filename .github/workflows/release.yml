@@ -85,6 +85,52 @@ jobs:
           gh release upload "$REL_TAG" \
             apps/desktop/bin/duckle-runner-linux-x64 --clobber
 
+  # #313 criterion 3: publish the capability registry with the release, so a
+  # tool or an agent can target a KNOWN Duckle version rather than asking a
+  # binary it may not have. Runs before `checksums`, like the runner asset, so
+  # SHA256SUMS covers it.
+  capability-registry:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      # duckle-runner links unixODBC statically, so building it needs the
+      # system libraries even though this job only wants the registry JSON.
+      # Without them the job died on `could not find native static library
+      # odbc` - after the whole workspace had compiled - and v0.7.2 built every
+      # binary but shipped no capabilities.json. libltdl-dev goes alongside
+      # unixodbc-dev for the static link (#131), the same pair ci.yml installs.
+      - name: Install ODBC build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev libltdl-dev
+
+      - name: Generate the registry
+        env:
+          REL_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          set -e
+          cargo run --release -p duckle-runner -- capabilities --json > capabilities.json
+          # Stamp the release it describes. The command itself cannot know the
+          # tag - it is a property of the publication, not of the build.
+          python3 - "$REL_TAG" <<'PY'
+          import json, sys
+          d = json.load(open("capabilities.json"))
+          d["duckleVersion"] = sys.argv[1]
+          json.dump(d, open("capabilities.json", "w"), indent=2)
+          print(f"stamped {d['count']} components as {sys.argv[1]}")
+          PY
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REL_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: gh release upload "$REL_TAG" capabilities.json --clobber
+
   # Compute the build matrix so a workflow_dispatch can re-roll a single OS
   # family (os_filter=linux) without rebuilding/clobbering the other assets. A
   # normal tag push leaves os_filter unset and builds every binary.
@@ -131,7 +177,7 @@ jobs:
           df -h /
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend deps
@@ -315,12 +361,46 @@ jobs:
           asset="${{ matrix.asset }}"
           gh release upload "$REL_TAG" "_release/$asset" --clobber
 
+  # Publish a software bill of materials with the release, so a deployment can
+  # answer "does this version contain <crate>?" against the artifact it actually
+  # installed, rather than against whatever the repository looks like today.
+  # CycloneDX because that is what the scanners consume.
+  sbom:
+    name: Publish SBOM
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          format: cyclonedx-json
+          output-file: duckle-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: duckle-sbom.cdx.json
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REL_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: gh release upload "$REL_TAG" duckle-sbom.cdx.json --clobber
+
   # Publish SHA256SUMS.txt covering the 6 binaries so the in-app self-updater
   # can verify a downloaded build before swapping it in. Uploads are per-matrix
   # job, so checksums must be a separate job that pulls the finished assets back.
   checksums:
     name: Publish SHA256SUMS
-    needs: build
+    # capability-registry is named explicitly rather than relied on to finish
+    # first: it uploads an asset (#313) and SHA256SUMS must cover it.
+    needs: [build, capability-registry]
     # Run even when a build leg failed (issue #156). The successful legs still
     # re-upload their binaries via --clobber, so if this job is skipped the
     # published SHA256SUMS.txt keeps stale checksums for the changed binaries and
@@ -332,6 +412,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Build provenance is signed with this workflow's own short-lived OIDC
+      # identity through Sigstore, so it needs no signing key or certificate of
+      # ours to manage, rotate or lose.
+      id-token: write
+      attestations: write
     steps:
       - name: Download assets, checksum, upload
         shell: bash
@@ -356,3 +441,28 @@ jobs:
             > SHA256SUMS.txt
           cat SHA256SUMS.txt
           gh release upload "$REL_TAG" SHA256SUMS.txt --clobber
+
+      # What SHA256SUMS.txt cannot say: WHERE a binary came from. The checksum
+      # proves a download was not altered in flight; it says nothing about who
+      # built it, from which commit, or on what workflow - so a substituted
+      # asset with a matching, also-substituted sums file passes. Provenance
+      # binds each digest to this repository, this commit and this run, and a
+      # consumer checks it without trusting the release page:
+      #
+      #   gh attestation verify Duckle-linux-x64 --repo ${{ github.repository }}
+      #
+      # Deliberately not the same thing as code signing. Authenticode and
+      # macOS notarization still need a purchased certificate; this is the
+      # supply-chain half, and it is free and keyless.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            _sums/Duckle-linux-x64
+            _sums/Duckle-linux-arm64
+            _sums/Duckle-macos-x64
+            _sums/Duckle-macos-arm64
+            _sums/Duckle-windows-x64.exe
+            _sums/Duckle-windows-arm64.exe
+            _sums/duckle-runner-linux-x64
+            _sums/SHA256SUMS.txt

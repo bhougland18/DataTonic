@@ -1,7 +1,13 @@
-import type { ComponentManifest, AutodetectFn } from './types';
+import type { ComponentManifest, AutodetectFn, FormSection } from './types';
 import type { Column } from '../../pipeline-types';
-import { synthesizeManifest, portsForComponent } from './manifest-synth';
-import { PALETTE } from '../palette-data';
+import {
+    synthesizeManifest,
+    portsForComponent,
+    deadLetterFields,
+    delimiterField,
+    encodingField,
+} from './manifest-synth';
+import { getExternalManifest, PALETTE } from '../palette-data';
 import { tauriAutodetect } from '../../tauri-bridge';
 
 const CSV_SAMPLE_SCHEMA: Column[] = [
@@ -95,19 +101,13 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         defaultValue: true,
                         placeholder: 'Use the first row as column names',
                     },
-                    {
-                        key: 'delimiter',
-                        label: 'Delimiter',
-                        kind: 'select',
-                        defaultValue: ',',
-                        options: [
-                            { label: 'Comma  ,', value: ',' },
-                            { label: 'Tab  \\t', value: '\t' },
-                            { label: 'Semicolon  ;', value: ';' },
-                            { label: 'Pipe  |', value: '|' },
-                            { label: 'Space', value: ' ' },
-                        ],
-                    },
+                    // Shared with the synthesized readers rather than listed
+                    // again here. This manifest is hand-written, so getManifest
+                    // returns it and src.csv never reached the synthesizer -
+                    // which is how it kept a five-option, non-typable delimiter
+                    // and a four-option encoding while every other delimited
+                    // reader had grown past both.
+                    delimiterField(','),
                     {
                         key: 'quoteChar',
                         label: 'Quote character',
@@ -119,18 +119,7 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                             { label: 'None', value: '' },
                         ],
                     },
-                    {
-                        key: 'encoding',
-                        label: 'Encoding',
-                        kind: 'select',
-                        defaultValue: 'utf-8',
-                        options: [
-                            { label: 'UTF-8', value: 'utf-8' },
-                            { label: 'UTF-16', value: 'utf-16' },
-                            { label: 'Latin-1 (ISO-8859-1)', value: 'latin-1' },
-                            { label: 'Windows-1252', value: 'windows-1252' },
-                        ],
-                    },
+                    encodingField(),
                     {
                         key: 'skipLines',
                         label: 'Skip lines (top)',
@@ -143,6 +132,40 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         kind: 'text',
                         placeholder: 'e.g. NULL, NA, \\N',
                         description: 'Strings that should be interpreted as NULL.',
+                    },
+                ],
+            },
+            {
+                // The engine has read these since #98 and this hand-written
+                // manifest never offered them, so the only way to reach a
+                // ragged CSV was to edit the pipeline file by hand. The
+                // synthesized manifest does have them - but a component listed
+                // in MANIFESTS never reaches the synthesizer, which is exactly
+                // how a hand-authored panel hides an engine feature.
+                label: 'Malformed rows',
+                fields: [
+                    {
+                        key: 'nullPadding',
+                        label: 'Pad short rows with NULL',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'A row with fewer columns than the header is padded with NULLs instead of failing the read. This is the one for "Expected Number of Columns: 5 Found: 4" when the row is real data with a trailing field missing. Maps to read_csv null_padding=true.',
+                    },
+                    {
+                        key: 'ignoreErrors',
+                        label: 'Skip rows that will not parse',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'Drop any row DuckDB cannot read - bad encoding, wrong column count, a trailing blank line - instead of failing the whole file. It does not report which rows went, so prefer padding when the data is worth keeping. Maps to read_csv ignore_errors=true.',
+                    },
+                    {
+                        key: 'readOptions',
+                        label: 'Extra read options',
+                        kind: 'key-value',
+                        description:
+                            'Any other DuckDB read_csv option, passed through as key=value (e.g. strict_mode=false, union_by_name=true, sample_size=-1). For a file that is ragged in a way the boxes above do not cover.',
                     },
                 ],
             },
@@ -177,12 +200,9 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         placeholder: 'leave blank for all columns',
                         description: 'Comma-separated; pushed down to the Parquet reader.',
                     },
-                    {
-                        key: 'rowGroupRange',
-                        label: 'Row group range',
-                        kind: 'text',
-                        placeholder: 'e.g. 0..10',
-                    },
+                    // A `rowGroupRange` box was here. build_parquet_source reads
+                    // path and columns and nothing else; read_parquet in the
+                    // pinned DuckDB exposes no row-group selection.
                 ],
             },
         ],
@@ -369,6 +389,16 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         kind: 'text',
                         placeholder: 'sales.orders',
                         description: 'Read this entire table when no SQL query is given.',
+                    },
+                    {
+                        // The arm reads this and this manifest is hand-written,
+                        // so it never passed through the synthesizer that would
+                        // have offered it. Fetch size was fixed at 5000.
+                        key: 'batchSize',
+                        label: 'Rows per fetch',
+                        kind: 'integer',
+                        defaultValue: 5000,
+                        description: 'How many rows are pulled from the ODBC driver at a time. Larger trades memory for fewer round trips.',
                     },
                 ],
             },
@@ -570,6 +600,20 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                     },
                 ],
             },
+            // Symmetric with snk.s3, which has always offered these. The
+            // engine's S3 secret needs accessKey and secretKey - without them
+            // no CREATE SECRET is emitted at all - and region silently defaults
+            // to us-east-1, so a bucket anywhere else was signed for the wrong
+            // region with nothing in the panel to correct it. A saved connection
+            // was the only way in.
+            {
+                label: 'Credentials',
+                fields: [
+                    { key: 'accessKey', label: 'Access key', kind: 'text' },
+                    { key: 'secretKey', label: 'Secret key', kind: 'text', placeholder: '••••••••' },
+                    { key: 'region', label: 'Region', kind: 'text', placeholder: 'us-east-1' },
+                ],
+            },
         ],
         ports: { inputs: [], outputs: [{ id: 'main', label: 'out', type: 'main' }] },
     },
@@ -728,12 +772,14 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         description:
                             'Visual builder with column / operator / value, or raw SQL. Rows where the predicate is true are kept.',
                     },
-                    {
-                        key: 'rejectOnError',
-                        label: 'Send errors to reject port',
-                        kind: 'bool',
-                        defaultValue: false,
-                    },
+                    // A "Send errors to reject port" box was here and nothing
+                    // read it. The reject stream is gated purely by WIRING -
+                    // plan/mod.rs only builds it when the port has a consumer,
+                    // exactly as for the joins - and the predicate is spliced
+                    // in raw with no error trapping, so the box neither enabled
+                    // nor disabled anything while claiming to change what
+                    // happens on failure. Wire the reject port to collect the
+                    // rows whose predicate is false or NULL.
                 ],
             },
         ],
@@ -848,29 +894,28 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
         schemaSource: 'upstream',
         sections: [
             {
+                // One ordered list, replacing the single Column + Direction +
+                // NULLs trio. build_sort has always preferred `orderBy` and
+                // fallen back to `sortColumn`, so multi-column sort worked in a
+                // hand-written pipeline and in the Python API and could not be
+                // expressed here - recorded as a KNOWN GAP in prop_contract.rs.
+                //
+                // The old keys are deliberately NOT declared as fields and NOT
+                // aliased. They stay readable by the engine and accepted by the
+                // property check (props.rs ACCEPTED), because an alias is a
+                // pure key rename and this is a shape change: renaming
+                // sortColumn to orderBy would hand build_sort a bare string
+                // where it wants an array and drop the ORDER BY in silence.
+                // The editor seeds the list from them instead, so an existing
+                // node opens showing the sort it already has.
                 label: 'Sort',
                 fields: [
                     {
-                        key: 'sortColumn',
-                        label: 'Column',
-                        kind: 'column',
-                        required: true,
-                    },
-                    {
-                        key: 'direction',
-                        label: 'Direction',
-                        kind: 'select',
-                        defaultValue: 'asc',
-                        options: [
-                            { label: 'Ascending', value: 'asc' },
-                            { label: 'Descending', value: 'desc' },
-                        ],
-                    },
-                    {
-                        key: 'nullsLast',
-                        label: 'NULLs last',
-                        kind: 'bool',
-                        defaultValue: true,
+                        key: 'orderBy',
+                        label: 'Sort keys',
+                        kind: 'sort-keys',
+                        description:
+                            'Keys apply left to right: the first orders the rows, the next breaks its ties. NULLs "Default" leaves placement to the database, which is what a sort with no explicit setting does today.',
                     },
                 ],
             },
@@ -892,6 +937,17 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         kind: 'columns',
                         description:
                             'Leave empty to deduplicate on the whole row.',
+                    },
+                    {
+                        // The builder has read this since the audit that added
+                        // it; the form never offered it, so the cheap
+                        // deterministic path was unreachable and every run
+                        // paid for ORDER BY ALL instead.
+                        key: 'orderBy',
+                        label: 'Tie-break columns (optional)',
+                        kind: 'columns',
+                        description:
+                            'Which row survives each duplicate group. Only used when Distinct columns is set. Left empty, the whole row is sorted so the result stays the same run to run, which is correct but costs a full sort on every column. Naming a few columns here keeps that determinism far more cheaply.',
                     },
                 ],
             },
@@ -925,8 +981,13 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         kind: 'select',
                         defaultValue: 'overwrite',
                         options: [
+                            // Append and "Error if exists" were here and no
+                            // file-sink builder reads `mode`. A COPY always
+                            // REPLACES, so picking Append destroyed the rows
+                            // already in the file - measured, rows 1,2 gone
+                            // after a second run wrote 3,4. build_sink_sql now
+                            // refuses either rather than replacing in silence.
                             { label: 'Overwrite (replace)', value: 'overwrite' },
-                            { label: 'Error if exists', value: 'error' },
                         ],
                     },
                     {
@@ -947,16 +1008,41 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         kind: 'bool',
                         defaultValue: true,
                     },
+                    // No Encoding here, deliberately. DuckDB writes UTF-8 and
+                    // refuses the option outright - COPY answers "Option
+                    // ENCODING is not supported for writing - only for
+                    // reading" - and nothing in the engine transcodes
+                    // afterwards. Measured: a sink set to CP1251 wrote UTF-8
+                    // bytes and reported ok, so the control could only mislead.
+                    // Writing a non-UTF-8 file is a real feature; it needs a
+                    // transcode pass, not a dropdown.
                     {
-                        key: 'encoding',
-                        label: 'Encoding',
-                        kind: 'select',
-                        defaultValue: 'utf-8',
-                        options: [
-                            { label: 'UTF-8', value: 'utf-8' },
-                            { label: 'UTF-16', value: 'utf-16' },
-                            { label: 'Latin-1', value: 'latin-1' },
-                        ],
+                        // build_csv_sink emits NULLSTR from this
+                        // (builders.rs:9170) and the panel never offered it, so
+                        // an empty cell and a NULL were indistinguishable in
+                        // every file Duckle wrote.
+                        key: 'nullValue',
+                        label: 'Write NULL as',
+                        kind: 'text',
+                        placeholder: 'leave blank for an empty field',
+                        description:
+                            'The text written for a NULL. Blank (the default) writes nothing between the delimiters, which a reader cannot tell from an empty string. Common choices are \\N and NULL. Maps to COPY ... (NULLSTR).',
+                    },
+                ],
+            },
+            {
+                // builders.rs:9179 reads partitionBy for the CSV sink exactly as
+                // it does for Parquet, and the synthesized manifest offers it -
+                // but snk.csv is hand-written in MANIFESTS, so it never reaches
+                // the synthesizer. Same shape of gap as the src.csv one below.
+                label: 'Partitioning',
+                fields: [
+                    {
+                        key: 'partitionBy',
+                        label: 'Partition by columns',
+                        kind: 'columns',
+                        description:
+                            'Write a Hive-style partitioned dataset under the output path instead of one file. Each column becomes a directory level (col=value/). Reruns overwrite the slice just emitted and leave sibling partitions alone.',
                     },
                 ],
             },
@@ -1006,6 +1092,80 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                     { key: 'accessKey', label: 'Access key', kind: 'text' },
                     { key: 'secretKey', label: 'Secret key', kind: 'text', placeholder: '••••••••' },
                     { key: 'region', label: 'Region', kind: 'text', placeholder: 'us-east-1' },
+                ],
+            },
+            {
+                // build_cloud_sink delegates to the SAME builders as the local
+                // file sinks (builders.rs:9086-9093), so every one of these is
+                // already honoured on an s3:// write - the panel simply never
+                // offered them, which left ZSTD Parquet and comma-with-header
+                // CSV as the only things this sink could produce.
+                //
+                // partitionBy is deliberately absent: builders.rs:9084 strips it
+                // before delegating, so a control for it would do nothing.
+                label: 'Write options',
+                fields: [
+                    {
+                        key: 'compression',
+                        label: 'Compression (Parquet)',
+                        kind: 'select',
+                        defaultValue: 'zstd',
+                        options: [
+                            { label: 'Zstd (smaller)', value: 'zstd' },
+                            { label: 'Snappy (fast)', value: 'snappy' },
+                            { label: 'Gzip', value: 'gzip' },
+                            { label: 'LZ4', value: 'lz4' },
+                            { label: 'None', value: 'none' },
+                        ],
+                    },
+                    {
+                        key: 'compressionLevel',
+                        label: 'Compression level (Parquet)',
+                        kind: 'integer',
+                        visibleWhen: { key: 'compression', equals: 'zstd' },
+                        description: 'ZSTD only (1-22). Leave empty for DuckDB\'s default.',
+                    },
+                    {
+                        key: 'parquetVersion',
+                        label: 'Parquet version',
+                        kind: 'select',
+                        defaultValue: 'v1',
+                        options: [
+                            { label: 'V1 (maximum compatibility)', value: 'v1' },
+                            { label: 'V2 (newer encodings)', value: 'v2' },
+                        ],
+                    },
+                    {
+                        key: 'rowGroupSize',
+                        label: 'Row group size (Parquet)',
+                        kind: 'integer',
+                        description: 'Rows per row group. Leave empty for DuckDB\'s default (~122,880); a larger value cuts metadata overhead on big writes.',
+                    },
+                    {
+                        key: 'delimiter',
+                        label: 'Delimiter (CSV)',
+                        kind: 'select',
+                        defaultValue: ',',
+                        options: [
+                            { label: 'Comma  ,', value: ',' },
+                            { label: 'Tab  \\t', value: '\t' },
+                            { label: 'Semicolon  ;', value: ';' },
+                            { label: 'Pipe  |', value: '|' },
+                        ],
+                    },
+                    {
+                        key: 'writeHeader',
+                        label: 'Write header row (CSV)',
+                        kind: 'bool',
+                        defaultValue: true,
+                    },
+                    {
+                        key: 'nullValue',
+                        label: 'Write NULL as (CSV)',
+                        kind: 'text',
+                        placeholder: 'leave blank for an empty field',
+                        description: 'The text written for a NULL, e.g. \\N. Blank writes nothing between the delimiters.',
+                    },
                 ],
             },
             {
@@ -1072,9 +1232,13 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         kind: 'select',
                         defaultValue: 'overwrite',
                         options: [
+                            // Append and "Error if exists" were here and no
+                            // file-sink builder reads `mode`. A COPY always
+                            // REPLACES, so picking Append destroyed the rows
+                            // already in the file - measured, rows 1,2 gone
+                            // after a second run wrote 3,4. build_sink_sql now
+                            // refuses either rather than replacing in silence.
                             { label: 'Overwrite', value: 'overwrite' },
-                            { label: 'Append', value: 'append' },
-                            { label: 'Error if exists', value: 'error' },
                         ],
                     },
                     {
@@ -1127,6 +1291,18 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
                         kind: 'integer',
                         defaultValue: 10000,
                         description: 'Safety cap: abort before writing if partitioning would create more than this many files (one per distinct value). 0 = unlimited. Only applies when Partition by columns is set.',
+                    },
+                    {
+                        // #319. One field rather than a checkbox plus a column:
+                        // a checkbox ticked with no column chosen is a state
+                        // the engine would have to guess at, and guessing which
+                        // column holds the geometry is how the wrong one gets
+                        // sorted on.
+                        key: 'hilbertColumn',
+                        label: 'Spatial sort (Hilbert)',
+                        kind: 'text',
+                        placeholder: 'geometry column, e.g. geom',
+                        description: 'Name a GEOMETRY column to sort rows along a Hilbert curve before writing, so geometries that are close on the ground land in the same row group and a spatial filter can skip more of the file. The curve is scaled to this dataset’s own extent, which costs one extra pass over the data. Leave empty to write rows in the order they arrive.',
                     },
                 ],
             },
@@ -1265,9 +1441,314 @@ export const MANIFESTS: Record<string, ComponentManifest> = {
     },
 };
 
+// Sinks the planner runs `dead_letter_prelude` on, from the two match arms at
+// builders.rs:9006-9019. It reads validateBeforeInsert / deadLetterPath /
+// deadLetterFormat for every one of them, whatever form happens to draw it, so
+// the section is added once here instead of in fourteen separate branches -
+// nine of which did not have it. snk.sqlite and snk.duckdb are the sharpest
+// case: `synthDbSink` carries a branch offering these three for exactly those
+// two ids, and it never runs, because a component listed in MANIFESTS never
+// reaches the synthesizer.
+const DEAD_LETTER_SINKS = new Set([
+    'snk.sqlite',
+    'snk.duckdb',
+    'snk.postgres',
+    'snk.cockroach',
+    'snk.mysql',
+    'snk.mariadb',
+    'snk.motherduck',
+    'snk.ducklake',
+    'snk.pgvector',
+    'snk.redshift',
+    'snk.bigquery',
+    'snk.quack',
+    'snk.sqlserver',
+    'snk.synapse',
+]);
+
+// Sources the planner hands to build_cloud_source (builders.rs:210-217), which
+// delegates to the LOCAL format builders with the resolved cloud path injected
+// (builders.rs:8890-8903). So an s3:// CSV honours every option a local CSV
+// does - and not one of the seven forms offered any of them, which left a
+// cloud CSV readable only as comma-delimited with a header, and a ragged one
+// not readable at all. Declared once here for the same reason as the
+// dead-letter section: src.s3 is hand-written and the other six are
+// synthesized, so a per-branch fix would have to be made twice.
+const CLOUD_FORMAT_SOURCES = new Set([
+    'src.s3',
+    'src.gcs',
+    'src.azureblob',
+    'src.http',
+    'src.minio',
+    'src.r2',
+    'src.b2',
+]);
+
+function withCloudReadOptions(id: string, m: ComponentManifest): ComponentManifest {
+    if (!CLOUD_FORMAT_SOURCES.has(id)) return m;
+    if (m.sections.some(s => s.fields.some(f => f.key === 'hasHeader'))) return m;
+    const sections: FormSection[] = [
+            {
+                label: 'Read options (CSV)',
+                fields: [
+                    { key: 'hasHeader', label: 'First row is header', kind: 'bool', defaultValue: true },
+                    {
+                        key: 'delimiter',
+                        label: 'Delimiter',
+                        kind: 'select',
+                        defaultValue: ',',
+                        options: [
+                            { label: 'Comma  ,', value: ',' },
+                            { label: 'Tab  \\t', value: '\t' },
+                            { label: 'Semicolon  ;', value: ';' },
+                            { label: 'Pipe  |', value: '|' },
+                        ],
+                    },
+                    {
+                        key: 'quoteChar',
+                        label: 'Quote character',
+                        kind: 'select',
+                        defaultValue: '"',
+                        options: [
+                            { label: 'Double quote  "', value: '"' },
+                            { label: "Single quote  '", value: "'" },
+                            { label: 'None', value: '' },
+                        ],
+                    },
+                    {
+                        key: 'encoding',
+                        label: 'Encoding',
+                        kind: 'select',
+                        defaultValue: 'utf-8',
+                        options: [
+                            { label: 'UTF-8', value: 'utf-8' },
+                            { label: 'UTF-16', value: 'utf-16' },
+                            { label: 'Latin-1 (ISO-8859-1)', value: 'latin-1' },
+                            { label: 'Windows-1252', value: 'windows-1252' },
+                        ],
+                    },
+                    { key: 'skipLines', label: 'Skip lines (top)', kind: 'integer', defaultValue: 0 },
+                    {
+                        key: 'nullValue',
+                        label: 'Null sentinel',
+                        kind: 'text',
+                        placeholder: 'e.g. NULL, NA, \\N',
+                        description: 'Strings that should be interpreted as NULL.',
+                    },
+                    {
+                        key: 'nullPadding',
+                        label: 'Pad short rows with NULL',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'A row with fewer columns than the header is padded with NULLs instead of failing the read. Maps to read_csv null_padding=true.',
+                    },
+                    {
+                        key: 'ignoreErrors',
+                        label: 'Skip rows that will not parse',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'Drop any row DuckDB cannot read instead of failing the whole file. It does not report which rows went, so prefer padding when the data is worth keeping.',
+                    },
+                    {
+                        key: 'readOptions',
+                        label: 'Extra read options',
+                        kind: 'key-value',
+                        description:
+                            'Any other DuckDB read_csv option, passed through as key=value (e.g. strict_mode=false, union_by_name=true, sample_size=-1).',
+                    },
+                ],
+            },
+            {
+                label: 'Read options (JSON)',
+                fields: [
+                    {
+                        key: 'recordsPath',
+                        label: 'Records path',
+                        kind: 'text',
+                        placeholder: 'data.items',
+                        description: 'Dotted path to the array of records inside the document. Leave blank when the file is already an array or NDJSON.',
+                    },
+                    {
+                        key: 'flatten',
+                        label: 'Flatten nested objects',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description: 'Expand nested objects into columns instead of leaving them as JSON.',
+                    },
+                    {
+                        key: 'keepParentNames',
+                        label: 'Keep parent names',
+                        kind: 'bool',
+                        defaultValue: false,
+                        description:
+                            'Name a flattened column after the object it came from: owner.Id and account.Id rather than Id_1 and Id_2.',
+                    },
+                ],
+            },
+    ];
+    return { ...m, sections: [...m.sections, ...sections] };
+}
+
+// The GraphQL sources are drawn by synthApiSource, which is the REST form, and
+// their arm in plan/mod.rs hardcodes everything to do with paging and fan-out:
+// pagination none, max_pages 1, concurrency 1, checkpoint false,
+// on_parent_error "fail", url_template / parent_key_column None, max_requests 0.
+// So every control below was drawn and read by nothing.
+//
+// Filtered here rather than in the synthesizer because these keys share a
+// `fields:` array with the incremental cursor, which GraphQL DOES use - slicing
+// that array by hand removed the wrong half twice.
+const GRAPHQL_DEAD_KEYS = new Set([
+    'paginationType', 'pageParam', 'pageSize', 'startPage', 'maxPages',
+    'cursorParam', 'cursorNextPath', 'offsetParam', 'totalCountPath',
+    'urlTemplate', 'parentKeyColumn', 'maxRequests', 'concurrency',
+    'checkpoint', 'onParentError', 'nextUrlPath',
+]);
+
+function withoutGraphqlPaging(id: string, m: ComponentManifest): ComponentManifest {
+    if (id !== 'src.graphql' && id !== 'src.linear' && id !== 'src.monday') return m;
+    return {
+        ...m,
+        sections: m.sections
+            .map(sec => ({ ...sec, fields: sec.fields.filter(f => !GRAPHQL_DEAD_KEYS.has(f.key)) }))
+            .filter(sec => sec.fields.length > 0),
+    };
+}
+
+// The REST fan-out fields describe UPSTREAM ROWS: "URL per upstream row",
+// "Carry upstream column", "How many upstream rows are requested at the same
+// time", "When a row request fails". They only mean anything on a node an edge
+// can be wired INTO.
+//
+// #257 gave that optional main input to src.rest alone - "the vendor aliases
+// keep their plain source shape" (manifest-synth.ts) - and src.http is not a
+// REST source at all: the engine routes it beside src.s3 / src.gcs and reads
+// the URL as a file. All 31 of them were drawn the six fan-out controls anyway,
+// with no way to connect the upstream every one of them talks about.
+//
+// Keyed off the PORTS rather than a list of ids, so a component that gains or
+// loses its main input is handled without anyone remembering to edit this.
+// Manifests that carry no ports are left alone rather than guessed at.
+//
+// Filtered out of the BUILT manifest rather than cut from the synthesizer's
+// shared `fields:` array, which is what withoutGraphqlPaging does and for the
+// same reason: those arrays are shared with the REST sources that DO fan out,
+// and slicing one by hand has twice removed the wrong half.
+// `urlTemplate`, `parentKeyColumn` and `onParentError` exist only to fan out
+// over an upstream, so their presence is what identifies a node as having been
+// drawn the block. The other three are ordinary words that mean something else
+// elsewhere - src.pdf's `concurrency` is how many DOCUMENTS it extracts at
+// once, and src.webhook has its own `maxRequests` - so they are removed only
+// alongside a marker, never on their own. Stripping them by name cost both of
+// those their real controls, which the engine-side contract test caught.
+const FAN_OUT_MARKERS = ['urlTemplate', 'parentKeyColumn', 'onParentError'];
+const FAN_OUT_KEYS = new Set([...FAN_OUT_MARKERS, 'maxRequests', 'concurrency', 'checkpoint']);
+
+function withoutFanOut(m: ComponentManifest): ComponentManifest {
+    const ports = m.ports;
+    if (!ports) return m;
+    if ((ports.inputs ?? []).some(i => i.id === 'main')) return m;
+    const drawnTheBlock = m.sections.some(sec =>
+        sec.fields.some(f => FAN_OUT_MARKERS.includes(f.key)),
+    );
+    if (!drawnTheBlock) return m;
+    const sections = m.sections
+        .map(sec => ({ ...sec, fields: sec.fields.filter(f => !FAN_OUT_KEYS.has(f.key)) }))
+        .filter(sec => sec.fields.length > 0);
+    return { ...m, sections };
+}
+
+function withDeadLetter(id: string, m: ComponentManifest): ComponentManifest {
+    if (!DEAD_LETTER_SINKS.has(id)) return m;
+    // A branch that already draws them keeps its own wording and placement.
+    if (m.sections.some(s => s.fields.some(f => f.key === 'validateBeforeInsert'))) return m;
+    return { ...m, sections: [...m.sections, { label: 'Bad rows', fields: deadLetterFields() }] };
+}
+
+/// Property keys whose VALUE is a credential.
+///
+/// Mirrors the engine's `is_secret_prop_key` (crates/duckdb-engine/src/util.rs),
+/// which decides what is redacted from run logs and refused on deploy. A value
+/// the engine calls a secret should not sit on screen in the clear - in a
+/// screen share, a screenshot or over a shoulder.
+///
+/// Three groups are deliberately absent, and each is a value the reader NEEDS
+/// to see:
+///   - paths (`privateKeyPath`, `credentialsPath`) - the point of the field is
+///     which file, and a masked path cannot be checked for a typo;
+///   - identifiers (`accessKeyId`) - AWS publishes these in ARNs; the matching
+///     `secretAccessKey` is the secret;
+///   - endpoints and mechanisms (`tokenUrl`, `saslMechanism`, `saslUsername`),
+///     which the engine no longer treats as credentials either.
+const CREDENTIAL_KEYS = new Set([
+    'password',
+    'passwd',
+    'passphrase',
+    'keyPassphrase',
+    'saslPassword',
+    'apiKey',
+    'authToken',
+    'accessToken',
+    'sessionToken',
+    'token',
+    'pat',
+    'accessKey',
+    'secretKey',
+    'secretAccessKey',
+    'clientSecret',
+    'privateKey',
+    'connectionString',
+]);
+
+/// Mask credential inputs, in one place rather than on ~50 declarations.
+///
+/// Setting `secret: true` field by field is how the flag ends up on some and
+/// not others: `password` was declared by 46 fields and marked on one. This
+/// runs over whatever the manifest produced, so a new component gets it for
+/// free and cannot forget.
+///
+/// Only `text` honours the flag - `TextField` is the sole renderer with a
+/// masked input. An `expression` field carrying a PEM or a connection string
+/// stays visible, because setting a flag its renderer ignores would be another
+/// control that claims to do something and does not.
+function withMaskedCredentials(m: ComponentManifest): ComponentManifest {
+    let changed = false;
+    const sections = m.sections.map(section => ({
+        ...section,
+        fields: section.fields.map(field => {
+            if (field.secret || field.kind !== 'text') return field;
+            if (!CREDENTIAL_KEYS.has(field.key)) return field;
+            changed = true;
+            return { ...field, secret: true };
+        }),
+    }));
+    return changed ? { ...m, sections } : m;
+}
+
 export function getManifest(componentId: string | undefined): ComponentManifest | undefined {
     if (!componentId) return undefined;
-    const m = MANIFESTS[componentId] ?? synthesizeManifest(componentId);
+    // #307: an external component's form comes from its own manifest. Checked
+    // before the built-ins rather than after, so a workspace's component is
+    // described by what it declares rather than by a synthesized guess from
+    // its id - and a palette tile with no editable properties is not a tile
+    // worth having.
+    if (componentId.startsWith('ext.')) {
+        const declared = getExternalManifest(componentId) as ComponentManifest | undefined;
+        if (declared) return declared;
+    }
+    const built = MANIFESTS[componentId] ?? synthesizeManifest(componentId);
+    const m = built
+        ? withMaskedCredentials(
+              withoutFanOut(
+                  withoutGraphqlPaging(
+                      componentId,
+                      withCloudReadOptions(componentId, withDeadLetter(componentId, built)),
+                  ),
+              ),
+          )
+        : built;
     if (m && !m.ports) {
         for (const cat of PALETTE) {
             for (const grp of cat.groups) {

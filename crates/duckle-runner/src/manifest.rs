@@ -112,6 +112,8 @@ pub fn write_manifest(
     lineage: Option<Lineage>,
     outputs: &[NodeOutcome],
     inputs: &[InputFingerprint],
+    artifacts: &[duckle_duckdb_engine::ArtifactRef],
+    artifacts_truncated: bool,
 ) -> Result<PathBuf, String> {
     let pipeline_hash = sha256_hex(&serde_json::to_vec(doc).unwrap_or_default());
     let compiled_hash = match compile_pipeline_sql(doc) {
@@ -139,6 +141,35 @@ pub fn write_manifest(
             m
         })
         .collect();
+    // #247: remote objects the run read or wrote. A local file input is pinned
+    // by path above; an s3:// or https:// object has no path, so without this
+    // the boundary that matters most in a raw-zone pipeline - where the bytes
+    // came from - was the one thing the signed manifest did not record.
+    let artifacts_json: Vec<Value> = artifacts
+        .iter()
+        .map(|a| serde_json::to_value(a).unwrap_or(Value::Null))
+        .collect();
+    // #278: the limits the run actually ran under, so two runs that spilled
+    // differently can be told apart from two runs given different budgets.
+    let limits = duckle_duckdb_engine::effective_resource_limits();
+    // #246: the Python environment, but only for a pipeline that has a Python
+    // stage - recording an unused interpreter would put noise in every
+    // manifest. Without it, two runs of the same pipeline under different
+    // package versions produce different numbers and identical provenance.
+    let python = doc
+        .nodes
+        .iter()
+        .any(|n| n.data.component_id.as_deref() == Some("code.python"))
+        .then(|| {
+            let e = duckle_duckdb_engine::pyenv::inspect(workspace);
+            json!({
+                "pythonVersion": e.python_version,
+                "platform": e.platform,
+                "lockSha256": e.lock_sha256,
+                "environmentHash": e.environment_hash,
+                "packageCount": e.installed.len(),
+            })
+        });
     let mut body = json!({
         "schemaVersion": SCHEMA_VERSION,
         "pipeline": name,
@@ -153,9 +184,15 @@ pub fn write_manifest(
         "duckleVersion": env!("CARGO_PKG_VERSION"),
         "duckdbVersion": DUCKDB_VERSION,
         "lineageResolved": lineage_json.is_some(),
+        "artifacts": artifacts_json,
+        "artifactsTruncated": artifacts_truncated,
+        "resourceLimits": limits,
     });
     if let (Some(l), Some(obj)) = (lineage_json, body.as_object_mut()) {
         obj.insert("lineage".to_string(), l);
+    }
+    if let (Some(py), Some(obj)) = (python, body.as_object_mut()) {
+        obj.insert("pythonEnvironment".to_string(), py);
     }
 
     let sk = signing_key(workspace)?;
@@ -226,7 +263,7 @@ mod tests {
             bytes: 12,
             sha256: Some("abc123".into()),
         }];
-        let path = write_manifest(ws, "demo", &doc, "ok", 12, 1_700_000_000_000, None, &outputs, &inputs)
+        let path = write_manifest(ws, "demo", &doc, "ok", 12, 1_700_000_000_000, None, &outputs, &inputs, &[], false)
             .unwrap();
         assert!(verify_manifest(&path).unwrap(), "fresh manifest should verify");
 
@@ -260,7 +297,7 @@ mod tests {
                 vec![RootColumn { node: "s".to_string(), column: "email".to_string() }],
             )],
         );
-        let path = write_manifest(ws, "demo", &doc, "ok", 5, 1_700_000_000_001, Some(lineage), &[], &[])
+        let path = write_manifest(ws, "demo", &doc, "ok", 5, 1_700_000_000_001, Some(lineage), &[], &[], &[], false)
             .unwrap();
         assert!(verify_manifest(&path).unwrap(), "manifest with lineage should verify");
 
@@ -268,5 +305,93 @@ mod tests {
         assert_eq!(m["body"]["lineageResolved"], json!(true));
         assert_eq!(m["body"]["lineage"]["s"][0]["column"], json!("email"));
         assert_eq!(m["body"]["lineage"]["s"][0]["roots"][0]["node"], json!("s"));
+    }
+    /// #247: a remote object has no path, so the manifest recorded nothing at
+    /// all about the boundary that matters most in a raw-zone pipeline - which
+    /// bytes were pulled in, and where they landed.
+    #[test]
+    fn remote_artifacts_are_recorded_and_signed() {
+        use duckle_duckdb_engine::ArtifactRef;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let doc: PipelineDoc = serde_json::from_str(
+            r#"{"nodes":[{"id":"c","position":{"x":0,"y":0},"data":{"label":"A","componentId":"src.changed","properties":{"uri":"s3://raw/feed.zip"}}}],"edges":[]}"#,
+        )
+        .unwrap();
+        let artifacts = vec![
+            // Observed but not read: an ETag and a size, and honestly no hash.
+            ArtifactRef {
+                node: "c".into(),
+                role: "input".into(),
+                uri: "s3://raw/feed.zip".into(),
+                name: Some("feed.zip".into()),
+                media_type: None,
+                size_bytes: Some(4096),
+                sha256: None,
+                etag: Some("abc123".into()),
+                modified_at: Some("2026-01-01T00:00:00Z".into()),
+            },
+            // Copied, so the bytes went through this run and the hash is real.
+            ArtifactRef {
+                node: "cp".into(),
+                role: "output".into(),
+                uri: "s3://lake/raw/feed.zip".into(),
+                name: Some("feed.zip".into()),
+                media_type: Some("application/zip".into()),
+                size_bytes: Some(4096),
+                sha256: Some("deadbeef".into()),
+                etag: None,
+                modified_at: None,
+            },
+        ];
+        let path = write_manifest(
+            ws, "demo", &doc, "ok", 5, 1_700_000_000_002, None, &[], &[], &artifacts, true,
+        )
+        .unwrap();
+        assert!(verify_manifest(&path).unwrap(), "a manifest with artifacts must verify");
+
+        let m: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let a = &m["body"]["artifacts"];
+        assert_eq!(a[0]["uri"], json!("s3://raw/feed.zip"));
+        assert_eq!(a[0]["etag"], json!("abc123"));
+        assert!(a[0].get("sha256").is_none(), "an object that was only OBSERVED has no hash");
+        assert_eq!(a[1]["role"], json!("output"));
+        assert_eq!(a[1]["sha256"], json!("deadbeef"));
+        assert_eq!(a[1]["mediaType"], json!("application/zip"));
+        assert_eq!(
+            m["body"]["artifactsTruncated"],
+            json!(true),
+            "a partial list must never read as a complete one"
+        );
+    }
+
+    /// #278: the budget a run was given is part of what makes it reproducible.
+    /// Only what was SET is recorded - inventing a value for an unset limit
+    /// would claim a setting nobody chose.
+    #[test]
+    fn the_resource_limits_a_run_used_are_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let doc: PipelineDoc = serde_json::from_str(
+            r#"{"nodes":[{"id":"s","position":{"x":0,"y":0},"data":{"label":"A","componentId":"src.csv","properties":{"path":"a.csv"}}}],"edges":[]}"#,
+        )
+        .unwrap();
+        std::env::set_var("DUCKLE_MEMORY_LIMIT", "4GB");
+        std::env::set_var("DUCKLE_THREADS", "2");
+        std::env::remove_var("DUCKLE_TEMP_DIR");
+        let path =
+            write_manifest(ws, "demo", &doc, "ok", 5, 1_700_000_000_003, None, &[], &[], &[], false)
+                .unwrap();
+        std::env::remove_var("DUCKLE_MEMORY_LIMIT");
+        std::env::remove_var("DUCKLE_THREADS");
+
+        let m: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(m["body"]["resourceLimits"]["memoryLimit"], json!("4GB"));
+        assert_eq!(m["body"]["resourceLimits"]["threads"], json!("2"));
+        assert!(
+            m["body"]["resourceLimits"].get("tempDirectory").is_none(),
+            "an unset limit is DuckDB's default, not a value we chose"
+        );
+        assert!(verify_manifest(&path).unwrap());
     }
 }

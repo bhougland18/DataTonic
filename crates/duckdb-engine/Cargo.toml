@@ -41,6 +41,11 @@ rustls-pemfile = "2"
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.11"
+# #311: OpenLineage requires runId to be a UUID, and Duckle run ids are readable
+# strings, so they are mapped by name. v5 is the name-based flavour.
+uuid = { workspace = true }
+chrono-tz = "0.10"
+cron = { workspace = true }
 # HMAC-SHA256 for AWS SigV4 signing in src.dynamodb (and any future
 # AWS services we add via direct HTTP). Avoids the aws-sdk-rust
 # dep tree (300+ services we don't need).
@@ -89,13 +94,16 @@ redis = { version = "1.6", default-features = false }
 # then either materialize as a DuckDB JSON table or write the JSON back
 # out as YAML/TOML. Avoids needing DuckDB extensions for either format.
 serde_yaml = "0.9"
-toml = "0.8"
+toml = "1.1"
 # Kafka (and Redpanda) producer + consumer via the pure-Rust rskafka
 # crate (InfluxDB IOx in production). Async-only - wrapped in tokio
 # block_on like mongo + tiberius + scylla. Avoids the C-lib rdkafka
 # build dance entirely, at the cost of fewer broker-protocol features
 # (good enough for batch produce + batch consume, no admin client).
-rskafka = "0.6"
+# transport-tls so a Kafka broker reached over SSL/SASL_SSL is actually
+# encrypted. It wants rustls 0.23 with the ring provider, which is exactly
+# what tls::build_client_config already produces, so no second TLS stack.
+rskafka = { version = "0.6", features = ["transport-tls"] }
 # Apache Avro container-file reader/writer. Pure Rust. Pairs with
 # Kafka topics that publish Avro-encoded payloads, and reads the
 # .avro / .ocf files that exporters drop on object storage.
@@ -105,7 +113,7 @@ async-nats = "0.50"
 # XML reader/writer. Used by src.xml (walks a row path, emits each
 # match as a JSON object) and snk.xml (wraps rows in row elements).
 # Pure Rust.
-quick-xml = "0.41"
+quick-xml = "0.42"
 # Pure-Rust .xlsx reader+writer for snk.xlsx (multi-tab Excel sink). Unlike
 # the DuckDB excel extension's COPY - which recreates the whole workbook on
 # every write - umya opens an existing workbook and adds/replaces a single
@@ -132,6 +140,9 @@ flate2 = "1"
 # .xlsx (which is a zip), add the attribute, and repack (#141). Deflate only -
 # no need for the bzip2 / zstd / aes backends.
 zip = { version = "8", default-features = false, features = ["deflate"] }
+# #284: TAR members, for the .tar and .tar.gz archives bulk publishers use.
+# Already in the lock via the desktop app, so this adds no new tree.
+tar = "0.4"
 # RabbitMQ / AMQP 0.9.1 client. Pure Rust, async. Same block_on
 # pattern as Kafka/NATS. Publishes to an exchange + routing key;
 # pulls from a queue with a per-message timeout for batch ETL.
@@ -139,7 +150,7 @@ lapin = { version = "4", default-features = false, features = ["rustls"] }
 # FTP / FTPS client. Pure Rust, synchronous API (fits the per-stage
 # blocking model - no block_on dance). Rustls-backed TLS keeps the
 # build self-contained on every OS.
-suppaftp = { version = "10", default-features = false, features = ["rustls-ring"] }
+suppaftp = { version = "11", default-features = false, features = ["rustls-ring"] }
 # SFTP (SSH-based) source, src.sftp. russh + russh-sftp on the `ring`
 # crypto backend (default-features=false drops aws-lc-rs, so NO NASM and
 # NO C toolchain - the same ring 0.17 stack the rest of our TLS already
@@ -147,7 +158,7 @@ suppaftp = { version = "10", default-features = false, features = ["rustls-ring"
 # async; run_sftp_source wraps it in block_on like the mongo / tiberius
 # sources to stay synchronous. Host-key/fingerprint is enforced in russh's
 # check_server_key callback.
-russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2.3"
 # System clipboard reader (src.clipboard). Text-only - image-data is
 # off because we never round-trip images through pipelines. arboard
@@ -159,13 +170,13 @@ arboard = { version = "3", default-features = false }
 # no cranelift - far smaller than wasmtime. Trade-off: slower
 # execution, but per-row ETL transforms aren't throughput-critical.
 # The wasm module runs in a sandbox - no fs, no network, no env vars.
-wasmi = "1.1"
+wasmi = "2.0"
 # Pure-Rust JavaScript engine for code.javascript. Boa is an
 # interpreter (no JIT), sandboxed by default - no DOM, no fetch, no
 # fs. The user supplies a transform(row) -> object function and the
 # engine calls it per row, marshalling JSON in / out via the boa
 # JsValue<->serde_json bridge.
-boa_engine = "0.21"
+boa_engine = "0.22"
 # Pure-Rust jq for xf.jq (GitHub #173). jaq is a jq clone with no C libjq and
 # no subprocess: the user's jq filter is parsed and interpreted in-process, then
 # applied per row to a JSON column. This is exactly the "no subprocess overhead"
@@ -225,9 +236,14 @@ odbc-sys = { version = "0.31", optional = true, features = ["static", "static_lt
 [features]
 default = ["oracle"]
 oracle = ["dep:oracle"]
-# Teradata via ODBC (odbc-api). Off by default so a plain engine build/test
-# needs no ODBC driver manager; the shipped binaries enable it.
-teradata = ["dep:odbc-api"]
+# ODBC (odbc-api) transport, shared by every connector that has no DuckDB
+# extension and no native Rust driver. Off by default so a plain engine
+# build/test needs no ODBC driver manager; the shipped binaries enable it.
+odbc = ["dep:odbc-api"]
+# Teradata and IBM DB2 both ride ODBC. They stay separate feature names so a
+# build can take one without the other; both just switch the transport on.
+teradata = ["odbc"]
+db2 = ["odbc"]
 # Linux self-contained ODBC: statically link the unixODBC driver manager so a
 # shipped Linux binary launches with no system libodbc.so.2 installed. Enabled
 # only on Linux (by the consuming crates' Linux target tables) alongside
@@ -244,6 +260,10 @@ required-features = ["oracle"]
 
 [dev-dependencies]
 tempfile = "3.10"
+# Re-imported as dev-deps so the integration tests can BUILD the archives they
+# then read back through xf.archive.extract. Same versions as the lib deps.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+tar = "0.4"
 # Re-imported as a dev-dep so the integration tests can call its
 # Writer to build a small .avro file inline before reading it back
 # through src.avro. Same version as the lib dep above.

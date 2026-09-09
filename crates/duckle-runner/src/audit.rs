@@ -13,7 +13,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::console_auth::{Identity, Role};
 
@@ -26,21 +26,12 @@ pub fn audit_path(workspace: &Path) -> PathBuf {
 /// The writer and the reader share this type on purpose: a log written by one
 /// shape and read by another drifts the first time a field is renamed, and the
 /// symptom is a reader that quietly shows blanks.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Entry {
-    /// RFC3339, when the attempt was made.
-    #[serde(default)]
-    pub at: String,
-    /// Who, or "-" for a caller that never identified itself.
-    #[serde(default)]
-    pub actor: String,
-    #[serde(default)]
-    pub role: String,
-    pub action: String,
-    #[serde(default)]
-    pub target: String,
-    pub outcome: String,
-}
+///
+/// It lives in the engine because the console is not the only writer. The CLI,
+/// MCP and the desktop panel reach the state mutators directly, and those
+/// record from inside the engine - so there has to be exactly one definition
+/// for all of them, not one per crate.
+pub use duckle_duckdb_engine::audit::Entry;
 
 /// How an attempt ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +70,7 @@ pub fn record(
     outcome: Outcome,
 ) {
     let entry = Entry {
+        detail: None,
         at: chrono::Utc::now().to_rfc3339(),
         // An unauthenticated caller has no name, and inventing one would make
         // the log read as though somebody known did this.
@@ -399,6 +391,27 @@ pub fn requirement(method: &str, path: &str) -> (Role, &'static str) {
         ("POST", "/api/admin/keys") => (Role::Admin, "admin.keys.add"),
         ("POST", "/api/admin/keys/revoke") => (Role::Admin, "admin.keys.revoke"),
 
+        // Backfill state. Reading is a viewer's business; changing it decides
+        // what data the next run processes, so it needs an operator. Named
+        // here rather than left to the fallback, or every operator gets a 403
+        // and the audit log calls the action "unknown".
+        ("GET", "/api/watermarks") => (Role::Viewer, "watermarks.read"),
+        ("POST", "/api/watermarks") => (Role::Operator, "watermark.write"),
+        ("DELETE", "/api/watermarks") => (Role::Operator, "watermark.clear"),
+
+        // #295: reading a backfill is a viewer's business; creating, retrying
+        // or cancelling one decides what runs, which is an operator's. Named
+        // here rather than left to the fallback, or every operator gets a 403
+        // and the audit log calls the action "unknown".
+        ("GET", "/api/backfills") => (Role::Viewer, "backfills.read"),
+        ("POST", "/api/backfills") => (Role::Operator, "backfill.write"),
+
+        // #300: a scraper is a reader. Named here rather than left to the
+        // fallback, which would demand admin - and handing a monitoring agent a
+        // credential that can also add users and deploy pipelines is a worse
+        // trade than not scraping at all.
+        ("GET", "/metrics") => (Role::Viewer, "metrics.read"),
+
         // Anything unrecognised needs the highest role. A route added later
         // without a line here is locked down rather than left open.
         _ => (Role::Admin, "unknown"),
@@ -407,6 +420,45 @@ pub fn requirement(method: &str, path: &str) -> (Role, &'static str) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The backfill routes: reading is a viewer's business, changing what the
+    /// next run processes is an operator's. A missing line here compiles,
+    /// serves, and 403s every operator in production - the same trap the run
+    /// routes below were written for.
+    #[test]
+    fn the_backfill_routes_are_not_admin_only_by_accident() {
+        use super::{requirement, Role};
+        assert_eq!(
+            requirement("GET", "/api/watermarks"),
+            (Role::Viewer, "watermarks.read"),
+            "seeing where a pipeline will resume from only reads"
+        );
+        assert_eq!(
+            requirement("POST", "/api/watermarks"),
+            (Role::Operator, "watermark.write"),
+            "moving a watermark decides what data the next run processes"
+        );
+        assert_eq!(
+            requirement("DELETE", "/api/watermarks"),
+            (Role::Operator, "watermark.clear"),
+            "clearing state is the same class of act as setting it"
+        );
+        // The failure this guards against: falling through to the fallback,
+        // which is admin-only and logs the action as "unknown".
+        for route in [
+            ("GET", "/api/watermarks"),
+            ("POST", "/api/watermarks"),
+            ("DELETE", "/api/watermarks"),
+        ] {
+            assert_ne!(
+                requirement(route.0, route.1).1,
+                "unknown",
+                "{} {} fell through to the admin fallback",
+                route.0,
+                route.1
+            );
+        }
+    }
 
     /// #259: every route dispatch_console serves needs a line in `requirement`.
     /// One that is missing falls through to the admin-only arm and 403s every

@@ -31,6 +31,9 @@ export interface InforNodeQuery {
     dataArea?: DataAreaId;
     businessClass?: string;
     fields?: string;
+    // Legacy simple-filter string from pre-filterTree nodes; kept so old
+    // saved nodes still hydrate their filter. New nodes use filterTree.
+    filter?: string;
     // The compiled LPL expression (what actually runs, sent as _lplFilter).
     lplFilter?: string;
     // The structured filter tree that produced lplFilter (round-trips so the

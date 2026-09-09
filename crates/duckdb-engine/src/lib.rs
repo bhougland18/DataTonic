@@ -12,7 +12,10 @@
 //! separate CLI invocations); sinks `COPY` from the upstream table.
 //! Cancellation kills the in-flight child process.
 
-use duckle_metadata::{Column, DataType};
+// Re-exported: NodePreview.columns is public, so its element type has to be
+// reachable by anything that reads a preview - the runner's test harness could
+// not name the type of a field it was handed.
+pub use duckle_metadata::{Column, DataType};
 use duckle_plugin_sdk::{Inspection, InspectError};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -35,16 +38,54 @@ pub mod drift;
 pub mod qvd;
 pub mod review;
 pub mod alerts;
+pub mod backfill;
+pub mod backfill_exec;
+pub mod capabilities;
+pub mod materialize;
+pub mod subscribe;
+pub mod chunk_exec;
+pub mod chunking;
+pub mod partition;
+pub mod sequence;
+pub mod plugin;
+pub mod pools;
+pub mod release;
+pub mod follow_session;
+pub mod sqlcomplete;
+pub mod sqldiag;
+pub mod openlineage;
+pub mod rundiff;
+pub mod props;
+pub mod affected;
+pub mod format;
 pub mod catalog;
 pub mod runlock;
+pub mod s3;
 pub mod batch;
+pub mod audit;
+pub mod baseline;
+pub mod budget;
+pub mod checkpoint;
+pub mod contracts;
+pub mod cronzone;
+pub mod mask;
+pub mod nodeout;
+pub mod occurrences;
+pub mod outcache;
+pub mod params;
+pub mod retry;
+pub mod sla;
 pub mod plans;
+pub mod policy;
+pub mod pyenv;
 pub mod schedules;
 pub mod talend;
 pub mod trust;
 pub mod tls;
 pub mod watermark;
+pub mod xsd;
 mod connectors;
+pub use connectors::remote_fingerprint;
 mod run_log;
 mod util;
 pub(crate) use util::*;
@@ -52,10 +93,12 @@ pub use util::{is_secret_prop_key, literal_secrets};
 pub use history::{append_run_record, load_run_history, RunRecord};
 pub use plan::{CompiledPipeline, PipelineDoc, Stage, StageKind};
 use plan::{
-    quote_ident, AiChunkSpec, AiClassifySpec, AiDedupeSpec, AiEmbedSpec, AiLlmSpec, AiPiiSpec,
+    quote_ident, AiChunkSpec, AiClassifySpec, AiDedupeSpec, AiEmbedSpec, AiLlmSpec, AiOnInvalid,
+    AiPiiSpec, AiResponseFormat,
     AvroSinkSpec, AvroSourceSpec, CassandraSinkSpec, CassandraSourceSpec, ClickHouseSinkSpec,
     ClickHouseSourceSpec, ClipboardSourceSpec, DatabricksSinkSpec, DatabricksSourceSpec,
     DbtSpec, DynamoDbSourceSpec, ElasticSourceSpec, EmailSinkSpec, EmailSourceSpec,
+    ManticoreSinkSpec, ManticoreSourceSpec,
     FormatFileSinkSpec,
     FormatFileSourceSpec, FormatKind, FtpSinkSpec, FtpSourceSpec, GitSourceSpec,
     GizmoSqlSinkSpec, GizmoSqlSourceSpec, HtmlSourceSpec, ModelCardSpec, PdfSourceSpec, HuggingFaceSinkSpec,
@@ -128,6 +171,43 @@ pub struct DuckdbEngine {
     /// variables reach the child only, so a value that has to survive the whole descent
     /// travels here instead.
     pub(crate) inherited_subs: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Files external components produced during this run (#307).
+    ///
+    /// Collected here because the engine runs the stage and the CALLER writes
+    /// the receipt: without somewhere to put them, an artifact would be known
+    /// only to the process that made it. Cleared per run for the same reason
+    /// the run id is - what a previous run produced is that run's provenance.
+    pub(crate) artifacts: Arc<std::sync::Mutex<Vec<ProducedArtifact>>>,
+    /// #305: what each node durably produced, so a later retry can bind a
+    /// VERIFIED output instead of trusting that a node once succeeded.
+    pub(crate) outputs: Arc<std::sync::Mutex<
+        std::collections::BTreeMap<String, crate::nodeout::NodeOutput>,
+    >>,
+    /// #305: node id -> a durable output to read INSTEAD of running that node.
+    ///
+    /// Set by a retry from a plan whose entries were verified - uri, size and
+    /// sha256 - before they got here. The engine binds what it is given; the
+    /// checking belongs to the planner, which is the thing that can explain a
+    /// failure to a person.
+    pub(crate) output_bindings: std::collections::BTreeMap<String, String>,
+    /// #305: nodes this run does not have to do at all, because everything that
+    /// reads them is bound from a file.
+    pub(crate) skip_nodes: std::collections::BTreeSet<String>,
+    /// The durable run id this engine is executing under (#259).
+    ///
+    /// Set by whoever minted it - always the same `retry::begin` that writes
+    /// the receipt - so the run log, the receipt and the history record all
+    /// name one run. Absent for a bare `execute` with no surrounding run, which
+    /// falls back to a minted id rather than logging under an empty one.
+    run_id: Option<String>,
+    /// Whether this engine is a PROBE and must not change anything.
+    ///
+    /// Autodetect learns a driver source's schema by running it (#148), and
+    /// some sources have effects when they run: a DuckLake CDC read advances
+    /// the consumed snapshot, a Kafka read advances the offset. Persisting that
+    /// from a probe makes the next real run see no changes - the schema preview
+    /// silently eats the data it was only supposed to look at.
+    probing: bool,
 }
 
 impl std::fmt::Debug for DuckdbEngine {
@@ -143,6 +223,140 @@ fn references_node_stat(sql: &str) -> bool {
     sql.contains("_NB_LINE}") || sql.contains("_NB_FILE}") || sql.contains("_DURATION}")
 }
 
+/// One file an external component produced, and which node produced it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProducedArtifact {
+    pub node_id: String,
+    #[serde(flatten)]
+    pub artifact: crate::plugin::Artifact,
+}
+
+/// What binding one node's SQL said (#314).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeAnalysis {
+    pub node_id: String,
+    pub component: String,
+    /// `duckdb` when Duckle runs the SQL itself, `remote` when it is sent to
+    /// another system. Criterion 5: never claim a DuckDB bind says anything
+    /// about BigQuery.
+    pub dialect: String,
+    /// The inferred output schema, when DuckDB bound it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<Column>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<sqldiag::Diagnostic>,
+    /// Whether DuckDB actually looked. False means nothing was checked, which
+    /// is not the same as checked and clean - the difference this field exists
+    /// to keep.
+    pub validated: bool,
+    /// Why it did not look, when it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The SQL a node's author actually wrote, if it has any.
+fn authored_sql(node: &duckle_metadata::PipelineNode) -> Option<String> {
+    let props = node.data.properties.as_ref()?;
+    for key in ["sql", "query"] {
+        if let Some(text) = props.get(key).and_then(|v| v.as_str()) {
+            if !text.trim().is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Locate a diagnostic by the identifier its message names, when the caret
+/// cannot be used.
+///
+/// DuckDB truncates the source line it echoes as soon as the statement is wide
+/// - and Duckle's compiled statement always is, because it prepends
+/// `CREATE OR REPLACE VIEW "q" AS WITH input AS (...)`. The caret is then
+/// aligned to a window whose starting offset is not printed, so it cannot be
+/// turned into an offset in anything.
+///
+/// The message still names the token: `Referenced column "regionn" not found`.
+/// Searching for it is honest only when it occurs EXACTLY once in the authored
+/// SQL - twice and there is no way to tell which one DuckDB meant, and pointing
+/// at the wrong one is the failure this whole path is trying to avoid.
+fn by_token(mut d: sqldiag::Diagnostic, authored: &str) -> sqldiag::Diagnostic {
+    d.line = None;
+    d.column = None;
+    let Some(token) = sqldiag::quoted(&d.message).into_iter().next() else { return d };
+    let mut found = authored.match_indices(&token);
+    let Some((at, _)) = found.next() else { return d };
+    if found.next().is_some() {
+        return d;
+    }
+    let before = &authored[..at];
+    d.line = Some(before.lines().count().max(1) as u32);
+    d.column = Some(before.lines().next_back().unwrap_or("").len() as u32 + 1);
+    d
+}
+
+/// Move a diagnostic's position from the compiled SQL onto the SQL the user
+/// wrote, or drop it.
+///
+/// The compiled text is not the authored text: a `WITH input AS (...)` preamble
+/// is prepended, stub views for every upstream are prepended before that, and a
+/// prelude can be prepended before those. A position that still pointed at the
+/// compiled text would send the reader to a line they never typed, with total
+/// confidence - so unless the authored SQL appears verbatim in what was run and
+/// the diagnostic falls inside it, the position is removed and the diagnostic
+/// stays node-level.
+fn reposition(
+    mut d: sqldiag::Diagnostic,
+    executed: &str,
+    authored: Option<&str>,
+) -> sqldiag::Diagnostic {
+    let Some(authored) = authored else {
+        d.line = None;
+        d.column = None;
+        return d;
+    };
+    let (Some(line), Some(column)) = (d.line, d.column) else {
+        return by_token(d, authored);
+    };
+    let Some(start) = executed.find(authored) else {
+        return by_token(d, authored);
+    };
+    // Absolute offset of the diagnostic within what was executed.
+    let mut offset = 0usize;
+    for (n, text) in executed.lines().enumerate() {
+        if n + 1 == line as usize {
+            offset += (column as usize).saturating_sub(1);
+            break;
+        }
+        offset += text.len() + 1;
+    }
+    if offset < start || offset >= start + authored.len() {
+        return by_token(d, authored);
+    }
+    // And the same offset expressed against the authored text.
+    let inner = &authored[..offset - start];
+    d.line = Some(inner.lines().count().max(1) as u32);
+    d.column = Some(inner.lines().next_back().unwrap_or("").len() as u32 + 1);
+    d
+}
+
+/// What to say when there is no DuckDB CLI where the engine expected one.
+///
+/// Deliberately not "Open Setup": this engine is shared by the desktop app,
+/// the headless runner and the console, and Setup only exists in the first.
+/// Measured on a clean Arch container with the runner installed from a
+/// package - the advice was to open a window that install has no way to show.
+pub(crate) fn duckdb_missing_message(bin: &std::path::Path) -> String {
+    format!(
+        "DuckDB engine not found at {}. In the desktop app, install it from \
+         Setup. Otherwise point DUCKLE_DUCKDB_BIN (or --duckdb) at a DuckDB \
+         CLI, or install one on PATH.",
+        bin.display()
+    )
+}
+
 impl DuckdbEngine {
     /// Construct an engine pointing at a DuckDB CLI binary. The binary
     /// need not exist yet - calls fail with a clear error if it's
@@ -153,7 +367,89 @@ impl DuckdbEngine {
             bin,
             inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             cancel: Arc::new(AtomicBool::new(false)),
+            artifacts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            outputs: Arc::new(std::sync::Mutex::new(Default::default())),
+            output_bindings: Default::default(),
+            skip_nodes: Default::default(),
+            run_id: None,
+            probing: false,
         }
+    }
+
+    /// Execute under a run id somebody else minted (#259).
+    ///
+    /// Given the id from `retry::begin`, so the run log names the same run as
+    /// the receipt and the history record. Without it the engine mints a
+    /// throwaway id that is written into log lines and nowhere else, which is
+    /// what made run-scoped logs unaddressable by the id every other surface
+    /// uses.
+    /// What external components produced during this run, for the receipt.
+    pub fn produced_artifacts(&self) -> Vec<ProducedArtifact> {
+        self.artifacts.lock().map(|a| a.clone()).unwrap_or_default()
+    }
+
+    /// #305: read these durable outputs instead of running the nodes that made
+    /// them. The retry planner supplies them, already verified.
+    pub fn with_output_bindings(
+        mut self,
+        bindings: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.output_bindings = bindings;
+        self
+    }
+
+    /// #305: do not stage these nodes at all. Everything that reads them is
+    /// bound, so their relations have no reader.
+    pub fn skipping(mut self, nodes: std::collections::BTreeSet<String>) -> Self {
+        self.skip_nodes = nodes;
+        self
+    }
+
+    /// #305: what this run durably produced, per node, for the receipt.
+    pub fn produced_outputs(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::nodeout::NodeOutput> {
+        self.outputs.lock().map(|o| o.clone()).unwrap_or_default()
+    }
+
+    /// Record a node's durable output, hashing it now.
+    ///
+    /// Best effort, like the cache write it follows: a file that cannot be
+    /// hashed means a later retry re-runs this node, which is the safe
+    /// direction. Recording it unhashed would not be - it would let a retry
+    /// bind bytes nobody checked.
+    pub(crate) fn record_output(
+        &self,
+        node_id: &str,
+        path: &Path,
+        cache_key: Option<String>,
+        columns: Vec<String>,
+    ) {
+        let Ok(mut out) =
+            crate::nodeout::NodeOutput::of_file(node_id, self.run_id.as_deref(), crate::nodeout::Kind::Relation, path)
+        else {
+            return;
+        };
+        out.cache_key = cache_key;
+        out.columns = columns;
+        if let Ok(mut held) = self.outputs.lock() {
+            held.insert(node_id.to_string(), out);
+        }
+    }
+
+    pub(crate) fn record_artifacts(&self, node_id: &str, artifacts: &[crate::plugin::Artifact]) {
+        if let Ok(mut held) = self.artifacts.lock() {
+            held.extend(artifacts.iter().cloned().map(|artifact| ProducedArtifact {
+                node_id: node_id.to_string(),
+                artifact,
+            }));
+        }
+    }
+
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        let id = run_id.into();
+        self.run_id = (!id.trim().is_empty()).then_some(id);
+        self
     }
 
     /// Stop fetching per-node preview rows.
@@ -181,9 +477,38 @@ impl DuckdbEngine {
             bin: self.bin.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             previews: self.previews,
+            // A new run is a new identity; carrying the previous one forward
+            // would file this run's log lines under that run.
+            run_id: None,
+            artifacts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            outputs: Arc::new(std::sync::Mutex::new(Default::default())),
+            output_bindings: Default::default(),
+            skip_nodes: Default::default(),
             // A new top-level run inherits nothing: what a previous run handed down
             // belonged to that run's call chain.
             inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // A real run is not a probe, whatever this engine was.
+            probing: false,
+        }
+    }
+
+    /// A clone of this engine that must not change anything.
+    ///
+    /// Shares this run's cancel flag, so cancelling still stops a probe, and
+    /// nothing else: a probe's identity, artifacts and inherited substitutions
+    /// are its own.
+    fn for_probe(&self) -> DuckdbEngine {
+        DuckdbEngine {
+            bin: self.bin.clone(),
+            cancel: Arc::clone(&self.cancel),
+            previews: false,
+            run_id: None,
+            artifacts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            outputs: Arc::new(std::sync::Mutex::new(Default::default())),
+            output_bindings: Default::default(),
+            skip_nodes: Default::default(),
+            inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            probing: true,
         }
     }
 
@@ -336,6 +661,83 @@ impl DuckdbEngine {
 
     /// Run SQL and return the first JSON array of rows it printed
     /// (DESCRIBE / SELECT produce one array; preludes produce none).
+    /// #252: the identity of this stage's completed output, or None when the
+    /// stage did not ask for caching or cannot be keyed honestly.
+    ///
+    /// Refused without an upstream relation on purpose. A stage that reads the
+    /// outside world has no input identity this pipeline can checksum, so the
+    /// only key available would be its configuration - and that would return
+    /// last week's answer for a file that has since changed.
+    fn output_cache_key(
+        &self,
+        db: &Path,
+        stage: &plan::Stage,
+        pipeline_name: Option<&str>,
+    ) -> Option<outcache::Key> {
+        if !stage.cache_output {
+            return None;
+        }
+        // One run that must not touch the cache, without editing the pipeline.
+        // Set by `duckle-runner --no-cache`. It neither reads nor writes: a run
+        // taken to settle whether the cache is lying should not then overwrite
+        // the evidence.
+        if std::env::var("DUCKLE_NO_CACHE").map(|v| v != "0").unwrap_or(false) {
+            return None;
+        }
+        let view = stage.cache_input_view.as_deref()?;
+        let ws = std::env::var("DUCKLE_WORKSPACE")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        // #246: for a Python stage the installed packages are part of the
+        // input, and a stage with no workspace environment has no identity to
+        // key on at all - so it is refused rather than keyed on the script.
+        let env_hash = if stage.component_id == "code.python" {
+            pyenv::inspect(std::path::Path::new(&ws)).environment_hash
+        } else {
+            None
+        };
+        let config_fp = outcache::config_with_environment(
+            &stage.component_id,
+            &stage.cache_config_fp,
+            env_hash.as_deref(),
+        )?;
+        let input_fp =
+            outcache::input_fingerprint(&self.bin, db, view, |d, sql| self.run_rows(Some(d), sql))
+                .ok()?;
+        Some(outcache::key_for(
+            std::path::Path::new(&ws),
+            pipeline_name.unwrap_or("pipeline"),
+            &stage.node_id,
+            &config_fp,
+            &input_fp,
+        ))
+    }
+
+    /// The columns of a parquet file, for the output record (#305).
+    ///
+    /// Best effort: an empty list means NOT RECORDED rather than "no columns",
+    /// which is why nothing treats emptiness as evidence. Asked of DuckDB
+    /// rather than inferred from the pipeline, because what matters later is
+    /// the shape of the FILE a retry would bind, not the shape the document
+    /// says the node has.
+    fn parquet_columns(&self, file: &Path) -> Vec<String> {
+        // `column_name`, not `name`: DESCRIBE names its first column
+        // `column_name`, and asking for `name` is a binder error that comes
+        // back as an empty list rather than a failure - which is how this
+        // silently recorded no columns at all until it was run.
+        let sql = format!(
+            "SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet('{}'))",
+            file.to_string_lossy().replace(char::from(92), "/").replace('\'', "''")
+        );
+        self.run_rows(None, &sql)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get("column_name").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn run_rows(&self, db: Option<&Path>, sql: &str) -> Result<Vec<JsonValue>, EngineError> {
         let out = self.run(db, sql, true)?;
         Ok(parse_json_arrays(&out).into_iter().next().unwrap_or_default())
@@ -489,6 +891,17 @@ impl DuckdbEngine {
         use std::sync::atomic::{AtomicU64, Ordering};
         static INSPECT_SEQ: AtomicU64 = AtomicU64::new(0);
 
+        // A probe RUNS the component, and DuckLake Maintenance compacts files,
+        // expires snapshots and deletes orphans. Performing that to find out
+        // which columns it returns is not a preview; it is maintenance nobody
+        // asked for - and unlike a CDC snapshot it cannot be made repeatable by
+        // declining to save state.
+        if format == "ducklake.maintain" {
+            return Err(EngineError::Unsupported(
+                "src.ducklake.maintain cannot be autodetected: finding out what it returns would                  mean performing the maintenance operation. It emits what it did, so run it to                  see the columns."
+                    .to_string(),
+            ));
+        }
         let component_id = format!("src.{}", format);
         // Cap the driver fetch where we can; correctness does not depend on it.
         let mut src_props = options.clone();
@@ -535,8 +948,9 @@ impl DuckdbEngine {
         // relies on the unwind panic strategy set in the release profile; the
         // probe DB / parquet / NDJSON are throwaway per-call temporaries, so
         // AssertUnwindSafe is sound.
+        let probe = self.for_probe();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.execute_pipeline(&doc)
+            probe.execute_pipeline(&doc)
         }))
         .map_err(|_| {
             let _ = std::fs::remove_file(&out);
@@ -639,6 +1053,7 @@ impl DuckdbEngine {
                     .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)))
                     .unwrap_or(true);
                 Some(Column {
+                    tags: Vec::new(),
                     name,
                     data_type: map_sqlserver_type(type_name),
                     nullable,
@@ -730,8 +1145,9 @@ impl DuckdbEngine {
         // The catalog queries return only decodable column types, so the tiberius
         // panic path is never taken; keep the guard so a driver quirk can never
         // abort the whole app. Temp parquet is a throwaway per-call file.
+        let probe = self.for_probe();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.execute_pipeline(&doc)
+            probe.execute_pipeline(&doc)
         }))
         .map_err(|_| {
             let _ = std::fs::remove_file(&out);
@@ -855,23 +1271,29 @@ impl DuckdbEngine {
     /// the azure extension, or ATTACH for a DuckDB file.
     fn source_prelude(&self, format: &str, options: &JsonValue) -> String {
         let mut p = String::new();
-        if let Some(secret) = secret_statement(format, "duckle_inspect", options) {
+        if let Some(secret) = secret_statement(secret_family(format), "duckle_inspect", options) {
             p.push_str(&secret);
             p.push(' ');
         }
         if format == "azureblob" {
             p.push_str("INSTALL azure; LOAD azure; ");
         }
-        // Extension-backed file formats need the same LOAD the run path emits
-        // (attach_prelude, builders.rs), or the inspect DESCRIBE / sample fails
-        // on a cold CLI that has not autoloaded the reader.
-        match format {
-            "avro" => p.push_str("LOAD avro; "),
-            "excel" => p.push_str("LOAD excel; "),
-            "iceberg" => p.push_str("LOAD iceberg; "),
-            "delta" => p.push_str("LOAD delta; "),
-            "spatial" => p.push_str("INSTALL spatial; LOAD spatial; "),
-            _ => {}
+        // What the RUN path loads for this component, asked OF the run path
+        // rather than kept as a second list here.
+        //
+        // A second list is how `gdb` came to be missing (#327: autodetect said
+        // "st_read is not in the catalog" on a node that ran fine) and how a
+        // Hugging Face token secret was missing after it. attach_prelude
+        // already knows every extension load and connector secret, so this
+        // asks it instead of restating it.
+        //
+        // Excluded: the formats whose ATTACH this function issues below with
+        // its own read-only variant. Attaching `duckle_src` twice is an error,
+        // not a no-op.
+        let attaches_here = matches!(format, "duckdb" | "ducklake" | "ducklake_snapshots")
+            || plan::is_attach_relational_format(format);
+        if !attaches_here {
+            p.push_str(&plan::attach_prelude(&format!("src.{format}"), options));
         }
         if format == "duckdb" {
             if let Some(db) = options.get("database").and_then(JsonValue::as_str) {
@@ -929,11 +1351,70 @@ impl DuckdbEngine {
         // nested sub-pipeline run (ctl.iterate/foreach/runjob/parallelize) wipe
         // a cancel the user requested mid-loop.
 
+        // #299: before ANY other check, including whether the engine is
+        // installed. A newer format may carry settings this build cannot see -
+        // a declared parameter contract, a schedule exclusion - and reading it
+        // anyway runs something other than what the file describes without
+        // failing. It is also the more useful of the two errors: upgrading
+        // Duckle is what fixes it, and that installs the engine too.
+        if let Err(e) = crate::format::refuse_if_too_new(doc.format_version) {
+            return RunResult::failed(total_start, e.to_string());
+        }
+
         if !self.bin.exists() {
-            return RunResult::failed(
-                total_start,
-                "DuckDB engine isn't installed yet. Open Setup to install it.".into(),
-            );
+            return RunResult::failed(total_start, duckdb_missing_message(&self.bin));
+        }
+
+        // #298: a property no builder reads changed nothing, and before this
+        // nothing said so - the run used the default and the numbers looked
+        // fine. Warned rather than refused, because a pipeline that has quietly
+        // carried a dead property for a year should start telling its operator,
+        // not stop running the day they upgrade. DUCKLE_STRICT_PROPERTIES=1
+        // turns it into a refusal for a workspace that wants one.
+        let property_findings: Vec<crate::props::Finding> =
+            crate::props::check(doc).into_iter().filter(|f| f.fails).collect();
+        if !property_findings.is_empty() {
+            if crate::props::strict_execution() {
+                return RunResult::failed(
+                    total_start,
+                    property_findings
+                        .iter()
+                        .map(|f| format!("{}: {}", f.node, f.message))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                );
+            }
+            for f in &property_findings {
+                user_on_event(PipelineEvent::Log {
+                    node_id: f.node.clone(),
+                    level: "warn".into(),
+                    message: f.message.clone(),
+                });
+            }
+        }
+
+        // #246: a Python stage against an environment that is not the one
+        // uv.lock describes produces a run that is not the run the lock says it
+        // is. Checked BEFORE anything executes, because the point is to catch
+        // it instead of discovering it in the numbers afterwards. Silent unless
+        // the workspace committed a lock, and silent for a pipeline with no
+        // Python in it.
+        if doc.nodes.iter().any(|n| {
+            n.data.component_id.as_deref() == Some("code.python")
+        }) {
+            if let Ok(ws) = std::env::var("DUCKLE_WORKSPACE") {
+                if !ws.trim().is_empty() {
+                    match pyenv::guard(std::path::Path::new(&ws)) {
+                        Ok(Some(note)) => user_on_event(PipelineEvent::Log {
+                            node_id: String::new(),
+                            level: "warn".into(),
+                            message: note,
+                        }),
+                        Ok(None) => {}
+                        Err(e) => return RunResult::failed(total_start, e.to_string()),
+                    }
+                }
+            }
         }
 
         // Create the parent folder of every local file sink before running, so a
@@ -949,16 +1430,29 @@ impl DuckdbEngine {
         // export path is already redacted (compile_pipeline_sql_opts); this
         // covers the execution path. (Named distinctly from the SECRET-prelude
         // `secrets` bound later in this fn.)
-        let redact_secrets = collect_secrets(doc);
+        // The workspace as well as the document: a context variable marked
+        // `secret: true` and substituted into an ordinary property is a secret
+        // because of where it came from, and nothing about the property it
+        // landed in says so.
+        let secret_ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.trim().is_empty());
+        let redact_secrets =
+            collect_secrets(doc, secret_ws.as_deref().map(std::path::Path::new));
 
         let compiled = match target {
             Some(t) => plan::compile_partial(doc, t),
             None => plan::compile(doc),
         };
-        let compiled = match compiled {
+        let mut compiled = match compiled {
             Ok(c) => c,
             Err(e) => return RunResult::failed(total_start, e.to_string()),
         };
+        // #305: a retry reads verified durable outputs instead of re-deriving
+        // them. Applied AFTER compiling rather than inside it, so the compiler
+        // stays a pure function of the document and nothing else has to learn
+        // about retries.
+        plan::apply_output_bindings(&mut compiled.stages, &self.output_bindings);
+        plan::drop_stages(&mut compiled.stages, &self.skip_nodes);
+        let compiled = compiled;
 
         // Component-level run log (Splunk / Dynatrace), gated on
         // DUCKLE_LOG_DIR. We tee every event through it so BOTH the fast
@@ -978,7 +1472,17 @@ impl DuckdbEngine {
                 )
             })
             .collect();
-        let run_id = format!("run-{}-{}", std::process::id(), now_nanos());
+        // #259: the DURABLE run id when the caller minted one, so a log line
+        // joins to the receipt and the history record for the same run. The
+        // engine used to mint its own `run-{pid}-{nanos}` here and never
+        // persist it, which is the third of the three competing id schemes
+        // #259 set out to remove - and the one that survived, leaving
+        // "run-scoped logs addressable by run_id" true of everything except
+        // the logs.
+        let run_id = self
+            .run_id
+            .clone()
+            .unwrap_or_else(|| format!("run-{}-{}", std::process::id(), now_nanos()));
         let mut runlog = run_log::RunLog::open(pipeline_name, run_id, node_meta);
         let mut on_event = |evt: PipelineEvent| {
             if runlog.enabled() {
@@ -1023,6 +1527,7 @@ impl DuckdbEngine {
         };
 
         let mut nodes: std::collections::BTreeMap<String, NodeRunStatus> = Default::default();
+        let mut cache_keys: std::collections::BTreeMap<String, String> = Default::default();
         let mut overall_error: Option<String> = None;
         // ctl.try installs a fallback path here. On any subsequent
         // stage failure, the engine runs it as a side effect before
@@ -1030,12 +1535,19 @@ impl DuckdbEngine {
         // recent ctl.try (no stacked nesting yet - DAG block refactor
         // would add that).
         let mut installed_fallback: Option<String> = None;
+        // #258: set by the first stage that stops at a ceiling it was given.
+        let mut incomplete_reason: Option<String> = None;
         let mut was_cancelled = false;
         let mut preview: Vec<NodePreview> = Vec::new();
         // xf.incremental high-water marks to persist - but only if the WHOLE
         // run succeeds, so a later-stage failure never advances the mark past
         // rows that were never actually delivered. (state file path, json).
-        let mut pending_writes: Vec<(std::path::PathBuf, JsonValue)> = Vec::new();
+        let mut pending_writes: Vec<PendingWrite> = Vec::new();
+        // Remote objects this run reads or writes, for the signed manifest. A
+        // local file source is already pinned by path; an s3:// or https:// one
+        // has no path, so without this the most important boundary in a raw-zone
+        // pipeline records nothing at all.
+        let mut artifacts: Vec<ArtifactRef> = Vec::new();
 
         // Fast path: if every stage is pure-SQL with no per-stage
         // hooks, pipe the whole pipeline as one SQL stream into a
@@ -1060,9 +1572,7 @@ impl DuckdbEngine {
         // PRAGMA across stages in a single session), and any
         // sink_mode="error" with a pre-existing local file (the
         // Rust pre-check guards against silent overwrite).
-        let batchable = target.is_none()
-            && compiled.stages.len() >= 2
-            && compiled.stages.iter().all(|s| {
+        let stage_batchable = |s: &plan::Stage| {
                 s.is_pure_sql()
                     && s.retry_attempts <= 1
                     && s.wait_ms.is_none()
@@ -1081,7 +1591,42 @@ impl DuckdbEngine {
                             .as_deref()
                             .map(|p| std::path::Path::new(p).exists())
                             .unwrap_or(false))
-            });
+        };
+        let batchable = target.is_none()
+            && compiled.stages.len() >= 2
+            && compiled.stages.iter().all(&stage_batchable);
+
+        // A publish group is one transaction, and a transaction lives inside one
+        // DuckDB session. The per-stage path spawns a process per stage, so there
+        // is no session to hold one open: the members would commit one at a time
+        // while the pipeline still claimed they commit together. Name what forced
+        // the slower path rather than running and quietly not being atomic.
+        if !batchable {
+            if let Some(group) = compiled
+                .stages
+                .iter()
+                .find_map(|s| s.publish_group.as_deref())
+            {
+                let why = if target.is_some() {
+                    "this is a partial run, which executes a stage at a time".to_string()
+                } else {
+                    match compiled.stages.iter().find(|s| !stage_batchable(s)) {
+                        Some(s) => format!(
+                            "'{}' has to run in its own process, which splits the run into one session per stage",
+                            s.label
+                        ),
+                        None => "the run has only one stage".to_string(),
+                    }
+                };
+                return RunResult::failed(
+                    total_start,
+                    format!(
+                        "publish group '{}' needs every stage in one session, but {}. The group's tables would be committed one at a time, which is what the group exists to prevent.",
+                        group, why
+                    ),
+                );
+            }
+        }
 
         if batchable {
             let r = self.execute_batched(
@@ -1090,6 +1635,7 @@ impl DuckdbEngine {
                 &compiled.stages,
                 &redact_secrets,
                 total_start,
+                &mask::tags_from_doc(doc),
                 &mut on_event,
             );
             return r;
@@ -1230,6 +1776,7 @@ impl DuckdbEngine {
                     NodeRunStatus {
                         status: "ok".into(),
                         kind: Some("sink".into()),
+                        note: None,
                         rows,
                         duration_ms: Some(0),
                         error: None,
@@ -1301,59 +1848,9 @@ impl DuckdbEngine {
             // and threading a config through every call site is invasive.
             // Env vars let the Tauri app's setup hook publish workspace
             // settings once, and tests can set them ad-hoc.
-            let memory_pragma = {
-                let mut prag = String::from(
-                    "PRAGMA preserve_insertion_order=false; \
-                     PRAGMA enable_object_cache=true; \
-                     PRAGMA enable_progress_bar=false; ",
-                );
-                let env_mem = std::env::var("DUCKLE_MEMORY_LIMIT").ok().filter(|s| !s.is_empty());
-                let mem = match stage.memory_limit_mb {
-                    Some(mb) => Some(format!("{}MB", mb)),
-                    None => env_mem,
-                };
-                if let Some(m) = mem {
-                    prag.push_str(&format!("PRAGMA memory_limit='{}'; ", m.replace('\'', "''")));
-                }
-                if let Ok(t) = std::env::var("DUCKLE_THREADS") {
-                    if let Ok(n) = t.trim().parse::<u32>() {
-                        if n > 0 {
-                            prag.push_str(&format!("PRAGMA threads={}; ", n));
-                        }
-                    }
-                }
-                if let Ok(d) = std::env::var("DUCKLE_TEMP_DIR") {
-                    let d = d.trim();
-                    if !d.is_empty() {
-                        // Give this run its OWN subdirectory rather than pointing
-                        // every run at the same one. DuckDB's default is already
-                        // per-database (`<db>.tmp`), so runs never collided until
-                        // someone set this variable - which is exactly what a user
-                        // does to move spill onto a bigger or faster disk, and it
-                        // silently made concurrent runs unsafe. The collision is
-                        // intermittent, so it reads as a flaky run rather than a
-                        // bug: over three trials of four concurrent spilling
-                        // queries on the pinned 1.5.4, a shared directory lost
-                        // 3 of 12 (segfault, or "Failed to delete file") while
-                        // private directories lost 0 of 12.
-                        let run_tmp = std::path::Path::new(d).join(
-                            db_path
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "duckle_run".to_string()),
-                        );
-                        // Best effort: if the directory cannot be made, fall back
-                        // to the configured root rather than failing the run.
-                        let target = match std::fs::create_dir_all(&run_tmp) {
-                            Ok(()) => run_tmp.to_string_lossy().into_owned(),
-                            Err(_) => d.to_string(),
-                        };
-                        let escaped = target.replace('\'', "''").replace('\\', "/");
-                        prag.push_str(&format!("PRAGMA temp_directory='{}'; ", escaped));
-                    }
-                }
-                prag
-            };
+            // Same builder the batched path uses, so a setting added to one
+            // cannot go missing from the other.
+            let memory_pragma = resource_pragmas(Some(&db_path), stage.memory_limit_mb);
             // Enforce "error if exists" before writing a local file sink.
             // A legacy job routinely branches on how many rows or files an earlier
             // component saw. Those figures are already recorded per node, so expose them
@@ -1441,7 +1938,13 @@ impl DuckdbEngine {
                 }
                 // ctl.foreach: read upstream rows, run the sub-pipeline
                 // once per row with ${ITER_ITEM_<FIELD>} substitutions.
-                if let Some(RuntimeSpec::Foreach { path: each_path, concurrency, item_key, queue }) =
+                if let Some(RuntimeSpec::Foreach {
+                    path: each_path,
+                    concurrency,
+                    item_key,
+                    queue,
+                    retry,
+                }) =
                     stage.runtime.as_ref()
                 {
                     // Materialize upstream first if it isn't already
@@ -1507,7 +2010,7 @@ impl DuckdbEngine {
                         // run. Skipping that leaves the stage marked as never
                         // executed, which reads as a failure.
                         if let Err(e) = self
-                            .queue_foreach_batch(&stage.node_id, each_path, &per_row)
+                            .queue_foreach_batch(&stage.node_id, each_path, &per_row, retry.as_ref())
                             .map(|note| eprintln!("duckle: {note}"))
                         {
                             each_err = Some(format!("ctl.foreach({}): {}", each_path, e));
@@ -1622,6 +2125,7 @@ impl DuckdbEngine {
                                         NodeRunStatus {
                                             status: st.status.clone(),
                                             kind: st.kind.clone(),
+                                            note: None,
                                             rows: st.rows,
                                             duration_ms: st.duration_ms,
                                             error: st.error.clone(),
@@ -1665,7 +2169,31 @@ impl DuckdbEngine {
                         continue;
                     }
                 }
-                result = match stage.runtime.as_ref() {
+                // #252: an unchanged rerun of a deterministic stage does not
+                // have to do the work again. The key is computed BEFORE the
+                // stage runs, from the relation it is about to read, so a
+                // changed input produces a different key and a genuine re-run.
+                let cache_key = self.output_cache_key(&db_path, stage, pipeline_name);
+                if let Some(k) = cache_key.as_ref() {
+                    cache_keys.insert(stage.node_id.clone(), k.key.clone());
+                }
+                let restored = match cache_key.as_ref() {
+                    Some(k) if outcache::hit(k) => {
+                        match outcache::restore(&self.bin, &db_path, &stage.node_id, k) {
+                            // Said out loud on the node, because a run that did
+                            // no work must not look like a run that did.
+                            Ok(()) => Some(format!("reused cached output {}", k.short())),
+                            // A cache that cannot be read is a slow run, not a
+                            // failed one - fall through and do the work.
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let did_restore = restored.is_some();
+                result = match restored {
+                    Some(note) => Ok(note),
+                    None => match stage.runtime.as_ref() {
                     // HTTP sink (snk.webhook / snk.rest): materialize the
                     // upstream as JSON via DuckDB, then dispatch one request
                     // per row or one batched request via ureq.
@@ -1712,9 +2240,17 @@ impl DuckdbEngine {
                     }
                     // Generic HTTP source: fetch URL, walk response_path,
                     // follow cursor pagination, materialize as table.
-                    Some(RuntimeSpec::RestSource(spec)) => self.run_rest_source(&db_path, spec),
+                    Some(RuntimeSpec::RestSource(spec)) => {
+                        self.run_rest_source(&db_path, spec, pipeline_name, &mut pending_writes)
+                    }
                     Some(RuntimeSpec::ElasticSource(spec)) => {
                         self.run_elastic_source(&db_path, spec)
+                    }
+                    Some(RuntimeSpec::ManticoreSource(spec)) => {
+                        self.run_manticore_source(&db_path, spec)
+                    }
+                    Some(RuntimeSpec::ManticoreSink(spec)) => {
+                        self.run_manticore_sink(&db_path, &secret_prefix, spec)
                     }
                     Some(RuntimeSpec::MongoSink(spec)) => self.run_mongo_sink(&db_path, spec),
                     Some(RuntimeSpec::HuggingFaceSink(spec)) => {
@@ -1731,6 +2267,43 @@ impl DuckdbEngine {
                     }
                     Some(RuntimeSpec::VortexSink(spec)) => self.run_vortex_sink(&db_path, spec),
                     Some(RuntimeSpec::VortexSource(spec)) => self.run_vortex_source(&db_path, spec),
+                    Some(RuntimeSpec::Tumble(spec)) => {
+                        self.run_tumble(&db_path, spec, pipeline_name, &mut pending_writes)
+                    }
+                    Some(RuntimeSpec::ChangedSource(spec)) => {
+                        self.run_changed_source(
+                            &db_path,
+                            spec,
+                            pipeline_name,
+                            &mut pending_writes,
+                            &mut artifacts,
+                        )
+                    }
+                    Some(RuntimeSpec::ArtifactCopy(spec)) => {
+                        self.run_artifact_copy(&db_path, &secret_prefix, spec, &mut artifacts)
+                    }
+                    Some(RuntimeSpec::ArchiveExtract(spec)) => {
+                        self.run_archive_extract(&db_path, &secret_prefix, spec, &mut artifacts)
+                    }
+                    Some(RuntimeSpec::Baseline(spec)) => self.run_baseline(
+                        &db_path,
+                        &secret_prefix,
+                        spec,
+                        pipeline_name,
+                        &mut pending_writes,
+                    ),
+                    Some(RuntimeSpec::DuckLakeMaintain(spec)) => {
+                        self.run_ducklake_maintain(&db_path, spec)
+                    }
+                    Some(RuntimeSpec::SpoolSource(spec)) => {
+                        self.run_spool_source(&db_path, spec, pipeline_name, &mut pending_writes)
+                    }
+                    Some(RuntimeSpec::Neo4jSource(spec)) => self.run_neo4j_source(&db_path, spec),
+                    Some(RuntimeSpec::Neo4jSink(spec)) => self.run_neo4j_sink(&db_path, spec),
+                    Some(RuntimeSpec::TursoSource(spec)) => self.run_turso_source(&db_path, spec),
+                    Some(RuntimeSpec::TursoSink(spec)) => self.run_turso_sink(&db_path, spec),
+                    Some(RuntimeSpec::Db2Source(spec)) => self.run_db2_source(&db_path, spec),
+                    Some(RuntimeSpec::Db2Sink(spec)) => self.run_db2_sink(&db_path, spec),
                     Some(RuntimeSpec::ClickhouseSink(spec)) => {
                         self.run_clickhouse_sink(&db_path, spec)
                     }
@@ -1790,16 +2363,20 @@ impl DuckdbEngine {
                     Some(RuntimeSpec::FormatSource(spec)) => self.run_format_source(&db_path, spec),
                     Some(RuntimeSpec::FormatSink(spec)) => self.run_format_sink(&db_path, spec),
                     Some(RuntimeSpec::KafkaSink(spec)) => self.run_kafka_sink(&db_path, spec),
-                    Some(RuntimeSpec::KafkaSource(spec)) => self.run_kafka_source(&db_path, spec),
+                    Some(RuntimeSpec::KafkaSource(spec)) => {
+                        self.run_kafka_source(&db_path, spec, pipeline_name, &mut pending_writes)
+                    }
                     Some(RuntimeSpec::AvroSource(spec)) => self.run_avro_source(&db_path, spec),
                     Some(RuntimeSpec::QvdSource(spec)) => self.run_qvd_source(&db_path, spec),
                     Some(RuntimeSpec::NatsSink(spec)) => self.run_nats_sink(&db_path, spec),
                     Some(RuntimeSpec::NatsSource(spec)) => self.run_nats_source(&db_path, spec),
                     Some(RuntimeSpec::PubsubSink(spec)) => self.run_pubsub_sink(&db_path, spec),
                     Some(RuntimeSpec::PubsubSource(spec)) => self.run_pubsub_source(&db_path, spec),
-                    Some(RuntimeSpec::PdfSource(spec)) => self.run_pdf_source(&db_path, spec),
+                    Some(RuntimeSpec::PdfSource(spec)) => {
+                        self.run_pdf_source(&db_path, &secret_prefix, spec)
+                    }
             Some(RuntimeSpec::HtmlSource(spec)) => self.run_html_source(&db_path, spec),
-            Some(RuntimeSpec::XmlSource(spec)) => self.run_xml_source(&db_path, spec),
+            Some(RuntimeSpec::XmlSource(spec)) => self.run_xml_source(&db_path, spec, &mut artifacts),
                     Some(RuntimeSpec::XmlSink(spec)) => self.run_xml_sink(&db_path, spec),
                     Some(RuntimeSpec::AvroSink(spec)) => self.run_avro_sink(&db_path, spec),
                     Some(RuntimeSpec::QvdSink(spec)) => self.run_qvd_sink(&db_path, spec),
@@ -1832,15 +2409,30 @@ impl DuckdbEngine {
                     Some(RuntimeSpec::ClipboardSource(spec)) => {
                         self.run_clipboard_source(&db_path, spec)
                     }
-                    Some(RuntimeSpec::AiEmbed(spec)) => self.run_ai_embed(&db_path, spec),
+                    Some(RuntimeSpec::AiEmbed(spec)) => {
+                        self.run_ai_embed(&db_path, spec, pipeline_name)
+                    }
                     Some(RuntimeSpec::Wasm(spec)) => self.run_wasm(&db_path, spec),
                     Some(RuntimeSpec::Javascript(spec)) => self.run_javascript(&db_path, spec),
                     Some(RuntimeSpec::Jq(spec)) => self.run_jq(&db_path, spec),
                     Some(RuntimeSpec::Python(spec)) => self.run_python(&db_path, spec),
+                    Some(RuntimeSpec::Plugin(spec)) => {
+                        // The workspace is where components are installed and
+                        // where policy lives; both are needed before this can
+                        // run anything.
+                        let ws = std::env::var("DUCKLE_WORKSPACE")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        self.run_plugin(&db_path, spec, &ws, self.run_id.as_deref().unwrap_or(""))
+                    }
                     Some(RuntimeSpec::AiChunk(spec)) => self.run_ai_chunk(&db_path, spec),
                     Some(RuntimeSpec::AiPii(spec)) => self.run_ai_pii(&db_path, spec),
-                    Some(RuntimeSpec::AiLlm(spec)) => self.run_ai_llm(&db_path, spec),
-                    Some(RuntimeSpec::AiClassify(spec)) => self.run_ai_classify(&db_path, spec),
+                    Some(RuntimeSpec::AiLlm(spec)) => {
+                        self.run_ai_llm(&db_path, spec, pipeline_name)
+                    }
+                    Some(RuntimeSpec::AiClassify(spec)) => {
+                        self.run_ai_classify(&db_path, spec, pipeline_name)
+                    }
                     Some(RuntimeSpec::AiDedupe(spec)) => self.run_ai_dedupe(&db_path, spec),
                     Some(RuntimeSpec::EmailSource(spec)) => self.run_email_source(&db_path, spec),
                     Some(RuntimeSpec::WebhookSource(spec)) => {
@@ -1945,7 +2537,31 @@ impl DuckdbEngine {
                             self.run(Some(&db_path), &sql, false)
                         }
                     }
+                    },
                 };
+                // Keep what the stage produced, so the next unchanged run skips
+                // it. Only on success, and only when the work actually ran.
+                if let Some(k) = cache_key.as_ref() {
+                    if !did_restore && result.is_ok() {
+                        outcache::store(&self.bin, &db_path, &stage.node_id, k);
+                        // #305: and record WHAT was stored, not just the key it
+                        // was filed under. A key is a hash of the inputs - it
+                        // says this work would produce the same answer, not
+                        // that the answer is still on disk, and a cache pruned
+                        // between the two runs is the ordinary way those
+                        // differ. Only after a hit, so nothing is recorded for
+                        // a store that silently failed.
+                        if outcache::hit(k) {
+                            let file = k.file();
+                            self.record_output(
+                                &stage.node_id,
+                                &file,
+                                Some(k.key.clone()),
+                                self.parquet_columns(&file),
+                            );
+                        }
+                    }
+                }
                 // Stop retrying on success OR cancellation - a cancel must
                 // exit immediately, not burn through the remaining attempts
                 // (the contract is "retry on engine errors, not cancellation").
@@ -1955,6 +2571,31 @@ impl DuckdbEngine {
             }
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
+            // A runtime stage can report that it checked its source and found
+            // nothing to do. The marker is stripped here so the message shown
+            // is the plain one, and only the node's status carries the fact.
+            let stage_unchanged = matches!(&result, Ok(m) if m.starts_with(UNCHANGED_MARKER));
+            // The sentence the connector returned, with the internal marker
+            // taken off. Pure-SQL stages return an empty string and get None.
+            // #258: a stage that stopped at a ceiling. Recorded before the
+            // note is rendered so the marker never reaches a person.
+            let stage_incomplete = match &result {
+                Ok(m) => split_incomplete(m),
+                Err(_) => None,
+            };
+            if let Some((reason, _)) = &stage_incomplete {
+                incomplete_reason.get_or_insert_with(|| reason.clone());
+            }
+            let stage_note = match &result {
+                Ok(m) => {
+                    let text = match &stage_incomplete {
+                        Some((_, text)) => text.clone(),
+                        None => split_unchanged(m).1,
+                    };
+                    Some(text).filter(|t| !t.trim().is_empty())
+                }
+                Err(_) => None,
+            };
             match result {
                 Ok(_) => {
                     // snk.excel post-write: DuckDB's xlsx writer drops
@@ -2036,8 +2677,9 @@ impl DuckdbEngine {
                     nodes.insert(
                         stage.node_id.clone(),
                         NodeRunStatus {
-                            status: "ok".into(),
+                            status: if stage_unchanged { "unchanged" } else { "ok" }.into(),
                             kind: Some(kind_label.into()),
+                            note: stage_note.clone(),
                             rows: rows_opt,
                             duration_ms: Some(elapsed_ms),
                             error: None,
@@ -2103,6 +2745,7 @@ impl DuckdbEngine {
                         NodeRunStatus {
                             status: "error".into(),
                             kind: Some(kind_label.into()),
+                            note: None,
                             rows: None,
                             duration_ms: Some(elapsed_ms),
                             error: Some(msg.clone()),
@@ -2151,9 +2794,38 @@ impl DuckdbEngine {
             if let Some(RuntimeSpec::InstallFallback(p)) = stage.runtime.as_ref() {
                 installed_fallback = Some(p.clone());
             }
+            // #258: a stage that stopped at a ceiling leaves a partial relation
+            // behind. Nothing after it may run, because the damage a budget
+            // stop does is not the stopping - it is a downstream sink
+            // publishing a tenth of a dataset as if it were all of it.
+            if incomplete_reason.is_some() {
+                break;
+            }
+        }
+        // Every stage after the stop is recorded as skipped, so the run report
+        // says which work did not happen rather than simply omitting it.
+        if incomplete_reason.is_some() {
+            for stage in &compiled.stages {
+                if nodes.contains_key(&stage.node_id) {
+                    continue;
+                }
+                nodes.insert(
+                    stage.node_id.clone(),
+                    NodeRunStatus {
+                        status: "skipped".into(),
+                        kind: None,
+                        note: Some("not run: an earlier stage stopped at its budget".into()),
+                        rows: None,
+                        duration_ms: None,
+                        error: None,
+                        category: None,
+                        sql: None,
+                    },
+                );
+            }
         }
 
-        let final_status = if was_cancelled {
+        let mut final_status = if was_cancelled {
             "cancelled"
         } else if overall_error.is_some() {
             "error"
@@ -2171,23 +2843,80 @@ impl DuckdbEngine {
         // would make the next full run skip rows that were never written to any
         // sink, and registering a model there would publish one from a run that
         // never reached its sink either.
-        if final_status == "ok" && target.is_none() {
-            for (path, value) in &pending_writes {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Ok(text) = serde_json::to_string_pretty(value) {
-                    // Write to a temp file and rename over the target, so a
-                    // reader never sees a half-written file. A model pointer is
-                    // read by other pipelines while this one is running, and a
-                    // torn read there is a wrong answer rather than an error.
-                    // On Windows rename replaces the destination, so removing
-                    // it first would only open a window where it does not exist.
-                    let tmp = path.with_extension("json.tmp");
-                    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_err() {
-                        let _ = std::fs::remove_file(&tmp);
+        // An incomplete run must NOT advance a watermark. It read a window and
+        // processed part of it; recording the end of that window would make the
+        // next run skip everything the budget stopped, permanently. This is the
+        // one place where "not a failure" must still behave like one.
+        // `!self.probing`: autodetect RUNS the source to learn its schema, and a
+        // probe that advanced a CDC snapshot or a Kafka offset would make the
+        // next real run skip the rows it was only looking at.
+        if final_status == "ok" && target.is_none() && incomplete_reason.is_none() && !self.probing {
+            // A failure here is NOT ignorable, which is what it used to be.
+            // "ok" from a pipeline that registered a model means the card is on
+            // disk; if the write failed, saying ok is a lie a later run acts on -
+            // src.model would read a stale `latest`, or nothing at all. A
+            // watermark or Kafka offset that did not land is milder, since the
+            // next run simply redoes that window, but it still has to be visible
+            // rather than silent.
+            //
+            // The rows are already written by this point, so this reports a run
+            // whose OUTPUT succeeded and whose recorded STATE did not. That is
+            // precisely what happened, and re-running is safe.
+            let mut failures: Vec<String> = Vec::new();
+            for PendingWrite { path, value, prior } in &pending_writes {
+                // Somebody changed this while the run was in flight. Their
+                // change wins: they made it deliberately, and this run's rows
+                // are already written. Overwriting would put the position back
+                // where they moved it away from, and say nothing about it.
+                if let PriorState::Was(expected) = prior {
+                    if read_state_snapshot(path).as_deref() != expected.as_deref() {
+                        failures.push(format!(
+                            "{}: changed while this run was in flight, so the run's position was NOT written - the change made during the run stands, and the next run resumes from it",
+                            path.display()
+                        ));
+                        continue;
                     }
                 }
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        failures.push(format!("{}: create {}: {}", path.display(), parent.display(), e));
+                        continue;
+                    }
+                }
+                let text = match serde_json::to_string_pretty(value) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        failures.push(format!("{}: serialize: {}", path.display(), e));
+                        continue;
+                    }
+                };
+                // Write to a temp file and rename over the target, so a reader
+                // never sees a half-written file. A model pointer is read by
+                // other pipelines while this one is running, and a torn read
+                // there is a wrong answer rather than an error. On Windows
+                // rename replaces the destination, so removing it first would
+                // only open a window where it does not exist.
+                let tmp = path.with_extension("json.tmp");
+                if let Err(e) = std::fs::write(&tmp, text) {
+                    failures.push(format!("{}: write: {}", path.display(), e));
+                    continue;
+                }
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    failures.push(format!("{}: rename into place: {}", path.display(), e));
+                }
+            }
+            if !failures.is_empty() {
+                overall_error.get_or_insert(format!(
+                    "the pipeline ran, but {} could not be recorded: {}",
+                    if failures.len() == 1 {
+                        "its state".to_string()
+                    } else {
+                        format!("{} pieces of its state", failures.len())
+                    },
+                    failures.join("; ")
+                ));
+                final_status = "error";
             }
         }
 
@@ -2199,13 +2928,34 @@ impl DuckdbEngine {
         let category = overall_error
             .as_deref()
             .map(|e| error_category::categorize_error(e).to_string());
+        // #301: mask before the previews leave the engine. Every inspection
+        // surface - the desktop panel, the CLI, the console API, the MCP tools
+        // an agent calls - reads this same list, so masking here makes them
+        // consistent by construction rather than by four callers remembering.
+        // Values only: the columns, their types and the row count are what make
+        // a preview useful for debugging and none of them is the sensitive part.
+        let mut preview = preview;
+        mask::mask_previews(&mut preview, &mask::tags_from_doc(doc));
+        let unchanged = run_was_unchanged(&nodes);
         RunResult {
+            cache_keys,
             status: final_status.into(),
             duration_ms: total_start.elapsed().as_millis() as u64,
             nodes,
             preview,
             error: overall_error,
             category,
+            unchanged,
+            incomplete: incomplete_reason.is_some(),
+            incomplete_reason,
+            // Capped so one copy of a hundred thousand files cannot put a
+            // hundred thousand entries in a signed manifest. The flag says the
+            // list is partial, so a truncated one never reads as complete.
+            artifacts_truncated: artifacts.len() > ARTIFACT_RECORD_CAP,
+            artifacts: {
+                artifacts.truncate(ARTIFACT_RECORD_CAP);
+                artifacts
+            },
         }
     }
 
@@ -2233,6 +2983,9 @@ impl DuckdbEngine {
         stages: &[plan::Stage],
         redact_secrets: &[Secret],
         total_start: Instant,
+        // #301: the batched path has stages rather than the document, so the
+        // column tags are handed in by the caller that does have it.
+        mask_tags: &mask::TagMap,
         on_event: &mut dyn FnMut(PipelineEvent),
     ) -> RunResult {
         use std::io::Write;
@@ -2306,36 +3059,7 @@ impl DuckdbEngine {
             batched_sql.push_str(secret_prefix);
             batched_sql.push('\n');
         }
-        batched_sql.push_str(
-            "PRAGMA preserve_insertion_order=false;\n\
-             PRAGMA enable_object_cache=true;\n\
-             PRAGMA enable_progress_bar=false;\n",
-        );
-        if let Ok(m) = std::env::var("DUCKLE_MEMORY_LIMIT") {
-            let m = m.trim();
-            if !m.is_empty() {
-                batched_sql.push_str(&format!(
-                    "PRAGMA memory_limit='{}';\n",
-                    m.replace('\'', "''")
-                ));
-            }
-        }
-        if let Ok(t) = std::env::var("DUCKLE_THREADS") {
-            if let Ok(n) = t.trim().parse::<u32>() {
-                if n > 0 {
-                    batched_sql.push_str(&format!("PRAGMA threads={};\n", n));
-                }
-            }
-        }
-        if let Ok(d) = std::env::var("DUCKLE_TEMP_DIR") {
-            let d = d.trim();
-            if !d.is_empty() {
-                batched_sql.push_str(&format!(
-                    "PRAGMA temp_directory='{}';\n",
-                    d.replace('\'', "''").replace('\\', "/"),
-                ));
-            }
-        }
+        batched_sql.push_str(&resource_pragmas(Some(&db_path), None));
 
         // Relations this batch has already emitted a COUNT(*) for. A sink
         // counts its UPSTREAM relation, which is normally the view the
@@ -2353,7 +3077,32 @@ impl DuckdbEngine {
             .filter(|s| sink_self_count(s).is_some())
             .filter_map(|s| s.from.as_deref())
             .collect();
+        // The span a publish group's transaction covers: from the first grouped
+        // sink to the last. Stages between them are inside it too - the
+        // topological order interleaves independent branches by construction, so
+        // demanding that members be contiguous would refuse the ordinary case.
+        //
+        // Two groups in one pipeline share the one transaction rather than
+        // nesting (DuckDB has no nested transactions). That is stronger than
+        // either group asked for, never weaker, and it matches what the rest of
+        // the engine already promises: a failed run changes nothing.
+        let group_span: Option<(usize, usize)> = {
+            let idx: Vec<usize> = stages
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.publish_group.is_some())
+                .map(|(i, _)| i)
+                .collect();
+            match (idx.first(), idx.last()) {
+                (Some(a), Some(b)) => Some((*a, *b)),
+                _ => None,
+            }
+        };
+
         for (i, stage) in stages.iter().enumerate() {
+            if group_span.map(|(first, _)| i == first).unwrap_or(false) {
+                batched_sql.push_str("BEGIN TRANSACTION;\n");
+            }
             batched_sql.push_str(&stage.sql);
             // Planner does not always terminate stage.sql with ';' -
             // the per-stage path tolerates it because each CLI invocation
@@ -2364,6 +3113,12 @@ impl DuckdbEngine {
                 batched_sql.push(';');
             }
             batched_sql.push('\n');
+            // Before this stage's marker, not after: the marker is the "done"
+            // signal and its COUNT(*) should read what actually landed, so a
+            // commit that fails cannot leave a stage reported as ok.
+            if group_span.map(|(_, last)| i == last).unwrap_or(false) {
+                batched_sql.push_str("COMMIT; DETACH duckle_dst;\n");
+            }
             // #102: expose this node's output under its user alias so raw / pure
             // SQL nodes downstream can reference it by a friendly name. The
             // node-id relation was just created by stage.sql above, so the alias
@@ -2654,6 +3409,7 @@ impl DuckdbEngine {
                     NodeRunStatus {
                         status: "error".into(),
                         kind: Some(kind.into()),
+                        note: None,
                         rows: None,
                         duration_ms: Some(elapsed),
                         error: Some(msg.clone()),
@@ -2693,15 +3449,15 @@ impl DuckdbEngine {
             }
             let schema_path = marker_dir.join(format!("{}_schema.json", i));
             let rows_path = marker_dir.join(format!("{}_rows.json", i));
-            let schema: Vec<Column> = read_ndjson(&schema_path)
-                .iter()
-                .filter_map(parse_describe_row)
-                .collect();
+            let schema_rows = read_ndjson(&schema_path);
+            let schema: Vec<Column> = schema_rows.iter().filter_map(parse_describe_row).collect();
             let rows = read_ndjson(&rows_path);
             preview.push(NodePreview {
                 node_id: stage.node_id.clone(),
                 columns: schema,
                 rows,
+                // Same rows, same filter, so the two stay aligned by index.
+                sql_types: schema_rows.iter().filter_map(describe_row_sql_type).collect(),
             });
         }
 
@@ -2721,13 +3477,32 @@ impl DuckdbEngine {
         let category = overall_error
             .as_deref()
             .map(|e| error_category::categorize_error(e).to_string());
+        // #301: mask before the previews leave the engine. Every inspection
+        // surface - the desktop panel, the CLI, the console API, the MCP tools
+        // an agent calls - reads this same list, so masking here makes them
+        // consistent by construction rather than by four callers remembering.
+        // Values only: the columns, their types and the row count are what make
+        // a preview useful for debugging and none of them is the sensitive part.
+        let mut preview = preview;
+        mask::mask_previews(&mut preview, mask_tags);
+        let unchanged = run_was_unchanged(&nodes);
         RunResult {
+            cache_keys: Default::default(),
             status: final_status.into(),
             duration_ms,
             nodes,
             preview,
             error: overall_error,
             category,
+            unchanged,
+            // A stage with a runtime spec is not pure SQL, so an inference
+            // budget can never stop a batched run.
+            incomplete: false,
+            incomplete_reason: None,
+            // Nothing here observes an artifact: a stage with a runtime spec is
+            // not pure SQL, so it never reaches the batched path.
+            artifacts: Vec::new(),
+            artifacts_truncated: false,
         }
     }
 
@@ -2849,9 +3624,361 @@ impl DuckdbEngine {
                 node_id: name.to_string(),
                 columns: schema,
                 rows: arrays.get(base + 1).cloned().unwrap_or_default(),
+                // Same rows, same filter, so the two stay aligned by index.
+                sql_types: schema_rows.iter().filter_map(describe_row_sql_type).collect(),
             }
         });
         (count, preview)
+    }
+
+    /// #226: the columns a node really produces, worked out without running it.
+    ///
+    /// The GUI derives each node's output schema from a per-component table, and
+    /// a component missing from that table falls through to "schema unchanged" -
+    /// so its new columns never appear in the Schema or Preview tabs, and a column
+    /// it dropped stays listed and renders empty. That is a whole CLASS of bug: it
+    /// is one entry per component, and there are far more components than entries.
+    ///
+    /// This removes the class instead of adding entries. The node's own compiled
+    /// SQL is run against a ZERO-ROW typed stub of its inputs, and DuckDB is asked
+    /// to DESCRIBE the result. The answer is whatever the transform actually
+    /// produces, for any component, including ones written after this code.
+    ///
+    /// Nothing is read: the stubs are `SELECT CAST(NULL AS ...) WHERE 1=0`, so no
+    /// file is opened, no credential is used and no network is touched. That is
+    /// what makes it usable for a Schema tab rather than only for a run.
+    pub fn describe_node_columns(
+        &self,
+        doc: &PipelineDoc,
+        node_id: &str,
+        inputs: &[(String, Vec<Column>)],
+    ) -> Result<Vec<Column>, EngineError> {
+        let analysis = self.analyze_node_sql(doc, node_id, inputs)?;
+        // The contract this had before #314, kept exactly. A node that was not
+        // looked at, and a node that would not bind, are both errors here - not
+        // an empty column list, which a caller would read as "it has no
+        // columns". Callers wanting the detail ask `analyze_node_sql`.
+        if let Some(note) = analysis.note {
+            return Err(EngineError::Config(note));
+        }
+        match analysis.diagnostics.first() {
+            Some(first) => Err(EngineError::Query(first.message.clone())),
+            None => Ok(analysis.columns),
+        }
+    }
+
+    /// #314: what could come next at this position in a node's SQL.
+    ///
+    /// Completion answers on every keystroke, so nothing expensive may depend
+    /// on the edit. The only thing read from DuckDB is its own function list,
+    /// which is a property of the binary and is cached for the process; the
+    /// columns come from the caller, who already has them. The user's SQL is
+    /// never executed - #314 is explicit that completion must not run source
+    /// queries or cause side effects.
+    pub fn complete_node_sql(
+        &self,
+        doc: &PipelineDoc,
+        node_id: &str,
+        inputs: &[(String, Vec<Column>)],
+        cursor: usize,
+        limit: usize,
+    ) -> Result<Vec<sqlcomplete::Completion>, EngineError> {
+        let node = doc.nodes.iter().find(|n| n.id == node_id);
+        let sql = node.and_then(authored_sql).unwrap_or_default();
+        let candidates = sqlcomplete::Candidates {
+            columns: inputs
+                .iter()
+                .flat_map(|(_, cols)| cols.iter())
+                .map(|c| (c.name.clone(), format!("{:?}", c.data_type)))
+                .collect(),
+            // `input` is what a default-mode code.sql node reads; the node ids
+            // are what a raw-mode one does. Offering both means the author does
+            // not have to know which mode they are in to get the name right.
+            relations: std::iter::once("input".to_string())
+                .chain(inputs.iter().map(|(id, _)| id.clone()))
+                .collect(),
+            functions: self.sql_functions(),
+            parameters: doc.parameters.keys().cloned().collect(),
+        };
+        Ok(sqlcomplete::complete(&sql, cursor, &candidates, limit.max(1)))
+    }
+
+    /// Every function this DuckDB has, cached for the process.
+    ///
+    /// It cannot change under a running binary, and asking per keystroke would
+    /// spawn a process per keystroke - which is the whole reason completion is
+    /// a separate path from the bind.
+    fn sql_functions(&self) -> Vec<String> {
+        static FUNCTIONS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        FUNCTIONS
+            .get_or_init(|| {
+                let Ok(out) = self.run(
+                    None,
+                    "SELECT DISTINCT function_name FROM duckdb_functions() ORDER BY 1;",
+                    true,
+                ) else {
+                    // No binary, no suggestions from it. Columns and keywords
+                    // still work, which is most of the value.
+                    return Vec::new();
+                };
+                parse_json_arrays(&out)
+                    .last()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|r| r.get("function_name").and_then(|v| v.as_str()))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .clone()
+    }
+
+    /// #314: analyse every SQL-bearing node of a pipeline, in dependency order.
+    ///
+    /// Each node is bound against the columns its upstreams were just found to
+    /// produce, so a whole pipeline can be checked without a run and without
+    /// the caller having to resolve schemas itself. This is what makes
+    /// criterion 4 true by construction: the CLI, MCP and the editor call the
+    /// same function rather than three that agree until they do not.
+    ///
+    /// Nodes whose upstream could not be resolved are analysed with whatever
+    /// was resolved; a node with no known inputs at all binds against nothing
+    /// and says so through its own diagnostics rather than being skipped
+    /// silently.
+    pub fn analyze_pipeline_sql(&self, doc: &PipelineDoc) -> Result<Vec<NodeAnalysis>, EngineError> {
+        let stages = compile_pipeline_sql(doc)?;
+        let mut known: std::collections::HashMap<String, Vec<Column>> =
+            std::collections::HashMap::new();
+        // A declared schema is the author's statement of what a source
+        // produces, and it is the only thing available for one: binding a
+        // source would mean connecting to it.
+        for node in &doc.nodes {
+            if let Some(schema) = node.data.schema.as_ref() {
+                if !schema.is_empty() {
+                    known.insert(node.id.clone(), schema.clone());
+                }
+            }
+        }
+        let mut upstreams: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for e in &doc.edges {
+            upstreams.entry(e.target.as_str()).or_default().push(e.source.as_str());
+        }
+
+        let mut out = Vec::new();
+        // Stage order is already dependency order, which is what lets one pass
+        // carry each node's columns forward to the nodes that read it.
+        for stage in &stages {
+            let inputs: Vec<(String, Vec<Column>)> = upstreams
+                .get(stage.node_id.as_str())
+                .into_iter()
+                .flatten()
+                .filter_map(|u| known.get(*u).map(|c| ((*u).to_string(), c.clone())))
+                .collect();
+            let analysis = self.analyze_node_sql(doc, &stage.node_id, &inputs)?;
+            if !analysis.columns.is_empty() {
+                known.insert(stage.node_id.clone(), analysis.columns.clone());
+            }
+            out.push(analysis);
+        }
+        Ok(out)
+    }
+
+    /// #314: bind a node's SQL without running anything, and report what DuckDB
+    /// said about it.
+    ///
+    /// The same side-effect-free bind [`describe_node_columns`] does, keeping
+    /// its diagnostics instead of collapsing them into one string. A typo was
+    /// already being caught here; the message naming the column, its position
+    /// and DuckDB's suggested replacement were all thrown away, so every
+    /// surface could say only that the node did not resolve.
+    ///
+    /// Never returns Err for a SQL problem: a pipeline whose SQL is wrong is
+    /// exactly the case this exists to describe. Err is reserved for not being
+    /// able to look at all.
+    pub fn analyze_node_sql(
+        &self,
+        doc: &PipelineDoc,
+        node_id: &str,
+        inputs: &[(String, Vec<Column>)],
+    ) -> Result<NodeAnalysis, EngineError> {
+        let node = doc.nodes.iter().find(|n| n.id == node_id);
+        let component = node.and_then(|n| n.data.component_id.clone()).unwrap_or_default();
+        let authored = node.and_then(authored_sql);
+        // A source only has a REMOTE dialect if it has SQL at all. `src.csv`
+        // reads a file and sends nothing anywhere; calling it remote and saying
+        // its SQL was not validated describes a node that has none, which is
+        // both wrong and the sort of thing that teaches people to skim the
+        // output.
+        let remote = component.starts_with("src.") && authored.is_some();
+        let mut analysis = NodeAnalysis {
+            node_id: node_id.to_string(),
+            component: component.clone(),
+            dialect: match remote {
+                true => "remote".into(),
+                false => "duckdb".into(),
+            },
+            columns: Vec::new(),
+            diagnostics: Vec::new(),
+            validated: false,
+            note: None,
+        };
+        // Criterion 5, said once and plainly. A source's `query` runs on
+        // Postgres or BigQuery or Snowflake; binding it against DuckDB would
+        // either reject valid SQL or accept invalid SQL, and either way the
+        // answer would be about the wrong engine.
+        if remote {
+            analysis.note = Some(format!(
+                "{component} sends its SQL to the remote system, so DuckDB cannot validate it. Checking it here would say nothing true about that dialect."
+            ));
+            // What CAN be said without knowing the dialect. Not a validation
+            // and not claimed as one - `validated` stays false - but an
+            // unclosed quote is an error on every engine there is, and saying
+            // so beats sending it and waiting for the round trip to say it in
+            // a message about a token far from the mistake.
+            analysis.diagnostics = sqldiag::remote_hints(&authored.unwrap_or_default());
+            return Ok(analysis);
+        }
+        if authored.is_none() && component.starts_with("src.") {
+            analysis.note = Some(format!("{component} has no SQL to check"));
+            return Ok(analysis);
+        }
+
+        let stages = compile_pipeline_sql(doc)?;
+        let stage = stages
+            .iter()
+            .find(|s| s.node_id == node_id)
+            .ok_or_else(|| EngineError::Config(format!("no stage for node {node_id:?}")))?;
+        // A sink's stage SQL is `COPY (...) TO 'file'`. Running it to find out
+        // its columns would WRITE that file - here, against a zero-row stub, so
+        // it would truncate the user's real output to nothing. The editor calls
+        // this whenever a node is selected, which would make that data loss a
+        // click away.
+        //
+        // Guarded here rather than in the caller: this is the code that holds
+        // the loaded gun, and a sink has no output columns to describe anyway.
+        if stage.kind != "view" {
+            analysis.note = Some(format!(
+                "node {node_id:?} is a {} stage, which produces no relation to describe - and running it to find out would perform its writes",
+                stage.kind
+            ));
+            return Ok(analysis);
+        }
+        // Defence in depth, because this function RUNS what it is handed and a
+        // "view" is not automatically inert: a source view can carry an ATTACH
+        // prelude that would dial a real database, and a prelude can INSTALL.
+        // A transform compiles to exactly one CREATE OR REPLACE VIEW over its
+        // upstream, so anything else is refused rather than executed to see
+        // what it does.
+        if !stage
+            .sql
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("CREATE OR REPLACE VIEW")
+        {
+            // Two different nodes reach here and they deserve different
+            // answers: a Pure SQL node is an effect step by design, and being
+            // told it "does not compile to a plain view" reads as a defect in
+            // something the author configured deliberately.
+            let pure = node
+                .and_then(|n| n.data.properties.as_ref())
+                .and_then(|p| p.get("pureSql"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            analysis.note = Some(match pure {
+                true => format!(
+                    "node {node_id:?} is a Pure SQL node: its statements run verbatim and may create, write or PRAGMA, so binding it to find its columns would perform those effects. That is what Pure SQL is for; it cannot also be checked without running."
+                ),
+                false => format!(
+                    "node {node_id:?} does not compile to a plain view, so describing it would run something with effects. Only derived relations can be described this way."
+                ),
+            });
+            return Ok(analysis);
+        }
+
+        let mut sql = String::new();
+        for (name, cols) in inputs {
+            // A zero-row relation with the right column names and types. WHERE 1=0
+            // keeps it empty while still binding, so the transform sees the shape
+            // it would see at run time and none of the data.
+            let projected: Vec<String> = cols
+                .iter()
+                .map(|c| {
+                    format!(
+                        "CAST(NULL AS {}) AS {}",
+                        plan::data_type_to_duckdb_sql(&c.data_type),
+                        plan::quote_ident(&c.name)
+                    )
+                })
+                .collect();
+            if projected.is_empty() {
+                continue;
+            }
+            sql.push_str(&format!(
+                "CREATE OR REPLACE VIEW {} AS SELECT {} WHERE 1=0;\n",
+                plan::quote_ident(name),
+                projected.join(", ")
+            ));
+            // #314: also under the upstream's ALIAS, when it has one. The
+            // executor creates `"<alias>"` so raw SQL can say `FROM orders`
+            // instead of `FROM node_3`; stubbing only the node ids meant that
+            // SQL failed to bind here and the author was told their pipeline
+            // "does not compile to a plain view" - about a node that compiles
+            // and runs perfectly well.
+            if let Some(alias) = doc
+                .nodes
+                .iter()
+                .find(|n| &n.id == name)
+                .and_then(|n| n.data.alias.as_deref())
+                .map(str::trim)
+                .filter(|a| !a.is_empty() && a != name)
+            {
+                sql.push_str(&format!(
+                    "CREATE OR REPLACE VIEW {} AS SELECT {} WHERE 1=0;
+",
+                    plan::quote_ident(alias),
+                    projected.join(", ")
+                ));
+            }
+        }
+        sql.push_str(stage.sql.trim_end_matches(';'));
+        sql.push_str(";\n");
+        sql.push_str(&format!("DESCRIBE {};", plan::quote_ident(node_id)));
+
+        match self.run(None, &sql, true) {
+            Ok(out) => {
+                let arrays = parse_json_arrays(&out);
+                // The DESCRIBE is the last statement, so its rows are last.
+                let described = arrays
+                    .last()
+                    .ok_or_else(|| EngineError::Query("no schema came back".into()))?;
+                analysis.columns = described.iter().filter_map(parse_describe_row).collect();
+                analysis.validated = true;
+            }
+            Err(EngineError::Query(stderr)) => {
+                analysis.diagnostics = sqldiag::parse(&stderr)
+                    .into_iter()
+                    .map(|d| reposition(d, &sql, authored.as_deref()))
+                    .collect();
+                // Nothing came back, but DuckDB DID bind it and object, which
+                // is a different thing from not having looked.
+                analysis.validated = true;
+                if analysis.diagnostics.is_empty() {
+                    // A failure this build cannot parse. Saying nothing about
+                    // it would report the node as clean.
+                    analysis.diagnostics.push(sqldiag::Diagnostic {
+                        kind: crate::error_category::categorize_error(&stderr).to_string(),
+                        message: stderr,
+                        line: None,
+                        column: None,
+                        candidates: Vec::new(),
+                    });
+                }
+            }
+            Err(other) => return Err(other),
+        }
+        Ok(analysis)
     }
 
     /// Run a single read-only SELECT and return its schema + up to `row_limit`
@@ -3067,6 +4194,7 @@ fn drain_batched_markers(
             NodeRunStatus {
                 status: "ok".into(),
                 kind: Some(kind.into()),
+                note: None,
                 rows,
                 duration_ms: Some(elapsed),
                 error: None,
@@ -3301,6 +4429,21 @@ fn run_file_op(spec: &FileOpSpec) -> Result<String, EngineError> {
                 // into an archive is the last step of a great many batch jobs,
                 // and doing it with a shell command means one pipeline per
                 // platform.
+                //
+                // The same guard the copy/move arm applies. It used to live only
+                // there, and File::create below TRUNCATES, so archiving over an
+                // existing archive destroyed it however the Overwrite box was
+                // set - against FileOpSpec.overwrite's own documented meaning,
+                // "Off means an existing file is an error".
+                if dst.exists() && !spec.overwrite {
+                    return Err(format!("destination exists: {}", spec.destination));
+                }
+                if let Some(parent) = dst.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
+                    }
+                }
                 let f = std::fs::File::create(dst)
                     .map_err(|e| format!("create {}: {}", spec.destination, e))?;
                 let mut zip = zip::ZipWriter::new(f);
@@ -3365,6 +4508,7 @@ fn run_file_op(spec: &FileOpSpec) -> Result<String, EngineError> {
 fn run_events_columns() -> Vec<Column> {
     use duckle_metadata::DataType;
     let text = |n: &str| Column {
+        tags: Vec::new(),
         name: n.to_string(),
         data_type: DataType::String,
         nullable: true,
@@ -3376,6 +4520,7 @@ fn run_events_columns() -> Vec<Column> {
         .map(|n| text(n))
         .collect();
     cols.push(Column {
+        tags: Vec::new(),
         name: "duration_ms".to_string(),
         data_type: DataType::Int64,
         nullable: true,
@@ -3494,6 +4639,36 @@ pub(crate) struct JsonLinesWriter {
     /// None -> an empty result is a clear source-level error rather than a
     /// misleading single-`json` column.
     empty_schema: Option<Vec<duckle_metadata::Column>>,
+    /// #283: convert to Parquet every N rows instead of growing one NDJSON file
+    /// to the size of the whole result.
+    spill: Option<Spill>,
+}
+
+/// Bounded materialization: roll the NDJSON to a compressed Parquet part every
+/// `every` rows, and read the parts back as one relation at the end.
+///
+/// #283: a streaming parser is out-of-core in RAM, but writing every parsed row
+/// to one NDJSON file puts the whole result on the temp volume - and NDJSON
+/// repeats every property name on every row, so a 30 GB compressed XML source
+/// can produce hundreds of gigabytes of intermediate. Rolling to Parquet keeps
+/// the uncompressed text bounded by one part and stores the rest columnar.
+/// A path as DuckDB SQL wants it: forward slashes, quotes doubled.
+fn sql_path(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/").replace('\'', "''")
+}
+
+pub(crate) struct Spill {
+    bin: PathBuf,
+    db: PathBuf,
+    /// The declared columns, so each part is typed as it is written rather than
+    /// inferred per part - two parts inferring different types for one column
+    /// is a union error at the end, and the declared schema is what makes this
+    /// path available in the first place.
+    columns_spec: String,
+    every: usize,
+    dir: PathBuf,
+    parts: usize,
+    rows_in_part: usize,
 }
 
 impl JsonLinesWriter {
@@ -3516,7 +4691,85 @@ impl JsonLinesWriter {
             path,
             rows_written: 0,
             empty_schema,
+            spill: None,
         })
+    }
+
+    /// Turn on bounded materialization (#283).
+    ///
+    /// Only available with a declared schema, because each part has to be typed
+    /// as it is written: two parts inferring different types for the same column
+    /// would fail to union at the end, and inference per part is exactly where
+    /// that happens.
+    pub(crate) fn spilling_every(
+        mut self,
+        bin: &Path,
+        db: &Path,
+        columns_spec: &str,
+        every: usize,
+    ) -> Result<Self, EngineError> {
+        let dir = self.path.with_extension("parts");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| EngineError::Query(format!("spill: create {}: {e}", dir.display())))?;
+        self.spill = Some(Spill {
+            bin: bin.to_path_buf(),
+            db: db.to_path_buf(),
+            columns_spec: columns_spec.to_string(),
+            every: every.max(1),
+            dir,
+            parts: 0,
+            rows_in_part: 0,
+        });
+        Ok(self)
+    }
+
+    /// Close the current NDJSON, convert it to a Parquet part, and start a new
+    /// one. DuckDB does the conversion, so there is no second JSON reader here
+    /// to disagree with the one that reads the parts back.
+    fn roll_part(&mut self) -> Result<(), EngineError> {
+        use std::io::Write;
+        let Some(spill) = self.spill.as_mut() else {
+            return Ok(());
+        };
+        if spill.rows_in_part == 0 {
+            return Ok(());
+        }
+        self.writer
+            .flush()
+            .map_err(|e| EngineError::Query(format!("spill: flush: {e}")))?;
+        // Reopen onto a fresh file after the conversion; the handle has to be
+        // closed first because DuckDB reads the same path.
+        let empty = std::fs::File::create(self.path.with_extension("rolling"))
+            .map_err(|e| EngineError::Query(format!("spill: create: {e}")))?;
+        let old = std::mem::replace(
+            &mut self.writer,
+            std::io::BufWriter::with_capacity(64 * 1024, empty),
+        );
+        drop(old);
+
+        let part = spill.dir.join(format!("part-{:06}.parquet", spill.parts));
+        let sql = format!(
+            "COPY (SELECT * FROM read_json('{}', format='newline_delimited', columns={{{}}})) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+            sql_path(&self.path),
+            spill.columns_spec,
+            sql_path(&part),
+        );
+        apply_duckdb_sql(&spill.bin, &spill.db, &sql)?;
+        spill.parts += 1;
+        spill.rows_in_part = 0;
+
+        // The NDJSON for this part is now redundant, and removing it here is
+        // what bounds the temp volume to one part rather than the whole result.
+        let _ = std::fs::remove_file(&self.path);
+        let fresh = std::fs::File::create(&self.path)
+            .map_err(|e| EngineError::Query(format!("spill: reopen: {e}")))?;
+        let rolling = std::mem::replace(
+            &mut self.writer,
+            std::io::BufWriter::with_capacity(64 * 1024, fresh),
+        );
+        drop(rolling);
+        let _ = std::fs::remove_file(self.path.with_extension("rolling"));
+        Ok(())
     }
 
     pub(crate) fn write_row(&mut self, row: &JsonValue) -> Result<(), EngineError> {
@@ -3527,6 +4780,12 @@ impl JsonLinesWriter {
             .write_all(b"\n")
             .map_err(|e| EngineError::Query(format!("rest source: write tmp file: {}", e)))?;
         self.rows_written += 1;
+        if let Some(spill) = self.spill.as_mut() {
+            spill.rows_in_part += 1;
+            if spill.rows_in_part >= spill.every {
+                self.roll_part()?;
+            }
+        }
         Ok(())
     }
 
@@ -3623,8 +4882,10 @@ impl JsonLinesWriter {
         node_id: &str,
         columns_spec: &str,
         select_list: &str,
-    ) -> Result<(), EngineError> {
+    ) -> Result<usize, EngineError> {
         use std::io::Write;
+        // Whatever is still in the current NDJSON becomes the last part.
+        self.roll_part()?;
         self.writer
             .flush()
             .map_err(|e| EngineError::Query(format!("rest source: flush tmp file: {}", e)))?;
@@ -3635,19 +4896,38 @@ impl JsonLinesWriter {
             .to_string()
             .replace('\\', "/")
             .replace('\'', "''");
-        let sql = format!(
-            "CREATE OR REPLACE TABLE {} AS SELECT {} FROM read_json('{}', format='newline_delimited', columns={{{}}})",
-            plan::quote_ident(node_id),
-            select_list,
-            path,
-            columns_spec,
-        );
+        // #283: with spilling on, the rows are already in Parquet parts and the
+        // NDJSON only ever held the tail. Reading the parts back is one relation
+        // either way, so nothing downstream can tell the difference.
+        let sql = if let Some(spill) = self.spill.as_ref() {
+            format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT {} FROM read_parquet('{}')",
+                plan::quote_ident(node_id),
+                select_list,
+                sql_path(&spill.dir.join("part-*.parquet")),
+            )
+        } else {
+            format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT {} FROM read_json('{}', format='newline_delimited', columns={{{}}})",
+                plan::quote_ident(node_id),
+                select_list,
+                path,
+                columns_spec,
+            )
+        };
         let r = apply_duckdb_sql(bin, db, &sql);
-        // Remove the temp NDJSON (sized to the whole result set) regardless of
-        // the load result; otherwise duckle-rest-*.json accumulate in the temp
-        // dir forever (mirrors finalize_into_table).
+        let parts = self.spill.as_ref().map(|s| s.parts).unwrap_or(0);
+        if let Some(spill) = self.spill.as_ref() {
+            // Every part is redundant once the relation exists. Removed whether
+            // the load worked or not: parts left behind are the temp volume this
+            // exists to protect.
+            let _ = std::fs::remove_dir_all(&spill.dir);
+        }
+        // Remove the temp NDJSON regardless of the load result; otherwise
+        // duckle-rest-*.json accumulate in the temp dir forever (mirrors
+        // finalize_into_table). With spilling on it only ever held the tail.
         let _ = std::fs::remove_file(&self.path);
-        r
+        r.map(|()| parts)
     }
 }
 
@@ -3704,7 +4984,7 @@ pub(crate) fn write_arrayrows_to(
 /// the DUCKLE_DUCKDB_BIN environment variable being set - the engine can be
 /// constructed with a valid binary and still materialize results even when
 /// the process env is empty (tests, embedded hosts).
-fn apply_duckdb_sql(bin: &Path, db: &Path, sql: &str) -> Result<(), EngineError> {
+pub(crate) fn apply_duckdb_sql(bin: &Path, db: &Path, sql: &str) -> Result<(), EngineError> {
     use std::process::Command;
     let mut cmd = Command::new(bin);
     #[cfg(windows)]
@@ -3749,8 +5029,26 @@ fn apply_duckdb_sql(bin: &Path, db: &Path, sql: &str) -> Result<(), EngineError>
 /// has to be a process argument, not SQL. Default OFF preserves the signed-only
 /// security posture; set DUCKLE_ALLOW_UNSIGNED_EXTENSIONS=1 (or true/yes/on).
 fn allow_unsigned_extensions() -> bool {
-    std::env::var("DUCKLE_ALLOW_UNSIGNED_EXTENSIONS")
+    let asked = std::env::var("DUCKLE_ALLOW_UNSIGNED_EXTENSIONS")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !asked {
+        return false;
+    }
+    // #285: `extensions.allowUnsigned: false` can WITHHOLD this; it can never
+    // grant it. An environment variable is set by whoever launches the run, so
+    // on its own it is not a boundary - the policy file lives outside the
+    // workspace precisely so that what writes pipelines cannot reach it.
+    //
+    // Only reached when someone actually asked for unsigned extensions, so the
+    // default path never touches the disk. A policy that cannot be read means
+    // no `-unsigned`, which is the safe direction.
+    let ws = std::env::var("DUCKLE_WORKSPACE")
+        .ok()
+        .filter(|w| !w.is_empty())
+        .map(std::path::PathBuf::from);
+    policy::load(ws.as_deref())
+        .map(|p| p.allow_unsigned_extensions)
         .unwrap_or(false)
 }
 
@@ -4456,7 +5754,7 @@ fn duckdb_type_to_snowflake(t: &str) -> String {
 /// Map a DuckDB column type to the closest Teradata type, for auto-creating a
 /// sink table that doesn't exist yet. Best-effort, mirroring the Oracle / SQL
 /// Server mappers; text falls back to VARCHAR(4000).
-#[cfg(feature = "teradata")]
+#[cfg(feature = "odbc")]
 fn duckdb_type_to_teradata(t: &str) -> String {
     let up = t.trim().to_ascii_uppercase();
     if up.starts_with("DECIMAL") || up.starts_with("NUMERIC") {
@@ -4476,6 +5774,41 @@ fn duckdb_type_to_teradata(t: &str) -> String {
             "TIMESTAMP(6)"
         }
         "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => "TIMESTAMP(6) WITH TIME ZONE",
+        "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => "BLOB",
+        _ => "VARCHAR(4000)",
+    }
+    .to_string()
+}
+
+/// Map a DuckDB column type to the closest IBM DB2 type, for auto-creating a
+/// target table. DB2 LUW 11.1+ has a real BOOLEAN but DB2 for z/OS does not,
+/// so booleans land in SMALLINT as 1/0 - portable across both, and lossless.
+#[cfg(feature = "odbc")]
+fn duckdb_type_to_db2(t: &str) -> String {
+    let up = t.trim().to_ascii_uppercase();
+    if up.starts_with("DECIMAL") || up.starts_with("NUMERIC") {
+        // DECIMAL(p,s) carries over; DB2 caps precision at 31.
+        return up.replacen("NUMERIC", "DECIMAL", 1);
+    }
+    match up.as_str() {
+        "BOOLEAN" | "BOOL" | "TINYINT" | "UTINYINT" => "SMALLINT",
+        "SMALLINT" | "INT2" | "USMALLINT" => "SMALLINT",
+        "INTEGER" | "INT" | "INT4" | "UINTEGER" => "INTEGER",
+        "BIGINT" | "INT8" | "UBIGINT" => "BIGINT",
+        // DB2 DECIMAL tops out at 31 digits, so a 38-digit HUGEINT cannot be
+        // represented exactly; VARCHAR keeps every digit rather than silently
+        // truncating one.
+        "HUGEINT" | "UHUGEINT" => "VARCHAR(40)",
+        "REAL" | "FLOAT4" => "REAL",
+        "FLOAT" | "DOUBLE" | "FLOAT8" => "DOUBLE",
+        "DATE" => "DATE",
+        "TIME" => "TIME",
+        "TIMESTAMP" | "DATETIME" | "TIMESTAMP_NS" | "TIMESTAMP_MS" | "TIMESTAMP_S" => {
+            "TIMESTAMP(6)"
+        }
+        // DB2 has no timestamp-with-timezone type at all; the offset would be
+        // dropped by a TIMESTAMP column, so keep the full ISO text instead.
+        "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => "VARCHAR(64)",
         "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => "BLOB",
         _ => "VARCHAR(4000)",
     }
@@ -4508,6 +5841,7 @@ enum Dialect {
     SqlServer,
     Cassandra,
     Teradata,
+    Db2,
 }
 
 /// Render a JSON cell value as a SQL literal for `dialect`, using the
@@ -4537,7 +5871,7 @@ fn sql_literal(v: &JsonValue, target_type: Option<&str>, dialect: Dialect) -> St
             // BIT takes 1/0. Cassandra CQL and Snowflake/Databricks accept
             // real booleans (CQL is lowercase).
             // Teradata has no boolean literal either; BYTEINT takes 1/0.
-            Dialect::Oracle | Dialect::SqlServer | Dialect::Teradata => {
+            Dialect::Oracle | Dialect::SqlServer | Dialect::Teradata | Dialect::Db2 => {
                 if *b { "1" } else { "0" }.into()
             }
             Dialect::Cassandra => if *b { "true" } else { "false" }.into(),
@@ -4587,6 +5921,24 @@ fn sql_literal(v: &JsonValue, target_type: Option<&str>, dialect: Dialect) -> St
                     }
                     if norm.starts_with("TIMESTAMP") || norm == "DATETIME" {
                         return format!("TIMESTAMP {}", quote(s));
+                    }
+                }
+            }
+            // DB2 casts a quoted ISO string to DATE/TIME/TIMESTAMP implicitly
+            // in most contexts, but not when the target is a parameter-less
+            // INSERT into a typed column of a different family. The scalar
+            // constructors are unambiguous and accepted on both LUW and z/OS.
+            if dialect == Dialect::Db2 {
+                if let Some(t) = target_type {
+                    let norm = t.trim().to_ascii_uppercase();
+                    if norm == "DATE" {
+                        return format!("DATE({})", quote(s));
+                    }
+                    if norm == "TIME" {
+                        return format!("TIME({})", quote(s));
+                    }
+                    if norm.starts_with("TIMESTAMP") || norm == "DATETIME" {
+                        return format!("TIMESTAMP({})", quote(s));
                     }
                 }
             }
@@ -4732,6 +6084,17 @@ fn parse_json_arrays(s: &str) -> Vec<Vec<JsonValue>> {
 }
 
 /// Turn one DuckDB `DESCRIBE` row into a Column.
+/// #250: the raw `column_type` from a DESCRIBE row, kept verbatim.
+fn describe_row_sql_type(v: &JsonValue) -> Option<String> {
+    v.get("column_name")?;
+    Some(
+        v.get("column_type")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("VARCHAR")
+            .to_string(),
+    )
+}
+
 fn parse_describe_row(v: &JsonValue) -> Option<Column> {
     let name = v.get("column_name")?.as_str()?.to_string();
     let type_name = v
@@ -4744,12 +6107,63 @@ fn parse_describe_row(v: &JsonValue) -> Option<Column> {
         .map(|s| !s.eq_ignore_ascii_case("NO"))
         .unwrap_or(true);
     Some(Column {
+        tags: Vec::new(),
         name,
         data_type: map_duckdb_type(type_name),
         nullable,
         primary_key: None,
         format: None,
     })
+}
+
+/// #250: a type name a person WROTE, parsed strictly.
+///
+/// Accepts SQL spellings (`BIGINT`, `DECIMAL(18,3)`, `TIMESTAMP`) and Duckle's
+/// own names (`int64`, `decimal`), so a test can be written in whichever
+/// vocabulary its author thinks in.
+///
+/// `None` for anything unrecognised, which is the whole reason this is not
+/// [`map_duckdb_type`]: that one falls back to String, so a typo in a test file
+/// would quietly assert VARCHAR and pass against a VARCHAR column. An assertion
+/// that cannot fail is worse than no assertion.
+pub fn parse_type_name(t: &str) -> Option<DataType> {
+    let raw = t.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Duckle's own vocabulary first: these are exact, so they cannot be
+    // confused with a SQL spelling.
+    for dt in [
+        DataType::String,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Bool,
+        DataType::Date,
+        DataType::Timestamp,
+        DataType::Time,
+        DataType::Decimal,
+        DataType::Json,
+        DataType::Binary,
+        DataType::Geometry,
+    ] {
+        if raw.eq_ignore_ascii_case(dt.name()) {
+            return Some(dt);
+        }
+    }
+    // SQL spellings, via the same table the engine uses to read a DESCRIBE - so
+    // an assertion and a real column are judged by one rule. VARCHAR has to be
+    // listed explicitly because map_duckdb_type reaches String by falling
+    // through, which is exactly what must not happen for an unknown name.
+    let base = raw.to_uppercase();
+    let base = base.split('(').next().unwrap_or(&base).trim();
+    if matches!(base, "VARCHAR" | "TEXT" | "STRING" | "CHAR" | "BPCHAR" | "UUID") {
+        return Some(DataType::String);
+    }
+    let mapped = map_duckdb_type(raw);
+    // Anything that only mapped because of the fallback is unknown.
+    (mapped != DataType::String).then_some(mapped)
 }
 
 fn map_duckdb_type(t: &str) -> DataType {
@@ -5019,6 +6433,24 @@ fn build_native_upsert_sql(
     }
 }
 
+/// The credential family a source or sink belongs to, given its format string
+/// (the component id minus the `src.` / `snk.` prefix).
+///
+/// MinIO, Cloudflare R2 and Backblaze B2 are S3-compatible: they are read
+/// through the `s3://` scheme and share the `TYPE S3` secret, which is also the
+/// only way the ENDPOINT and URL_STYLE their forms collect ever reach DuckDB.
+/// Three places already aliased them - the run's secret collection, the view
+/// SQL, and schema drift - and the inspect prelude was the fourth that did not,
+/// so Autodetect on a MinIO bucket signed against real AWS with no credentials
+/// and failed on a node that ran perfectly well. One function now, so a fifth
+/// caller cannot disagree.
+pub(crate) fn secret_family(format: &str) -> &str {
+    match format {
+        "minio" | "r2" | "b2" => "s3",
+        other => other,
+    }
+}
+
 pub(crate) fn secret_statement(
     format: &str,
     secret_name: &str,
@@ -5129,15 +6561,13 @@ pub(crate) fn collect_pipeline_secrets(doc: &PipelineDoc) -> Vec<String> {
             Some(s) => s,
             None => continue,
         };
-        let format = match id {
-            // S3-compatible (plain S3 + MinIO / R2 / B2) all use the same
-            // CREATE SECRET (TYPE S3) machinery; the MinIO / R2 / B2
-            // variants add ENDPOINT + URL_STYLE in the form.
-            "src.s3" | "snk.s3"
-            | "src.minio" | "src.r2" | "src.b2"
-            | "snk.minio" | "snk.r2" | "snk.b2" => "s3",
-            "src.gcs" | "snk.gcs" => "gcs",
-            "src.azureblob" | "snk.azureblob" => "azureblob",
+        // S3-compatible (plain S3 + MinIO / R2 / B2) all use the same
+        // CREATE SECRET (TYPE S3) machinery; the MinIO / R2 / B2 variants add
+        // ENDPOINT + URL_STYLE in the form. The alias is `secret_family` so this
+        // and the inspect prelude cannot drift apart again.
+        let bare = id.split_once('.').map(|(_, f)| f).unwrap_or(id);
+        let format = match secret_family(bare) {
+            f @ ("s3" | "gcs" | "azureblob") => f,
             _ => continue,
         };
         if let Some(props) = node.data.properties.as_ref() {
@@ -5190,8 +6620,260 @@ pub enum PipelineEvent {
     },
 }
 
+/// Prefix a runtime stage's message with this to report that node as
+/// `unchanged` rather than `ok`: it checked its source successfully and there
+/// was nothing to do.
+///
+/// A marker in the message rather than a change to the return type, because
+/// every runtime arm returns `Result<String, EngineError>` and threading a new
+/// type through all of them to carry one bit is not worth it. The control
+/// characters make a collision with real message text impossible, and the
+/// executor strips it before anyone sees the message.
+///
+/// NODE level only. The run status stays ok/error/cancelled, so nothing that
+/// keys off it - alerts, plans, exit codes, the scheduler, the batch ledger,
+/// the console, the desktop UI - can misread a quiet poll as a failure.
+pub(crate) const UNCHANGED_MARKER: &str = "\u{1}unchanged\u{1}";
+
+/// #258: a stage stopped at a ceiling it was given. What follows the second
+/// marker is the machine-readable reason (`budget:maxRequests`), then a space,
+/// then the sentence for a person.
+///
+/// A marker rather than a status value, for the same reason `unchanged` is one:
+/// `status` is read in about forty places and a value none of them know turns a
+/// deliberate stop into a page or a red CI job.
+pub(crate) const INCOMPLETE_MARKER: &str = "\u{1}incomplete\u{1}";
+
+/// Split an `INCOMPLETE_MARKER` message into (reason, text).
+pub(crate) fn split_incomplete(msg: &str) -> Option<(String, String)> {
+    let rest = msg.strip_prefix(INCOMPLETE_MARKER)?;
+    let (reason, text) = rest.split_once(' ').unwrap_or((rest, ""));
+    Some((reason.to_string(), text.to_string()))
+}
+
+/// Split an `unchanged` marker off a stage message.
+pub(crate) fn split_unchanged(msg: &str) -> (bool, String) {
+    match msg.strip_prefix(UNCHANGED_MARKER) {
+        Some(rest) => (true, rest.to_string()),
+        None => (false, msg.to_string()),
+    }
+}
+
+/// Did this run do any publishable work?
+///
+/// A node being unchanged is normal and says nothing about the run; the RUN is
+/// unchanged only when it checked, found nothing, and wrote nothing. A run
+/// where one source was unchanged and another loaded rows is an ordinary `ok`.
+pub(crate) fn run_was_unchanged(
+    nodes: &std::collections::BTreeMap<String, NodeRunStatus>,
+) -> bool {
+    nodes.values().any(|n| n.status == "unchanged")
+        && !nodes
+            .values()
+            .filter(|n| n.kind.as_deref() == Some("sink"))
+            .any(|n| n.rows.unwrap_or(0) > 0)
+}
+
+/// The resource and performance pragmas every DuckDB invocation opens with.
+///
+/// ONE builder, used by both execution paths. They had a copy each and had
+/// already drifted: the per-stage path gave each run its own spill
+/// subdirectory - the fix for a real collision, where four concurrent
+/// spilling queries sharing one temp directory lost 3 of 12 to segfaults and
+/// "Failed to delete file" - and the batched path still pointed every run at
+/// the same directory. A second copy of a setting is a second chance to miss
+/// one.
+/// The resource limits this process will actually apply, for the record.
+///
+/// #278: the budget is settable but was nowhere in the signed manifest, so a
+/// run that spilled differently from another could not be told apart from one
+/// that was given different limits. Only what is SET appears: an absent key
+/// means DuckDB's own default, and inventing a value for it would claim a
+/// setting nobody chose.
+pub fn effective_resource_limits() -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (env, key) in [
+        ("DUCKLE_MEMORY_LIMIT", "memoryLimit"),
+        ("DUCKLE_THREADS", "threads"),
+        ("DUCKLE_TEMP_DIR", "tempDirectory"),
+        ("DUCKLE_MAX_TEMP_DIR_SIZE", "maxTempDirectorySize"),
+    ] {
+        if let Some(v) = std::env::var(env).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+            out.insert(key.to_string(), v);
+        }
+    }
+    out
+}
+
+pub(crate) fn resource_pragmas(
+    run_db: Option<&std::path::Path>,
+    stage_memory_mb: Option<u32>,
+) -> String {
+    // Always on. These flip DuckDB defaults that cost ETL throughput.
+    let mut p = String::from(
+        "PRAGMA preserve_insertion_order=false;\n\
+         PRAGMA enable_object_cache=true;\n\
+         PRAGMA enable_progress_bar=false;\n",
+    );
+    // #290: where the policy restricts the network, take DuckDB off it too.
+    // First, so nothing in the run can get a request out ahead of it.
+    if crate::policy::duckdb_external_io_denied() {
+        p.push_str(crate::policy::DUCKDB_OFF_NETWORK);
+    }
+    let env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let mem = stage_memory_mb
+        .map(|mb| format!("{}MB", mb))
+        .or_else(|| env("DUCKLE_MEMORY_LIMIT"));
+    if let Some(m) = mem {
+        p.push_str(&format!("PRAGMA memory_limit='{}';\n", m.replace('\'', "''")));
+    }
+    if let Some(t) = env("DUCKLE_THREADS") {
+        if let Ok(n) = t.parse::<u32>() {
+            if n > 0 {
+                p.push_str(&format!("PRAGMA threads={};\n", n));
+            }
+        }
+    }
+    // Without this DuckDB's default cap is "90% of available disk space", so
+    // one unexpectedly large join can fill the volume the OS is on and take
+    // unrelated services with it. On a shared machine that is the difference
+    // between one slow pipeline and an outage.
+    if let Some(sz) = env("DUCKLE_MAX_TEMP_DIR_SIZE") {
+        p.push_str(&format!(
+            "PRAGMA max_temp_directory_size='{}';\n",
+            sz.replace('\'', "''")
+        ));
+    }
+    if let Some(d) = env("DUCKLE_TEMP_DIR") {
+        // A private subdirectory per run. Pointing every run at one directory
+        // is what a user does to move spill onto a bigger disk, and it
+        // silently made concurrent runs unsafe.
+        let target = match run_db.and_then(|db| db.file_name()) {
+            Some(nm) => {
+                let sub = std::path::Path::new(&d).join(nm);
+                match std::fs::create_dir_all(&sub) {
+                    Ok(()) => sub.to_string_lossy().into_owned(),
+                    Err(_) => d.clone(),
+                }
+            }
+            None => d.clone(),
+        };
+        p.push_str(&format!(
+            "PRAGMA temp_directory='{}';\n",
+            target.replace('\'', "''").replace('\\', "/")
+        ));
+    }
+    p
+}
+
+/// A state write held until the run succeeds.
+///
+/// `prior` carries what was on disk when this run READ that state, for writes
+/// where somebody else may have changed it since. An operator can move a
+/// watermark through the backfill panel, the CLI, the API or MCP while a run
+/// is in flight; without this the run's flush lands afterwards and silently
+/// undoes their change, and the next run resumes from the position they
+/// thought they had replaced.
+///
+/// A lock would not do here: only scheduled runs take one (serve.rs), and
+/// extending it to every run would deadlock a parallel `ctl.foreach` whose
+/// children re-enter the same named-run path. Comparing what we read is
+/// cheaper, covers every run path, and also catches an edit that lands between
+/// the read and the flush - which a lock taken at the start would not.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingWrite {
+    pub path: std::path::PathBuf,
+    pub value: JsonValue,
+    pub prior: PriorState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PriorState {
+    /// Write whatever is there. For outputs like a model card, which nobody
+    /// hand-edits between a run reading and writing them.
+    Unchecked,
+    /// What the run read. `None` means the file did not exist then.
+    Was(Option<String>),
+}
+
+impl PendingWrite {
+    /// Resumable position state, whose write must not clobber a mid-run edit.
+    pub(crate) fn state(
+        path: std::path::PathBuf,
+        value: JsonValue,
+        prior: Option<String>,
+    ) -> Self {
+        Self { path, value, prior: PriorState::Was(prior) }
+    }
+
+    /// An output, written unconditionally.
+    pub(crate) fn output(path: std::path::PathBuf, value: JsonValue) -> Self {
+        Self { path, value, prior: PriorState::Unchecked }
+    }
+}
+
+/// Read a state file as raw text for the conflict check. Missing reads as
+/// `None`, which is a real prior state: "there was nothing here when I looked".
+pub(crate) fn read_state_snapshot(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// One artifact a run read or wrote, as the provenance manifest needs it.
+///
+/// #247: a pipeline whose most important boundary is "we pulled this PDF
+/// bundle out of B2 and parsed it" had that boundary invisible to the signed
+/// manifest, which pinned only local file inputs by path. A remote object has
+/// no path, so it recorded nothing at all.
+///
+/// The fields are what can honestly be known about a remote object, in
+/// descending order of strength: a sha256 when the bytes actually passed
+/// through us, and otherwise the ETag with the size and mtime - none of which
+/// is a content hash, but all of which is comparable to itself across runs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactRef {
+    pub node: String,
+    /// "input" for something the run read, "output" for something it wrote.
+    pub role: String,
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    /// Present only when the bytes passed through this run. An artifact that
+    /// was merely OBSERVED has no hash, and claiming one would be a lie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+}
+
+/// How many artifacts one run records before it stops. A copy of a hundred
+/// thousand files would otherwise put a hundred thousand entries in a signed
+/// manifest; the count of what was dropped is recorded instead, so a truncated
+/// list never reads as a complete one.
+pub const ARTIFACT_RECORD_CAP: usize = 1000;
+
 #[derive(Debug, Serialize)]
 pub struct RunResult {
+    /// #305: the output-cache key each node's result was stored under, when it
+    /// had one. Carried so a run can record what it produced in terms a later
+    /// retry can verify: "node D succeeded" says nothing about whether D's
+    /// output still exists, and a content key does.
+    ///
+    /// Empty for every node that is not cache-eligible, which is most of them,
+    /// so it is skipped when empty rather than padding every API response.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cache_keys: std::collections::BTreeMap<String, String>,
     pub status: String,
     pub duration_ms: u64,
     pub nodes: std::collections::BTreeMap<String, NodeRunStatus>,
@@ -5201,18 +6883,56 @@ pub struct RunResult {
     /// Coarse bucket of `error` (see error_category) - present only on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// The run checked its sources, found nothing changed, and wrote nothing.
+    ///
+    /// Beside `status`, not a fourth status value. A healthy poll can be
+    /// unchanged hundreds of times between real updates and that is worth
+    /// counting separately - but `status` is read in about forty places, and a
+    /// value none of them know turns a quiet poll into a page, a failed plan
+    /// step or a red CI job. `plans.rs` also already uses "skipped" for the
+    /// opposite meaning (a step an earlier failure stopped from running).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
+    /// #258: the run produced rows, they are correct, and they are not all of
+    /// them - a stage stopped at a ceiling it was given.
+    ///
+    /// Beside `status` for the same reason as `unchanged`, and distinct from it
+    /// in the one way that matters: `unchanged` does not stop anything
+    /// downstream, because there was nothing to stop. This does, because there
+    /// is a partial dataset that must not be published.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
+    /// Why, machine-readable (`budget:maxRequests`). Alerting has to tell "we
+    /// hit the ceiling" apart from "it broke", and a sentence cannot be matched
+    /// on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
+    /// Remote objects this run read or wrote, for the provenance manifest.
+    /// Capped at ARTIFACT_RECORD_CAP; `artifacts_truncated` says how many more
+    /// there were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub artifacts_truncated: bool,
 }
 
 impl RunResult {
     fn failed(start: Instant, error: String) -> Self {
         let category = error_category::categorize_error(&error);
         RunResult {
+            cache_keys: Default::default(),
             status: "error".into(),
             duration_ms: start.elapsed().as_millis() as u64,
             nodes: Default::default(),
             preview: Vec::new(),
             error: Some(error),
             category: Some(category.into()),
+            // A failure is never "nothing to do".
+            unchanged: false,
+            incomplete: false,
+            incomplete_reason: None,
+            artifacts: Vec::new(),
+            artifacts_truncated: false,
         }
     }
 }
@@ -5222,6 +6942,16 @@ pub struct NodeRunStatus {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// What the node reported on SUCCESS, when it had something to say.
+    ///
+    /// Driver connectors already return a sentence describing what they did -
+    /// "compact: files 4 -> 1", "changed: 2 of 40 entries changed" - and it was
+    /// being thrown away for every successful stage, so the only way to see it
+    /// was to read stderr. A maintenance run that has to record what it did
+    /// (#279) needs somewhere for that to live, and so does every other node
+    /// that was already producing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5244,6 +6974,17 @@ pub struct NodePreview {
     pub node_id: String,
     pub columns: Vec<Column>,
     pub rows: Vec<JsonValue>,
+    /// #250: the DuckDB type exactly as DESCRIBE reported it, aligned with
+    /// `columns` by index.
+    ///
+    /// `Column.data_type` collapses `DECIMAL(18,3)` to `decimal`, which is
+    /// right for the schema model and wrong for an assertion about precision:
+    /// `DECIMAL(18,3)` becoming `DECIMAL(10,2)` can round, lose precision or
+    /// overflow while reading as the same broad type. Kept beside rather than
+    /// inside `Column`, because precision is a fact about THIS run's relation,
+    /// not part of the declared-schema vocabulary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sql_types: Vec<String>,
 }
 
 /// Schema + rows from a single read-only query ([`Engine::query`]). The
@@ -5293,12 +7034,34 @@ pub fn compile_pipeline_sql_opts(
     let secrets = if include_secrets {
         Vec::new()
     } else {
-        collect_secrets(doc)
+        // Same reasoning as the execution path: an exported script would
+        // otherwise carry a context secret in plaintext wherever it was
+        // substituted into a property this does not recognise as secret.
+        let ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|w| !w.trim().is_empty());
+        collect_secrets(doc, ws.as_deref().map(std::path::Path::new))
+    };
+    // The batched executor wraps a publish group in one transaction. The export
+    // has to show it, or the script a user copies out is not the script that
+    // runs - it would publish each table on its own while the pipeline claims
+    // they publish together.
+    let group_span: Option<(usize, usize)> = {
+        let idx: Vec<usize> = compiled
+            .stages
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.publish_group.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        match (idx.first(), idx.last()) {
+            (Some(a), Some(b)) => Some((*a, *b)),
+            _ => None,
+        }
     };
     Ok(compiled
         .stages
         .into_iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             // Driver-backed and control-flow stages carry no DuckDB SQL
             // (they run in the Duckle runtime via Rust connectors / hooks).
             // For the SQL export we annotate them so the exported script
@@ -5324,6 +7087,18 @@ pub fn compile_pipeline_sql_opts(
                 format!("{}\n{}", procedural_note(&s), redact_secret_values(&s.sql, &secrets))
             } else {
                 redact_secret_values(&s.sql, &secrets)
+            };
+            let sql = match group_span {
+                Some((first, last)) if i == first && i == last => {
+                    format!("BEGIN TRANSACTION;\n{}\nCOMMIT; DETACH duckle_dst;", sql)
+                }
+                Some((first, _)) if i == first => {
+                    format!("BEGIN TRANSACTION;\n{}", sql)
+                }
+                Some((_, last)) if i == last => {
+                    format!("{}\nCOMMIT; DETACH duckle_dst;", sql)
+                }
+                _ => sql,
             };
             StageSql {
                 node_id: s.node_id,
@@ -5387,6 +7162,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let col = |name: &str, dt: DataType| Column {
+            tags: Vec::new(),
             name: name.into(),
             data_type: dt,
             nullable: true,
@@ -5571,12 +7347,16 @@ mod tests {
     /// `views_counted_by_sink` and `sink_self_count` read are ever varied.
     fn st(node_id: &str, component_id: &str, kind: crate::plan::StageKind) -> crate::plan::Stage {
         crate::plan::Stage {
+            cache_output: false,
+            cache_input_view: None,
+            cache_config_fp: String::new(),
             node_id: node_id.into(),
             component_id: component_id.into(),
             label: node_id.into(),
             sql: String::new(),
             kind,
             from: None,
+            publish_group: None,
             sink_path: None,
             sink_mode: None,
             sink_compression: None,
@@ -6177,5 +7957,528 @@ mod oracle_insert_all_tests {
     fn zero_cols_defensive() {
         // Defensive divisor max(1): 999 / 1 = 999, then .min(1000) = 999.
         assert_eq!(f(0, 1000), 999);
+    }
+}
+
+#[cfg(test)]
+mod resource_pragma_tests {
+    use super::resource_pragmas;
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = L.lock().unwrap_or_else(|e| e.into_inner());
+        for k in [
+            "DUCKLE_MEMORY_LIMIT",
+            "DUCKLE_THREADS",
+            "DUCKLE_TEMP_DIR",
+            "DUCKLE_MAX_TEMP_DIR_SIZE",
+        ] {
+            std::env::remove_var(k);
+        }
+        g
+    }
+
+    /// #290: a policy that restricts the network must take DuckDB off it too.
+    ///
+    /// Duckle's own HTTP client enforces the domain allowlist, but SQL that
+    /// DuckDB runs never passes through that client. `read_parquet` over
+    /// https, a remote `ATTACH`, a `COPY ... TO` a remote URI all leave
+    /// through a door the client cannot see, and scanning the SQL for them is
+    /// not a boundary: it is generated by dbt, Python, templates and MCP, and
+    /// a path can be built at run time from a row.
+    #[test]
+    fn a_restricted_network_takes_duckdb_off_the_network_too() {
+        let _g = guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let pol = tmp.path().join("policy.yaml");
+        std::fs::write(
+            &pol,
+            "mode: enforce
+network:
+  allowedDomains:
+    - api.example
+",
+        )
+        .unwrap();
+        std::env::set_var("DUCKLE_POLICY_FILE", &pol);
+
+        let p = resource_pragmas(None, None);
+
+        std::env::remove_var("DUCKLE_POLICY_FILE");
+        assert!(
+            p.contains("disabled_filesystems"),
+            "DuckDB could still read https:// itself, outside the allowlist: {p}"
+        );
+        assert!(
+            p.contains("allow_community_extensions=false"),
+            "an extension carrying its own network code would still load: {p}"
+        );
+    }
+
+    /// And an environment with no policy is not hardened, so an ordinary local
+    /// run is completely unchanged.
+    #[test]
+    fn no_policy_leaves_duckdb_on_the_network() {
+        let _g = guard();
+        std::env::remove_var("DUCKLE_POLICY_FILE");
+        std::env::remove_var("DUCKLE_WORKSPACE");
+        assert!(!resource_pragmas(None, None).contains("disabled_filesystems"));
+    }
+
+    /// The preset is unconditional, so a pipeline with no resource settings
+    /// still gets the throughput defaults.
+    #[test]
+    fn the_performance_preset_is_always_present() {
+        let _g = guard();
+        let p = resource_pragmas(None, None);
+        assert!(p.contains("preserve_insertion_order=false"));
+        assert!(p.contains("enable_object_cache=true"));
+        assert!(p.contains("enable_progress_bar=false"));
+        // Nothing configured means nothing capped - DuckDB's own defaults.
+        assert!(!p.contains("memory_limit"));
+        assert!(!p.contains("max_temp_directory_size"));
+    }
+
+    /// The one that stops a runaway job filling the volume the OS is on.
+    /// DuckDB's own default is "90% of available disk space", which on a
+    /// shared machine is the difference between a slow pipeline and an outage.
+    #[test]
+    fn the_temp_size_cap_is_emitted_when_set() {
+        let _g = guard();
+        std::env::set_var("DUCKLE_MAX_TEMP_DIR_SIZE", "300GB");
+        let p = resource_pragmas(None, None);
+        assert!(
+            p.contains("PRAGMA max_temp_directory_size='300GB'"),
+            "spill would be capped at 90% of the disk instead: {p}"
+        );
+        std::env::remove_var("DUCKLE_MAX_TEMP_DIR_SIZE");
+    }
+
+    #[test]
+    fn a_per_stage_memory_limit_beats_the_environment() {
+        let _g = guard();
+        std::env::set_var("DUCKLE_MEMORY_LIMIT", "16GB");
+        assert!(resource_pragmas(None, None).contains("memory_limit='16GB'"));
+        assert!(
+            resource_pragmas(None, Some(512)).contains("memory_limit='512MB'"),
+            "a stage that asked for a limit must get the one it asked for"
+        );
+        std::env::remove_var("DUCKLE_MEMORY_LIMIT");
+    }
+
+    /// Concurrent runs sharing one spill directory lost 3 of 12 queries to
+    /// segfaults and delete failures. Each run gets its own subdirectory, and
+    /// this is what both execution paths now go through - the batched one used
+    /// to skip it.
+    #[test]
+    fn each_run_spills_into_its_own_directory() {
+        let _g = guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DUCKLE_TEMP_DIR", tmp.path());
+        let a = resource_pragmas(Some(std::path::Path::new("/x/duckle_run_1.duckdb")), None);
+        let b = resource_pragmas(Some(std::path::Path::new("/x/duckle_run_2.duckdb")), None);
+        assert!(a.contains("duckle_run_1.duckdb"), "{a}");
+        assert!(b.contains("duckle_run_2.duckdb"), "{b}");
+        assert_ne!(a, b, "two runs must not be pointed at the same spill directory");
+        std::env::remove_var("DUCKLE_TEMP_DIR");
+    }
+
+    #[test]
+    fn a_quote_in_a_setting_cannot_break_out_of_the_pragma() {
+        let _g = guard();
+        std::env::set_var("DUCKLE_MEMORY_LIMIT", "4GB'; DROP TABLE x; --");
+        assert!(
+            std::env::var("DUCKLE_MEMORY_LIMIT").is_ok(),
+            "the value did not survive set_var"
+        );
+        let p = resource_pragmas(None, None);
+        let line = p
+            .lines()
+            .find(|l| l.contains("memory_limit"))
+            .expect("the setting should be emitted");
+        // Doubling is what keeps it ONE string literal: SQL reads '' as a
+        // literal quote rather than the end of the string, so the rest cannot
+        // become a second statement.
+        assert!(line.contains("'4GB''; DROP TABLE x; --'"), "not escaped: {line}");
+        assert_eq!(
+            line.matches('\'').count() % 2,
+            0,
+            "an odd number of quotes means the literal is not closed: {line}"
+        );
+        std::env::remove_var("DUCKLE_MEMORY_LIMIT");
+    }
+}
+
+#[cfg(test)]
+mod autodetect_probe_tests {
+    use super::*;
+
+    fn engine() -> DuckdbEngine {
+        DuckdbEngine::new(PathBuf::from("no-such-duckdb-binary"))
+    }
+
+    /// Autodetect learns a driver source's schema by RUNNING it. DuckLake
+    /// Maintenance compacts files, expires snapshots and deletes orphans, so
+    /// running it to find out which columns it returns is not a preview - it is
+    /// maintenance nobody asked for, against a real lake.
+    #[test]
+    fn maintenance_is_not_performed_to_find_out_what_it_returns() {
+        let e = engine().inspect("ducklake.maintain", serde_json::json!({ "path": "x.ducklake" }));
+        let err = e.expect_err("autodetect ran a maintenance operation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be autodetected"),
+            "the refusal does not say why: {msg}"
+        );
+    }
+
+    /// The reported bug: Autodetect on DuckLake CDC or Data Diff said
+    /// "autodetect failed for src.ducklake" - a component the author had not
+    /// chosen. The probe has to be of the component that was selected, or the
+    /// error describes something else entirely.
+    #[test]
+    fn a_probe_is_of_the_component_that_was_chosen() {
+        for format in ["ducklake.changes", "ducklake.diff"] {
+            let err = engine()
+                .inspect(format, serde_json::json!({ "path": "x.ducklake", "table": "t" }))
+                .expect_err("a probe with no DuckDB should fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(format),
+                "the probe was of some other component: {msg}"
+            );
+        }
+    }
+
+    /// A probe must not advance anything a run would.
+    ///
+    /// Read from the source rather than exercised, because the failure has no
+    /// visible symptom here: it shows up later, as a real CDC run that finds no
+    /// changes because the schema preview already consumed them. The needle is
+    /// built from pieces so it cannot match itself in this file.
+    #[test]
+    fn a_probe_never_persists_what_a_run_would() {
+        let src = include_str!("lib.rs");
+        let gate = format!("!self.{}", "probing");
+        let line = src
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with("if final_status ==") && l.contains("incomplete_reason"))
+            .expect("the deferred-state persistence condition");
+        assert!(
+            line.contains(&gate),
+            "deferred state is persisted without checking for a probe, so autodetecting a CDC \
+             source would advance its snapshot: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inspect_prelude_tests {
+    use super::*;
+
+    /// Every format autodetect can inspect, so the guard covers a format added
+    /// later rather than only the ones that were wrong.
+    const INSPECTABLE: &[&str] = &[
+        "csv", "tsv", "parquet", "json", "jsonl", "ndjson", "sqlite", "duckdb", "excel", "avro",
+        "inline", "filelist", "iceberg", "delta", "spatial", "gdb", "huggingface", "fixedwidth",
+        "ducklake", "ducklake_snapshots", "s3", "gcs", "azureblob", "http", "https", "minio",
+        "r2", "b2",
+    ];
+
+    /// #327: autodetect must load whatever its OWN generated SQL needs.
+    ///
+    /// `src.gdb` failed with "Table Function with name st_read is not in the
+    /// catalog" while running the pipeline worked, because the run path loads
+    /// spatial for src.gdb and the inspect path had an arm for `spatial` and
+    /// none for `gdb`. Two hand-maintained lists of which formats need an
+    /// extension will disagree again, so this asks the SQL: if what inspect is
+    /// about to run mentions an `ST_` function, its prelude has to load spatial.
+    #[test]
+    fn an_inspect_prelude_loads_the_extension_its_own_sql_needs() {
+        // Enough properties that every builder produces something; a builder
+        // that wants none of them ignores the rest.
+        let props = serde_json::json!({
+            "path": "sample.gdb",
+            "database": "sample.duckdb",
+            "tableName": "orders",
+            "table": "orders",
+            "layer": "roads",
+            "url": "https://example.invalid/x.csv",
+            "dataset": "org/ds",
+            "repo": "org/ds",
+            "rows": [{ "a": 1 }],
+            "columns": [{ "name": "a", "type": "int64" }],
+        });
+        let engine = DuckdbEngine::new(PathBuf::from("duckdb"));
+        let mut checked = 0;
+        for format in INSPECTABLE {
+            let Some(sql) = plan::source_select_for_format(format, &props) else { continue };
+            if !plan::references_spatial(&sql) {
+                continue;
+            }
+            checked += 1;
+            let prelude = engine.source_prelude(format, &props);
+            assert!(
+                prelude.contains("LOAD spatial"),
+                "autodetect of {format:?} runs {sql:?}, which needs the spatial extension, and \
+                 its prelude does not load it: {prelude:?}"
+            );
+        }
+        // If this ever hits zero the test has stopped testing anything - a
+        // renamed builder, or props no longer good enough to produce SQL.
+        assert!(checked >= 2, "only {checked} spatial format(s) were exercised");
+    }
+
+    /// And the credential half of the same rule.
+    ///
+    /// MinIO, R2 and B2 are read through the `s3://` scheme and share the
+    /// `TYPE S3` secret, which is the only way the ENDPOINT their forms collect
+    /// reaches DuckDB. Inspect passed the un-aliased format to
+    /// `secret_statement`, which matches only `s3`/`gcs`/`azureblob`, so it
+    /// created nothing and Autodetect signed against real AWS with no key -
+    /// on a node that ran perfectly well.
+    ///
+    /// Stated as the parity property rather than as a list: if the credentials
+    /// on this node would produce a secret for its family, the inspect prelude
+    /// has to contain one.
+    #[test]
+    fn an_inspect_prelude_creates_the_secret_its_own_credentials_imply() {
+        let props = serde_json::json!({
+            "bucket": "b",
+            "key": "data.parquet",
+            "path": "b/data.parquet",
+            "accessKey": "AKIAEXAMPLE",
+            "secretKey": "s3cret",
+            "region": "us-east-1",
+            "endpoint": "localhost:9000",
+            "urlStyle": "path",
+            "useSsl": false,
+        });
+        let engine = DuckdbEngine::new(PathBuf::from("duckdb"));
+        let mut checked = 0;
+        for format in INSPECTABLE {
+            // What the RUN path would make for this node, by family.
+            if secret_statement(secret_family(format), "duckle_run", &props).is_none() {
+                continue;
+            }
+            // Only formats autodetect actually builds a SELECT for; anything
+            // else goes to inspect_driver_source and gets the run path itself.
+            if plan::source_select_for_format(format, &props).is_none() {
+                continue;
+            }
+            checked += 1;
+            let prelude = engine.source_prelude(format, &props);
+            assert!(
+                prelude.contains("SECRET"),
+                "autodetect of {format:?} reads a cloud URL with credentials set and creates no                  secret, so it authenticates as nobody: {prelude:?}"
+            );
+        }
+        assert!(
+            checked >= 4,
+            "only {checked} credentialled format(s) were exercised - the props are no longer              enough to make a secret, so this test proves nothing"
+        );
+    }
+
+    /// The general form, which the two above are instances of.
+    ///
+    /// Autodetect runs the same read a pipeline does, so whatever the run path
+    /// loads before that read, inspect has to load too. Stated once, over every
+    /// format, so the next connector to need an extension or a connector secret
+    /// is covered without anyone adding it to a list - which is exactly what
+    /// went wrong for `gdb` (#327), for the Hugging Face token, and for the
+    /// S3-compatible endpoints.
+    #[test]
+    fn an_inspect_prelude_contains_everything_the_run_path_loads() {
+        let props = serde_json::json!({
+            "path": "sample.gdb",
+            "repo": "org/private-ds",
+            "token": "hf_example",
+            "bucket": "b",
+            "key": "data.parquet",
+            "accessKey": "AKIAEXAMPLE",
+            "secretKey": "s3cret",
+            "endpoint": "localhost:9000",
+            "layer": "roads",
+        });
+        let engine = DuckdbEngine::new(PathBuf::from("duckdb"));
+        let mut checked = 0;
+        for format in INSPECTABLE {
+            // These issue their own read-only ATTACH in source_prelude;
+            // attaching duckle_src twice is an error, not a no-op.
+            if matches!(*format, "duckdb" | "ducklake" | "ducklake_snapshots")
+                || plan::is_attach_relational_format(format)
+            {
+                continue;
+            }
+            let run = plan::attach_prelude(&format!("src.{format}"), &props);
+            if run.trim().is_empty() {
+                continue;
+            }
+            checked += 1;
+            let inspect = engine.source_prelude(format, &props);
+            assert!(
+                inspect.contains(&run),
+                "autodetect of {format:?} omits what the run path loads.
+  run wants: {run:?}
+                   inspect has: {inspect:?}"
+            );
+        }
+        assert!(checked >= 3, "only {checked} format(s) had a run-path prelude to compare");
+    }
+
+    /// The three cases named in the commit, spelled out, so a reader can see
+    /// what the general rule buys without re-deriving it.
+    #[test]
+    fn the_three_known_gaps_are_closed() {
+        let engine = DuckdbEngine::new(PathBuf::from("duckdb"));
+
+        // #327: ESRI FileGDB.
+        let gdb = engine.source_prelude("gdb", &serde_json::json!({ "path": "x.gdb" }));
+        assert!(gdb.contains("LOAD spatial"), "gdb: {gdb:?}");
+
+        // A private Hugging Face dataset: httpfs, and the token secret.
+        let hf = engine.source_prelude(
+            "huggingface",
+            &serde_json::json!({ "repo": "org/private", "token": "hf_example" }),
+        );
+        assert!(hf.contains("LOAD httpfs"), "huggingface: {hf:?}");
+        assert!(hf.contains("TYPE HUGGINGFACE"), "huggingface token secret missing: {hf:?}");
+
+        // MinIO / R2 / B2: the TYPE S3 secret, which is the only way the
+        // endpoint the form collects ever reaches DuckDB.
+        for format in ["minio", "r2", "b2"] {
+            let p = engine.source_prelude(
+                format,
+                &serde_json::json!({
+                    "bucket": "b", "key": "k.parquet",
+                    "accessKey": "AK", "secretKey": "SK",
+                    "endpoint": "localhost:9000"
+                }),
+            );
+            assert!(p.contains("TYPE S3"), "{format} has no S3 secret: {p:?}");
+            assert!(
+                p.contains("localhost:9000"),
+                "{format} loses the endpoint, so autodetect aims at real AWS: {p:?}"
+            );
+        }
+    }
+}
+
+/// The DuckDB extensions a component's run-time prelude loads.
+///
+/// Derived from `attach_prelude` - the very statements a run emits - rather
+/// than written down a second time. `duckle build` decides what to embed in a
+/// self-contained bundle, and it kept its own list, which had drifted: the
+/// engine force-loads spatial for `src.gdb`, the geometry checks and five geo
+/// transforms, and none of them were on it. A bundle containing one shipped
+/// without spatial and failed at run time with "st_read is not in the catalog",
+/// offline, where INSTALL cannot rescue it.
+///
+/// Only what the prelude LOADs. A component whose extension arrives some other
+/// way - the json and parquet readers are built in, the relational families
+/// come through their ATTACH - is not reported here, so the caller unions this
+/// with whatever else it knows rather than replacing its own knowledge.
+pub fn extensions_for_component(component_id: &str, props: &JsonValue) -> Vec<String> {
+    let prelude = plan::attach_prelude(component_id, props);
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in prelude.match_indices("LOAD ") {
+        let rest = &prelude[i + "LOAD ".len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod component_extension_tests {
+    use super::*;
+
+    /// The engine is the authority on what a component loads, so this asks it
+    /// the same way the bundler will.
+    #[test]
+    fn a_components_extensions_come_from_the_prelude_it_actually_emits() {
+        let none = serde_json::json!({ "path": "x" });
+        assert_eq!(extensions_for_component("src.gdb", &none), vec!["spatial".to_string()]);
+        assert_eq!(extensions_for_component("src.avro", &none), vec!["avro".to_string()]);
+        assert_eq!(extensions_for_component("qa.geomvalidate", &none), vec!["spatial".to_string()]);
+        // A component with no prelude reports nothing rather than guessing.
+        assert!(extensions_for_component("src.csv", &none).is_empty());
+    }
+}
+
+/// ctl.file's "Overwrite an existing destination" guard covered copy and move
+/// and not archive.
+///
+/// FileOpSpec.overwrite is documented as "Off means an existing file is an
+/// error", and the check that enforces it lives in the catch-all `op =>` arm.
+/// The "archive" arm returns before ever reaching it and opens the destination
+/// with File::create, which TRUNCATES. So archiving over yesterday's archive
+/// destroyed it with the box unticked.
+#[cfg(test)]
+mod file_op_overwrite {
+    use super::*;
+
+    fn spec(op: &str, src: &str, dst: &str, overwrite: bool) -> FileOpSpec {
+        FileOpSpec {
+            op: op.to_string(),
+            source: src.to_string(),
+            destination: dst.to_string(),
+            overwrite,
+            fail_on_error: true,
+        }
+    }
+
+    #[test]
+    fn archive_refuses_an_existing_destination_unless_overwrite_is_set() {
+        let tmp = std::env::temp_dir().join(format!("duckle-archive-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("data.txt");
+        let dst = tmp.join("out.zip");
+        std::fs::write(&src, b"fresh").unwrap();
+        std::fs::write(&dst, b"an archive somebody already cared about").unwrap();
+        let before = std::fs::read(&dst).unwrap();
+
+        let err = run_file_op(&spec(
+            "archive",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+            false,
+        ));
+        assert!(err.is_err(), "archive must refuse to clobber an existing destination");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            before,
+            "the existing file must still be there, byte for byte"
+        );
+
+        // With overwrite on it goes ahead, which is the whole point of the box.
+        run_file_op(&spec("archive", src.to_str().unwrap(), dst.to_str().unwrap(), true))
+            .expect("overwrite=true must archive");
+        assert_ne!(std::fs::read(&dst).unwrap(), before, "overwrite=true must replace it");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn archive_still_writes_when_the_destination_is_new() {
+        let tmp = std::env::temp_dir().join(format!("duckle-archive-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("data.txt");
+        let dst = tmp.join("new.zip");
+        std::fs::write(&src, b"fresh").unwrap();
+
+        run_file_op(&spec("archive", src.to_str().unwrap(), dst.to_str().unwrap(), false))
+            .expect("a destination that does not exist yet is not a clobber");
+        assert!(dst.exists(), "the archive should have been written");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

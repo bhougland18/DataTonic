@@ -31,6 +31,33 @@ pub struct RunRecord {
     pub trigger: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The run checked its sources, found nothing changed, and wrote nothing.
+    ///
+    /// Persisted because the durable distinction is the point: a recurring
+    /// poll is unchanged hundreds of times between real updates, and later you
+    /// have to be able to tell "the last poll succeeded and the source was
+    /// unchanged" from "the last poll ingested new data". Without it on the
+    /// record, both read as an ordinary ok the moment the run is over.
+    ///
+    /// `default` so records written before this existed still load.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
+    /// #258: the run produced rows, they are correct, and they are not all of
+    /// them - a stage stopped at a ceiling it was given.
+    ///
+    /// Persisted for the same reason `unchanged` is, and it matters more: the
+    /// moment the run is over, a budget stop is indistinguishable from an
+    /// ordinary success unless the record says otherwise. Alerting and the Runs
+    /// tab both read this history, and "we hit the ceiling" has to be tellable
+    /// from "it worked".
+    ///
+    /// `default` so records written before this existed still load.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
+    /// Why, machine-readable (`budget:maxRequests`), so alerting can match on
+    /// it rather than on a sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
     /// Coarse error bucket (see error_category) - present only on failure.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub category: Option<String>,
@@ -80,6 +107,9 @@ impl RunRecord {
             rows,
             node_count: result.nodes.len(),
             trigger: trigger.to_string(),
+            unchanged: result.unchanged,
+            incomplete: result.incomplete,
+            incomplete_reason: result.incomplete_reason.clone(),
             error: result.error.clone(),
             category: result.category.clone(),
             assets: Vec::new(),
@@ -137,12 +167,34 @@ pub fn append_run_record(
         std::fs::create_dir_all(parent)?;
     }
     let mut records = load_run_history(workspace, pipeline_id);
+    // #325: a successful publication is an event, recorded HERE rather than at
+    // each of the four places that append a record. Four call sites is four
+    // chances to forget, and the standing evidence that they do is that only
+    // three of them raise alerts.
+    //
+    // After the history write below would be tidier and is wrong: the record is
+    // the source of truth an event is rebuilt FROM, so it has to be durable
+    // first. Ordered this way, a crash between the two costs an index entry
+    // that `materialize::reconcile` can rebuild, not a publication.
+    let publication = record.clone();
     records.push(record);
     let start = records.len().saturating_sub(MAX_RECORDS);
     let trimmed = &records[start..];
     let json = serde_json::to_string_pretty(trimmed)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(&path, json)?;
+    // The record is durable now, so the event can be indexed from it. Reported
+    // rather than swallowed: a lost alert loses a notification, a lost
+    // publication event loses downstream WORK, and the producer will not
+    // publish again until its next cycle. It is not fatal, because the record
+    // it is derived from is already on disk and `materialize::reconcile`
+    // rebuilds what the log is missing - the failure costs latency, not the
+    // event.
+    if let Err(e) = crate::materialize::append(workspace, pipeline_id, &publication) {
+        eprintln!(
+            "duckle: {pipeline_id} published but its materialization event was not recorded              ({e}). Downstream triggers will not see it until the log is reconciled."
+        );
+    }
     // Refresh the OpenMetrics textfile alongside the history. Best-effort:
     // monitoring must never fail a run.
     let _ = write_metrics_textfile(workspace);
@@ -160,6 +212,33 @@ pub fn append_run_record(
 /// counters - the metric names say so. Written atomically (temp file +
 /// rename) so a concurrent scrape never reads a half-written file.
 pub fn write_metrics_textfile(workspace: &Path) -> std::io::Result<()> {
+    let out = render_metrics(workspace)?;
+    let logs_dir = workspace.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let final_path = logs_dir.join("duckle_metrics.prom");
+    let tmp_path = logs_dir.join("duckle_metrics.prom.tmp");
+    std::fs::write(&tmp_path, &out)?;
+    std::fs::rename(&tmp_path, &final_path)
+}
+
+/// How many pipelines may contribute label values.
+///
+/// #300 asks for bounded labels, and nothing prunes `runs/`: a workspace that
+/// has ever run five thousand pipelines would otherwise emit five thousand
+/// label values forever, and serving that over HTTP turns a local file into a
+/// scraped time series that never shrinks. The cap is generous because the
+/// pipeline that breaks is exactly the one you must not have dropped - and
+/// when it does bite, [`OMITTED`] says so rather than the series simply not
+/// being there.
+const MAX_PIPELINE_SERIES: usize = 1000;
+const OMITTED: &str = "duckle_metrics_pipelines_omitted";
+
+/// The metrics document, without writing it anywhere (#300).
+///
+/// Split from [`write_metrics_textfile`] so the console can serve the same
+/// bytes at `/metrics`. Rendering twice - once for the textfile, once for the
+/// endpoint - is how the two would come to disagree about what a series means.
+pub fn render_metrics(workspace: &Path) -> std::io::Result<String> {
     let runs_dir = workspace.join("runs");
     let mut out = String::new();
     out.push_str("# HELP duckle_run_last_status 1 when the pipeline's most recent run succeeded, 0 when it failed or was cancelled.\n# TYPE duckle_run_last_status gauge\n");
@@ -167,6 +246,7 @@ pub fn write_metrics_textfile(workspace: &Path) -> std::io::Result<()> {
     let mut last_duration = String::new();
     let mut last_rows = String::new();
     let mut last_ts = String::new();
+    let mut last_unchanged = String::new();
     let mut window_runs = String::new();
 
     let entries = std::fs::read_dir(&runs_dir)?;
@@ -176,6 +256,10 @@ pub fn write_metrics_textfile(workspace: &Path) -> std::io::Result<()> {
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .collect();
     files.sort();
+    // Newest first, so if the cap bites it drops pipelines nobody has run in
+    // months rather than whichever happens to sort last. Sorted by name second
+    // so the choice is deterministic when timestamps tie.
+    let mut loaded: Vec<(String, Vec<RunRecord>, i64)> = Vec::new();
     for path in files {
         let Some(pipeline_id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
@@ -184,11 +268,30 @@ pub fn write_metrics_textfile(workspace: &Path) -> std::io::Result<()> {
         let Some(last) = records.last() else {
             continue;
         };
+        let at = chrono::DateTime::parse_from_rfc3339(&last.at).map(|t| t.timestamp()).unwrap_or(0);
+        loaded.push((pipeline_id.to_string(), records, at));
+    }
+    loaded.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let omitted = loaded.len().saturating_sub(MAX_PIPELINE_SERIES);
+    loaded.truncate(MAX_PIPELINE_SERIES);
+
+    for (pipeline_id, records, _) in &loaded {
+        let pipeline_id = pipeline_id.as_str();
+        let last = records.last().expect("only pipelines with a record are loaded");
         let label = escape_label(pipeline_id);
         let ok = if last.status == "ok" { 1 } else { 0 };
         last_status.push_str(&format!(
             "duckle_run_last_status{{pipeline=\"{}\"}} {}\n",
             label, ok
+        ));
+        // A quiet poll is a success, so last_status alone cannot tell a
+        // pipeline that is working and finding nothing from one that is
+        // ingesting. Freshness alerting needs both.
+        last_unchanged.push_str(&format!(
+            "duckle_run_last_unchanged{{pipeline=\"{}\"}} {}
+",
+            label,
+            if last.unchanged { 1 } else { 0 }
         ));
         last_duration.push_str(&format!(
             "duckle_run_last_duration_seconds{{pipeline=\"{}\"}} {}\n",
@@ -207,15 +310,31 @@ pub fn write_metrics_textfile(workspace: &Path) -> std::io::Result<()> {
             ));
         }
         for status in ["ok", "error", "cancelled"] {
-            let n = records.iter().filter(|r| r.status == status).count();
+            // An unchanged run has status "ok", so inside that bucket it would
+            // be indistinguishable. Counting it out keeps "ok" meaning "did
+            // work", and the buckets still sum to the number of runs.
+            let n = records
+                .iter()
+                .filter(|r| r.status == status && !(status == "ok" && r.unchanged))
+                .count();
             window_runs.push_str(&format!(
                 "duckle_runs_window{{pipeline=\"{}\",status=\"{}\"}} {}\n",
                 label, status, n
             ));
         }
+        window_runs.push_str(&format!(
+            "duckle_runs_window{{pipeline=\"{}\",status=\"unchanged\"}} {}
+",
+            label,
+            records.iter().filter(|r| r.unchanged).count()
+        ));
     }
 
     out.push_str(&last_status);
+    out.push_str("# HELP duckle_run_last_unchanged 1 when the most recent run checked its sources, found nothing changed and wrote nothing. Such a run is a success, so duckle_run_last_status is 1 for it too - this is what separates a poll that is working and finding nothing from one that is ingesting.
+# TYPE duckle_run_last_unchanged gauge
+");
+    out.push_str(&last_unchanged);
     out.push_str("# HELP duckle_run_last_duration_seconds Wall-clock duration of the most recent run.\n# TYPE duckle_run_last_duration_seconds gauge\n");
     out.push_str(&last_duration);
     out.push_str("# HELP duckle_run_last_rows Rows written across all sinks in the most recent run.\n# TYPE duckle_run_last_rows gauge\n");
@@ -224,18 +343,78 @@ pub fn write_metrics_textfile(workspace: &Path) -> std::io::Result<()> {
     out.push_str(&last_ts);
     out.push_str("# HELP duckle_runs_window Runs by status within the retained history window (not a lifetime counter).\n# TYPE duckle_runs_window gauge\n");
     out.push_str(&window_runs);
-
-    let logs_dir = workspace.join("logs");
-    std::fs::create_dir_all(&logs_dir)?;
-    let final_path = logs_dir.join("duckle_metrics.prom");
-    let tmp_path = logs_dir.join("duckle_metrics.prom.tmp");
-    std::fs::write(&tmp_path, &out)?;
-    std::fs::rename(&tmp_path, &final_path)
+    // One push per line. A `\` continuation inside a string literal keeps the
+    // indentation of the next source line, and Prometheus requires every line
+    // to begin in column zero.
+    out.push_str("# HELP duckle_metrics_pipelines Pipelines contributing a label value to this document.
+");
+    out.push_str("# TYPE duckle_metrics_pipelines gauge
+");
+    out.push_str(&format!("duckle_metrics_pipelines {}
+", loaded.len()));
+    out.push_str(&format!("# HELP {OMITTED} Pipelines left out because the label budget was reached. Alert on this being above zero: those pipelines are not being monitored.
+"));
+    out.push_str(&format!("# TYPE {OMITTED} gauge
+"));
+    out.push_str(&format!("{OMITTED} {omitted}
+"));
+    Ok(out)
 }
 
 /// Escape a value for a Prometheus label: backslash, quote, newline.
 fn escape_label(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod incomplete_record_tests {
+    use super::*;
+
+    fn result(incomplete: bool, reason: Option<&str>) -> RunResult {
+        RunResult {
+            cache_keys: Default::default(),
+            status: "ok".into(),
+            duration_ms: 1,
+            nodes: Default::default(),
+            preview: Vec::new(),
+            error: None,
+            category: None,
+            unchanged: false,
+            incomplete,
+            incomplete_reason: reason.map(str::to_string),
+            artifacts: Vec::new(),
+            artifacts_truncated: false,
+        }
+    }
+
+    /// #258: the moment the run is over, a budget stop is indistinguishable
+    /// from an ordinary success unless the RECORD says otherwise. Alerting and
+    /// the Runs tab read this history, not the RunResult that is long gone.
+    #[test]
+    fn an_incomplete_run_stays_incomplete_in_its_record() {
+        let rec = RunRecord::from_result(&result(true, Some("budget:maxRequests")), "manual");
+        assert_eq!(rec.status, "ok", "a budget stop is not a failure");
+        assert!(rec.incomplete, "but the record must not call it a plain success");
+        assert_eq!(rec.incomplete_reason.as_deref(), Some("budget:maxRequests"));
+
+        // A record written before this existed still loads, and reads as
+        // complete rather than failing to parse.
+        let old: RunRecord =
+            serde_json::from_str(r#"{"at":"2026-01-01","status":"ok","duration_ms":1,"rows":0,"node_count":1,"trigger":"manual"}"#)
+                .expect("an older record must still load");
+        assert!(!old.incomplete);
+        assert_eq!(old.incomplete_reason, None);
+    }
+
+    /// And an ordinary run is not marked, so the flag means something.
+    #[test]
+    fn an_ordinary_run_is_not_marked_incomplete() {
+        let rec = RunRecord::from_result(&result(false, None), "manual");
+        assert!(!rec.incomplete);
+        // It is skipped in the JSON entirely, so old readers see no new key.
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("incomplete"), "{json}");
+    }
 }
 
 #[cfg(test)]
@@ -254,7 +433,25 @@ mod tests {
             error: (status == "error").then(|| "Binder Error: column gone".into()),
             category: (status == "error").then(|| "schema".into()),
             assets: Vec::new(),
+            unchanged: false,
+            incomplete: false,
+            incomplete_reason: None,
         }
+    }
+
+    #[test]
+    fn the_label_budget_is_reported_rather_than_assumed() {
+        // #300 asks for bounded labels, and nothing prunes runs/. The bound is
+        // only trustworthy if hitting it is visible: a pipeline silently
+        // dropped from the metrics is a pipeline nobody is alerting on.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("runs")).unwrap();
+        append_run_record(ws.path(), "one", record("ok", 10, 1));
+        let out = render_metrics(ws.path()).unwrap();
+        assert!(out.contains("duckle_metrics_pipelines 1"), "{out}");
+        assert!(out.contains("duckle_metrics_pipelines_omitted 0"), "{out}");
+        // and the cap is a real number, not unbounded by accident
+        assert!(MAX_PIPELINE_SERIES > 0);
     }
 
     #[test]
@@ -294,4 +491,87 @@ pub fn load_run_history(workspace: &Path, pipeline_id: &str) -> Vec<RunRecord> {
         return Vec::new();
     };
     serde_json::from_str(&content).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod unchanged_persistence_tests {
+    use super::*;
+
+    fn rec(status: &str, unchanged: bool) -> RunRecord {
+        RunRecord {
+            run_id: None,
+            at: Utc::now().to_rfc3339(),
+            status: status.into(),
+            duration_ms: 5,
+            rows: 0,
+            node_count: 1,
+            trigger: "scheduled".into(),
+            unchanged,
+            error: None,
+            category: None,
+            incomplete: false,
+            incomplete_reason: None,
+            assets: Vec::new(),
+        }
+    }
+
+    /// The whole point of persisting it: once the run is over, "succeeded and
+    /// found nothing" and "succeeded and ingested" are both status ok. If the
+    /// flag does not survive the round trip, that question cannot be answered
+    /// later - which is when it is actually asked.
+    #[test]
+    fn the_flag_survives_being_written_and_read_back() {
+        let r = rec("ok", true);
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(text.contains("\"unchanged\":true"), "{text}");
+        let back: RunRecord = serde_json::from_str(&text).unwrap();
+        assert!(back.unchanged);
+        assert_eq!(back.status, "ok", "an unchanged run is still a success");
+    }
+
+    /// Records written before the flag existed must still load, or upgrading
+    /// loses a pipeline's history.
+    #[test]
+    fn a_record_from_before_this_existed_still_loads() {
+        let old = r#"{"at":"2026-01-01T00:00:00Z","status":"ok","duration_ms":5,
+                      "rows":10,"node_count":2,"trigger":"manual"}"#;
+        let back: RunRecord = serde_json::from_str(old).expect("old records must still parse");
+        assert!(!back.unchanged, "absent means it did work, which is the safe reading");
+    }
+
+    /// An unchanged run is a success, so `last_status` says 1 for it. Only the
+    /// new gauge separates a poll that is working and finding nothing from one
+    /// that is ingesting.
+    #[test]
+    fn the_metrics_separate_a_quiet_poll_from_an_ingesting_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("runs")).unwrap();
+        std::fs::write(
+            ws.join("runs").join("quiet.json"),
+            serde_json::to_string(&vec![rec("ok", false), rec("ok", true)]).unwrap(),
+        )
+        .unwrap();
+
+        write_metrics_textfile(ws).expect("write metrics");
+        let text = std::fs::read_to_string(ws.join("logs").join("duckle_metrics.prom"))
+            .expect("metrics file");
+        assert!(
+            text.contains("duckle_run_last_unchanged{pipeline=\"quiet\"} 1"),
+            "the last run was a quiet poll and nothing says so: {text}"
+        );
+        assert!(
+            text.contains("duckle_run_last_status{pipeline=\"quiet\"} 1"),
+            "and it is still a success: {text}"
+        );
+        // Counted out of "ok" so the buckets still sum to the run count.
+        assert!(
+            text.contains("duckle_runs_window{pipeline=\"quiet\",status=\"ok\"} 1"),
+            "only the ingesting run belongs in ok: {text}"
+        );
+        assert!(
+            text.contains("duckle_runs_window{pipeline=\"quiet\",status=\"unchanged\"} 1"),
+            "{text}"
+        );
+    }
 }

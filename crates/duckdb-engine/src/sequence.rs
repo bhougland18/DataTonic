@@ -1,0 +1,1761 @@
+//! #326: an ordered delta chain, and whether the next link may be applied.
+//!
+//! Some feeds are a set of independent objects and some are a chain. For a
+//! chain, discovering `D20260903.zip` is not permission to apply it: if
+//! `D20260902.zip` never arrived, applying the third delta produces a dataset
+//! that is structurally valid, reports success, and is WRONG. Nothing in the
+//! pipeline notices, because nothing was ever told the objects were ordered.
+//!
+//! ## This module is the generator, not the executor
+//!
+//! A sequence is a third slice generator, after a partition (#295) and a chunk
+//! (#306) - not a third ledger and not a second scheduler. What lives here is
+//! what a slice IS: parsing a key out of an object name, and saying which key
+//! must come before which. Whether a slice may run is one predicate on the
+//! ledger, where the concurrency and retry rules already are.
+//!
+//! ## The ledger is the only record of how far the chain got
+//!
+//! The obvious design is an accepted-position pointer plus the slices, and it
+//! is wrong: two records that must agree, whose interesting failures are
+//! exactly the disagreements - a retry that moves the ledger and not the
+//! pointer, an operator edit that moves the pointer past a slice that never
+//! ran. There is no pointer here. The position is derived by walking the
+//! slices, so it cannot disagree with them.
+//!
+//! ## Parsing is total, or it is a lie
+//!
+//! Every object that reaches the generator must produce exactly one key or a
+//! structured refusal. A skip is not a safe default here, it is the failure
+//! mode: given
+//!
+//! ```text
+//! D20260901.zip
+//! D202609O2.zip   <- a capital O where a zero belongs
+//! D20260903.zip
+//! ```
+//!
+//! a parser that skips what it cannot read reports a gap at 2026-09-02 while
+//! the file is sitting right there under a malformed name. The gap report would
+//! be true and the diagnosis it invites - "chase the publisher" - would be
+//! wrong. So a name that does not parse is an error against the object, naming
+//! the object.
+//!
+//! ## An open head is not a gap
+//!
+//! A chain is always missing its next element; that is what being at the head
+//! means. Two states that look identical to a pointer and are completely
+//! different to an operator:
+//!
+//! - nothing after the last success has been seen -> `waiting_for_next`, and
+//!   the chain is healthy as far as continuity can tell. Whether the publisher
+//!   is LATE is a freshness question (#304), not a continuity one, and this
+//!   module deliberately does not answer it.
+//! - a later object exists -> the hole is proven, immediately and without any
+//!   grace period, because something that comes after it is already here.
+
+use serde::{Deserialize, Serialize};
+
+use crate::partition::Cadence;
+
+/// How keys are ordered, and therefore what "the next one" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Order {
+    /// Calendar keys at a fixed cadence. Reuses the partition cadence rather
+    /// than declaring a second one, so `2026-02-28`'s successor is decided in
+    /// one place for the whole engine.
+    Date {
+        #[serde(default = "day")]
+        cadence: Cadence,
+    },
+    /// Monotonic integers, step one. A registry that numbers its publications
+    /// 101, 102, 103 has a gap at 102 whether or not it also has a schedule.
+    Integer,
+}
+
+fn day() -> Cadence {
+    Cadence::Day
+}
+
+impl Order {
+    /// The key that must immediately precede `key`'s successor.
+    pub fn next(self, key: &str) -> Option<String> {
+        match self {
+            Order::Date { cadence } => crate::partition::next_key(key, cadence),
+            Order::Integer => key.trim().parse::<i64>().ok()?.checked_add(1).map(|n| n.to_string()),
+        }
+    }
+
+    /// Sort order over canonical keys.
+    ///
+    /// Not string order: `9` sorts after `10` as text, which would put an
+    /// integer chain in the wrong sequence and invent gaps that are not there.
+    /// Date keys are ISO and do compare as text, which is why they are stored
+    /// that way.
+    fn rank(self, key: &str) -> Option<Rank> {
+        match self {
+            Order::Date { .. } => Some(Rank::Date(key.to_string())),
+            Order::Integer => key.trim().parse::<i64>().ok().map(Rank::Int),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    Date(String),
+    Int(i64),
+}
+
+/// A declared ordered feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SequenceDef {
+    /// Where the collection is: a directory, or an `s3://bucket/prefix`.
+    ///
+    /// Optional because the chain is defined over a list of objects, not over a
+    /// way of getting one. Supplying the list directly is what lets the whole
+    /// contract be tested without a network, and it is the seam #324's
+    /// discovery plugs into when a listing should come from somewhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// How an object's leaf name spells its key: `D{date:YYYYMMDD}.KBO.zip`.
+    pub pattern: String,
+    pub order: Order,
+    /// Whether a missing predecessor BLOCKS, or is only reported.
+    ///
+    /// Opt-in, and deliberately separate from declaring the sequence at all. A
+    /// plain watermark over an append-only stream is allowed to have gaps -
+    /// that is what a watermark means - and only the operator knows whether
+    /// this particular feed promises not to. Off, the chain is still parsed and
+    /// gaps are still reported; nothing is prevented.
+    #[serde(default)]
+    pub require_continuity: bool,
+    /// Where this generation of the chain starts: the last key that is taken as
+    /// already applied. `2026-01-01`, or `123456`, or the key of an accepted
+    /// full snapshot.
+    ///
+    /// Absent, the chain starts at the lowest key observed, whose predecessor
+    /// is then nothing. That is the workable default and it is strictly weaker:
+    /// if the listing is missing the FIRST delta, an implicit baseline cannot
+    /// know, and the chain begins one late while looking contiguous. An
+    /// explicit baseline is the only way to state where the chain should have
+    /// begun.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
+    /// Which generation this is - the id of the full snapshot that reset it.
+    ///
+    /// A feed that republishes a full snapshot starts a new chain. The old
+    /// epoch's slices stay for provenance and stop blocking, which is the
+    /// difference between an operator-recoverable system and one that needs a
+    /// state file edited by hand after every permanently missed delta.
+    ///
+    /// Authored, or derived by [`active_epoch`] from a snapshot that has been
+    /// applied. Where `snapshotPattern` is declared this is the STARTING
+    /// generation rather than the current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    /// AC5: how a full snapshot's leaf name spells its key, when the feed
+    /// publishes them - `F{date:YYYYMMDD}.KBO.zip` beside the deltas.
+    ///
+    /// A registry that issues a periodic full snapshot and daily deltas from it
+    /// is the common shape, and the snapshot is what makes the feed recoverable:
+    /// a permanently broken delta blocks every delta after it forever, and the
+    /// next authoritative full state is the way out. Without this, the way out
+    /// is an operator editing `baseline` and `epoch` by hand, which is exactly
+    /// what those fields exist to avoid.
+    ///
+    /// Read against the same `order` as the deltas, so both live on one
+    /// timeline and a snapshot can be said to supersede the deltas below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_pattern: Option<String>,
+}
+
+/// An object that produced a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Observed {
+    pub key: String,
+    pub uri: String,
+}
+
+/// Why an object produced no key.
+///
+/// Four codes rather than the single `invalid_sequence_key` the issue sketched,
+/// because the operator response differs: a mismatch is usually a discovery
+/// filter that is too wide, an invalid date is usually a typo in one
+/// publication, and a duplicate is two objects claiming to be the same delta -
+/// which is the only one of the four that is a correctness emergency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalCode {
+    /// The name does not fit the pattern at all.
+    PatternMismatch,
+    InvalidDate,
+    InvalidInteger,
+    /// Two different objects claim one link of the chain.
+    DuplicateSequenceKey,
+}
+
+impl RefusalCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefusalCode::PatternMismatch => "pattern_mismatch",
+            RefusalCode::InvalidDate => "invalid_date",
+            RefusalCode::InvalidInteger => "invalid_integer",
+            RefusalCode::DuplicateSequenceKey => "duplicate_sequence_key",
+        }
+    }
+}
+
+/// An object that could not produce exactly one key.
+///
+/// Machine-readable on purpose: the point of the totality contract is that a
+/// malformed name is diagnosable without reading a log, so the code, the object
+/// and the pattern it was measured against all travel together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Refusal {
+    pub code: RefusalCode,
+    pub uri: String,
+    pub expected_pattern: String,
+    pub detail: String,
+}
+
+/// What the selected objects turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reading {
+    /// Ascending by key.
+    pub items: Vec<Observed>,
+    pub refusals: Vec<Refusal>,
+    /// AC5: the full snapshots in the same listing, ascending by key.
+    ///
+    /// Kept apart from `items` rather than mixed in, because a snapshot is a
+    /// different kind of object: it depends on nothing, it supersedes what came
+    /// before it, and treating it as one more link would put it in a chain it
+    /// is meant to restart.
+    pub snapshots: Vec<Observed>,
+}
+
+/// One link of the chain: a key, and what must come before it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Link {
+    pub key: String,
+    /// The key that must have succeeded first. `None` only for the first link
+    /// of an epoch, whose predecessor is the baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<String>,
+    /// The object, when one was observed. Absent means the chain requires this
+    /// key and nothing published it - the hole itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
+impl Link {
+    /// Whether this link is a hole rather than a publication.
+    pub fn is_missing(&self) -> bool {
+        self.uri.is_none()
+    }
+}
+
+/// Why the chain cannot proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    /// A required key was never published, and a later one was.
+    SequenceGap,
+    /// A required key was published and its slice has not succeeded.
+    PredecessorFailed,
+}
+
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reason::SequenceGap => "sequence_gap",
+            Reason::PredecessorFailed => "predecessor_failed",
+        }
+    }
+}
+
+/// Where the chain has got to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Verdict {
+    #[serde(flatten)]
+    pub state: Status,
+    /// The highest key applied contiguously from the baseline. `None` means
+    /// nothing has been applied in this epoch yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Status {
+    /// Every observed key has been applied, contiguously.
+    Complete,
+    /// The chain is healthy and not finished: the next required key is not
+    /// applied yet, and nothing after it proves a hole.
+    #[serde(rename_all = "camelCase")]
+    WaitingForNext {
+        expected: String,
+        /// Whether that key has actually been published.
+        ///
+        /// The distinction an operator needs and a position pointer cannot
+        /// make: `false` means the publisher has not released it, which is a
+        /// freshness question (#304); `true` means it is here and Duckle has
+        /// not applied it yet, which is ordinary pending work. Reporting both
+        /// as "waiting" would send someone to chase a publisher who has
+        /// already delivered.
+        observed: bool,
+    },
+    /// A later key exists, so the hole is proven.
+    #[serde(rename_all = "camelCase")]
+    Blocked {
+        expected: String,
+        /// The published key that is waiting behind `expected`. Always present
+        /// for a gap - it is what proves one - and absent when the head itself
+        /// failed and nothing after it has arrived.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_observed: Option<String>,
+        reason: Reason,
+    },
+}
+
+/// A pattern with exactly one placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Compiled {
+    prefix: String,
+    suffix: String,
+    slot: Slot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Slot {
+    /// `{date:YYYYMMDD}` - a format of `YYYY`/`MM`/`DD`/`HH` tokens and
+    /// literals.
+    Date(String),
+    /// `{seq}` - digits.
+    Seq,
+}
+
+/// Read a pattern.
+///
+/// Exactly one placeholder is required, and more than one is refused rather
+/// than resolved: two variables in a name make it ambiguous which one orders
+/// the chain, and guessing would put the sequence silently in the wrong order.
+fn compile(pattern: &str) -> Result<Compiled, String> {
+    let open = pattern.find('{');
+    let close = pattern.find('}');
+    let (open, close) = match (open, close) {
+        (Some(o), Some(c)) if c > o => (o, c),
+        _ => {
+            return Err(format!(
+                "the sequence pattern {pattern:?} has no placeholder. It needs exactly one \
+                 {{date:YYYYMMDD}} or {{seq}}, which is the part that orders the chain."
+            ))
+        }
+    };
+    let rest = &pattern[close + 1..];
+    if rest.contains('{') {
+        return Err(format!(
+            "the sequence pattern {pattern:?} has more than one placeholder. Exactly one orders \
+             the chain; with two it is not defined which."
+        ));
+    }
+    let inner = &pattern[open + 1..close];
+    let slot = match inner {
+        "seq" => Slot::Seq,
+        _ => match inner.strip_prefix("date:") {
+            Some(fmt) if !fmt.is_empty() => Slot::Date(fmt.to_string()),
+            _ => {
+                return Err(format!(
+                    "the sequence placeholder {{{inner}}} is not one I know. Use {{seq}} for an \
+                     integer or {{date:YYYYMMDD}} for a date."
+                ))
+            }
+        },
+    };
+    Ok(Compiled {
+        prefix: pattern[..open].to_string(),
+        suffix: rest.to_string(),
+        slot,
+    })
+}
+
+/// The object's leaf name - what the pattern describes.
+fn leaf(uri: &str) -> &str {
+    let cut = uri.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    &uri[cut..]
+}
+
+/// Pull the key text out of a name, or say it did not match.
+fn capture<'a>(c: &Compiled, name: &'a str) -> Option<&'a str> {
+    let text = name.strip_prefix(&c.prefix)?.strip_suffix(&c.suffix)?;
+    (!text.is_empty()).then_some(text)
+}
+
+/// `YYYYMMDD` against `20260901` - fixed-width fields and literals.
+///
+/// Written out rather than translated into a strftime, because the interesting
+/// part is the refusal: a scanner that knows it wanted two digits and got `O2`
+/// can say so, and a format-string parse can only say the whole thing failed.
+fn read_date(text: &str, fmt: &str, cadence: Cadence) -> Result<String, String> {
+    let (mut year, mut month, mut day, mut hour) = (None, 1u32, 1u32, 0u32);
+    let (f, t) = (fmt.as_bytes(), text.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < f.len() {
+        let token = [(&b"YYYY"[..], 4u32), (&b"MM"[..], 2), (&b"DD"[..], 2), (&b"HH"[..], 2)]
+            .into_iter()
+            .find(|(tok, _)| f[i..].starts_with(tok));
+        let Some((tok, width)) = token else {
+            // A literal in the format must be a literal in the text.
+            if j >= t.len() || t[j] != f[i] {
+                return Err(format!(
+                    "{text:?} does not match the date format {fmt:?} at character {}",
+                    j + 1
+                ));
+            }
+            i += 1;
+            j += 1;
+            continue;
+        };
+        let width = width as usize;
+        if j + width > t.len() {
+            return Err(format!("{text:?} is too short for the date format {fmt:?}"));
+        }
+        let field = std::str::from_utf8(&t[j..j + width])
+            .map_err(|_| format!("{text:?} is not text at character {}", j + 1))?;
+        let value: u32 = field.parse().map_err(|_| {
+            format!("{field:?} in {text:?} is not a number, and {fmt:?} wants one there")
+        })?;
+        match tok {
+            b"YYYY" => year = Some(value as i32),
+            b"MM" => month = value,
+            b"DD" => day = value,
+            _ => hour = value,
+        }
+        i += tok.len();
+        j += width;
+    }
+    if j != t.len() {
+        return Err(format!("{text:?} has characters the date format {fmt:?} does not describe"));
+    }
+    let year = year.ok_or_else(|| format!("the date format {fmt:?} has no YYYY, so it names no year"))?;
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .ok_or_else(|| format!("{year:04}-{month:02}-{day:02} is not a date"))?;
+    crate::partition::key_of(date, hour, cadence)
+        .ok_or_else(|| format!("{text:?} does not name a {cadence:?} slice"))
+}
+
+fn read_int(text: &str) -> Result<String, String> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{text:?} is not a whole number"));
+    }
+    // Canonical decimal, so `007` and `7` are the same link rather than two.
+    text.parse::<i64>()
+        .map(|n| n.to_string())
+        .map_err(|_| format!("{text:?} does not fit in a sequence number"))
+}
+
+/// Read every selected object: a key each, or a refusal each.
+///
+/// Objects are assumed already filtered by discovery. Louis's framing on the
+/// issue, and it is what makes totality affordable: unrelated files in the same
+/// directory are removed by the include/exclude the listing already has, so
+/// everything that reaches here is CLAIMED to be part of the sequence, and a
+/// name that then does not parse is a real problem rather than a neighbour.
+pub fn read(def: &SequenceDef, uris: &[String]) -> Result<Reading, String> {
+    let c = compile(&def.pattern)?;
+    // AC5: a full snapshot is measured against its OWN pattern, and first. It is
+    // a different kind of object, so letting the delta pattern have it would
+    // report the feed's recovery point as a malformed delta.
+    let snap = def.snapshot_pattern.as_deref().map(compile).transpose()?;
+    let mut out = Reading::default();
+    // key -> the uri that claimed it, to catch two objects claiming one delta.
+    let mut claimed: std::collections::BTreeMap<String, String> = Default::default();
+    // Snapshots claim their own keys: a snapshot and a delta for the same key
+    // are two different statements about that key, not a duplicate.
+    let mut snap_claimed: std::collections::BTreeMap<String, String> = Default::default();
+    for uri in uris {
+        let name = leaf(uri);
+        if let Some(sc) = &snap {
+            if let Some(text) = capture(sc, name) {
+                let pattern = def.snapshot_pattern.clone().unwrap_or_default();
+                match read_slot(&sc.slot, def.order, text) {
+                    Ok(key) => match snap_claimed.get(&key) {
+                        Some(first) if first == uri => {}
+                        Some(first) => out.refusals.push(Refusal {
+                            code: RefusalCode::DuplicateSequenceKey,
+                            uri: uri.clone(),
+                            expected_pattern: pattern,
+                            detail: format!("{key} is already claimed by {first}"),
+                        }),
+                        None => {
+                            snap_claimed.insert(key.clone(), uri.clone());
+                            out.snapshots.push(Observed { key, uri: uri.clone() });
+                        }
+                    },
+                    Err(detail) => out.refusals.push(Refusal {
+                        code: slot_refusal(&sc.slot, def.order),
+                        uri: uri.clone(),
+                        expected_pattern: pattern,
+                        detail,
+                    }),
+                }
+                continue;
+            }
+        }
+        let Some(text) = capture(&c, name) else {
+            out.refusals.push(Refusal {
+                code: RefusalCode::PatternMismatch,
+                uri: uri.clone(),
+                expected_pattern: def.pattern.clone(),
+                detail: format!("{name:?} does not match the sequence pattern"),
+            });
+            continue;
+        };
+        let key = match read_slot(&c.slot, def.order, text) {
+            Ok(k) => k,
+            Err(detail) => {
+                out.refusals.push(Refusal {
+                    code: slot_refusal(&c.slot, def.order),
+                    uri: uri.clone(),
+                    expected_pattern: def.pattern.clone(),
+                    detail,
+                });
+                continue;
+            }
+        };
+        match claimed.get(&key) {
+            // The same listing returned twice is not a conflict.
+            Some(first) if first == uri => continue,
+            Some(first) => {
+                out.refusals.push(Refusal {
+                    code: RefusalCode::DuplicateSequenceKey,
+                    uri: uri.clone(),
+                    expected_pattern: def.pattern.clone(),
+                    detail: format!("{key} is already claimed by {first}"),
+                });
+                continue;
+            }
+            None => {
+                claimed.insert(key.clone(), uri.clone());
+                out.items.push(Observed { key, uri: uri.clone() });
+            }
+        }
+    }
+    // Ascending by VALUE, so an integer chain is not ordered as text.
+    let mut ranked: Vec<(Rank, Observed)> = Vec::with_capacity(out.items.len());
+    for item in std::mem::take(&mut out.items) {
+        let rank = def
+            .order
+            .rank(&item.key)
+            .ok_or_else(|| format!("{} is not orderable, which should be impossible", item.key))?;
+        ranked.push((rank, item));
+    }
+    ranked.sort_by(|a, b| a.0.cmp(&b.0));
+    out.items = ranked.into_iter().map(|(_, i)| i).collect();
+    // Snapshots share the timeline, so they are ranked the same way: "the
+    // newest applied snapshot" has to mean newest by VALUE.
+    let mut ranked_snaps: Vec<(Rank, Observed)> = Vec::with_capacity(out.snapshots.len());
+    for item in std::mem::take(&mut out.snapshots) {
+        let rank = def.order.rank(&item.key).ok_or_else(|| {
+            format!("{} is not orderable, which should be impossible", item.key)
+        })?;
+        ranked_snaps.push((rank, item));
+    }
+    ranked_snaps.sort_by(|a, b| a.0.cmp(&b.0));
+    out.snapshots = ranked_snaps.into_iter().map(|(_, i)| i).collect();
+    Ok(out)
+}
+
+/// AC5: the generation the chain is actually in, given what has been applied.
+///
+/// A full snapshot is a complete state, so once one has been APPLIED the deltas
+/// below it are superseded: they cannot block, and re-running them would undo
+/// work. This returns the definition rebased on the newest such snapshot, which
+/// is the whole reset - `chain` already drops keys below the baseline and
+/// `slices` already drops the requirement that names it.
+///
+/// **Applied, not published.** A snapshot sitting in the listing has proved
+/// nothing. Rebasing on it would skip every delta between the old baseline and
+/// the snapshot while nobody had loaded the snapshot itself, which is silent
+/// data loss dressed as a recovery.
+///
+/// The old epoch is not touched. Its slices keep their own epoch id and stay as
+/// provenance, which is why this returns a new definition rather than editing
+/// anything: there is no plan to reinterpret.
+pub fn active_epoch(
+    def: &SequenceDef,
+    reading: &Reading,
+    state_of: impl Fn(&str) -> Option<crate::backfill::State>,
+) -> SequenceDef {
+    let applied = reading
+        .snapshots
+        .iter()
+        .rev()
+        .find(|s| state_of(&s.key) == Some(crate::backfill::State::Succeeded));
+    match applied {
+        Some(s) => SequenceDef {
+            baseline: Some(s.key.clone()),
+            epoch: Some(s.key.clone()),
+            ..def.clone()
+        },
+        None => def.clone(),
+    }
+}
+
+/// AC5: one slice per published full snapshot, so it can be run.
+///
+/// A snapshot **requires nothing**. That is the point: the chain it replaces is
+/// blocked precisely when a delta has failed permanently, and a recovery point
+/// that inherited that block would be no recovery at all.
+///
+/// Each snapshot is recorded in the epoch it ANCHORS - its own key - rather than
+/// in the epoch that was current when it was planned. That keeps the question
+/// "has the snapshot that opens epoch F2 been applied" answerable by looking in
+/// epoch F2, instead of having to know which generation happened to plan it.
+pub fn snapshot_slices(
+    def: &SequenceDef,
+    pipeline: &str,
+    release: Option<&str>,
+    reading: &Reading,
+) -> Vec<crate::backfill::PartitionRun> {
+    use crate::backfill::{occurrence_id, PartitionRun, State};
+    let _ = def;
+    reading
+        .snapshots
+        .iter()
+        .map(|s| {
+            let mut params = std::collections::BTreeMap::new();
+            params.insert("sequence_key".to_string(), s.key.clone());
+            params.insert("sequence_object".to_string(), s.uri.clone());
+            params.insert("sequence_epoch".to_string(), s.key.clone());
+            // Provenance: which of the two kinds of object this run applied.
+            // A consumer that treats a full snapshot as a delta would append a
+            // complete state onto the state it replaces.
+            params.insert("sequence_kind".to_string(), "snapshot".to_string());
+            PartitionRun {
+                occurrence: Some(occurrence_id(
+                    pipeline,
+                    &format!("sequence:{}:{}", s.key, s.key),
+                    release,
+                    None,
+                )),
+                key: s.key.clone(),
+                state: State::Requested,
+                run_id: None,
+                attempts: 0,
+                error: None,
+                finished_at: None,
+                params,
+                predicate: None,
+                artifact: None,
+                requires: None,
+                source_uri: Some(s.uri.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Turn a captured slot into a key, or say why it is not one.
+///
+/// Shared by the delta pattern and the snapshot pattern so the two cannot come
+/// to disagree about what `{date:YYYYMMDD}` means in the same feed.
+fn read_slot(slot: &Slot, order: Order, text: &str) -> Result<String, String> {
+    match (slot, order) {
+        (Slot::Date(fmt), Order::Date { cadence }) => read_date(text, fmt, cadence),
+        (Slot::Seq, Order::Integer) => read_int(text),
+        (Slot::Date(_), Order::Integer) => Err(
+            "the pattern reads a date and the sequence is ordered by integer. Use {seq}, or \
+             order the sequence by date."
+                .to_string(),
+        ),
+        (Slot::Seq, Order::Date { .. }) => Err(
+            "the pattern reads an integer and the sequence is ordered by date. Use \
+             {date:YYYYMMDD}, or order the sequence by integer."
+                .to_string(),
+        ),
+    }
+}
+
+/// Which refusal a failed [`read_slot`] is.
+fn slot_refusal(slot: &Slot, order: Order) -> RefusalCode {
+    match (slot, order) {
+        (Slot::Date(_), Order::Date { .. }) => RefusalCode::InvalidDate,
+        (Slot::Seq, Order::Integer) => RefusalCode::InvalidInteger,
+        // A pattern that cannot produce the declared order is a definition
+        // error, not a bad object; it is reported per object because that is
+        // where it is noticed.
+        _ => RefusalCode::PatternMismatch,
+    }
+}
+
+/// How far a chain may be expanded before it is called a definition error.
+///
+/// A baseline a million links behind the first observed object is not a chain
+/// with a large gap, it is a wrong baseline, and expanding it would build a
+/// vector until the process died. The same guard `partition::generate` uses,
+/// for the same reason.
+pub const MAX_LINKS: usize = 200_000;
+
+/// Every link from the baseline up to the highest observed key.
+///
+/// Missing keys are MATERIALISED as links with no object, because a hole has to
+/// be nameable to be reported: "expected 2026-09-02" is only sayable if the
+/// walk produced 2026-09-02 as a thing that ought to exist.
+///
+/// Keys below the baseline are dropped. That is the epoch rule: a full snapshot
+/// resets the chain, and the deltas it superseded must stop blocking without
+/// being deleted from history.
+pub fn chain(def: &SequenceDef, items: &[Observed]) -> Result<Vec<Link>, String> {
+    let Some(last) = items.last() else {
+        return Ok(Vec::new());
+    };
+    let top = def
+        .order
+        .rank(&last.key)
+        .ok_or_else(|| format!("{} is not orderable", last.key))?;
+
+    // The first key this epoch requires: the successor of the baseline, or the
+    // lowest thing actually seen.
+    let (start, mut predecessor) = match &def.baseline {
+        Some(base) => {
+            let base = base.trim();
+            let next = def.order.next(base).ok_or_else(|| {
+                format!("the sequence baseline {base:?} is not a key this order can advance")
+            })?;
+            (next, Some(base.to_string()))
+        }
+        None => (items[0].key.clone(), None),
+    };
+
+    let observed: std::collections::BTreeMap<&str, &str> =
+        items.iter().map(|i| (i.key.as_str(), i.uri.as_str())).collect();
+
+    let mut out = Vec::new();
+    let mut key = start;
+    loop {
+        let rank = def
+            .order
+            .rank(&key)
+            .ok_or_else(|| format!("{key} is not orderable"))?;
+        if rank > top {
+            break;
+        }
+        out.push(Link {
+            key: key.clone(),
+            predecessor: predecessor.clone(),
+            uri: observed.get(key.as_str()).map(|u| u.to_string()),
+        });
+        if out.len() >= MAX_LINKS {
+            return Err(format!(
+                "the chain from {start:?} to {} is longer than {MAX_LINKS} links. That is a \
+                 baseline far behind the data rather than a gap; set the baseline to where this \
+                 generation of the chain actually starts.",
+                last.key,
+                start = out[0].key
+            ));
+        }
+        predecessor = Some(key.clone());
+        key = def
+            .order
+            .next(&key)
+            .ok_or_else(|| format!("{key} has no successor, so the chain cannot be walked"))?;
+    }
+    Ok(out)
+}
+
+/// Where the chain has got to, given which keys have succeeded.
+///
+/// `succeeded` answers "has the slice for this key been applied". It is a
+/// closure rather than a set so the caller can consult the ledger directly -
+/// there is no second copy of the position to fall out of step with.
+pub fn verdict(
+    links: &[Link],
+    state_of: impl Fn(&str) -> Option<crate::backfill::State>,
+) -> Verdict {
+    use crate::backfill::State;
+    // The position is the contiguous run of successes from the start, which is
+    // derived rather than stored: it cannot disagree with the slices because it
+    // IS the slices.
+    let applied =
+        links.iter().take_while(|l| state_of(&l.key) == Some(State::Succeeded)).count();
+    let position = applied.checked_sub(1).map(|i| links[i].key.clone());
+
+    let Some(next) = links.get(applied) else {
+        return Verdict { state: Status::Complete, position };
+    };
+    // Only an OBSERVED later object proves a hole; a materialised hole is
+    // another way of saying the same key is missing.
+    let later = links[applied + 1..].iter().find(|l| !l.is_missing()).map(|l| l.key.clone());
+
+    // Three cases, and the reason they are three is that a state pointer
+    // reports them identically while an operator has to do something different
+    // about each. Deciding this on a boolean "has it succeeded" cannot work: a
+    // link that is published and has not started yet reads the same as one that
+    // failed, and calling the first blocked sends someone to retry a slice that
+    // was never asked to run.
+    let state = match (next.is_missing(), state_of(&next.key), later) {
+        // A hole with something after it. Proven immediately, no grace period.
+        (true, _, Some(next_observed)) => Status::Blocked {
+            expected: next.key.clone(),
+            next_observed: Some(next_observed),
+            reason: Reason::SequenceGap,
+        },
+        // A hole at the head. Not a gap: the publisher may simply not have
+        // released it, and whether that is LATE is #304's question.
+        (true, _, None) => {
+            Status::WaitingForNext { expected: next.key.clone(), observed: false }
+        }
+        // Published and it failed. Blocked until someone retries it, whether or
+        // not anything after it has arrived.
+        (false, Some(State::Failed | State::Interrupted), later) => Status::Blocked {
+            expected: next.key.clone(),
+            next_observed: later,
+            reason: Reason::PredecessorFailed,
+        },
+        // Published and simply not applied yet. Ordinary pending work.
+        (false, _, _) => Status::WaitingForNext { expected: next.key.clone(), observed: true },
+    };
+    Verdict { state, position }
+}
+
+/// The sequence definition a pipeline document declares, if any.
+pub fn of(doc: &serde_json::Value) -> Option<SequenceDef> {
+    serde_json::from_value(doc.get("sequence")?.clone()).ok()
+}
+
+/// Every object in the collection, unfiltered.
+///
+/// Listing only. Nothing here decides what is part of the sequence - that is
+/// the pattern's job, and a name that does not match becomes a refusal rather
+/// than being quietly dropped, which is the whole totality contract.
+///
+/// `props` carries S3 credentials when the URI is an `s3://` one; it is the
+/// sequence block itself, so a saved connection merged onto it and keys typed
+/// in by hand arrive identically.
+///
+/// One directory, not a walk. A delta chain is published into one prefix, and
+/// recursing would pull in an archive subdirectory of superseded generations -
+/// which, under a totality contract, becomes a wall of duplicate-key refusals
+/// rather than a silent inclusion.
+pub fn collect(uri: &str, props: &serde_json::Value) -> Result<Vec<String>, String> {
+    if let Some(rest) = uri.strip_prefix("s3://").or_else(|| uri.strip_prefix("s3a://")) {
+        let _ = rest;
+        let cfg = crate::s3::S3Config::from_props(props).ok_or_else(|| {
+            format!(
+                "{uri} needs S3 credentials on the sequence block - an access key and secret, or \
+                 a saved connection"
+            )
+        })?;
+        let (bucket, prefix) = crate::s3::parse_s3_uri(uri).map_err(|e| e.to_string())?;
+        // The same cap the listing source uses, so a prefix holding years of
+        // drops is bounded work rather than an unbounded walk.
+        let objects = cfg.list(&bucket, &prefix, 10_000).map_err(|e| e.to_string())?;
+        return Ok(objects
+            .into_iter()
+            .map(|o| format!("s3://{bucket}/{}", o.key))
+            .filter(|u| !u.ends_with('/'))
+            .collect());
+    }
+    let dir = std::path::Path::new(uri.strip_prefix("file://").unwrap_or(uri));
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        // Forward slashes, as `backfill::commit` does for the same reason: a
+        // URI that reads `./drops\D20260901.zip` on Windows and
+        // `./drops/D20260901.zip` on Linux is the same object under two names,
+        // and it lands in provenance either way.
+        out.push(entry.path().display().to_string().replace(char::from(92), "/"));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Turn a chain into ledger slices.
+///
+/// One slice per PUBLISHED link. A hole gets no slice, because there is nothing
+/// to run: it is represented by the requirement its successor carries, which is
+/// what makes an absent predecessor block instead of quietly passing. The hole
+/// is still nameable - [`verdict`] reports it - it just is not a unit of work.
+///
+/// `requires` is only set when the definition asked for continuity. Without it
+/// the same links are planned and nothing blocks: a plain feed is allowed to
+/// have gaps, and `xf.incremental` keeps the semantics it has.
+pub fn slices(
+    def: &SequenceDef,
+    pipeline: &str,
+    release: Option<&str>,
+    links: &[Link],
+) -> Vec<crate::backfill::PartitionRun> {
+    use crate::backfill::{occurrence_id, PartitionRun, State};
+    links
+        .iter()
+        .filter(|l| !l.is_missing())
+        .map(|l| {
+            let mut params = std::collections::BTreeMap::new();
+            params.insert("sequence_key".to_string(), l.key.clone());
+            if let Some(uri) = &l.uri {
+                params.insert("sequence_object".to_string(), uri.clone());
+            }
+            // Provenance, per acceptance criterion 6: the key, the key that had
+            // to come first, and the object. The producing run and the
+            // resulting position are the ledger's own, already.
+            if let Some(prev) = &l.predecessor {
+                params.insert("sequence_previous".to_string(), prev.clone());
+            }
+            if let Some(epoch) = &def.epoch {
+                params.insert("sequence_epoch".to_string(), epoch.clone());
+            }
+            PartitionRun {
+                occurrence: Some(occurrence_id(
+                    pipeline,
+                    &format!("sequence:{}:{}", def.epoch.as_deref().unwrap_or(""), l.key),
+                    release,
+                    None,
+                )),
+                key: l.key.clone(),
+                state: State::Requested,
+                run_id: None,
+                attempts: 0,
+                error: None,
+                finished_at: None,
+                params,
+                predicate: None,
+                artifact: None,
+                // "predecessor succeeded OR predecessor == the accepted
+                // baseline". The baseline has no slice - it is what the epoch
+                // starts FROM, already applied - so requiring it would block
+                // the first link of every chain forever. Dropping the
+                // requirement is how the second half of the rule is expressed.
+                requires: def
+                    .require_continuity
+                    .then(|| l.predecessor.clone())
+                    .flatten()
+                    .filter(|prev| Some(prev.as_str()) != def.baseline.as_deref()),
+                source_uri: l.uri.clone(),
+            }
+        })
+        .collect()
+}
+
+/// What this workspace has done with each key of a chain.
+///
+/// Read from the ledgers, because they ARE the record of progression - there is
+/// no pointer to consult and therefore none to disagree with. Scoped to the
+/// epoch, so a chain reset by a new full snapshot is not credited with the old
+/// generation's successes, and the old generation's slices stay for provenance
+/// without counting towards the new one.
+///
+/// The STATE, not a "did it succeed" flag. A link that failed and one that has
+/// not been asked to run yet are both "not succeeded" and call for opposite
+/// responses - retry it, or wait - so collapsing them here would make the two
+/// unrecoverable further up.
+pub fn ledger_states(
+    workspace: &std::path::Path,
+    pipeline: &str,
+    epoch: Option<&str>,
+) -> std::collections::BTreeMap<String, crate::backfill::State> {
+    let mut out = std::collections::BTreeMap::new();
+    for b in crate::backfill::list(workspace)
+        .into_iter()
+        .filter(|b| b.kind == crate::backfill::Kind::Sequence && b.pipeline == pipeline)
+        .filter(|b| b.epoch.as_deref() == epoch)
+    {
+        for p in b.partitions {
+            // Ledgers come newest first, and a later ledger for the same epoch
+            // supersedes an earlier one - but a success anywhere stands: the
+            // work was done, and a re-plan that has not run yet must not
+            // un-apply it.
+            match out.get(&p.key) {
+                Some(crate::backfill::State::Succeeded) => {}
+                _ => {
+                    out.insert(p.key, p.state);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Everything a caller wants to know about one chain, in one pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Report {
+    #[serde(flatten)]
+    pub verdict: Verdict,
+    /// Whether a hole actually stops work, or is only being reported.
+    pub require_continuity: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
+    pub links: Vec<Link>,
+    /// Objects that could not produce a key. Never empty-by-omission: an empty
+    /// list means every selected object parsed, not that nothing was checked.
+    pub refusals: Vec<Refusal>,
+    /// AC5: the full snapshots this feed publishes, ascending. Each one is a
+    /// recovery point - the epoch it would anchor is its own key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<Observed>,
+}
+
+/// Read a pipeline's chain and say where it stands.
+///
+/// `state_of` answers "what happened to this key", which the caller takes from
+/// the ledger. Passed in rather than looked up here so there is exactly one
+/// record of progression - the slices - and this cannot form a second opinion
+/// about it.
+pub fn report(
+    def: &SequenceDef,
+    props: &serde_json::Value,
+    state_of: impl Fn(&str) -> Option<crate::backfill::State>,
+) -> Result<Report, String> {
+    let reading = survey(def, props)?;
+    report_from(def, reading, state_of)
+}
+
+/// List the collection and read it, without judging it.
+///
+/// Split from [`report`] because AC5 needs the snapshots BEFORE it can say which
+/// epoch the chain is in, and the epoch decides which ledger the verdict must be
+/// read against. Listing twice to answer that would be two listings that can
+/// disagree.
+pub fn survey(def: &SequenceDef, props: &serde_json::Value) -> Result<Reading, String> {
+    let uri = def
+        .uri
+        .as_deref()
+        .ok_or("the sequence declares no `uri`, so there is no collection to list")?;
+    read(def, &collect(uri, props)?)
+}
+
+/// Where a chain stands, given a listing already read.
+pub fn report_from(
+    def: &SequenceDef,
+    reading: Reading,
+    state_of: impl Fn(&str) -> Option<crate::backfill::State>,
+) -> Result<Report, String> {
+    let links = chain(def, &reading.items)?;
+    Ok(Report {
+        verdict: verdict(&links, state_of),
+        require_continuity: def.require_continuity,
+        epoch: def.epoch.clone(),
+        baseline: def.baseline.clone(),
+        links,
+        refusals: reading.refusals,
+        snapshots: reading.snapshots,
+    })
+}
+
+/// AC5: the next full snapshot to apply, if one supersedes the active epoch.
+///
+/// A published snapshot newer than the baseline makes every delta below it
+/// redundant, so it is the next unit of work rather than something to get to
+/// after the chain it replaces - and when that chain is blocked by a permanently
+/// failed delta, it is the only unit of work left.
+///
+/// The OLDEST such snapshot, not the newest: applying them in order is what
+/// makes each one's epoch a state the workspace was actually in.
+///
+/// `snapshot_state` answers for a snapshot's own epoch, the one it anchors.
+pub fn pending_snapshot<'a>(
+    active: &SequenceDef,
+    reading: &'a Reading,
+    snapshot_state: impl Fn(&str) -> Option<crate::backfill::State>,
+) -> Option<&'a Observed> {
+    let floor = active.baseline.as_deref();
+    reading.snapshots.iter().find(|s| {
+        let newer = match floor {
+            Some(b) => active.order.rank(&s.key) > active.order.rank(b),
+            None => true,
+        };
+        newer && snapshot_state(&s.key) != Some(crate::backfill::State::Succeeded)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dated(pattern: &str) -> SequenceDef {
+        SequenceDef {
+            uri: None,
+            pattern: pattern.to_string(),
+            order: Order::Date { cadence: Cadence::Day },
+            require_continuity: true,
+            baseline: None,
+            epoch: None,
+            snapshot_pattern: None,
+        }
+    }
+
+    fn ints(pattern: &str) -> SequenceDef {
+        SequenceDef { order: Order::Integer, ..dated(pattern) }
+    }
+
+    fn uris(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| format!("s3://reg/{n}")).collect()
+    }
+
+    /// The ledger view the tests need: these keys succeeded, nothing else ran.
+    fn done<'a>(keys: &'a [&'a str]) -> impl Fn(&str) -> Option<crate::backfill::State> + 'a {
+        move |k| keys.contains(&k).then_some(crate::backfill::State::Succeeded)
+    }
+
+    /// A ledger where some keys succeeded and one FAILED, which is a different
+    /// thing from not having run.
+    fn done_and_failed<'a>(
+        ok: &'a [&'a str],
+        failed: &'a str,
+    ) -> impl Fn(&str) -> Option<crate::backfill::State> + 'a {
+        move |k| match () {
+            _ if ok.contains(&k) => Some(crate::backfill::State::Succeeded),
+            _ if k == failed => Some(crate::backfill::State::Failed),
+            _ => None,
+        }
+    }
+
+    fn keys(r: &Reading) -> Vec<&str> {
+        r.items.iter().map(|i| i.key.as_str()).collect()
+    }
+
+    #[test]
+    fn a_dated_chain_reads_in_order() {
+        let def = dated("D{date:YYYYMMDD}.KBO.zip");
+        let r = read(&def, &uris(&["D20260903.KBO.zip", "D20260901.KBO.zip", "D20260902.KBO.zip"]))
+            .expect("a reading");
+        assert_eq!(keys(&r), ["2026-09-01", "2026-09-02", "2026-09-03"]);
+        assert!(r.refusals.is_empty(), "{:?}", r.refusals);
+    }
+
+    /// The failure this whole module exists to prevent.
+    #[test]
+    fn a_malformed_name_is_an_error_and_not_a_gap() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        // A capital O where a zero belongs.
+        let r = read(&def, &uris(&["D20260901.zip", "D202609O2.zip", "D20260903.zip"])).unwrap();
+        assert_eq!(keys(&r), ["2026-09-01", "2026-09-03"]);
+        assert_eq!(r.refusals.len(), 1, "the typo must be reported, not skipped");
+        let bad = &r.refusals[0];
+        assert_eq!(bad.code, RefusalCode::InvalidDate);
+        assert!(bad.uri.ends_with("D202609O2.zip"), "it names the object: {}", bad.uri);
+        assert_eq!(bad.expected_pattern, "D{date:YYYYMMDD}.zip");
+        assert!(bad.detail.contains("O2"), "it names what failed: {}", bad.detail);
+    }
+
+    #[test]
+    fn every_way_an_object_can_fail_is_named() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let r = read(
+            &def,
+            &[
+                "s3://reg/D20260901.zip".to_string(),
+                "s3://reg/notes.txt".to_string(),
+                "s3://reg/D20260230.zip".to_string(),
+                // A second object claiming a delta that is already claimed.
+                "s3://reg/copy/D20260901.zip".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(keys(&r), ["2026-09-01"]);
+        let codes: Vec<&str> = r.refusals.iter().map(|f| f.code.as_str()).collect();
+        assert_eq!(codes, ["pattern_mismatch", "invalid_date", "duplicate_sequence_key"]);
+        assert!(
+            r.refusals[1].detail.contains("2026-02-30"),
+            "February has no 30th, and it says so: {}",
+            r.refusals[1].detail
+        );
+    }
+
+    #[test]
+    fn the_same_object_listed_twice_is_not_a_duplicate() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let same = "s3://reg/D20260901.zip".to_string();
+        let r = read(&def, &[same.clone(), same]).unwrap();
+        assert_eq!(keys(&r), ["2026-09-01"]);
+        assert!(r.refusals.is_empty(), "a repeated listing is not a conflict: {:?}", r.refusals);
+    }
+
+    #[test]
+    fn integers_order_by_value_and_not_as_text() {
+        let def = ints("f-{seq}.json");
+        let r = read(&def, &uris(&["f-10.json", "f-9.json", "f-11.json"])).unwrap();
+        assert_eq!(keys(&r), ["9", "10", "11"], "9 comes before 10");
+        // Leading zeros name the same link, so they are a duplicate.
+        let r = read(&def, &uris(&["f-007.json", "f-7.json"])).unwrap();
+        assert_eq!(keys(&r), ["7"]);
+        assert_eq!(r.refusals[0].code, RefusalCode::DuplicateSequenceKey);
+    }
+
+    #[test]
+    fn a_pattern_must_have_exactly_one_placeholder() {
+        assert!(read(&dated("D.zip"), &[]).is_err(), "no placeholder");
+        assert!(read(&dated("{date:YYYY}-{seq}.zip"), &[]).is_err(), "two placeholders");
+        assert!(read(&dated("D{when}.zip"), &[]).is_err(), "an unknown placeholder");
+        assert!(read(&dated("D{date:YYYYMMDD}.zip"), &[]).is_ok());
+    }
+
+    #[test]
+    fn a_pattern_that_disagrees_with_the_order_is_refused_per_object() {
+        let def = SequenceDef { order: Order::Integer, ..dated("D{date:YYYYMMDD}.zip") };
+        let r = read(&def, &uris(&["D20260901.zip"])).unwrap();
+        assert!(r.items.is_empty());
+        assert_eq!(r.refusals[0].code, RefusalCode::PatternMismatch);
+        assert!(r.refusals[0].detail.contains("{seq}"), "{}", r.refusals[0].detail);
+    }
+
+    #[test]
+    fn a_hole_is_materialised_so_it_can_be_named() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let r = read(&def, &uris(&["D20260901.zip", "D20260903.zip"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+        assert_eq!(
+            links.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(),
+            ["2026-09-01", "2026-09-02", "2026-09-03"]
+        );
+        assert!(links[1].is_missing(), "the 2nd was never published");
+        assert_eq!(links[2].predecessor.as_deref(), Some("2026-09-02"));
+        // With no declared baseline the first link starts the epoch.
+        assert_eq!(links[0].predecessor, None);
+    }
+
+    #[test]
+    fn a_baseline_starts_the_chain_after_it() {
+        let def = SequenceDef { baseline: Some("2026-08-31".into()), ..dated("D{date:YYYYMMDD}.zip") };
+        let r = read(&def, &uris(&["D20260901.zip", "D20260902.zip"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+        assert_eq!(links[0].key, "2026-09-01");
+        assert_eq!(
+            links[0].predecessor.as_deref(),
+            Some("2026-08-31"),
+            "the first link of an epoch answers to the baseline"
+        );
+    }
+
+    /// Acceptance criterion 5: a new full snapshot resets the chain, and the
+    /// gap in the old generation stops blocking.
+    #[test]
+    fn a_new_baseline_drops_the_superseded_deltas() {
+        let def = SequenceDef {
+            baseline: Some("2026-09-03".into()),
+            epoch: Some("F2".into()),
+            ..dated("D{date:YYYYMMDD}.zip")
+        };
+        // D02 is still in the listing and is still missing. It is before the
+        // new baseline, so it is not this epoch's problem.
+        let r = read(&def, &uris(&["D20260901.zip", "D20260903.zip", "D20260904.zip"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+        assert_eq!(links.len(), 1, "only what follows F2: {links:?}");
+        assert_eq!(links[0].key, "2026-09-04");
+        assert!(matches!(verdict(&links, done(&[])).state, Status::WaitingForNext { .. }));
+    }
+
+    #[test]
+    fn an_open_head_is_healthy_and_a_proven_hole_is_not() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+
+        // Nothing after the last success -> waiting, not blocked.
+        let r = read(&def, &uris(&["D20260901.zip"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+        let v = verdict(&links, done(&["2026-09-01"]));
+        assert_eq!(v.position.as_deref(), Some("2026-09-01"));
+        assert_eq!(v.state, Status::Complete, "everything observed is applied");
+
+        // A later object proves the hole immediately, with no grace period.
+        let r = read(&def, &uris(&["D20260901.zip", "D20260903.zip"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+        let v = verdict(&links, done(&["2026-09-01"]));
+        assert_eq!(v.position.as_deref(), Some("2026-09-01"));
+        assert_eq!(
+            v.state,
+            Status::Blocked {
+                expected: "2026-09-02".into(),
+                next_observed: Some("2026-09-03".into()),
+                reason: Reason::SequenceGap,
+            }
+        );
+    }
+
+    /// The issue's own worked example: D02 exists and failed, so D03 waits.
+    #[test]
+    fn a_failed_predecessor_blocks_and_a_retry_unblocks() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let r = read(&def, &uris(&["D20260901.zip", "D20260902.zip", "D20260903.zip"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+
+        let v = verdict(&links, done_and_failed(&["2026-09-01"], "2026-09-02"));
+        assert_eq!(v.position.as_deref(), Some("2026-09-01"), "the position stays at D01");
+        assert_eq!(
+            v.state,
+            Status::Blocked {
+                expected: "2026-09-02".into(),
+                next_observed: Some("2026-09-03".into()),
+                // D02 is present, so this is a failure and not a missing file.
+                reason: Reason::PredecessorFailed,
+            }
+        );
+
+        // Retrying D02 successfully makes D03 eligible - acceptance criterion 4.
+        let v = verdict(&links, done(&["2026-09-01", "2026-09-02"]));
+        assert_eq!(v.position.as_deref(), Some("2026-09-02"));
+        assert_eq!(
+            v.state,
+            Status::WaitingForNext { expected: "2026-09-03".into(), observed: true },
+            "D03 is here and has not run - not a publisher problem"
+        );
+    }
+
+    /// Acceptance criterion 3, and the one property that must not be got wrong.
+    ///
+    /// A later slice succeeding does NOT move the position past a predecessor
+    /// that did not. The distinction is contiguity, not a count: a position
+    /// derived by counting successes reads D01 ok, D02 failed, D03 ok as
+    /// "two applied" and puts the position on D02 - a key that never ran -
+    /// which is exactly the "advance past a missing predecessor" this issue is
+    /// about. Every other test here happens to have its successes in a prefix,
+    /// where counting and contiguity agree, so this is the only one that can
+    /// tell them apart.
+    #[test]
+    fn a_later_success_does_not_carry_the_position_over_a_hole() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let r = read(&def, &uris(&["D20260901.zip", "D20260902.zip", "D20260903.zip"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+
+        // D02 failed and D03 somehow succeeded anyway.
+        let v = verdict(&links, |k| match k {
+            "2026-09-01" | "2026-09-03" => Some(crate::backfill::State::Succeeded),
+            "2026-09-02" => Some(crate::backfill::State::Failed),
+            _ => None,
+        });
+        assert_eq!(
+            v.position.as_deref(),
+            Some("2026-09-01"),
+            "the chain is only applied as far as it is unbroken"
+        );
+        assert_eq!(
+            v.state,
+            Status::Blocked {
+                expected: "2026-09-02".into(),
+                next_observed: Some("2026-09-03".into()),
+                reason: Reason::PredecessorFailed,
+            }
+        );
+    }
+
+    #[test]
+    fn an_integer_gap_is_proven_without_any_schedule() {
+        let def = ints("f-{seq}.json");
+        let r = read(&def, &uris(&["f-101.json", "f-103.json"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+        let v = verdict(&links, done(&["101"]));
+        assert_eq!(
+            v.state,
+            Status::Blocked {
+                expected: "102".into(),
+                next_observed: Some("103".into()),
+                reason: Reason::SequenceGap,
+            },
+            "101 succeeded, 103 exists, so 102 is absent - no cadence needed to know that"
+        );
+    }
+
+    #[test]
+    fn nothing_observed_is_an_empty_chain_rather_than_an_error() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let links = chain(&def, &[]).unwrap();
+        assert!(links.is_empty());
+        assert_eq!(verdict(&links, done(&[])).state, Status::Complete);
+    }
+
+    #[test]
+    fn a_baseline_far_behind_the_data_is_a_definition_error() {
+        let def = SequenceDef { baseline: Some("1".into()), ..ints("f-{seq}.json") };
+        let err = chain(&def, &[Observed { key: "900000".into(), uri: "f-900000.json".into() }])
+            .expect_err("a chain that long is a wrong baseline");
+        assert!(err.contains("baseline"), "it says what to fix: {err}");
+    }
+
+    /// The report the issue asks for, as JSON.
+    ///
+    /// ```text
+    /// sequence status: blocked
+    /// expected: 2026-09-02
+    /// next observed: 2026-09-03
+    /// reason: sequence_gap
+    /// ```
+    #[test]
+    fn the_verdict_serialises_as_the_report_the_issue_asks_for() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let r = read(&def, &uris(&["D20260901.zip", "D20260903.zip"])).unwrap();
+        let links = chain(&def, &r.items).unwrap();
+        let v = verdict(&links, done(&["2026-09-01"]));
+        assert_eq!(
+            serde_json::to_value(&v).unwrap(),
+            serde_json::json!({
+                "status": "blocked",
+                "expected": "2026-09-02",
+                "nextObserved": "2026-09-03",
+                "reason": "sequence_gap",
+                "position": "2026-09-01",
+            })
+        );
+        // And it reads back, so a console can hold one.
+        assert_eq!(serde_json::from_value::<Verdict>(serde_json::to_value(&v).unwrap()).unwrap(), v);
+    }
+
+    /// Build a ledger the way a real chain would, for the claim rule.
+    fn ledger(def: &SequenceDef, names: &[&str]) -> crate::backfill::Backfill {
+        let r = read(def, &uris(names)).expect("a reading");
+        let links = chain(def, &r.items).expect("a chain");
+        crate::backfill::Backfill {
+            id: "b1".into(),
+            pipeline: "reg".into(),
+            pipeline_path: "reg.json".into(),
+            created_at: "2026-09-04T00:00:00Z".into(),
+            release_id: None,
+            max_concurrent: 4,
+            pid: None,
+            kind: crate::backfill::Kind::Sequence,
+            chunk_node: None,
+            staging: None,
+            epoch: def.epoch.clone(),
+            partitions: slices(def, "reg", None, &links),
+        }
+    }
+
+    fn at(plan: &crate::backfill::Backfill, key: &str) -> usize {
+        plan.partitions.iter().position(|p| p.key == key).unwrap_or_else(|| panic!("no {key}"))
+    }
+
+    /// Acceptance criteria 2 and 3, as the ledger rule Louis specified.
+    #[test]
+    fn a_link_is_not_claimable_until_its_predecessor_has_succeeded() {
+        use crate::backfill::State;
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let mut plan = ledger(&def, &["D20260901.zip", "D20260902.zip", "D20260903.zip"]);
+
+        // Nothing has run. Only the head of the chain may be claimed, even
+        // though all three are requested and workers are free.
+        assert!(plan.claimable(at(&plan, "2026-09-01")));
+        assert!(!plan.claimable(at(&plan, "2026-09-02")));
+        assert!(!plan.claimable(at(&plan, "2026-09-03")));
+        assert_eq!(plan.claimable_count(), 1, "a chain is not a fan-out");
+
+        // D01 lands -> D02 opens, D03 still waits.
+        let i = at(&plan, "2026-09-01");
+        plan.partitions[i].state = State::Succeeded;
+        assert!(plan.claimable(at(&plan, "2026-09-02")));
+        assert!(!plan.claimable(at(&plan, "2026-09-03")));
+
+        // D02 FAILS -> D03 stays shut, and the reason names the retry.
+        let i = at(&plan, "2026-09-02");
+        plan.partitions[i].state = State::Failed;
+        let three = at(&plan, "2026-09-03");
+        assert!(!plan.claimable(three));
+        assert_eq!(
+            plan.blocked_reason(three).as_deref(),
+            Some("waiting for 2026-09-02, which has not succeeded")
+        );
+
+        // Acceptance criterion 4: retry D02, it succeeds, D03 is eligible.
+        plan.retry_open(None);
+        let i = at(&plan, "2026-09-02");
+        plan.partitions[i].state = State::Succeeded;
+        assert!(plan.claimable(three), "a successful retry unblocks what followed");
+    }
+
+    /// A hole has no slice, so the rule has to block on a key that is absent.
+    #[test]
+    fn a_never_published_predecessor_blocks_and_says_so() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let mut plan = ledger(&def, &["D20260901.zip", "D20260903.zip"]);
+        assert_eq!(plan.partitions.len(), 2, "the hole is not a unit of work");
+
+        let i = at(&plan, "2026-09-01");
+        plan.partitions[i].state = crate::backfill::State::Succeeded;
+        let three = at(&plan, "2026-09-03");
+        assert!(!plan.claimable(three), "2026-09-02 was never published");
+        assert_eq!(
+            plan.blocked_reason(three).as_deref(),
+            Some("waiting for 2026-09-02, which was never published"),
+            "a hole and a failure are different conversations"
+        );
+    }
+
+    /// The first link of an epoch answers to the baseline, which has no slice.
+    #[test]
+    fn the_first_link_after_a_baseline_is_claimable() {
+        let def = SequenceDef {
+            baseline: Some("2026-08-31".into()),
+            ..dated("D{date:YYYYMMDD}.zip")
+        };
+        let plan = ledger(&def, &["D20260901.zip", "D20260902.zip"]);
+        let first = at(&plan, "2026-09-01");
+        assert_eq!(
+            plan.partitions[first].requires, None,
+            "requiring the baseline would block every chain forever"
+        );
+        assert!(plan.claimable(first));
+        assert!(!plan.claimable(at(&plan, "2026-09-02")));
+    }
+
+    /// Continuity is opt-in: without it, the same links plan and nothing blocks.
+    #[test]
+    fn without_continuity_nothing_is_ordered() {
+        let def = SequenceDef { require_continuity: false, ..dated("D{date:YYYYMMDD}.zip") };
+        let plan = ledger(&def, &["D20260901.zip", "D20260903.zip"]);
+        assert_eq!(plan.claimable_count(), 2, "a plain feed may have gaps");
+        assert!(plan.partitions.iter().all(|p| p.requires.is_none()));
+    }
+
+    /// Provenance, acceptance criterion 6.
+    #[test]
+    fn a_slice_carries_its_key_predecessor_object_and_epoch() {
+        let def = SequenceDef {
+            baseline: Some("2026-08-31".into()),
+            epoch: Some("F2".into()),
+            ..dated("D{date:YYYYMMDD}.zip")
+        };
+        let plan = ledger(&def, &["D20260901.zip", "D20260902.zip"]);
+        let p = &plan.partitions[at(&plan, "2026-09-02")];
+        assert_eq!(p.params["sequence_key"], "2026-09-02");
+        assert_eq!(p.params["sequence_previous"], "2026-09-01");
+        assert_eq!(p.params["sequence_epoch"], "F2");
+        assert!(p.params["sequence_object"].ends_with("D20260902.zip"));
+        assert_eq!(p.source_uri.as_deref(), Some("s3://reg/D20260902.zip"));
+        // Two epochs of the same key are different work, so a new snapshot does
+        // not collide with what the old generation already did.
+        let other = SequenceDef { epoch: Some("F3".into()), ..def.clone() };
+        let plan2 = ledger(&other, &["D20260901.zip", "D20260902.zip"]);
+        assert_ne!(
+            plan.partitions[0].occurrence, plan2.partitions[0].occurrence,
+            "the epoch is part of what a slice IS"
+        );
+    }
+
+    /// The whole contract over a real directory: list, parse, chain, verdict.
+    #[test]
+    fn a_directory_of_drops_reports_its_own_hole() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["D20260901.zip", "D20260903.zip", "D20260904.zip", "README.md"] {
+            std::fs::write(tmp.path().join(name), b"x").unwrap();
+        }
+        // A subdirectory of superseded generations must not be walked into.
+        std::fs::create_dir(tmp.path().join("archive")).unwrap();
+        std::fs::write(tmp.path().join("archive").join("D20260901.zip"), b"x").unwrap();
+
+        let def = SequenceDef {
+            uri: Some(tmp.path().display().to_string()),
+            baseline: Some("2026-08-31".into()),
+            ..dated("D{date:YYYYMMDD}.zip")
+        };
+        let r = report(&def, &serde_json::json!({}), done(&["2026-09-01"])).expect("a report");
+
+        assert_eq!(
+            r.verdict.state,
+            Status::Blocked {
+                expected: "2026-09-02".into(),
+                next_observed: Some("2026-09-03".into()),
+                reason: Reason::SequenceGap,
+            }
+        );
+        assert_eq!(r.verdict.position.as_deref(), Some("2026-09-01"));
+        // README.md is refused rather than ignored, and the archive copy of
+        // D20260901.zip never reaches the parser to become a duplicate.
+        assert_eq!(r.refusals.len(), 1, "{:?}", r.refusals);
+        assert_eq!(r.refusals[0].code, RefusalCode::PatternMismatch);
+        assert!(r.refusals[0].uri.ends_with("README.md"));
+        assert_eq!(r.links.len(), 4, "01, the hole at 02, 03, 04");
+        assert!(r.links[1].is_missing());
+    }
+
+    #[test]
+    fn a_sequence_with_no_collection_says_so() {
+        let def = dated("D{date:YYYYMMDD}.zip");
+        let err = report(&def, &serde_json::json!({}), done(&[])).expect_err("no uri");
+        assert!(err.contains("uri"), "{err}");
+    }
+
+    #[test]
+    fn a_definition_is_read_off_the_document() {
+        let doc = serde_json::json!({
+            "sequence": {
+                "pattern": "D{date:YYYYMMDD}.KBO.zip",
+                "order": { "type": "date", "cadence": "day" },
+                "requireContinuity": true,
+                "baseline": "2026-08-31"
+            }
+        });
+        let def = of(&doc).expect("a definition");
+        assert!(def.require_continuity);
+        assert_eq!(def.baseline.as_deref(), Some("2026-08-31"));
+        assert_eq!(def.order, Order::Date { cadence: Cadence::Day });
+        assert!(of(&serde_json::json!({ "nodes": [] })).is_none());
+    }
+
+    /// #326 AC5, exactly the scenario asked for: a newly accepted full snapshot
+    /// resets the chain.
+    ///
+    /// ```text
+    /// epoch 2026-08-31   D01 ok, D02 FAILED, D03 blocked behind it
+    /// F 2026-09-04 succeeds
+    /// epoch 2026-09-04   the snapshot is the baseline, D05 is the new chain,
+    ///                    D02 is still in the ledger and blocks nothing
+    /// ```
+    ///
+    /// The old plan is not mutated or reinterpreted. A new epoch is derived, and
+    /// the old one keeps its slices as provenance.
+    fn feed() -> SequenceDef {
+        SequenceDef {
+            snapshot_pattern: Some("F{date:YYYYMMDD}.zip".into()),
+            baseline: Some("2026-08-31".into()),
+            epoch: Some("2026-08-31".into()),
+            ..dated("D{date:YYYYMMDD}.zip")
+        }
+    }
+
+    fn listing() -> Vec<String> {
+        uris(&[
+            "D20260901.zip",
+            "D20260902.zip",
+            "D20260903.zip",
+            "F20260904.zip",
+            "D20260905.zip",
+        ])
+    }
+
+    #[test]
+    fn a_full_snapshot_is_read_as_a_snapshot_and_not_as_a_delta() {
+        let r = read(&feed(), &listing()).expect("a reading");
+        assert_eq!(keys(&r), ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-05"]);
+        assert_eq!(
+            r.snapshots.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            ["2026-09-04"],
+            "the full snapshot belongs to its own list, not the delta chain",
+        );
+        assert!(r.refusals.is_empty(), "a snapshot is not a malformed delta: {:?}", r.refusals);
+    }
+
+    #[test]
+    fn an_unapplied_snapshot_leaves_the_current_epoch_alone() {
+        let r = read(&feed(), &listing()).unwrap();
+        // D01 done, D02 failed, and the snapshot has not been run.
+        let active = active_epoch(&feed(), &r, done_and_failed(&["2026-09-01"], "2026-09-02"));
+        assert_eq!(
+            active.epoch.as_deref(),
+            Some("2026-08-31"),
+            "a snapshot that has merely been PUBLISHED resets nothing; it has to be applied",
+        );
+        assert_eq!(active.baseline.as_deref(), Some("2026-08-31"));
+    }
+
+    #[test]
+    fn a_snapshot_can_be_applied_while_the_chain_it_replaces_is_blocked() {
+        // The whole point of a recovery point: D02 failed permanently, so every
+        // delta after it is blocked. The snapshot must not be blocked too, or
+        // there is no way out without editing state by hand.
+        let r = read(&feed(), &listing()).unwrap();
+        let slices = snapshot_slices(&feed(), "p", None, &r);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].key, "2026-09-04");
+        assert!(
+            slices[0].requires.is_none(),
+            "a full snapshot depends on nothing - it is a complete state, not a delta",
+        );
+        assert_eq!(
+            slices[0].params.get("sequence_epoch").map(String::as_str),
+            Some("2026-09-04"),
+            "a snapshot anchors the epoch it opens, so it is recorded in that epoch",
+        );
+    }
+
+    #[test]
+    fn an_applied_snapshot_opens_its_epoch_and_rebases_the_chain() {
+        let r = read(&feed(), &listing()).unwrap();
+        // D01 ok, D02 still failed, and now the snapshot has been applied.
+        let active =
+            active_epoch(&feed(), &r, done_and_failed(&["2026-09-01", "2026-09-04"], "2026-09-02"));
+        assert_eq!(active.epoch.as_deref(), Some("2026-09-04"));
+        assert_eq!(active.baseline.as_deref(), Some("2026-09-04"));
+
+        let links = chain(&active, &r.items).expect("a chain");
+        assert_eq!(
+            links.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(),
+            ["2026-09-05"],
+            "the superseded deltas are gone from the chain, D02 included",
+        );
+
+        let slices = slices(&active, "p", None, &links);
+        assert_eq!(slices.len(), 1);
+        assert!(
+            slices[0].requires.is_none(),
+            "the first delta after a snapshot is anchored by it and waits for nothing",
+        );
+    }
+
+    /// The other half: the old epoch is evidence, not something that was
+    /// deleted. Its slices are still addressed under the old epoch id.
+    #[test]
+    fn the_superseded_epoch_keeps_its_own_slices() {
+        let r = read(&feed(), &listing()).unwrap();
+        let old = chain(&feed(), &r.items).unwrap();
+        let old_slices = slices(&feed(), "p", None, &old);
+        let old_keys: Vec<&str> = old_slices.iter().map(|s| s.key.as_str()).collect();
+        assert!(
+            old_keys.contains(&"2026-09-02"),
+            "the failed delta still has its slice in the epoch it belonged to: {old_keys:?}",
+        );
+        assert!(
+            old_slices
+                .iter()
+                .all(|s| s.params.get("sequence_epoch").map(String::as_str) == Some("2026-08-31")),
+            "and they stay addressed under the epoch that planned them",
+        );
+    }
+
+    /// A feed with no snapshot pattern behaves exactly as it did before: this
+    /// is an added capability, not a change to what a plain chain means.
+    #[test]
+    fn a_feed_that_declares_no_snapshots_is_unaffected() {
+        let def = SequenceDef { baseline: Some("2026-08-31".into()), ..dated("D{date:YYYYMMDD}.zip") };
+        let r = read(&def, &uris(&["D20260901.zip", "F20260904.zip", "D20260905.zip"])).unwrap();
+        assert!(r.snapshots.is_empty());
+        assert_eq!(
+            r.refusals.len(),
+            1,
+            "without a snapshot pattern F20260904 is just a name that does not match",
+        );
+        let active = active_epoch(&def, &r, done(&["2026-09-01"]));
+        assert_eq!(active.epoch, def.epoch);
+        assert_eq!(active.baseline, def.baseline);
+    }
+
+    /// Several snapshots: the newest APPLIED one wins, not the newest published.
+    #[test]
+    fn the_newest_applied_snapshot_is_the_one_that_anchors() {
+        let def = feed();
+        let r = read(
+            &def,
+            &uris(&["F20260904.zip", "D20260905.zip", "F20260906.zip", "D20260907.zip"]),
+        )
+        .unwrap();
+        assert_eq!(
+            r.snapshots.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            ["2026-09-04", "2026-09-06"],
+        );
+        // The later snapshot exists but has not been applied.
+        let active = active_epoch(&def, &r, done(&["2026-09-04"]));
+        assert_eq!(
+            active.epoch.as_deref(),
+            Some("2026-09-04"),
+            "an unapplied later snapshot must not rebase the chain past data nobody has loaded",
+        );
+    }
+}

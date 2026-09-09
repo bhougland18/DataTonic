@@ -401,6 +401,20 @@ pub struct FormatFileSinkSpec {
     pub format: FormatKind,
 }
 
+/// SASL credentials for a Kafka broker.
+///
+/// The GUI has offered these fields since the connector shipped while nothing
+/// read them, so a user who filled them in got an unauthenticated connection
+/// and no indication of it.
+#[derive(Debug, Clone)]
+pub struct KafkaSasl {
+    /// PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512. Anything else is refused at plan
+    /// time rather than silently downgraded.
+    pub mechanism: String,
+    pub username: String,
+    pub password: String,
+}
+
 /// snk.kafka / snk.redpanda: bulk-produce one Kafka record per
 /// upstream row. Record key = optional keyColumn value; record value
 /// = JSON-stringified row. Records are produced into a single
@@ -408,6 +422,10 @@ pub struct FormatFileSinkSpec {
 /// produce is a follow-up.
 #[derive(Debug, Clone)]
 pub struct KafkaSinkSpec {
+    /// Connect over TLS. Set from the Security protocol field (SSL / SASL_SSL).
+    pub tls: bool,
+    /// SASL credentials, when the node supplies them.
+    pub sasl: Option<KafkaSasl>,
     pub from_view: String,
     /// Comma-separated list of "host:port" entries.
     pub bootstrap_servers: String,
@@ -426,12 +444,28 @@ pub struct KafkaSinkSpec {
 /// rows; value is the raw byte string (no schema unpacking, no Avro).
 #[derive(Debug, Clone)]
 pub struct KafkaSourceSpec {
+    /// Confluent Schema Registry base URL. When set, a message carrying the
+    /// Confluent framing (a zero byte, then a big-endian schema id) is decoded
+    /// against the schema that id names, instead of being handed back as text.
+    pub schema_registry_url: Option<String>,
+    /// Connect over TLS. Set from the Security protocol field (SSL / SASL_SSL).
+    pub tls: bool,
+    /// SASL credentials, when the node supplies them.
+    pub sasl: Option<KafkaSasl>,
     pub node_id: String,
     pub bootstrap_servers: String,
     pub topic: String,
     pub partition_id: i32,
     pub start_offset: i64,
     pub max_records: u64,
+    /// Remember where this node got to, and resume there next run.
+    ///
+    /// Without it a scheduled read either re-reads the whole backlog (an
+    /// `earliest` start) or skips everything that arrived since the last run (a
+    /// `latest` start), so repeated runs cannot be stitched into a stream. The
+    /// resume point is written only when the whole run succeeded, so a failure
+    /// after the read re-delivers rather than loses: at-least-once.
+    pub track_offset: bool,
 }
 
 /// src.avro: read an Apache Avro container file (.avro / .ocf) via
@@ -535,8 +569,19 @@ pub struct ModelCardSpec {
 #[derive(Debug, Clone)]
 pub struct PdfSourceSpec {
     pub node_id: String,
-    /// A .pdf file, or a directory of them.
+    /// A .pdf file, or a directory of them. Ignored when `input` names an
+    /// upstream relation.
     pub path: String,
+    /// #282: read the documents named by an upstream artifact relation instead
+    /// of a configured path.
+    pub input: ArtifactInput,
+    /// How many documents to parse at once. Sequential by default: rendering
+    /// and parsing a document can take a lot of memory, and the bound that
+    /// matters is one artifact times this.
+    pub concurrency: usize,
+    /// What to do with a document that cannot be parsed: "fail" the run,
+    /// "skip" it, or "reject" it down the reject port.
+    pub on_error: String,
     /// Descend into sub-directories when `path` is a directory.
     pub recursive: bool,
     /// Optional declared output schema (the node's Schema tab).
@@ -564,6 +609,24 @@ pub struct HtmlColumn {
 /// outright, so this parses with a tolerant HTML parser instead.
 #[derive(Debug, Clone)]
 pub struct HtmlSourceSpec {
+    /// #255: a CSS selector for the link to the next page.
+    ///
+    /// Empty = one page, which is every pipeline that existed before. Only
+    /// followed on the configured-path route: a corpus wired in from upstream
+    /// already names every document it wants.
+    pub next_page_selector: String,
+    /// Which attribute of that element holds the URL. `href` by default.
+    pub next_page_attribute: String,
+    /// Hard cap on pages followed. A pagination link that points at itself is a
+    /// loop, and a loop with no cap is a run that never ends.
+    pub max_pages: u64,
+    /// #260: where to persist the ORIGINAL page, before parsing.
+    ///
+    /// Same contract as `src.rest`: empty = capture nothing, `{sha256}` and
+    /// `{date}` are substituted, and the bytes written are the bytes parsed -
+    /// `html_text` fetches once and both the archive and the parser consume
+    /// that one result.
+    pub raw_response_destination: String,
     /// #256: per-node transport (proxy, timeouts, User-Agent), usually filled
     /// from a saved `http` connection. None uses the shared default agent.
     pub transport: Option<crate::tls::HttpTransport>,
@@ -583,6 +646,11 @@ pub struct HtmlSourceSpec {
     /// result is pinned to exactly these columns and types, so a daily scrape
     /// keeps a stable shape even on a day the page renders a column empty.
     pub declared_schema: Option<Vec<duckle_metadata::Column>>,
+    /// #282: the pages to read, when an upstream relation names them.
+    /// `path` is the single-document fallback when nothing is wired in.
+    pub input: ArtifactInput,
+    /// "fail" or "skip" for a page in the corpus that cannot be read.
+    pub on_error: String,
 }
 
 /// src.xml: walk an XML document, find every element matching a
@@ -612,6 +680,33 @@ pub struct XmlSourceSpec {
     pub sftp_private_key: Option<String>,
     pub sftp_key_passphrase: Option<String>,
     pub sftp_host_fingerprint: Option<String>,
+    /// #283: rows per Parquet part when a schema is declared. Bounds the
+    /// UNCOMPRESSED intermediate to one part rather than the whole result.
+    pub batch_rows: usize,
+    /// #286: a published XSD to derive the declared schema from.
+    ///
+    /// Empty = none. Only read when the Schema tab is empty, so a hand-written
+    /// schema always wins: the person who typed it knows something the XSD may
+    /// not, and having the file quietly override them would be a surprise.
+    pub xsd_path: String,
+    /// #315: what to do when the resolved schema SET stops matching the one
+    /// this workspace accepted.
+    ///
+    /// `allow` does not look, `warn` says so once and accepts, `fail` refuses.
+    /// Defaults to `warn`: a publisher reissuing a schema is normal, and a
+    /// silent change of parser contract is what is not.
+    pub xsd_change_policy: String,
+    /// #282: the documents to parse, when an upstream relation names them.
+    ///
+    /// With this wired the node reads a CORPUS rather than one file, and each
+    /// document is streamed straight out of the artifact reader - the pull
+    /// parser does not seek, so spooling it to disk first would buy nothing.
+    /// `path` is the single-document fallback when nothing is wired in.
+    pub input: ArtifactInput,
+    /// "fail" or "skip" for a document in the corpus that cannot be read or
+    /// parsed. One malformed file in forty thousand should not have to end the
+    /// run, and pretending it parsed would be worse than either.
+    pub on_error: String,
 }
 
 /// snk.xml: write rows as
@@ -1059,6 +1154,8 @@ pub struct WebSocketSinkSpec {
 /// llama.cpp embedding server, etc) - just change base_url.
 #[derive(Debug, Clone)]
 pub struct AiEmbedSpec {
+    /// #258: a hard ceiling on what this stage may spend.
+    pub budget: AiBudgetSpec,
     pub node_id: String,
     pub from_view: String,
     pub input_column: String,
@@ -1081,6 +1178,13 @@ pub struct AiEmbedSpec {
     /// Retry-After. A rate limit at row 400,000 must not discard the 399,999
     /// rows already paid for.
     pub max_retries: u32,
+    /// #258: reuse an embedding this row already has rather than paying for
+    /// it a second time. Off by default.
+    pub checkpoint: bool,
+    /// Columns forming the logical identity of a row.
+    pub checkpoint_key: Vec<String>,
+    /// Columns that decide whether the INPUT changed. Empty = the whole row.
+    pub checkpoint_fingerprint: Vec<String>,
 }
 
 /// code.wasm: per-row WASM transform. The user supplies bytes (via
@@ -1143,6 +1247,16 @@ pub struct JqSpec {
 /// `process(row)` returning a dict (the output row); returning None drops the
 /// row. The engine passes rows in/out as JSON, so it carries no Python runtime.
 #[derive(Debug, Clone)]
+/// #307: an external component, run out of process.
+pub struct PluginSpec {
+    pub node_id: String,
+    pub component_id: String,
+    /// Absent for a source, which has nothing upstream to hand over.
+    pub from_view: Option<String>,
+    pub properties: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct PythonSpec {
     pub node_id: String,
     pub from_view: String,
@@ -1186,10 +1300,94 @@ pub struct AiPiiSpec {
 /// `prompt_template` with {column_name} substitution; if empty, the
 /// row's `input_column` text is sent as the user message verbatim.
 /// Optional `system_prompt`. Result lands in `output_column`.
+/// #258: a hard ceiling on what one inference stage may spend.
+///
+/// Declared numbers rather than a built [`crate::budget::Budget`], so a spec
+/// stays plain data: the budget itself holds live counters and is constructed
+/// once per run.
+#[derive(Debug, Clone, Default)]
+pub struct AiBudgetSpec {
+    pub max_requests: Option<u64>,
+    pub max_input_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub max_cost_usd: Option<f64>,
+    pub input_usd_per_mtok: f64,
+    pub output_usd_per_mtok: f64,
+}
+
+impl AiBudgetSpec {
+    pub fn read(props: &serde_json::Value) -> Self {
+        // Zero is a real value, not "unset": a ceiling of zero has to mean
+        // zero. Absent is what `None` means.
+        let n = |k: &str| props.get(k).and_then(serde_json::Value::as_u64);
+        let f = |k: &str| props.get(k).and_then(serde_json::Value::as_f64);
+        AiBudgetSpec {
+            max_requests: n("maxRequests"),
+            max_input_tokens: n("maxInputTokens"),
+            max_output_tokens: n("maxOutputTokens"),
+            max_cost_usd: f("maxEstimatedCostUsd"),
+            input_usd_per_mtok: f("inputUsdPerMillionTokens").unwrap_or(0.0),
+            output_usd_per_mtok: f("outputUsdPerMillionTokens").unwrap_or(0.0),
+        }
+    }
+
+    /// Build the live budget, or `None` when nothing was capped.
+    pub fn build(&self) -> Result<Option<crate::budget::Budget>, crate::EngineError> {
+        crate::budget::Budget::new(
+            self.max_requests,
+            self.max_input_tokens,
+            self.max_output_tokens,
+            self.max_cost_usd,
+            self.input_usd_per_mtok,
+            self.output_usd_per_mtok,
+        )
+    }
+}
+
+/// #258: how the model is asked to shape its reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiResponseFormat {
+    /// Whatever the model writes. What this stage has always done.
+    Text,
+    /// `response_format: {"type":"json_object"}` - valid JSON, any shape.
+    JsonObject,
+    /// `response_format: {"type":"json_schema", ..., "strict": true}` - the
+    /// provider enforces the shape during decoding, which is the only way to
+    /// get it reliably. Falls back to nothing on a provider that ignores the
+    /// field, which is why the reply is re-checked locally as well.
+    JsonSchema,
+}
+
+/// #258: what to do with a reply that is not the shape it was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiOnInvalid {
+    /// Stop the run. An extraction that silently produced nulls for a tenth of
+    /// its rows is worse than one that stopped.
+    Fail,
+    /// Null the output for that row and carry on. For a run over messy input
+    /// where some rows genuinely have no answer.
+    Null,
+}
+
 #[derive(Debug, Clone)]
 pub struct AiLlmSpec {
+    /// #258: a hard ceiling on what this stage may spend.
+    pub budget: AiBudgetSpec,
     pub node_id: String,
     pub from_view: String,
+    /// #252: reuse a row's answer when the same row was already paid for.
+    ///
+    /// Off by default, because a checkpoint that nobody asked for is a cache
+    /// nobody knows is there - and a stale answer that looks fresh is worse
+    /// than paying twice.
+    pub checkpoint: bool,
+    /// Columns forming the logical identity of a row. Optional: with none, the
+    /// whole row is the key.
+    pub checkpoint_key: Vec<String>,
+    /// Columns that decide whether the INPUT changed. Optional: with none, the
+    /// whole row does, which never reuses a stale answer and never reuses
+    /// anything at all when a volatile column is present.
+    pub checkpoint_fingerprint: Vec<String>,
     pub input_column: String,
     pub output_column: String,
     pub model: String,
@@ -1214,6 +1412,19 @@ pub struct AiLlmSpec {
     /// while the request body never carried it, so an unbounded reply was
     /// billed on every row. None = send no max_tokens, exactly as before.
     pub max_tokens: Option<u32>,
+    /// #258: the shape the reply must take.
+    pub response_format: AiResponseFormat,
+    /// The JSON Schema, as written. Only read for [`AiResponseFormat::JsonSchema`].
+    pub json_schema: String,
+    /// The name the provider requires alongside the schema.
+    pub schema_name: String,
+    /// Turn the reply's top-level fields into their own columns.
+    ///
+    /// The point of extraction is columns, not a JSON blob a downstream stage
+    /// has to unpack again.
+    pub expand_columns: bool,
+    /// What a reply that does not validate does to the run.
+    pub on_invalid: AiOnInvalid,
 }
 
 /// xf.ai.classify: per-row LLM-backed classifier. Pins each row's
@@ -1224,6 +1435,8 @@ pub struct AiLlmSpec {
 /// not in the category list).
 #[derive(Debug, Clone)]
 pub struct AiClassifySpec {
+    /// #258: a hard ceiling on what this stage may spend.
+    pub budget: AiBudgetSpec,
     pub node_id: String,
     pub from_view: String,
     pub input_column: String,
@@ -1244,6 +1457,13 @@ pub struct AiClassifySpec {
     /// Retry-After. A rate limit at row 400,000 must not discard the 399,999
     /// rows already paid for.
     pub max_retries: u32,
+    /// #258: reuse a category this row was already classified into rather
+    /// than paying for it a second time. Off by default.
+    pub checkpoint: bool,
+    /// Columns forming the logical identity of a row.
+    pub checkpoint_key: Vec<String>,
+    /// Columns that decide whether the INPUT changed. Empty = the whole row.
+    pub checkpoint_fingerprint: Vec<String>,
 }
 
 /// xf.ai.dedupe: semantic dedupe via cosine similarity over a
@@ -1540,6 +1760,46 @@ pub struct ElasticSourceSpec {
     pub pagination: ElasticPagination,
 }
 
+/// Manticore Search `/search` source (#340).
+///
+/// Manticore's HTTP JSON API answers in Elasticsearch's response shape
+/// (`hits.hits[]._source`) but takes a different request: the table is named
+/// in the BODY under `table` (`index` was renamed in Manticore 6.0) rather
+/// than in the path, and the window is `limit`/`offset` rather than
+/// `size`/`from`.
+#[derive(Debug, Clone)]
+pub struct ManticoreSourceSpec {
+    pub node_id: String,
+    /// HTTP API endpoint, e.g. "http://localhost:9308".
+    pub endpoint: String,
+    /// Table to search.
+    pub table: String,
+    /// Raw Manticore JSON query. None = `{"match_all": {}}`.
+    pub query: Option<String>,
+    /// Page size (default 1000).
+    pub limit: u64,
+    pub max_pages: u64,
+    /// Optional HTTP Basic credentials.
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+/// Manticore Search `/bulk` sink (#340).
+#[derive(Debug, Clone)]
+pub struct ManticoreSinkSpec {
+    pub from_view: String,
+    pub endpoint: String,
+    pub table: String,
+    /// Bulk action: "insert" (fails on a duplicate id) or "replace"
+    /// (upsert by id). Manticore also has update/delete, which need a
+    /// document id or a filter and so are not write shapes for a sink.
+    pub action: String,
+    /// Rows per `/bulk` request.
+    pub batch_size: usize,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
 /// Pagination style for src.rest.
 #[derive(Debug, Clone)]
 pub enum RestPagination {
@@ -1607,6 +1867,47 @@ pub struct RestSourceSpec {
     /// careless upstream cannot turn into an unbounded request storm. Only
     /// applies when fanning out.
     pub max_requests: u64,
+    /// #260: credentials for the raw capture when its destination is `s3://`.
+    ///
+    /// Separate from the request's own auth: the API you read and the bucket
+    /// you archive into are different systems, and sharing one credential
+    /// between them would be an accident waiting to happen.
+    pub raw_auth: crate::plan::ArtifactAuth,
+    /// #257 + #252: remember each parent as its walk finishes, so a rerun does
+    /// not re-fetch the ones that already succeeded.
+    ///
+    /// The SAME store the AI transforms use, deliberately. A fan-out that
+    /// shipped its own record of what succeeded would be a second answer to
+    /// the same question, and two records of that kind drift.
+    pub checkpoint: bool,
+    /// #257: the response field that derives the next high-water mark.
+    ///
+    /// A plain key (`updated_at`) or a JSON pointer (`/meta/updated_at`) into
+    /// each returned ROW. None = no request-side incremental state, which is
+    /// every pipeline that existed before.
+    ///
+    /// Fetch-then-filter is not incremental for an API: filtering after the
+    /// fetch still pays for the whole dataset every run. The cursor has to
+    /// reach the request, which is what `{incremental}` is for.
+    pub incremental_field: Option<String>,
+    /// The value `{incremental}` takes on the first run, before any mark has
+    /// been saved. Empty is a legitimate choice for an API that treats a blank
+    /// cursor as "from the beginning".
+    pub incremental_initial: String,
+    /// #257: how many parent requests may be in flight at once.
+    ///
+    /// 1 is sequential and byte for byte what this node did before, including
+    /// the output row order. Above 1 the output order is NOT the parent order -
+    /// rows land as their walks finish - which is why the carried parent key
+    /// exists and why this is opt-in.
+    pub concurrency: usize,
+    /// #257: what one parent's failure does to the fan-out.
+    ///
+    /// `fail` (the default, and what this node did before) ends the run.
+    /// `skip` drops that parent and carries on. `reject` also carries on and
+    /// writes the failure to `<node>__reject`, so a run that half-failed leaves
+    /// its failures durable next to its successes rather than only in a log.
+    pub on_parent_error: String,
     pub url: String,
     pub method: String,
     pub headers: Vec<(String, String)>,
@@ -1628,6 +1929,15 @@ pub struct RestSourceSpec {
     /// source changed or because the parser did", and an API that quietly
     /// starts paginating differently looks identical downstream.
     pub response_metadata: bool,
+    /// #260: where to persist the ORIGINAL response body, before parsing.
+    ///
+    /// Empty = do not capture. `{sha256}` in the path is replaced with the hash
+    /// of the body, which is the default and the safe one: a URL is a name that
+    /// can be rebound, so naming a capture after its URL and skipping when the
+    /// file exists keeps the OLD body when the resource changed. Content
+    /// addressing makes a changed body a new object and an unchanged one a
+    /// genuine no-op.
+    pub raw_response_destination: String,
     /// #166: when set (src.salesforce with OAuth client-credentials auth), the
     /// runner mints a fresh access token per run and injects
     /// `Authorization: Bearer <token>` before the request loop, overriding any
@@ -2073,4 +2383,396 @@ pub enum UpsertFamily {
     Postgres,
     /// `ON DUPLICATE KEY UPDATE col = VALUES(col)` (MySQL, MariaDB).
     MySql,
+}
+
+/// src.neo4j: Cypher read over the HTTP Query API.
+///   POST {endpoint}/db/{database}/query/v2
+///   Body:     { "statement": "MATCH ...", "parameters": {...} }
+///   Response: { "data": { "fields": [...], "values": [[...]] } }
+#[derive(Debug, Clone)]
+pub struct Neo4jSourceSpec {
+    pub node_id: String,
+    pub endpoint: String,
+    pub database: String,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub cypher: String,
+    /// Optional Cypher parameters, passed through as `$name` bindings.
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// snk.neo4j: write rows as nodes over the same Query API. Rows go up as the
+/// `$rows` parameter and are expanded server side with UNWIND.
+#[derive(Debug, Clone)]
+pub struct Neo4jSinkSpec {
+    pub from_view: String,
+    pub endpoint: String,
+    pub database: String,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    /// Node label to write.
+    pub label: String,
+    /// When non-empty, MERGE on these properties instead of CREATE, so a
+    /// re-run updates the matched nodes rather than duplicating them.
+    pub merge_keys: Vec<String>,
+    /// Full override: a Cypher statement that consumes `$rows` itself.
+    pub cypher: Option<String>,
+    pub batch_size: usize,
+}
+
+/// src.turso: SQL read over the libSQL HTTP pipeline API.
+///   POST {url}/v2/pipeline
+///   Body:     { "requests": [ {"type":"execute","stmt":{"sql":...}}, {"type":"close"} ] }
+///   Response: { "results": [ { "response": { "result": { "cols":[], "rows":[[]] } } } ] }
+#[derive(Debug, Clone)]
+pub struct TursoSourceSpec {
+    pub node_id: String,
+    /// The database URL. `libsql://` is accepted and normalized to https.
+    pub url: String,
+    pub auth_token: Option<String>,
+    pub query: String,
+}
+
+/// snk.turso: INSERT rows over the libSQL HTTP pipeline API.
+#[derive(Debug, Clone)]
+pub struct TursoSinkSpec {
+    pub from_view: String,
+    pub url: String,
+    pub auth_token: Option<String>,
+    pub table: String,
+    /// "append" (default) or "overwrite", which clears the table first.
+    pub mode: String,
+    pub batch_size: usize,
+}
+
+/// src.db2: IBM DB2 read over the IBM Data Server ODBC driver. Same transport
+/// as Teradata - DB2 ships no DuckDB extension and no native Rust driver.
+#[derive(Debug, Clone)]
+pub struct Db2SourceSpec {
+    pub node_id: String,
+    pub conn_str: String,
+    pub query: String,
+    pub batch_rows: usize,
+}
+
+/// snk.db2: auto-create the target table from the upstream column types, then
+/// INSERT over ODBC.
+#[derive(Debug, Clone)]
+pub struct Db2SinkSpec {
+    pub from_view: String,
+    pub conn_str: String,
+    /// Optional schema qualifier; DB2 defaults to the connecting user's schema.
+    pub schema: Option<String>,
+    pub table: String,
+    /// "append" (default) or "overwrite", which clears the table first.
+    pub mode: String,
+}
+
+/// src.spool: tail an append-only NDJSON file from where the last successful
+/// run stopped.
+///
+/// The half of push-source support that makes it lossless. A webhook or
+/// WebSocket listener that lives inside a pipeline run can only collect while
+/// that run is executing - between runs the port is closed and arriving
+/// requests are refused. `duckle-runner listen` keeps the listener up and
+/// appends here instead, so arrival is decoupled from processing and a batch
+/// boundary costs nothing.
+///
+/// Position is a BYTE offset, which works because the file is append-only:
+/// there is no reader/writer race to lose to, and nothing has to be deleted.
+#[derive(Debug, Clone)]
+pub struct SpoolSourceSpec {
+    pub node_id: String,
+    pub path: String,
+    /// Remember where this run stopped, so the next one resumes there.
+    pub track_offset: bool,
+    /// Most bytes to take in one pass. Bounds a batch when a listener has been
+    /// running unattended for a long time, so the first run after a backlog
+    /// does not try to materialize the whole thing at once.
+    pub max_bytes: u64,
+}
+
+/// xf.tumble: event-time tumbling windows that survive across runs.
+///
+/// Rows are assigned to fixed-size buckets by their event time, held until the
+/// bucket CLOSES, then emitted. Closing is decided by a watermark - the
+/// greatest event time seen so far, across runs - rather than by wall clock,
+/// so replaying yesterday's data produces yesterday's windows instead of
+/// closing all of them at once.
+///
+/// The state that has to survive between runs is the rows in windows that are
+/// still open, plus the watermark. Both are swapped in through the deferred
+/// flush, so a run that fails downstream leaves the previous state in place
+/// and its rows are re-processed rather than lost. That is the same guarantee
+/// every source position gets, and it is the part SQLFlow's equivalent does
+/// not have: there, a collect and a delete are separate lock acquisitions
+/// around a sink write, each evaluating `now()` on its own, so a window can be
+/// deleted after being collected but before being written.
+#[derive(Debug, Clone)]
+pub struct TumbleSpec {
+    pub node_id: String,
+    pub from_view: String,
+    /// The event-time column. Windows are cut on this, never on arrival time.
+    pub time_column: String,
+    /// Window size as a DuckDB interval, e.g. `1 hour`, `5 minutes`.
+    pub size: String,
+    /// How far past a window's end the watermark must reach before the window
+    /// closes. Buys time for out-of-order arrivals at the cost of latency.
+    pub allowed_lateness: String,
+}
+
+/// src.changed: poll a remote source's METADATA and emit only what changed.
+///
+/// Two patterns, one component, because they are the same question asked of a
+/// different number of objects:
+///
+/// - **object**: one URI replaced periodically. Emits one row when its
+///   fingerprint differs from the last successfully processed one, and nothing
+///   when it does not.
+/// - **listing**: a directory or prefix of immutable files. Lists it, compares
+///   each entry against what has been processed, and emits the new and changed
+///   ones as ordinary rows for a ForEach or an artifact copy downstream.
+///
+/// The point is not to pay for the object to find out whether it was needed.
+/// A HEAD or a stat is cheap; a 30 GB download is not.
+///
+/// Fingerprints are conservative by design. None of the signals are
+/// guarantees: ETag can be absent, can weaken under compression, and on S3 is
+/// a digest-of-digests for a multipart upload rather than the object's hash;
+/// Last-Modified has one-second resolution; SFTP realistically offers mtime
+/// and size. So a missing or unreadable signal reads as CHANGED. Re-reading
+/// something unnecessarily costs compute; skipping something that did change
+/// loses data.
+#[derive(Debug, Clone)]
+pub struct ChangedSourceSpec {
+    pub node_id: String,
+    /// `https://...` or `sftp://[user@]host[:port]/path`.
+    pub uri: String,
+    /// True to list a directory/prefix rather than probe one object.
+    pub listing: bool,
+    /// Only list entries whose name ends with this (listing mode).
+    pub suffix: Option<String>,
+    /// Most entries to emit in one run, so a first run against a directory
+    /// with years of drops does not try to process all of it at once.
+    pub max_entries: usize,
+    /// Remember what was processed, so the next run only sees what is new.
+    /// Off means every run treats everything as changed.
+    pub track_state: bool,
+    // SFTP auth, ignored for https.
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub private_key: Option<String>,
+    pub key_passphrase: Option<String>,
+    pub host_fingerprint: Option<String>,
+    /// Extra request headers for https (an API key on a metadata endpoint).
+    pub headers: Vec<(String, String)>,
+    /// Credentials for an `s3://` uri. None for every other scheme, and also
+    /// for an S3 URI with no credentials on the node - which is an error worth
+    /// reporting rather than an anonymous request that 403s.
+    pub s3: Option<crate::s3::S3Config>,
+}
+
+/// How to reach an artifact, whatever scheme its URI is written in.
+///
+/// #282: the artifact boundary is only composable if every parser reaches a URI
+/// the SAME way. Giving `src.pdf`, `src.xml` and `src.html` each their own
+/// credential fields would produce three conventions that agree until the day
+/// one of them does not, so the auth lives here once and each of them holds one.
+#[derive(Debug, Clone, Default)]
+pub struct ArtifactAuth {
+    /// Credentials for `s3://`.
+    pub s3: Option<crate::s3::S3Config>,
+    /// Extra request headers for `https://`.
+    pub headers: Vec<(String, String)>,
+    // SFTP.
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub private_key: Option<String>,
+    pub key_passphrase: Option<String>,
+    pub host_fingerprint: Option<String>,
+}
+
+/// A parser's optional artifact input: the upstream relation naming what to
+/// read, and which of its columns holds the URI.
+///
+/// Absent means the node reads its configured path, exactly as it always has -
+/// every existing pipeline keeps working, which is the only acceptable way to
+/// add this.
+#[derive(Debug, Clone)]
+pub struct ArtifactInput {
+    /// The upstream relation. None when the node has no input wired.
+    pub from_view: Option<String>,
+    /// Column holding each artifact's URI. `uri` by default, which is what
+    /// `src.changed`, `src.artifact` and `xf.artifact.copy` all emit.
+    pub uri_column: String,
+    /// Column holding the hash of those bytes, carried through to the parsed
+    /// rows. Not recomputed: the copy that landed the artifact already hashed
+    /// exactly those bytes, and re-hashing would both cost a second full read
+    /// and produce the hash of whatever is at that URI NOW.
+    pub sha_column: String,
+    /// Upstream columns to copy onto every row the parser emits.
+    ///
+    /// The business keys that say what a document IS - company_id, filing_id -
+    /// live on the artifact row and are lost the moment a parser emits pages
+    /// instead. Carrying them is what lets the pages be joined back to the
+    /// thing they came from without a second lookup.
+    pub carry: Vec<String>,
+    pub auth: ArtifactAuth,
+}
+
+impl Default for ArtifactInput {
+    fn default() -> Self {
+        ArtifactInput {
+            from_view: None,
+            uri_column: "uri".into(),
+            sha_column: "sha256".into(),
+            carry: Vec::new(),
+            auth: ArtifactAuth::default(),
+        }
+    }
+}
+
+/// One run-to-run rule: what to watch, and how far it may move.
+#[derive(Debug, Clone)]
+pub struct BaselineRule {
+    /// "row_count", "null_pct", "distinct_count", "min", "max", "mean".
+    pub metric: String,
+    /// The column the metric is about. None for dataset-level metrics.
+    pub column: Option<String>,
+    /// Fail when the value drops by more than this fraction of the baseline.
+    pub max_decrease_pct: Option<f64>,
+    pub max_increase_pct: Option<f64>,
+    /// Absolute movement limits, for metrics where a percentage is meaningless
+    /// - a null rate going from 0% to 5% is an infinite percentage increase.
+    pub max_increase: Option<f64>,
+    pub max_decrease: Option<f64>,
+    pub max_difference: Option<f64>,
+}
+
+/// `qa.baseline`: compare this run against what previous runs looked like.
+///
+/// #281: every row can satisfy the schema and every row-level rule while the
+/// dataset is nothing like what normally arrives - 842,114 rows where five
+/// million usually come, a null rate that went from 4% to 71%, a country
+/// partition that vanished. Those are more dangerous than a crash, because the
+/// pipeline stays green and the wrong data gets published.
+#[derive(Debug, Clone)]
+pub struct BaselineSpec {
+    pub node_id: String,
+    pub from_view: String,
+    /// How many accepted profiles to keep and compare against. The comparison
+    /// uses their MEDIAN, so one odd day does not move the baseline much.
+    pub history: usize,
+    /// Columns to profile. Empty means every column of the input.
+    pub columns: Vec<String>,
+    /// Compare per group as well as overall, so a partition disappearing is
+    /// caught even when the total stays in range.
+    pub group_by: Vec<String>,
+    /// Fail the run when a group that used to be there is missing.
+    pub require_existing_groups: bool,
+    pub rules: Vec<BaselineRule>,
+    /// "gate" fails the run on a violation; "report" only emits the rows.
+    pub mode: String,
+}
+
+/// `xf.archive.extract`: turn one archive artifact into one artifact per member.
+///
+/// #284: bulk data is published as archives far more often than as readable
+/// files, and unpacking one used to mean a shell stage. As an ARTIFACT
+/// operation rather than something built into each parser, a ZIP of CSVs, a TAR
+/// of JSON and a GZIP of NDJSON all land the same way and each member then
+/// flows into whichever parser suits it.
+#[derive(Debug, Clone)]
+pub struct ArchiveExtractSpec {
+    pub node_id: String,
+    /// The archives to open, named by an upstream relation.
+    pub input: ArtifactInput,
+    /// Where members land: an `s3://` prefix or a local directory.
+    pub destination: String,
+    /// "preserve" the member's path inside the archive, "flat" for its file
+    /// name only, or "hash" for a content-addressed name.
+    pub naming: String,
+    /// "skip" (the default), "replace" or "error" when a member is already at
+    /// the destination.
+    pub if_exists: String,
+    pub part_size_bytes: usize,
+    /// Only extract members matching one of these globs. Empty means all.
+    pub include: Vec<String>,
+    /// Never extract members matching one of these, applied after `include`.
+    pub exclude: Vec<String>,
+    /// Most members to take out of one archive.
+    pub max_members: usize,
+    /// Refuse an archive that expands past this. A ZIP is a compression format,
+    /// so a small one can expand to fill a disk - an archive from an external
+    /// publisher is untrusted input and this is the bound that says so.
+    pub max_uncompressed_bytes: u64,
+    /// What to do with an archive that cannot be opened: "fail" or "skip".
+    pub on_error: String,
+}
+
+/// `src.ducklake.maintain`: run one of DuckLake's own maintenance operations
+/// and emit what it did as an ordinary relation.
+///
+/// #279 asks for a THIN surface over what the installed DuckLake supports,
+/// rather than a lakehouse optimiser of our own. So every operation here is one
+/// DuckLake function, its options are that function's options, and its output
+/// is that function's own result rows - which means a quality gate or an alert
+/// can read a compaction the same way it reads anything else.
+#[derive(Debug, Clone)]
+pub struct DuckLakeMaintainSpec {
+    pub node_id: String,
+    /// The ATTACH prelude for the catalog, built the same way every other
+    /// DuckLake node builds it, so one saved lake is described once.
+    pub attach: String,
+    /// For the message and the lock: which catalog this is.
+    pub catalog_path: String,
+    /// compact | rewrite | expireSnapshots | cleanupFiles | deleteOrphans |
+    /// flushInlined | stats
+    pub operation: String,
+    pub schema_name: Option<String>,
+    pub table_name: Option<String>,
+    /// Only meaningful where DuckLake offers it: expireSnapshots,
+    /// cleanupFiles, deleteOrphans. Elsewhere it is refused rather than
+    /// ignored, because a dry run that silently deleted things is the worst
+    /// possible outcome for this component.
+    pub dry_run: bool,
+    /// The retention boundary. DuckLake expires NOTHING without one, which is
+    /// the right default and is surfaced rather than replaced.
+    pub older_than: Option<String>,
+    pub versions: Option<String>,
+    pub cleanup_all: bool,
+    pub min_file_size: Option<u64>,
+    pub max_file_size: Option<u64>,
+    pub max_compacted_files: Option<u64>,
+    pub delete_threshold: Option<f64>,
+}
+
+/// `xf.artifact.copy`: take artifact rows in, land the BYTES somewhere durable,
+/// and emit a row per landed copy.
+///
+/// This is the piece that turns a change feed into a raw zone. The bytes are
+/// streamed, never held: the whole point of an artifact being a reference is
+/// that a 40GB model file does not become 40GB of memory on the way past.
+#[derive(Debug, Clone)]
+pub struct ArtifactCopySpec {
+    pub node_id: String,
+    /// The relation whose rows name the artifacts to copy.
+    pub from_view: String,
+    /// Column holding the source URI. Defaults to `uri`, which is what
+    /// `src.changed` and `src.artifact` both emit.
+    pub uri_column: String,
+    /// Where the copies land: `s3://bucket/prefix/` or a local directory.
+    pub destination: String,
+    /// "keep" the source's file name, "hash" for a content-addressed name, or
+    /// "path" to preserve the source's directory structure under the prefix.
+    pub naming: String,
+    /// What to do when the destination key already holds something: "skip"
+    /// (the default, and the right one for an immutable raw zone), "replace",
+    /// or "error".
+    pub if_exists: String,
+    /// Bytes per multipart part when writing to S3. Also the ceiling on memory
+    /// used per object, which is why it is a knob at all.
+    pub part_size_bytes: usize,
+    /// Credentials for whichever side is `s3://`, and for the other schemes.
+    pub auth: ArtifactAuth,
 }

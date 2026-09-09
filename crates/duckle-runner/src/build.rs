@@ -19,7 +19,6 @@ use base64::Engine as _;
 use duckle_duckdb_engine::{is_secret_prop_key, PipelineDoc};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -671,6 +670,43 @@ pub fn run() -> Result<(), String> {
         record(&mut files, &rel);
     }
 
+    // #246: a deployed pipeline with a Python step carries its lock contract.
+    //
+    // Without it the target has nothing to verify against, and the engine's
+    // preflight - which only fires when a uv.lock is present - stays silent.
+    // The bundle would then run against whatever interpreter the target
+    // happens to have, which is exactly what committing a lock rules out.
+    //
+    // The lock is shipped, NOT the environment. Duckle does not package
+    // wheels: preparing the target stays an explicit step, because resolving
+    // dependencies at run time is what an air-gapped or scheduled box cannot
+    // have. pyproject.toml rides along because `uv sync` needs it to act on
+    // the lock at all.
+    if doc.nodes.iter().any(|n| n.data.component_id.as_deref() == Some("code.python")) {
+        let mut carried = 0;
+        for name in ["uv.lock", "pyproject.toml"] {
+            let src = args.workspace.join(name);
+            if !src.exists() {
+                continue;
+            }
+            let bytes = std::fs::read(&src)
+                .map_err(|e| format!("read {}: {}", src.display(), e))?;
+            write_file(&root.join(name), &bytes)?;
+            record(&mut files, name);
+            carried += 1;
+        }
+        if carried == 0 {
+            // Said out loud rather than left to be discovered on the target. A
+            // bundle with a Python step and no lock is a bundle whose Python
+            // behaviour is whatever the target machine decides.
+            eprintln!(
+                "duckle: this pipeline has a code.python step and the workspace has no uv.lock, \
+                 so the bundle cannot pin its Python environment. The target will run against \
+                 whatever interpreter it has. Commit a uv.lock to make it reproducible."
+            );
+        }
+    }
+
     // routines/ are intentionally NOT shipped: resolve_workspace already
     // inlines SQL routine bodies into the pipeline doc at build time, and
     // run_artifact only ever reads pipeline/<name>.json. Copying routine
@@ -827,6 +863,23 @@ fn needed_extensions(doc: &PipelineDoc) -> std::collections::BTreeSet<String> {
         for e in ext {
             set.insert((*e).to_string());
         }
+        // And whatever the ENGINE's own prelude loads for this component, which
+        // is the authority: this match and `attach_prelude` are two answers to
+        // one question and they had drifted - src.gdb, the geometry checks and
+        // five geo transforms all load spatial at run time and none were listed
+        // above, so a bundle containing one shipped without it and failed
+        // offline, where INSTALL cannot rescue it.
+        //
+        // Unioned rather than substituted: the list above also knows things the
+        // prelude does not say out loud, like httpfs for the cloud sources.
+        let props = node
+            .get("data")
+            .and_then(|d| d.get("properties"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        for e in duckle_duckdb_engine::extensions_for_component(cid, &props) {
+            set.insert(e);
+        }
     }
     set
 }
@@ -976,9 +1029,8 @@ fn encrypt_secrets(key_map: &[(String, String)]) -> Result<String, String> {
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init: {}", e))?;
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut nonce_bytes).map_err(|e| format!("nonce: {}", e))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plain.as_bytes())
+        .encrypt(&Nonce::from(nonce_bytes), plain.as_bytes())
         .map_err(|e| format!("encrypt: {}", e))?;
 
     let mut payload = Vec::with_capacity(BUNDLE_MAGIC.len() + BUNDLE_SALT_LEN + 12 + ciphertext.len());
@@ -1066,8 +1118,36 @@ fn render_manifest(
 
 
 #[cfg(test)]
-mod bundle_key_tests {
+mod tests {
+
+    /// A bundled pipeline must keep the endpoint it authenticates against.
+    ///
+    /// `is_secret_key` decides what gets rewritten to `${ENV:NAME}` in the
+    /// packaged artifact. `tokenUrl` matched the `token` needle, so an OAuth
+    /// endpoint - a public URL, declared by 37 fields across the REST family -
+    /// was replaced by a variable nobody sets, and the bundle failed at run
+    /// time looking for it. Exactly the failure the `pat` / `path` fix above
+    /// describes, one needle over.
+    ///
+    /// This crate already refined `pat` and `sas` to delimited words, which is
+    /// why `saslMechanism` and `saslUsername` were safe HERE while the engine
+    /// still called them credentials; the two now agree.
+    #[test]
+    fn a_public_endpoint_is_not_bundled_away_as_a_secret() {
+        for key in ["tokenUrl", "saslMechanism", "saslUsername", "path", "filePath"] {
+            assert!(!super::is_secret_key(key), "{key} must survive the bundle intact");
+        }
+        for key in [
+            "authToken", "sessionToken", "password", "apiKey", "clientSecret",
+            "privateKey", "pat", "saslPassword",
+            // A path that reaches a credential stays redacted on purpose.
+            "credentialsPath", "privateKeyPath",
+        ] {
+            assert!(super::is_secret_key(key), "{key} must not be bundled in the clear");
+        }
+    }
     use super::*;
+    use sha2::{Digest, Sha256};
 
     /// secrets.enc ships inside the bundle, so whoever holds the artifact can attack
     /// the passphrase offline. The original key was `Sha256::digest(passphrase)`: no
@@ -1141,5 +1221,66 @@ mod duckdb_default_tests {
             .join(if cfg!(windows) { "duckdb.exe" } else { "duckdb" });
         assert_eq!(got, want);
         assert_ne!(duckdb_under(Path::new("/one")), duckdb_under(Path::new("/two")));
+    }
+}
+
+#[cfg(test)]
+mod bundle_extensions {
+    use super::*;
+
+    fn doc_with(component: &str) -> PipelineDoc {
+        serde_json::from_value(serde_json::json!({
+            "nodes": [{
+                "id": "n",
+                "position": { "x": 0, "y": 0 },
+                "data": { "label": "n", "componentId": component, "properties": { "path": "x" } }
+            }],
+            "edges": []
+        }))
+        .expect("a one-node document")
+    }
+
+    /// A bundle must embed every extension the engine will try to LOAD.
+    ///
+    /// This list and the engine's run-time prelude are two answers to one
+    /// question, and they had diverged: the engine force-loads spatial for
+    /// `src.gdb`, the geometry DQ checks and five geo transforms, and none of
+    /// them were here. A bundle containing one shipped WITHOUT spatial and
+    /// failed at run time with "st_read is not in the catalog" - the same
+    /// failure as #327, except offline, where INSTALL cannot rescue it.
+    ///
+    /// So the question is asked of the engine rather than answered twice.
+    #[test]
+    fn a_bundle_embeds_every_extension_the_engine_loads() {
+        for component in [
+            "src.gdb",
+            "src.spatial",
+            "snk.spatial",
+            "xf.geo.clip",
+            "xf.geo.erase",
+            "xf.geo.reproject",
+            "xf.geo.setcrs",
+            "xf.geo.create",
+            "qa.geomvalidate",
+            "qa.geomrepair",
+            "qa.geomempty",
+        ] {
+            let embedded = needed_extensions(&doc_with(component));
+            assert!(
+                embedded.contains("spatial"),
+                "a bundle containing {component} would ship without the spatial extension, and \
+                 an offline bundle cannot INSTALL one: {embedded:?}"
+            );
+        }
+    }
+
+    /// And the ones that were already right stay right, so the fix cannot be a
+    /// blanket "embed everything".
+    #[test]
+    fn a_plain_file_pipeline_still_embeds_nothing() {
+        assert!(
+            needed_extensions(&doc_with("src.csv")).is_empty(),
+            "a CSV pipeline should need no extension at all"
+        );
     }
 }

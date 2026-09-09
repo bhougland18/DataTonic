@@ -3494,6 +3494,49 @@ html[dir='rtl'] .topbar-lang {
     border-bottom: none;
 }
 
+/* Guidance on a form, not a setting. These were `text` inputs, so a fact about
+   the connector looked like an empty box waiting to be filled in. */
+.field-note {
+    padding: 6px 8px;
+    border-left: 2px solid var(--border-strong);
+    background: var(--bg-2);
+    border-radius: 0 3px 3px 0;
+    color: var(--text-2);
+    font-size: 0.8462rem;
+    line-height: 1.5;
+}
+
+/* Sort keys apply left to right, so their order is part of the value and the
+   rows have to be reorderable rather than just add/remove. */
+.field-sort-move {
+    display: flex;
+    gap: 2px;
+}
+
+.field-sort-move button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--bg-elevated);
+    color: var(--text-2);
+    cursor: pointer;
+}
+
+.field-sort-move button:hover:not(:disabled) {
+    color: var(--text-1);
+    border-color: var(--accent);
+}
+
+.field-sort-move button:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
 .field-agg-header {
     font-size: 0.7692rem;
     text-transform: uppercase;
@@ -9422,3 +9465,98 @@ select.modal-select:focus {
 }
 .spin { animation: setup-spin 900ms linear infinite; }
 @keyframes setup-spin { to { transform: rotate(360deg); } }
+
+
+/* #314: what DuckDB objected to about a node's SQL. Amber rather than the
+   error red: the pipeline is not broken, one node's SQL will not bind, and the
+   author is probably mid-edit. */
+.properties-sql-diagnostics {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0 0 10px;
+}
+
+.properties-sql-diagnostic {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    padding: 8px 10px;
+    border: 1px solid var(--duckle-orange, #e08a3c);
+    border-left-width: 3px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--duckle-orange, #e08a3c) 8%, transparent);
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.properties-sql-diagnostic code {
+    font-size: 11px;
+    opacity: 0.8;
+}
+
+.properties-sql-diagnostic em {
+    font-style: normal;
+    opacity: 0.85;
+}
+
+
+/* #314: completions under the SQL field. Anchored to the field rather than the
+   page, so the list follows the textarea when the panel scrolls. */
+.sql-field {
+    position: relative;
+}
+
+.sql-completions {
+    position: absolute;
+    z-index: 20;
+    left: 0;
+    right: 0;
+    margin: 2px 0 0;
+    padding: 4px;
+    list-style: none;
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--duckle-slate-300, #cbd5e1);
+    border-radius: 6px;
+    background: var(--duckle-surface, #fff);
+    box-shadow: 0 6px 18px rgb(0 0 0 / 12%);
+    font-size: 12px;
+}
+
+.sql-completions li {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.sql-completions li.is-active {
+    background: color-mix(in srgb, var(--duckle-maya, #4aa8e0) 18%, transparent);
+}
+
+/* One letter, so the kind is readable without reading. */
+.sql-completion-kind {
+    flex: 0 0 14px;
+    text-align: center;
+    text-transform: uppercase;
+    font-size: 10px;
+    font-weight: 600;
+    opacity: 0.75;
+}
+
+.sql-completion-kind.kind-column { color: var(--duckle-maya, #4aa8e0); }
+.sql-completion-kind.kind-relation { color: var(--duckle-orange, #e08a3c); }
+.sql-completion-kind.kind-parameter { color: var(--duckle-lemon-ink, #8a7a20); }
+
+.sql-completion-text {
+    font-family: var(--duckle-mono, ui-monospace, monospace);
+}
+
+.sql-completion-detail {
+    margin-left: auto;
+    opacity: 0.6;
+    font-size: 11px;
+}

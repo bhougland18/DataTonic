@@ -1055,6 +1055,48 @@
         assert_eq!(b2, "SELECT * FROM ducklake_table_changes('duckle_src', 'main', 'orders', 1, 3)");
     }
 
+    /// #114. The Visual Mapper's Type column was written by the form into
+    /// `mapper.outputs[].type` and never read here, so the real column type was
+    /// whatever the expression produced. Picking DATE changed nothing, the
+    /// node's declared schema disagreed with its own output, and casting inside
+    /// the expression was the only thing that worked.
+    #[test]
+    fn the_mapper_casts_each_output_to_the_type_it_declares() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["input".into()]);
+        let sql = build_mapper(
+            &ni,
+            &serde_json::json!({
+                "mapper": { "outputs": [
+                    { "name": "dob",    "expression": "date_of_birth", "type": "date" },
+                    { "name": "amount", "expression": "amt",           "type": "int64" },
+                    { "name": "note",   "expression": "memo" },
+                ]}
+            }),
+        )
+        .expect("builds");
+        assert!(sql.contains("CAST(date_of_birth AS DATE) AS \"dob\""), "got: {sql}");
+        assert!(sql.contains("CAST(amt AS BIGINT) AS \"amount\""), "got: {sql}");
+        // An output with no declared type is left exactly as it was, so a
+        // hand-authored or AI-written mapper does not acquire a cast.
+        assert!(sql.contains("memo AS \"note\""), "got: {sql}");
+        assert!(!sql.contains("CAST(memo"), "got: {sql}");
+    }
+
+    /// The key-value `expressions` spellings carry no type, so they must stay
+    /// byte-for-byte what they were.
+    #[test]
+    fn a_mapper_written_as_expressions_is_unchanged() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["input".into()]);
+        let sql = build_mapper(
+            &ni,
+            &serde_json::json!({ "expressions": { "total": "qty * price" } }),
+        )
+        .expect("builds");
+        assert_eq!(sql, "SELECT qty * price AS \"total\" FROM \"input\"");
+    }
+
     #[test]
     fn diffsummary_reduces_change_feed() {
         // xf.diffsummary: counts insert/delete/update_postimage from a change
@@ -1425,11 +1467,11 @@
         // and join with the plain set operator.
         let mut ni = NodeInputs::default();
         ni.ports.insert("main".into(), vec!["a".into(), "b".into()]);
-        let sql = build_setop(&ni, "INTERSECT").unwrap();
+        let sql = build_setop(&ni, "INTERSECT", &serde_json::json!({})).unwrap();
         assert!(!sql.contains("INTERSECT BY NAME"), "must not emit invalid INTERSECT BY NAME, got: {}", sql);
         assert!(sql.contains(" INTERSECT "), "must join legs with plain INTERSECT, got: {}", sql);
         assert!(sql.contains("WHERE false UNION ALL BY NAME"), "must realign later legs by name, got: {}", sql);
-        let ex = build_setop(&ni, "EXCEPT").unwrap();
+        let ex = build_setop(&ni, "EXCEPT", &serde_json::json!({})).unwrap();
         assert!(ex.contains(" EXCEPT ") && !ex.contains("EXCEPT BY NAME"), "got: {}", ex);
     }
 
@@ -2051,13 +2093,13 @@
     fn a_file_list_pointed_at_one_path_is_an_existence_test() {
         // Pointed at a single file the listing yields one row, or none. That is
         // what a job's file-exists check needs, and it needs no second component.
-        let one = build_filelist_source(&serde_json::json!({ "path": "/data/in/today.csv" }));
+        let one = build_filelist_source(&serde_json::json!({ "path": "/data/in/today.csv" })).expect("configured");
         assert!(one.contains("glob('/data/in/today.csv')"), "got: {one}");
         // An explicit path wins over directory + pattern rather than being
         // silently combined with them into a path that names nothing.
         let both = build_filelist_source(&serde_json::json!({
             "path": "/data/in/today.csv", "directory": "/elsewhere", "pattern": "*.txt"
-        }));
+        })).expect("configured");
         assert!(both.contains("glob('/data/in/today.csv')"), "got: {both}");
         assert!(!both.contains("/elsewhere"), "got: {both}");
     }
@@ -2092,16 +2134,16 @@
     fn a_file_list_globs_the_directory_and_names_each_file() {
         let flat = build_filelist_source(&serde_json::json!({
             "directory": "/data/in/", "pattern": "*.csv"
-        }));
+        })).expect("configured");
         // The trailing separator must not double up.
         assert!(flat.contains("glob('/data/in/*.csv')"), "got: {flat}");
         assert!(flat.contains("parse_filename(file) AS filename"), "got: {flat}");
         let deep = build_filelist_source(&serde_json::json!({
             "directory": "/data/in", "pattern": "*.csv", "recursive": true
-        }));
+        })).expect("configured");
         assert!(deep.contains("glob('/data/in/**/*.csv')"), "got: {deep}");
         // No pattern lists everything rather than nothing.
-        let all = build_filelist_source(&serde_json::json!({ "directory": "/data/in" }));
+        let all = build_filelist_source(&serde_json::json!({ "directory": "/data/in" })).expect("configured");
         assert!(all.contains("glob('/data/in/*')"), "got: {all}");
     }
 
@@ -2156,8 +2198,8 @@
         // column00..columnNN and every downstream expression fails to bind.
         use duckle_metadata::{Column, DataType};
         let cols = vec![
-            Column { name: "c00".into(), data_type: DataType::String, nullable: true, format: None, primary_key: None },
-            Column { name: "c01".into(), data_type: DataType::String, nullable: true, format: None, primary_key: None },
+            Column { name: "c00".into(), data_type: DataType::String, nullable: true, format: None, primary_key: None, tags: Vec::new() },
+            Column { name: "c01".into(), data_type: DataType::String, nullable: true, format: None, primary_key: None, tags: Vec::new() },
         ];
         let sql = build_csv_source(
             &serde_json::json!({ "path": "d.txt", "hasHeader": false, "nullPadding": true,
@@ -2301,6 +2343,11 @@
 
         // And in a real workspace it lands somewhere obvious and easy to throw away:
         // deleting the folder is the whole of "clear the cache".
+        // DUCKLE_WORKSPACE is process-global; without this the remove_var below
+        // reaches into whatever test is running alongside. It did: the SFTP
+        // known-hosts tests read their file through this variable, and lost it
+        // mid-test roughly one run in three.
+        let _g = crate::util::workspace_env_guard();
         std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
         let dir = crate::plan::cache_dir().expect("a workspace gives a cache folder");
         std::env::remove_var("DUCKLE_WORKSPACE");
@@ -2404,6 +2451,121 @@
     }
 
     #[test]
+    fn the_geospatial_sink_can_hilbert_order_its_geoparquet() {
+        // #241 follow-up. The Geospatial sink writes GeoParquet, but #319 put the
+        // Hilbert option only on snk.parquet - so the sink someone reaches for when
+        // the work IS geospatial was the one without the spatial optimisation, and
+        // the two sinks otherwise emit the same GeoParquet (verified: both footers
+        // carry the same `geo` key, version 1.0.0, primary_column geom).
+        use crate::plan::builders::build_spatial_sink;
+        let sql = build_spatial_sink(
+            &serde_json::json!({
+                "path": "/out/f.parquet", "driver": "GeoParquet", "hilbertColumn": "geom"
+            }),
+            "up",
+        );
+        assert!(sql.contains("ORDER BY ST_Hilbert(\"geom\""), "{sql}");
+        assert!(sql.contains("ST_Extent(ST_Extent_Agg(\"geom\"))"), "{sql}");
+        assert!(sql.contains("FORMAT PARQUET"), "{sql}");
+        // Same reason as the Parquet sink: geometry that arrived from a plain
+        // Parquet file does not taint this stage, and ST_Hilbert would then fail
+        // at write time, after the whole pipeline had already run.
+        assert!(sql.starts_with("INSTALL spatial; LOAD spatial;"), "{sql}");
+
+        // Not on the GDAL drivers. Hilbert ordering buys row-group pruning, and
+        // GeoJSON, Shapefile and friends have no row groups to prune.
+        for d in ["GeoJSON", "GPKG", "ESRI Shapefile"] {
+            let sql = build_spatial_sink(
+                &serde_json::json!({ "path": "/out/f", "driver": d, "hilbertColumn": "geom" }),
+                "up",
+            );
+            assert!(!sql.contains("ST_Hilbert"), "{d}: {sql}");
+            assert!(sql.contains("FORMAT GDAL"), "{d}: {sql}");
+        }
+
+        // A field cleared in the form arrives as "", and ordering by a column
+        // called "" would fail the write.
+        for value in ["", "   "] {
+            let off = build_spatial_sink(
+                &serde_json::json!({
+                    "path": "/out/f.parquet", "driver": "GeoParquet", "hilbertColumn": value
+                }),
+                "up",
+            );
+            assert_eq!(
+                off,
+                "COPY (SELECT * FROM \"up\") TO '/out/f.parquet' (FORMAT PARQUET)",
+                "{value:?} should be byte-for-byte the old output"
+            );
+        }
+    }
+
+    /// #238 follow-up. The JSON SOURCE can already flatten recursively and keep
+    /// parent names; the transforms could not, so a pipeline that exploded an
+    /// array and then flattened it met `Id`, `Id_1`, `Id_2` again downstream -
+    /// the very thing the source option exists to avoid.
+    ///
+    /// Measured on DuckDB 1.5.4: `unnest(s, recursive := true)` alone produces
+    /// several columns all named `Id`, and only `keep_parent_names := true`
+    /// turns them into `Id`, `owner.Id`, `account.Id`.
+    #[test]
+    fn flatten_and_explode_can_recurse_and_keep_parent_names() {
+        use crate::plan::builders::{build_array, build_json_flatten};
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["up".into()]);
+
+        // Flatten, recursive, with parent names.
+        let sql = build_json_flatten(
+            &ni,
+            &serde_json::json!({ "column": "s", "recursive": true, "keepParentNames": true }),
+        )
+        .expect("builds");
+        assert!(sql.contains("unnest(\"s\", recursive := true, keep_parent_names := true)"), "{sql}");
+        assert!(sql.contains("* EXCLUDE (\"s\")"), "the other columns must survive: {sql}");
+
+        // Recursive without parent names is a different, and legal, choice.
+        let plain = build_json_flatten(
+            &ni,
+            &serde_json::json!({ "column": "s", "recursive": true }),
+        )
+        .expect("builds");
+        assert!(plain.contains("recursive := true"), "{plain}");
+        assert!(!plain.contains("keep_parent_names"), "{plain}");
+
+        // Explode, recursive: no `AS` alias, because unnest then yields several
+        // columns rather than one. The NULL/empty guard stays - a sparse array
+        // must still keep its row.
+        let ex = build_array(
+            &ni,
+            &serde_json::json!({ "column": "items", "recursive": true, "keepParentNames": true }),
+            "xf.arr.explode",
+        )
+        .expect("builds");
+        assert!(ex.contains("recursive := true, keep_parent_names := true"), "{ex}");
+        assert!(ex.contains("CASE WHEN \"items\" IS NULL"), "the guard must survive: {ex}");
+        assert!(!ex.contains("END) AS \"items\""), "an aliased multi-column unnest is invalid: {ex}");
+    }
+
+    /// Both transforms are byte-for-byte what they were unless asked otherwise,
+    /// so nothing already saved changes.
+    #[test]
+    fn flatten_and_explode_are_unchanged_by_default() {
+        use crate::plan::builders::{build_array, build_json_flatten};
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["up".into()]);
+
+        assert_eq!(
+            build_json_flatten(&ni, &serde_json::json!({ "column": "s" })).unwrap(),
+            "SELECT * EXCLUDE (\"s\"), \"s\".* FROM \"up\""
+        );
+        assert_eq!(
+            build_array(&ni, &serde_json::json!({ "column": "items" }), "xf.arr.explode").unwrap(),
+            "SELECT unnest(CASE WHEN \"items\" IS NULL OR length(\"items\") = 0 THEN [NULL] \
+             ELSE \"items\" END) AS \"items\", * EXCLUDE (\"items\") FROM \"up\""
+        );
+    }
+
+    #[test]
     fn json_flatten_is_a_setting_and_repeated_keys_can_keep_their_parent() {
         // #238. Two things, reported together.
         //
@@ -2446,11 +2608,13 @@
         assert!(whole.contains("unnest("), "got: {whole}");
         assert!(whole.contains("recursive := true"), "got: {whole}");
         assert!(whole.contains("keep_parent_names := true"), "got: {whole}");
-        // Not asked for, the read is exactly what it was.
+        // Not asked for, the read is a plain one - now carrying sample_size=-1,
+        // because DuckDB's 20480-row default silently DROPS a column that first
+        // appears later in a sparse document.
         let flat_off = build_json_source(&serde_json::json!({ "path": "d.json" }));
         assert_eq!(
             flat_off,
-            "SELECT * FROM read_json_auto('d.json', maximum_object_size=104857600)"
+            "SELECT * FROM read_json_auto('d.json', maximum_object_size=104857600, sample_size=-1)"
         );
     }
 
@@ -2575,6 +2739,99 @@
         let mut no_prev = NodeInputs::default();
         no_prev.ports.insert("main".into(), vec!["c1".into()]);
         assert!(build_scd3(&no_prev, &props).is_err());
+    }
+
+    /// The SCD3 form and the SCD3 builder have to agree on the property names.
+    ///
+    /// They did not. The manifest declares `naturalKey` / `compareColumns`,
+    /// which is what every other CDC builder reads, and `build_scd3` alone read
+    /// `keyColumns` / `trackColumns`. So configuring SCD3 in the editor produced
+    /// "SCD3 needs key columns" while looking at a filled-in Natural key field,
+    /// and there was no way to fix it from the UI because the field the error
+    /// asks for is not on the form.
+    ///
+    /// The older test passed throughout, because it asserted the spelling the
+    /// code used rather than the one the form writes.
+    #[test]
+    fn scd3_reads_the_property_names_its_form_writes() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["c1".into()]);
+        ni.ports.insert("lookup".into(), vec!["p1".into()]);
+
+        // Exactly what the editor stores for this component.
+        let declared = serde_json::json!({
+            "naturalKey": ["id"],
+            "compareColumns": ["v"],
+        });
+        let sql = build_scd3(&ni, &declared).expect(
+            "the keys the form writes must build; anything else is a component              nobody can configure from the GUI",
+        );
+        assert!(
+            sql.contains("p.\"v\" AS \"previous_v\""),
+            "the tracked column has to come from compareColumns: {sql}"
+        );
+        assert!(
+            sql.contains("p.\"id\" = c.\"id\""),
+            "the join key has to come from naturalKey: {sql}"
+        );
+
+        // The engine's own older spelling keeps working, so a hand-written
+        // pipeline that used it does not break.
+        let legacy = serde_json::json!({ "keyColumns": ["id"], "trackColumns": ["v"] });
+        assert!(build_scd3(&ni, &legacy).is_ok(), "the legacy spelling must stay accepted");
+    }
+
+    /// The Fixed-width form and the Fixed-width source have to agree.
+    ///
+    /// They did not. The form offers `columnWidths` ("10,20,8"), and the
+    /// builder required `columns` as an array of {name,start,width} and
+    /// nothing else, so configuring the node in the editor failed outright
+    /// with "columns array required" and no field on the form could satisfy
+    /// it. `columnWidths` appears nowhere but the manifest: no converter, no
+    /// engine read.
+    ///
+    /// Widths are cumulative, so the Nth column starts after the previous
+    /// ones. Names come from the declared schema when there is one, which is
+    /// the same rule a headerless CSV already follows.
+    #[test]
+    fn fixedwidth_reads_the_widths_its_form_writes() {
+        use duckle_metadata::{Column, DataType};
+
+        let props = serde_json::json!({ "path": "/tmp/f.txt", "columnWidths": "10,5,8" });
+        let sql = build_fixedwidth_source(&props, None).expect(
+            "the key the form writes must build; anything else is a source \
+             nobody can configure from the GUI",
+        );
+        // 1-based, cumulative: 1, then 1+10, then 1+10+5.
+        assert!(sql.contains("substr(line, 1, 10)"), "first column: {sql}");
+        assert!(sql.contains("substr(line, 11, 5)"), "second starts after the first: {sql}");
+        assert!(sql.contains("substr(line, 16, 8)"), "third starts after both: {sql}");
+
+        // With no declared schema the names are positional but usable.
+        assert!(sql.contains("AS \"col1\""), "got: {sql}");
+
+        // A declared schema names them, exactly like a headerless CSV.
+        let declared = vec![
+            Column { name: "id".into(), data_type: DataType::String, nullable: true, primary_key: None, format: None, tags: Vec::new() },
+            Column { name: "code".into(), data_type: DataType::String, nullable: true, primary_key: None, format: None, tags: Vec::new() },
+            Column { name: "amount".into(), data_type: DataType::String, nullable: true, primary_key: None, format: None, tags: Vec::new() },
+        ];
+        let named = build_fixedwidth_source(&props, Some(&declared)).unwrap();
+        assert!(named.contains("AS \"id\""), "declared names must win: {named}");
+        assert!(named.contains("AS \"amount\""), "got: {named}");
+
+        // The explicit form keeps working unchanged.
+        let explicit = serde_json::json!({
+            "path": "/tmp/f.txt",
+            "columns": [{ "name": "a", "start": 1, "width": 3 }],
+        });
+        let ex = build_fixedwidth_source(&explicit, None).unwrap();
+        assert!(ex.contains("substr(line, 1, 3)") && ex.contains("AS \"a\""), "got: {ex}");
+
+        // Neither form supplied is still an error, and it names both keys.
+        let err = build_fixedwidth_source(&serde_json::json!({ "path": "/tmp/f.txt" }), None)
+            .unwrap_err();
+        assert!(err.contains("columnWidths"), "the error must name the form's key: {err}");
     }
 
     #[test]
@@ -4112,6 +4369,7 @@
         // audit B1: a cloud CSV source must honor a Schema-panel declaration
         // via types= (issue #3 parity), not a bare read_csv_auto.
         let cols = vec![duckle_metadata::Column {
+            tags: Vec::new(),
             name: "amt".into(),
             data_type: duckle_metadata::DataType::String,
             nullable: true,
@@ -4137,6 +4395,7 @@
         // rows that fail to parse (raw text), and a tolerant split main that
         // drops exactly those rows. The two predicates must be complementary.
         let cols = vec![duckle_metadata::Column {
+            tags: Vec::new(),
             name: "order_date".into(),
             data_type: duckle_metadata::DataType::Date,
             nullable: true,
@@ -4166,6 +4425,7 @@
         // No declared schema (or all-text schema) => nothing to reject.
         assert!(build_csv_reject_sql(&props, None, false).is_none());
         let text_cols = vec![duckle_metadata::Column {
+            tags: Vec::new(),
             name: "name".into(),
             data_type: duckle_metadata::DataType::String,
             nullable: true,
@@ -4173,6 +4433,75 @@
             format: None,
         }];
         assert!(build_csv_reject_sql(&props, Some(&text_cols), false).is_none());
+    }
+
+    #[test]
+    fn the_geospatial_source_reads_geoparquet_with_read_parquet() {
+        // #241: ST_Read is GDAL-backed and the bundled spatial extension has no
+        // GDAL Parquet driver, so a .geoparquet path fails with "Could not open
+        // GDAL dataset" - the file is fine, that function just cannot open it.
+        for path in ["/data/a.geoparquet", "/data/a.parquet", "s3://b/k.PARQUET", "/d/*.parquet"] {
+            let sql = super::builders::build_spatial_source(
+                &serde_json::json!({ "path": path }),
+            );
+            assert!(sql.contains("read_parquet"), "{path} -> {sql}");
+            assert!(!sql.contains("ST_Read"), "{path} -> {sql}");
+        }
+    }
+
+    #[test]
+    fn every_other_geospatial_format_still_goes_through_st_read() {
+        // ST_Read is what reads these, and routing them to read_parquet would
+        // break every format the component was built for.
+        for path in ["/d/a.geojson", "/d/a.shp", "/d/a.gpkg", "/d/a.kml", "/d/roads.gml"] {
+            let sql = super::builders::build_spatial_source(
+                &serde_json::json!({ "path": path }),
+            );
+            assert!(sql.contains("ST_Read"), "{path} -> {sql}");
+            assert!(!sql.contains("read_parquet"), "{path} -> {sql}");
+        }
+    }
+
+    #[test]
+    fn parquet_sink_orders_by_hilbert_without_writing_the_bounds_out() {
+        // #319. The issue proposes `CROSS JOIN bounds`, which puts the bbox in
+        // the exported file as a column; a scalar subquery does not. And
+        // ST_Extent_Agg(g)::BOX_2D, also from the issue, is rejected by DuckDB
+        // 1.5.4 outright - ST_Extent(ST_Extent_Agg(g)) is the form that works.
+        let sql = super::builders::build_parquet_sink(
+            &serde_json::json!({ "path": "/lake/out.parquet", "hilbertColumn": "geom" }),
+            "v",
+        );
+        assert!(sql.contains("ORDER BY ST_Hilbert(\"geom\""), "{sql}");
+        assert!(sql.contains("ST_Extent(ST_Extent_Agg(\"geom\"))"), "{sql}");
+        assert!(!sql.contains("CROSS JOIN"), "the bbox would become a column: {sql}");
+        assert!(!sql.contains("BOX_2D"), "that cast does not work on 1.5.4: {sql}");
+        // Spatial is loaded by the sink itself: geometry read back from a plain
+        // Parquet file does not taint this stage, and ST_Hilbert would then
+        // fail at write time, after the whole pipeline had run.
+        assert!(sql.starts_with("INSTALL spatial; LOAD spatial;"), "{sql}");
+    }
+
+    #[test]
+    fn a_parquet_sink_without_the_option_is_byte_for_byte_what_it_was() {
+        let sql = super::builders::build_parquet_sink(
+            &serde_json::json!({ "path": "/lake/out.parquet" }),
+            "v",
+        );
+        assert_eq!(sql, "COPY (SELECT * FROM \"v\") TO '/lake/out.parquet' (FORMAT PARQUET, COMPRESSION 'ZSTD')");
+    }
+
+    #[test]
+    fn an_empty_hilbert_column_is_off_rather_than_an_error() {
+        // A field cleared in the form arrives as "", and sorting by a column
+        // called "" would fail the write.
+        for value in ["", "   "] {
+            let sql = super::builders::build_parquet_sink(
+                &serde_json::json!({ "path": "/o.parquet", "hilbertColumn": value }),
+                "v",
+            );
+            assert!(!sql.contains("ST_Hilbert"), "{value:?} -> {sql}");
+        }
     }
 
     #[test]
@@ -5021,6 +5350,7 @@
         // schema -> unchanged read (all columns, auto-inferred).
         use duckle_metadata::{Column, DataType};
         let col = |name: &str, dt: DataType, fmt: Option<&str>| Column {
+            tags: Vec::new(),
             name: name.into(),
             data_type: dt,
             nullable: true,
@@ -5365,3 +5695,1338 @@
             assert_eq!(studio_rej, base_rej, "{studio} reject-port must match {base}");
         }
     }
+    // -----------------------------------------------------------------------
+    // #274 - a publish group must REFUSE rather than shrink. Each of these is a
+    // way a group of N quietly became a group of N-1 while still claiming the
+    // tables publish together, which is worse than not offering the guarantee.
+    // -----------------------------------------------------------------------
+
+    fn grouped_lake_doc(extra_w2: &str, w2_path: &str) -> PipelineDoc {
+        pipeline_from_json(&format!(
+            r#"{{
+              "nodes": [
+                {{"id":"s1","position":{{"x":0,"y":0}},"data":{{"label":"a","componentId":"code.sql","properties":{{"sql":"SELECT 1 AS id"}}}}}},
+                {{"id":"s2","position":{{"x":0,"y":0}},"data":{{"label":"b","componentId":"code.sql","properties":{{"sql":"SELECT 2 AS id"}}}}}},
+                {{"id":"w1","position":{{"x":0,"y":0}},"data":{{"label":"dim","componentId":"snk.ducklake","properties":{{
+                  "path":"/tmp/lake.duckdb","schemaName":"main","tableName":"dim","mode":"overwrite","publishGroup":"nightly"}}}}}},
+                {{"id":"w2","position":{{"x":0,"y":0}},"data":{{"label":"fact",{extra}"componentId":"snk.ducklake","properties":{{
+                  "path":"{path}","schemaName":"main","tableName":"fact","mode":"overwrite","publishGroup":"nightly"}}}}}}
+              ],
+              "edges":[
+                {{"id":"e1","source":"s1","target":"w1","data":{{"connectionType":"main"}}}},
+                {{"id":"e2","source":"s2","target":"w2","data":{{"connectionType":"main"}}}}
+              ]
+            }}"#,
+            extra = extra_w2,
+            path = w2_path
+        ))
+    }
+
+    /// A group of two whose second member is disabled is a group of one. The
+    /// planner has always honoured `disabled` silently, which here would mean
+    /// publishing one table while the pipeline says two publish together.
+    #[test]
+    fn publish_group_refuses_a_disabled_member() {
+        let doc = grouped_lake_doc("\"disabled\":true,", "/tmp/lake.duckdb");
+        let err = compile(&doc).unwrap_err().to_string();
+        assert!(
+            err.contains("nightly") && err.contains("fact") && err.contains("disabled"),
+            "must name the group, the member and why: {}",
+            err
+        );
+    }
+
+    /// Two catalogs cannot be committed together. One transaction reaches one
+    /// database - there is no ordering of two commits that makes both land or
+    /// neither, so offering the option at all would be a lie.
+    #[test]
+    fn publish_group_refuses_two_different_lakes() {
+        let doc = grouped_lake_doc("", "/tmp/other-lake.duckdb");
+        let err = compile(&doc).unwrap_err().to_string();
+        assert!(
+            err.contains("nightly") && err.contains("other-lake"),
+            "must name the group and the second catalog: {}",
+            err
+        );
+    }
+
+    /// "Run from here" walks back along data edges only, so a partial run can
+    /// contain one member of a group and not the other. Publishing the half it
+    /// happens to reach is exactly the split the group exists to prevent.
+    #[test]
+    fn publish_group_refuses_a_partial_run_that_splits_it() {
+        let doc = grouped_lake_doc("", "/tmp/lake.duckdb");
+        // Running from w1 pulls in s1 and w1 - w2 is on a separate branch and
+        // is left out entirely.
+        let err = compile_partial(&doc, "w1").unwrap_err().to_string();
+        assert!(
+            err.contains("nightly") && err.contains("fact") && err.contains("not part of this run"),
+            "must say the run does not contain the whole group: {}",
+            err
+        );
+    }
+
+    /// A member inside a ctl.parallelize branch runs as its own sub-pipeline,
+    /// in its own process, and cannot join this run's transaction. The planner
+    /// removes such nodes from the main plan, so the group would have committed
+    /// without it and reported success.
+    #[test]
+    fn publish_group_refuses_a_member_inside_parallelize() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s1","position":{"x":0,"y":0},"data":{"label":"a","componentId":"code.sql","properties":{"sql":"SELECT 1 AS id"}}},
+                {"id":"p","position":{"x":0,"y":0},"data":{"label":"fan","componentId":"ctl.parallelize","properties":{}}},
+                {"id":"w1","position":{"x":0,"y":0},"data":{"label":"dim","componentId":"snk.ducklake","properties":{
+                  "path":"/tmp/lake.duckdb","schemaName":"main","tableName":"dim","mode":"overwrite","publishGroup":"nightly"}}},
+                {"id":"w2","position":{"x":0,"y":0},"data":{"label":"fact","componentId":"snk.ducklake","properties":{
+                  "path":"/tmp/lake.duckdb","schemaName":"main","tableName":"fact","mode":"overwrite","publishGroup":"nightly"}}}
+              ],
+              "edges":[
+                {"id":"e1","source":"s1","target":"p","data":{"connectionType":"main"}},
+                {"id":"e2","source":"p","target":"w1","data":{"connectionType":"main"}},
+                {"id":"e3","source":"p","target":"w2","data":{"connectionType":"main"}}
+              ]
+            }"#,
+        );
+        let err = compile(&doc).unwrap_err().to_string();
+        assert!(
+            err.contains("nightly") && err.contains("parallelize"),
+            "must name the group and parallelize: {}",
+            err
+        );
+    }
+
+
+    /// #305: a durable output read INSTEAD of running the node that made it.
+    #[test]
+    fn a_bound_output_replaces_the_stage_and_keeps_its_name() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"f","position":{"x":0,"y":0},"data":{
+                  "label":"Filter","componentId":"xf.filter",
+                  "properties":{"predicate":"amt > 1"}}},
+                {"id":"out","position":{"x":0,"y":0},"data":{
+                  "label":"Write","componentId":"snk.parquet",
+                  "properties":{"path":"/tmp/out.parquet"}}}
+              ],
+              "edges":[
+                {"id":"e1","source":"s","target":"f","data":{"connectionType":"main"}},
+                {"id":"e2","source":"f","target":"out","data":{"connectionType":"main"}}
+              ]
+            }"#,
+        );
+
+        let bind = |pairs: &[(&str, &str)]| {
+            let mut stages = compile(&doc).unwrap().stages;
+            let map: std::collections::BTreeMap<String, String> =
+                pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            crate::plan::apply_output_bindings(&mut stages, &map);
+            stages
+        };
+
+        // Nothing bound: the plan is exactly what it was.
+        let before = compile(&doc).unwrap().stages;
+        let plain = bind(&[]);
+        assert_eq!(
+            plain.iter().map(|s| s.sql.clone()).collect::<Vec<_>>(),
+            before.iter().map(|s| s.sql.clone()).collect::<Vec<_>>(),
+            "an ordinary run must be untouched"
+        );
+
+        // Bound: the source reads a parquet somebody else made, under its own
+        // relation name, so nothing downstream can tell.
+        let bound = bind(&[("s", "/ws/cache/p/s/K.parquet")]);
+        let s = bound.iter().find(|x| x.node_id == "s").unwrap();
+        assert!(
+            s.sql.contains("CREATE OR REPLACE VIEW \"s\" AS SELECT * FROM read_parquet("),
+            "{}",
+            s.sql
+        );
+        assert!(s.sql.contains("/ws/cache/p/s/K.parquet"), "{}", s.sql);
+        assert!(!s.sql.contains("read_csv"), "the source is not read again: {}", s.sql);
+        assert!(s.runtime.is_none());
+        assert!(!s.attach_view);
+
+        // Downstream is not edited at all - it still reads "s" by name.
+        let f = bound.iter().find(|x| x.node_id == "f").unwrap();
+        let f_before = before.iter().find(|x| x.node_id == "f").unwrap();
+        assert_eq!(f.sql, f_before.sql, "no consumer is rewritten");
+    }
+
+    /// A sink's effect is outside the run. Reading a file back neither repeats
+    /// nor undoes it, so binding one would silently skip the write it exists to
+    /// do.
+    #[test]
+    fn a_sink_is_never_bound() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"out","position":{"x":0,"y":0},"data":{
+                  "label":"Write","componentId":"snk.parquet",
+                  "properties":{"path":"/tmp/out.parquet"}}}
+              ],
+              "edges":[{"id":"e","source":"s","target":"out","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        let before = compile(&doc).unwrap().stages;
+        let mut stages = compile(&doc).unwrap().stages;
+        crate::plan::apply_output_bindings(
+            &mut stages,
+            &[("out".to_string(), "/ws/anything.parquet".to_string())].into_iter().collect(),
+        );
+        let out = stages.iter().find(|x| x.node_id == "out").unwrap();
+        let out_before = before.iter().find(|x| x.node_id == "out").unwrap();
+        assert_eq!(out.sql, out_before.sql, "the write must still happen");
+    }
+
+    #[test]
+    fn a_quote_in_a_bound_path_cannot_break_out_of_the_literal() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [{"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}}],
+              "edges":[]
+            }"#,
+        );
+        let mut stages = compile(&doc).unwrap().stages;
+        crate::plan::apply_output_bindings(
+            &mut stages,
+            &[("s".to_string(), "/ws/it's.parquet".to_string())].into_iter().collect(),
+        );
+        assert!(stages[0].sql.contains("it''s.parquet"), "{}", stages[0].sql);
+    }
+
+    /// The two traps binding has to clear, on a stage that actually has them.
+    ///
+    /// `src.csv` has neither, so asserting against a compiled CSV stage proves
+    /// nothing - it was already true. This drives the pass directly instead.
+    #[test]
+    fn binding_clears_the_runtime_hook_and_the_attach() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [{"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}}],
+              "edges":[]
+            }"#,
+        );
+        let mut stages = compile(&doc).unwrap().stages;
+        // A stage that would take the runtime branch and ignore its SQL, and
+        // would ATTACH a database this run never opened.
+        stages[0].runtime = Some(crate::plan::RuntimeSpec::InstallFallback("/tmp/x".into()));
+        stages[0].attach_view = true;
+
+        crate::plan::apply_output_bindings(
+            &mut stages,
+            &[("s".to_string(), "/ws/s.parquet".to_string())].into_iter().collect(),
+        );
+        assert!(
+            stages[0].runtime.is_none(),
+            "a runtime hook left in place makes the executor ignore the bound SQL entirely"
+        );
+        assert!(
+            !stages[0].attach_view,
+            "it must not ATTACH a source database this run never opened"
+        );
+        assert!(stages[0].sql.contains("read_parquet("), "{}", stages[0].sql);
+    }
+
+    /// #305: a skipped node is not staged at all.
+    ///
+    /// Without this the plan says "skip" and the stage runs anyway - which is
+    /// exactly what happened the first time it was run end to end: the dry run
+    /// reported `skip download` and the retry still read the CSV.
+    #[test]
+    fn a_skipped_node_is_not_staged() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"f","position":{"x":0,"y":0},"data":{
+                  "label":"Filter","componentId":"xf.filter",
+                  "properties":{"predicate":"amt > 1"}}},
+                {"id":"out","position":{"x":0,"y":0},"data":{
+                  "label":"Write","componentId":"snk.parquet",
+                  "properties":{"path":"/tmp/out.parquet"}}}
+              ],
+              "edges":[
+                {"id":"e1","source":"s","target":"f","data":{"connectionType":"main"}},
+                {"id":"e2","source":"f","target":"out","data":{"connectionType":"main"}}
+              ]
+            }"#,
+        );
+        let mut stages = compile(&doc).unwrap().stages;
+        let before = stages.len();
+        crate::plan::drop_stages(&mut stages, &["s".to_string()].into_iter().collect());
+        assert_eq!(stages.len(), before - 1, "the skipped stage is gone");
+        assert!(!stages.iter().any(|x| x.node_id == "s"));
+        assert!(stages.iter().any(|x| x.node_id == "f"), "its consumer stays");
+    }
+
+    /// A sink is an end, so the backward walk always reaches it. Dropping one
+    /// would silently skip the write it exists to do.
+    #[test]
+    fn a_sink_is_never_dropped() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"out","position":{"x":0,"y":0},"data":{
+                  "label":"Write","componentId":"snk.parquet",
+                  "properties":{"path":"/tmp/out.parquet"}}}
+              ],
+              "edges":[{"id":"e","source":"s","target":"out","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        let mut stages = compile(&doc).unwrap().stages;
+        crate::plan::drop_stages(&mut stages, &["out".to_string()].into_iter().collect());
+        assert!(stages.iter().any(|x| x.node_id == "out"), "the write must still happen");
+    }
+
+    /// A port the GUI wrote as a NUMBER must reach the connection.
+    ///
+    /// The integer field writes a JSON number and the port was read with
+    /// `string_prop`, which is `as_str()` only - so every port typed into the
+    /// panel parsed to None and fell through to the 31337 default. The user
+    /// set 5000, Duckle dialled 31337, and nothing said why.
+    #[test]
+    fn a_port_typed_in_the_panel_is_not_discarded() {
+        use crate::plan::builders::port_prop;
+        // What the GUI actually stores.
+        let gui = serde_json::json!({ "port": 5000 });
+        assert_eq!(port_prop(&gui, "port"), Some(5000), "a JSON number is what the panel writes");
+
+        // What a hand-written pipeline file and older saves spell.
+        let text = serde_json::json!({ "port": "5000" });
+        assert_eq!(port_prop(&text, "port"), Some(5000), "text must keep working");
+        assert_eq!(port_prop(&serde_json::json!({ "port": " 5000 " }), "port"), Some(5000));
+
+        // Absent and nonsense both fall through to the caller's default.
+        assert_eq!(port_prop(&serde_json::json!({}), "port"), None);
+        assert_eq!(port_prop(&serde_json::json!({ "port": "abc" }), "port"), None);
+        // Out of range is not a port, and must not wrap to one.
+        assert_eq!(port_prop(&serde_json::json!({ "port": 70000 }), "port"), None);
+    }
+
+    /// The GUI's "- column -" option writes column:"" and the builder emits
+    /// COUNT("") - a quoted empty identifier, which is not valid SQL.
+    #[test]
+    fn a_group_by_count_with_no_column_is_not_broken_sql() {
+        let doc = pipeline_from_json(
+            r#"{
+              "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{
+                  "label":"CSV","componentId":"src.csv",
+                  "properties":{"path":"/tmp/a.csv","hasHeader":true}}},
+                {"id":"g","position":{"x":0,"y":0},"data":{
+                  "label":"Group","componentId":"xf.groupby",
+                  "properties":{"groupKeys":["k"],
+                    "aggregations":[{"column":"","func":"count","output":"n"}]}}}
+              ],
+              "edges":[{"id":"e","source":"s","target":"g","data":{"connectionType":"main"}}]
+            }"#,
+        );
+        let sql = compile(&doc).unwrap().stages.into_iter()
+            .find(|s| s.node_id == "g").unwrap().sql;
+        assert!(
+            !sql.contains("count(\"\")") && !sql.contains("COUNT(\"\")"),
+            "an empty column must not become a quoted empty identifier: {sql}"
+        );
+        assert!(sql.contains("COUNT(*)"), "it means COUNT(*), which is what the option says: {sql}");
+    }
+
+/// The PII contract's escape hatch, in the exact shape the Properties Panel
+/// writes. The gate at plan/mod.rs:1102 has always told the operator to "set
+/// contracts.allowPii=true" and, until the Advanced tab grew the field, nothing
+/// in the interface could write it - so the way out of the refusal was to edit
+/// the pipeline file by hand. Neither half had a test.
+fn pii_doc(sink_props: &str) -> PipelineDoc {
+    pipeline_from_json(&format!(
+        r#"{{
+          "nodes": [
+            {{"id":"s","position":{{"x":0,"y":0}},"data":{{"label":"people","componentId":"src.csv",
+              "properties":{{"path":"/tmp/people.csv","hasHeader":true,"contracts":{{"pii":["email"]}}}},
+              "schema":[{{"name":"id","type":"int64"}},{{"name":"email","type":"string"}}]}}}},
+            {{"id":"k","position":{{"x":0,"y":0}},"data":{{"label":"out","componentId":"snk.csv",
+              "properties":{{"path":"/tmp/out.csv"{}}}}}}}
+          ],
+          "edges":[{{"id":"e1","source":"s","target":"k","data":{{"connectionType":"main"}}}}]
+        }}"#,
+        sink_props
+    ))
+}
+
+/// A quality gate that is not configured must refuse, not pass every row.
+///
+/// Measured before the fix, through the runner, on three rows where one held a
+/// NULL: qa.notnull with no columns, qa.schemavalidate with no expectedColumns,
+/// and qa.range with a column but neither min nor max each reported `ok` and
+/// emitted all three rows. `quality_pass_predicate` returned "TRUE" for an
+/// empty configuration, so the gate evaluated to a tautology.
+///
+/// That is worse than an error. The node exists only to reject rows, so a run
+/// with one in it is a run someone believes is checked - and it reported
+/// success while checking nothing. Every sibling gate already refuses: qa.mask,
+/// qa.expect, qa.unique, qa.dedupe and qa.contract all fail when unconfigured,
+/// and qa.range itself fails when its column is missing. These three were the
+/// inconsistency.
+/// "Read every sheet" has to learn the sheet names from the file, because
+/// DuckDB cannot tell it: the excel extension exposes `read_xlsx` and nothing
+/// else, so there is no sheet catalogue to query.
+///
+/// Built here as a minimal .xlsx - a zip holding `xl/workbook.xml` - so the
+/// test needs no fixture binary and no spreadsheet library. Verified against a
+/// real three-sheet workbook end to end as well: 2 + 1 + 2 rows came back as 5.
+#[test]
+fn every_sheet_name_is_read_from_the_workbook_in_order() {
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("book.xlsx");
+
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("xl/workbook.xml", opts).unwrap();
+        // An ampersand in a sheet name is stored escaped. Asking read_xlsx for
+        // the raw spelling would not match the sheet, so it has to come back
+        // unescaped.
+        zip.write_all(
+            br#"<?xml version="1.0"?><workbook><sheets>
+                 <sheet name="January" sheetId="1" r:id="rId1"/>
+                 <sheet name="March 2026" sheetId="2" r:id="rId2"/>
+                 <sheet name="R&amp;D" sheetId="3" r:id="rId3"/>
+               </sheets></workbook>"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+    }
+
+    let names = crate::plan::builders::excel_sheet_names(path.to_str().unwrap());
+    assert_eq!(
+        names,
+        vec![
+            "January".to_string(),
+            "March 2026".to_string(),
+            "R&D".to_string()
+        ],
+        "workbook order, with entities decoded"
+    );
+}
+
+/// Anything unreadable returns nothing, and the caller falls back to the
+/// single-sheet read - so a bad path still fails where it always failed,
+/// rather than becoming a confusing error about sheets.
+#[test]
+fn an_unreadable_workbook_yields_no_sheet_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("nope.xlsx");
+    assert!(crate::plan::builders::excel_sheet_names(missing.to_str().unwrap()).is_empty());
+
+    // A .xls (or anything else that is not a zip) must not panic.
+    let not_zip = tmp.path().join("old.xls");
+    std::fs::write(&not_zip, b"not a zip at all").unwrap();
+    assert!(crate::plan::builders::excel_sheet_names(not_zip.to_str().unwrap()).is_empty());
+}
+
+#[test]
+fn an_unconfigured_quality_gate_refuses_rather_than_passing_everything() {
+    use crate::plan::builders::quality_pass_predicate;
+
+    for (component, props) in [
+        ("qa.notnull", serde_json::json!({})),
+        ("qa.notnull", serde_json::json!({ "columns": [] })),
+        ("qa.schemavalidate", serde_json::json!({})),
+        // A column, but nothing to compare it against.
+        ("qa.range", serde_json::json!({ "column": "amt" })),
+    ] {
+        let got = quality_pass_predicate(component, &props);
+        assert!(
+            got.is_err(),
+            "{component} with {props} produced {got:?} instead of refusing"
+        );
+    }
+}
+
+/// And the configured forms keep working, so the refusal above cannot be
+/// satisfied by refusing everything.
+#[test]
+fn a_configured_quality_gate_still_builds_its_predicate() {
+    use crate::plan::builders::quality_pass_predicate;
+
+    let nn = quality_pass_predicate("qa.notnull", &serde_json::json!({ "columns": ["amt"] }))
+        .expect("columns given");
+    assert!(nn.contains("IS NOT NULL"), "got: {nn}");
+
+    let sv = quality_pass_predicate(
+        "qa.schemavalidate",
+        &serde_json::json!({ "expectedColumns": ["amt"] }),
+    )
+    .expect("expectedColumns given");
+    assert!(sv.contains("IS NOT NULL"), "got: {sv}");
+
+    let lo = quality_pass_predicate("qa.range", &serde_json::json!({ "column": "amt", "min": 1 }))
+        .expect("a min alone is a real bound");
+    assert!(lo.contains(">="), "got: {lo}");
+
+    let hi = quality_pass_predicate("qa.range", &serde_json::json!({ "column": "amt", "max": 9 }))
+        .expect("a max alone is a real bound");
+    assert!(hi.contains("<="), "got: {hi}");
+}
+
+#[test]
+fn a_pii_column_reaching_a_sink_is_refused() {
+    let err = compile(&pii_doc("")).expect_err("a tagged column reached a sink unmasked");
+    let msg = err.to_string();
+    assert!(msg.contains("tagged PII"), "the gate must be what refused it: {msg}");
+    assert!(msg.contains("email"), "and it must name the column: {msg}");
+}
+
+#[test]
+fn the_panels_allow_pii_shape_lifts_the_refusal() {
+    // Nested under `contracts`, which is what setProperty('contracts.allowPii')
+    // writes - a flat "contracts.allowPii" key would not be read at all.
+    let plan = compile(&pii_doc(r#","contracts":{"allowPii":true}"#))
+        .expect("the documented escape hatch has to actually compile");
+    assert!(
+        plan.stages.iter().any(|s| s.node_id == "k"),
+        "and the sink still has to be planned"
+    );
+}
+
+#[test]
+fn a_flat_dotted_key_does_not_lift_the_refusal() {
+    // The mistake the panel's dotted-key setter exists to prevent: writing the
+    // literal property "contracts.allowPii" looks right in a pipeline file and
+    // is read by nothing.
+    let err = compile(&pii_doc(r#","contracts.allowPii":true"#))
+        .expect_err("a flat key must not be mistaken for the contract");
+    assert!(err.to_string().contains("tagged PII"), "{err}");
+}
+
+/// The Parquet half of the same delegation. The panel's S3 sink now offers
+/// compression / level / version / row-group size and a CSV header toggle
+/// because build_cloud_sink hands the props to the local builders unchanged;
+/// only the CSV delimiter and null string had a test saying so.
+#[test]
+fn cloud_parquet_sink_honors_the_write_options_the_panel_offers() {
+    let sql = build_cloud_sink(
+        "s3",
+        &serde_json::json!({
+            "path": "s3://b/out.parquet",
+            "compression": "zstd",
+            "compressionLevel": 9,
+            "parquetVersion": "v2",
+            "rowGroupSize": 1000000
+        }),
+        "v",
+    )
+    .unwrap();
+    assert!(sql.contains("COMPRESSION 'zstd'"), "{sql}");
+    assert!(sql.contains("COMPRESSION_LEVEL 9"), "{sql}");
+    assert!(sql.contains("PARQUET_VERSION V2"), "{sql}");
+    assert!(sql.contains("ROW_GROUP_SIZE 1000000"), "{sql}");
+}
+
+#[test]
+fn a_cloud_csv_sink_can_be_written_without_a_header() {
+    let sql = build_cloud_sink(
+        "s3",
+        &serde_json::json!({"path": "s3://b/out.csv", "writeHeader": false}),
+        "v",
+    )
+    .unwrap();
+    assert!(sql.contains("HEADER false"), "the toggle has to reach the COPY: {sql}");
+}
+
+/// build_sort had no direct unit test. Everything asserted about it was
+/// indirect - one end-to-end sortColumn run and a compile-only fixture that
+/// never looks at the SQL - so every disagreement between its two branches
+/// went unnoticed. These pin the whole surface before it is changed.
+#[cfg(test)]
+mod sorting {
+    use super::*;
+
+    fn sort_sql(props: serde_json::Value) -> String {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["up".into()]);
+        build_sort(&ni, &props).expect("build_sort")
+    }
+
+    fn order_by(props: serde_json::Value) -> String {
+        let sql = sort_sql(props);
+        match sql.split_once("ORDER BY ") {
+            Some((_, keys)) => keys.to_string(),
+            None => panic!("no ORDER BY in: {sql}"),
+        }
+    }
+
+    /// The two branches parsed `direction` differently: the orderBy element
+    /// branch trims and lowercases, the single-column branch matched "desc"
+    /// exactly. So "DESC" - which a hand-written pipeline, an import or an SDK
+    /// will write - sorted ASCENDING, with no error and no warning.
+    #[test]
+    fn an_uppercase_direction_still_means_descending() {
+        for spelling in ["DESC", "Desc", " desc", "desc "] {
+            let keys = order_by(serde_json::json!({
+                "sortColumn": "amount", "direction": spelling
+            }));
+            assert!(
+                keys.starts_with("\"amount\" DESC"),
+                "direction {spelling:?} must sort descending, got: {keys}"
+            );
+        }
+    }
+
+    /// columns_list accepts a bare string as a one-element list precisely
+    /// because writing "id" instead of ["id"] is the obvious mistake. orderBy
+    /// was the one reader that did not, and the node degraded to an unordered
+    /// SELECT * in silence.
+    #[test]
+    fn a_bare_string_order_by_still_sorts() {
+        assert_eq!(order_by(serde_json::json!({ "orderBy": "amount" })), "\"amount\" ASC");
+    }
+
+    /// The column name went into the SQL verbatim, so any name needing quotes
+    /// produced a parse error rather than a sort.
+    #[test]
+    fn a_column_name_that_needs_quoting_is_quoted() {
+        assert_eq!(order_by(serde_json::json!({ "orderBy": ["my col"] })), "\"my col\" ASC");
+    }
+
+    /// The documented workaround for multi-column sort, which the editor could
+    /// not express: a trailing direction inside the string. It has to keep
+    /// working, which is why the column cannot simply be quoted whole.
+    #[test]
+    fn a_trailing_direction_inside_the_string_is_understood() {
+        assert_eq!(
+            order_by(serde_json::json!({ "orderBy": ["amount DESC", "name asc"] })),
+            "\"amount\" DESC, \"name\" ASC"
+        );
+    }
+
+    /// nullsLast was read only in the single-column fallback, so a multi-column
+    /// sort silently lost it.
+    #[test]
+    fn null_ordering_is_reachable_per_key() {
+        assert_eq!(
+            order_by(serde_json::json!({
+                "orderBy": [
+                    { "column": "a", "direction": "desc", "nullsLast": false },
+                    { "column": "b", "nullsLast": true }
+                ]
+            })),
+            "\"a\" DESC NULLS FIRST, \"b\" ASC NULLS LAST"
+        );
+    }
+
+    /// A key that says nothing about nulls must emit no NULLS clause, or every
+    /// pipeline already using orderBy changes its output ordering on upgrade.
+    #[test]
+    fn a_key_that_says_nothing_about_nulls_emits_no_clause() {
+        assert_eq!(
+            order_by(serde_json::json!({
+                "orderBy": [{ "column": "a" }, { "column": "b", "direction": "desc" }]
+            })),
+            "\"a\" ASC, \"b\" DESC"
+        );
+    }
+
+    /// The single-column form's existing semantics, unchanged.
+    #[test]
+    fn the_single_column_form_keeps_its_null_default() {
+        assert_eq!(order_by(serde_json::json!({ "sortColumn": "c" })), "\"c\" ASC NULLS LAST");
+        assert_eq!(
+            order_by(serde_json::json!({ "sortColumn": "c", "nullsLast": false })),
+            "\"c\" ASC NULLS FIRST"
+        );
+    }
+
+    /// orderBy wins when both are present, and an unconfigured node is still a
+    /// pass-through rather than an error.
+    #[test]
+    fn order_by_wins_and_an_empty_sort_is_a_pass_through() {
+        assert_eq!(
+            order_by(serde_json::json!({ "orderBy": ["a"], "sortColumn": "b" })),
+            "\"a\" ASC"
+        );
+        assert_eq!(sort_sql(serde_json::json!({})), "SELECT * FROM \"up\"");
+    }
+}
+
+/// The validator and build_sort have to agree about what a sort key IS, or one
+/// half rejects a pipeline the other half compiles correctly.
+#[cfg(test)]
+mod sort_validation {
+    use super::*;
+
+    fn doc(sort_props: serde_json::Value) -> PipelineDoc {
+        serde_json::from_value(serde_json::json!({
+            "nodes": [
+                {"id":"s","position":{"x":0,"y":0},"data":{"label":"in","componentId":"src.csv",
+                  "properties":{"path":"/tmp/in.csv","hasHeader":true},
+                  "schema":[{"name":"amount","type":"int64"},{"name":"name","type":"string"}]}},
+                {"id":"t","position":{"x":0,"y":0},"data":{"label":"Sort","componentId":"xf.sort",
+                  "properties": sort_props}},
+                {"id":"k","position":{"x":0,"y":0},"data":{"label":"out","componentId":"snk.csv",
+                  "properties":{"path":"/tmp/out.csv"}}}
+            ],
+            "edges":[
+                {"id":"e1","source":"s","target":"t","data":{"connectionType":"main"}},
+                {"id":"e2","source":"t","target":"k","data":{"connectionType":"main"}}
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// The documented multi-column workaround. build_sort has always understood
+    /// it; the validator checked the whole string as a column name and refused
+    /// the pipeline before build_sort ever saw it.
+    #[test]
+    fn a_trailing_direction_is_not_read_as_part_of_the_column_name() {
+        let plan = compile(&doc(serde_json::json!({ "orderBy": ["amount DESC", "name"] })))
+            .expect("the string form has to validate as well as compile");
+        let sql = plan.stages.iter().find(|s| s.node_id == "t").expect("sort stage").sql.clone();
+        assert!(sql.contains("ORDER BY \"amount\" DESC, \"name\" ASC"), "{sql}");
+    }
+
+    /// A real typo still has to be caught, or the check is worthless.
+    #[test]
+    fn a_misspelled_sort_column_is_still_refused() {
+        let err = compile(&doc(serde_json::json!({ "orderBy": ["amonut DESC"] })))
+            .expect_err("a column that does not exist must not compile");
+        assert!(err.to_string().contains("amonut"), "it names the typo: {err}");
+    }
+
+    /// The legacy single-key form was never validated at all, so a typo in the
+    /// editor's own Column field survived planning and failed inside DuckDB
+    /// with a message about SQL rather than about the field.
+    #[test]
+    fn a_misspelled_single_sort_column_is_refused_too() {
+        let err = compile(&doc(serde_json::json!({ "sortColumn": "amonut" })))
+            .expect_err("the single-column form must be checked like every other");
+        assert!(err.to_string().contains("amonut"), "{err}");
+    }
+
+    /// The bare-string form compiles, so it must validate.
+    #[test]
+    fn a_bare_string_order_by_is_validated_not_ignored() {
+        compile(&doc(serde_json::json!({ "orderBy": "amount" }))).expect("valid");
+        let err = compile(&doc(serde_json::json!({ "orderBy": "amonut" })))
+            .expect_err("a typo in the bare-string form must be caught");
+        assert!(err.to_string().contains("amonut"), "{err}");
+    }
+}
+
+/// A GraphQL source has to be buildable from the form that draws it.
+///
+/// The arm requires `query` and reads `variables`, and synthApiSource declared
+/// neither - it draws the REST `body` textarea, which this arm ignores because
+/// it builds the body itself from query + variables. So every src.graphql,
+/// src.linear and src.monday node the editor could produce failed at plan time
+/// on "query required", and the only way to make one was to write the pipeline
+/// file by hand.
+#[cfg(test)]
+mod graphql_source {
+    use super::*;
+
+    fn node(props: serde_json::Value) -> PipelineDoc {
+        serde_json::from_value(serde_json::json!({
+            "nodes": [
+                {"id":"g","position":{"x":0,"y":0},
+                 "data":{"label":"GQL","componentId":"src.graphql","properties": props}},
+                {"id":"k","position":{"x":0,"y":0},
+                 "data":{"label":"out","componentId":"snk.csv","properties":{"path":"/tmp/o.csv"}}}
+            ],
+            "edges":[{"id":"e1","source":"g","target":"k","data":{"connectionType":"main"}}]
+        }))
+        .unwrap()
+    }
+
+    /// The form's own keys, and nothing a hand-written file would add.
+    #[test]
+    fn the_fields_the_form_offers_are_enough_to_compile() {
+        let plan = node(serde_json::json!({
+            "url": "https://api.example.invalid/graphql",
+            "query": "query { issues { nodes { id updatedAt } } }",
+            "variables": "{\"first\": 50}",
+            "responsePath": "/data/issues/nodes",
+        }));
+        let plan = compile(&plan).expect("a node built from the form must compile");
+        assert!(plan.stages.iter().any(|s| s.node_id == "g"), "the source has to be planned");
+    }
+
+    /// And the query has to reach the request body, not just be accepted.
+    #[test]
+    fn the_query_and_variables_become_the_request_body() {
+        let d = node(serde_json::json!({
+            "url": "https://api.example.invalid/graphql",
+            "query": "query Q { things { id } }",
+            "variables": "{\"first\": 50}",
+        }));
+        let plan = compile(&d).expect("compiles");
+        let stage = plan.stages.iter().find(|s| s.node_id == "g").expect("stage");
+        let spec = stage.runtime.as_ref().expect("a GraphQL source runs a request");
+        let body = match spec {
+            crate::plan::RuntimeSpec::RestSource(r) => r.body.clone().unwrap_or_default(),
+            other => panic!("expected a REST-backed source, got {other:?}"),
+        };
+        assert!(body.contains("query Q { things { id } }"), "the query is the body: {body}");
+        assert!(body.contains("\"first\":50"), "and the variables are parsed JSON: {body}");
+    }
+
+    /// The failure this closes, kept so the message stays actionable if the
+    /// form ever drops the field again.
+    #[test]
+    fn a_graphql_node_with_no_query_says_so() {
+        let err = compile(&node(serde_json::json!({ "url": "https://x.invalid/graphql" })))
+            .expect_err("a GraphQL request without a query is not a request");
+        assert!(err.to_string().contains("query required"), "{err}");
+    }
+}
+
+/// The join family declares a `reject` output port and nothing could fill it.
+///
+/// build_reject_sql is a per-component match and the joins were simply not in
+/// it, so wiring the port failed the whole run with
+/// `Table with name <node>__reject does not exist` - an internal name, for a
+/// port the editor offers.
+#[cfg(test)]
+mod join_rejects {
+    use super::*;
+
+    fn reject(component: &str, props: serde_json::Value) -> Option<String> {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["l".into()]);
+        ni.ports.insert("lookup".into(), vec!["r".into()]);
+        build_reject_sql(component, &props, &ni, None).expect("reject sql")
+    }
+
+    /// An inner join DROPS the unmatched rows, which is exactly why someone
+    /// wires the port: to find out which ones went.
+    #[test]
+    fn an_inner_join_rejects_the_rows_that_matched_nothing() {
+        let sql = reject(
+            "xf.join.inner",
+            serde_json::json!({ "leftKey": "cust", "rightKey": "cust" }),
+        )
+        .expect("an inner join has unmatched rows to reject");
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"l\" m WHERE NOT EXISTS (SELECT 1 FROM \"r\" r WHERE m.\"cust\" = r.\"cust\")"
+        );
+    }
+
+    /// Same question for a lookup and a semi join, which read the same keys.
+    #[test]
+    fn a_lookup_and_a_semi_join_answer_the_same_question() {
+        for id in ["xf.join", "xf.lookup", "xf.lookup.outer", "xf.semi", "xf.semi.join"] {
+            let sql = reject(id, serde_json::json!({ "leftKey": "a", "rightKey": "b" }))
+                .unwrap_or_else(|| panic!("{id} declares a reject port and must fill it"));
+            assert!(sql.contains("NOT EXISTS"), "{id}: {sql}");
+            assert!(sql.contains("m.\"a\" = r.\"b\""), "{id}: {sql}");
+        }
+    }
+
+    /// Composite keys ride the same construction as the join itself.
+    #[test]
+    fn a_composite_key_rejects_on_every_column() {
+        let sql = reject(
+            "xf.join.inner",
+            serde_json::json!({ "leftKey": "a,b", "rightKey": "x,y" }),
+        )
+        .expect("sql");
+        assert!(sql.contains("m.\"a\" = r.\"x\" AND m.\"b\" = r.\"y\""), "{sql}");
+    }
+
+    /// NOT EXISTS rather than NOT IN, for the reason build_semi already gives:
+    /// a single NULL on the right makes `NOT IN` return UNKNOWN and silently
+    /// reject every row. The reject stream is the last place to reintroduce it.
+    #[test]
+    fn the_reject_uses_not_exists_not_not_in() {
+        let sql = reject("xf.join", serde_json::json!({ "leftKey": "a", "rightKey": "b" }))
+            .expect("sql");
+        assert!(!sql.contains("NOT IN"), "{sql}");
+    }
+
+    /// Without keys there is no way to say what "unmatched" means, and the
+    /// message has to say that rather than produce an empty stream.
+    #[test]
+    fn a_join_with_no_keys_says_why_it_cannot_reject() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["l".into()]);
+        ni.ports.insert("lookup".into(), vec!["r".into()]);
+        let err = build_reject_sql("xf.join.inner", &serde_json::json!({}), &ni, None)
+            .expect_err("no keys, no answer");
+        assert!(err.contains("key"), "{err}");
+    }
+}
+
+/// "Column match: by position" did nothing.
+///
+/// The four set operations declare a `matchBy` select, and build_union and
+/// build_setop took no props at all - both hardcoded BY NAME. Someone whose
+/// inputs are positionally aligned but differently NAMED picked "By position",
+/// got a by-name union, and their columns were padded with NULLs into a wider
+/// table instead of stacked. No error, wrong data.
+#[cfg(test)]
+mod set_operation_match_by {
+    use super::*;
+
+    fn two() -> NodeInputs {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["a".into(), "b".into()]);
+        ni
+    }
+
+    fn by(v: &str) -> serde_json::Value {
+        serde_json::json!({ "matchBy": v })
+    }
+
+    /// By name is the default and stays the default: an existing pipeline that
+    /// never touched the control must emit exactly what it emitted before.
+    #[test]
+    fn by_name_remains_what_an_untouched_node_does() {
+        for props in [serde_json::json!({}), by("name")] {
+            let sql = build_union(&two(), true, &props).unwrap();
+            assert!(sql.contains("UNION BY NAME"), "{sql}");
+        }
+        let all = build_union(&two(), false, &serde_json::json!({})).unwrap();
+        assert!(all.contains("UNION ALL BY NAME"), "{all}");
+    }
+
+    /// The setting the form offers, which is the whole point.
+    #[test]
+    fn by_position_stacks_the_columns_as_they_come() {
+        let sql = build_union(&two(), true, &by("position")).unwrap();
+        assert!(sql.contains(" UNION "), "{sql}");
+        assert!(!sql.contains("BY NAME"), "by position must not realign on names: {sql}");
+
+        let all = build_union(&two(), false, &by("position")).unwrap();
+        assert!(all.contains(" UNION ALL "), "{all}");
+        assert!(!all.contains("BY NAME"), "{all}");
+    }
+
+    /// INTERSECT / EXCEPT realign later legs through a 0-row UNION ALL BY NAME
+    /// template, because `INTERSECT BY NAME` is a parser error. By position
+    /// there is nothing to realign, so the legs are compared as they stand.
+    #[test]
+    fn a_positional_intersect_drops_the_realignment_template() {
+        for op in ["INTERSECT", "EXCEPT"] {
+            let sql = build_setop(&two(), op, &by("position")).unwrap();
+            assert!(sql.contains(&format!(" {op} ")), "{sql}");
+            assert!(
+                !sql.contains("WHERE false UNION ALL BY NAME"),
+                "by position must not realign: {sql}"
+            );
+            assert!(!sql.contains(&format!("{op} BY NAME")), "still invalid syntax: {sql}");
+        }
+    }
+
+    /// And by name it keeps realigning, which is the behaviour that guards
+    /// against comparing the wrong columns.
+    #[test]
+    fn a_named_intersect_still_realigns() {
+        let sql = build_setop(&two(), "INTERSECT", &by("name")).unwrap();
+        assert!(sql.contains("WHERE false UNION ALL BY NAME"), "{sql}");
+    }
+}
+
+/// The last three reject ports the join family advertised and could not fill.
+///
+/// xf.join.spatial can: unmatched is "no feature satisfied the predicate", the
+/// same anti-join shape as a key join with ST_ in place of equality.
+///
+/// xf.anti and xf.join.cross cannot, structurally. An anti join's MAIN output
+/// already IS the unmatched rows, so a reject port there would have to mean the
+/// matched ones - a second meaning for the same word on the same canvas. A
+/// cross join has no predicate, so nothing is ever unmatched. Their ports are
+/// gone rather than filled.
+#[cfg(test)]
+mod spatial_and_the_ports_that_cannot_exist {
+    use super::*;
+
+    #[test]
+    fn a_spatial_join_rejects_features_that_matched_nothing() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["l".into()]);
+        ni.ports.insert("lookup".into(), vec!["r".into()]);
+        let sql = build_reject_sql(
+            "xf.join.spatial",
+            &serde_json::json!({
+                "leftGeomColumn": "geom",
+                "rightGeomColumn": "shape",
+                "relation": "within"
+            }),
+            &ni,
+            None,
+        )
+        .expect("reject sql")
+        .expect("a spatial join has unmatched features to reject");
+        assert!(sql.contains("NOT EXISTS"), "{sql}");
+        assert!(sql.contains("ST_Within"), "the reject must use the SAME predicate: {sql}");
+        assert!(sql.contains("m.\"geom\"") && sql.contains("r.\"shape\""), "{sql}");
+    }
+
+    /// An unrecognised relation falls back to ST_Intersects in the join, so it
+    /// has to fall back the same way here - or the two halves disagree about
+    /// what "matched" meant.
+    #[test]
+    fn the_reject_falls_back_to_the_same_default_predicate() {
+        let mut ni = NodeInputs::default();
+        ni.ports.insert("main".into(), vec!["l".into()]);
+        ni.ports.insert("lookup".into(), vec!["r".into()]);
+        let sql = build_reject_sql(
+            "xf.join.spatial",
+            &serde_json::json!({ "leftGeomColumn": "g", "rightGeomColumn": "g" }),
+            &ni,
+            None,
+        )
+        .expect("ok")
+        .expect("some sql");
+        assert!(sql.contains("ST_Intersects"), "{sql}");
+    }
+}
+
+/// A file sink must not silently overwrite when asked to do something else.
+///
+/// snk.parquet offered Append, snk.csv / json / jsonl / excel offered "Error if
+/// exists", and NONE of those builders reads `mode` at all. An unrecognised
+/// mode is not an error in a COPY - it is the default, and the default is
+/// replace. Measured end to end before this guard: rows 1,2 written, a second
+/// run with mode=append writing 3,4, and the file afterwards held ONLY 3,4.
+/// The user asked to add to a dataset and destroyed it, with no error.
+#[cfg(test)]
+mod file_sink_modes {
+    use super::*;
+
+    fn sink(component: &str, mode: &str) -> Result<String, EngineError> {
+        build_sink_sql(
+            component,
+            &serde_json::json!({ "path": "/tmp/out.dat", "mode": mode }),
+            "v",
+            &[],
+            None,
+        )
+    }
+
+    #[test]
+    fn append_on_a_file_sink_is_refused_rather_than_silently_replacing() {
+        let err = sink("snk.parquet", "append").expect_err("append must not plan as a replace");
+        let msg = err.to_string();
+        assert!(msg.contains("append"), "it names the mode: {msg}");
+        assert!(msg.contains("replace") || msg.contains("overwrite"), "and what it would do: {msg}");
+    }
+
+    #[test]
+    fn error_if_exists_is_refused_on_every_file_sink_that_offered_it() {
+        for id in ["snk.csv", "snk.json", "snk.jsonl", "snk.parquet", "snk.excel"] {
+            let err = sink(id, "error")
+                .err()
+                .unwrap_or_else(|| panic!("{id} accepted a mode it does not implement"));
+            assert!(err.to_string().contains("error"), "{id}: {err}");
+        }
+    }
+
+    /// Overwrite is what these sinks do, and an unset mode means the same, so
+    /// both must keep planning exactly as before.
+    #[test]
+    fn overwrite_and_an_unset_mode_still_plan() {
+        for id in ["snk.csv", "snk.json", "snk.parquet", "snk.excel"] {
+            sink(id, "overwrite").unwrap_or_else(|e| panic!("{id} overwrite: {e}"));
+            build_sink_sql(id, &serde_json::json!({ "path": "/tmp/o.dat" }), "v", &[], None)
+                .unwrap_or_else(|e| panic!("{id} default: {e}"));
+        }
+    }
+}
+
+/// qa.* "On failure" offers reject / warn / fail, and warn is labelled
+/// "Log warning, keep row" in the editor. It kept nothing: warn took the same
+/// filtered path as reject, so the rows it promised to keep were dropped and
+/// the run reported success.
+///
+/// Measured with the runner's own test harness before this was written -
+/// three rows in, two out, through a qa.notnull with onFail=warn.
+#[cfg(test)]
+mod quality_gate_on_fail {
+    use super::*;
+
+    fn gate(on_fail: &str, reject: bool) -> String {
+        let mut inputs = NodeInputs::default();
+        inputs.ports.insert("main".into(), vec!["up".into()]);
+        build_quality(
+            &inputs,
+            &serde_json::json!({ "columns": "name", "onFail": on_fail }),
+            "qa.notnull",
+            reject,
+        )
+        .expect("gate builds")
+    }
+
+    #[test]
+    fn warn_keeps_every_row() {
+        let sql = gate("warn", false);
+        assert!(
+            !sql.contains("WHERE"),
+            "warn says it keeps the row, so the main output must not filter: {sql}"
+        );
+    }
+
+    #[test]
+    fn reject_still_filters_and_fail_still_raises() {
+        assert!(gate("reject", false).contains("WHERE"), "reject drops failing rows");
+        assert!(gate("", false).contains("WHERE"), "an unset setting behaves as reject");
+        assert!(gate("fail", false).contains("error("), "fail raises");
+    }
+
+    #[test]
+    fn the_reject_port_carries_failures_whatever_the_setting_says() {
+        for mode in ["reject", "warn", "fail"] {
+            let sql = gate(mode, true);
+            assert!(
+                sql.contains("WHERE NOT"),
+                "the reject port must still carry the failing rows for {mode}: {sql}"
+            );
+        }
+    }
+}
+
+/// #332: the MySQL sink gave no way to control transaction behaviour.
+///
+/// snk.mysql writes through DuckDB's mysql extension - db_attach emitted only
+/// `LOAD mysql; ATTACH ...`, with no SET of any kind, and the write itself is a
+/// single `INSERT INTO ... SELECT`. DuckDB wraps that in one transaction, which
+/// is what an InnoDB Cluster feels as one enormous commit.
+///
+/// `mysql_enable_transactions` is a real setting in the pinned 1.5.4 - measured:
+///   duckdb -c "LOAD mysql; SELECT name, value, description FROM duckdb_settings()
+///              WHERE name = 'mysql_enable_transactions';"
+///   -> true, "Whether to run 'START TRANSACTION'/'COMMIT'/'ROLLBACK' on MySQL connections"
+///
+/// Emitted the way the SQL Server path already emits mssql_insert_batch_size:
+/// after LOAD, before ATTACH.
+#[cfg(test)]
+mod mysql_sink_transactions {
+    use super::*;
+
+    fn attach(props: serde_json::Value) -> String {
+        crate::plan::builders::db_attach(&props, "mysql", 3306, false)
+    }
+
+    #[test]
+    fn transactions_off_disables_them_on_the_connection() {
+        let sql = attach(serde_json::json!({ "host": "h", "database": "d", "transactions": false }));
+        assert!(
+            sql.contains("SET mysql_enable_transactions = false;"),
+            "asked for no transaction and got none of it: {sql}"
+        );
+        // After LOAD and before ATTACH, like the mssql path.
+        let load = sql.find("LOAD mysql;").expect("LOAD");
+        let set = sql.find("SET mysql_enable_transactions").expect("SET");
+        let att = sql.find("ATTACH").expect("ATTACH");
+        assert!(load < set && set < att, "the SET must sit between LOAD and ATTACH: {sql}");
+    }
+
+    #[test]
+    fn the_default_leaves_the_connection_alone() {
+        for props in [
+            serde_json::json!({ "host": "h", "database": "d" }),
+            serde_json::json!({ "host": "h", "database": "d", "transactions": true }),
+        ] {
+            let sql = attach(props);
+            assert!(
+                !sql.contains("mysql_enable_transactions"),
+                "an untouched sink must emit exactly what it emitted before: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn it_is_mysql_only_and_sink_only() {
+        // Postgres has no such setting - 1.5.4 exposes only
+        // pg_idle_in_transaction_timeout_millis - so emitting it would be a
+        // "Catalog Error: unrecognized configuration parameter".
+        let pg = crate::plan::builders::db_attach(
+            &serde_json::json!({ "host": "h", "database": "d", "transactions": false }),
+            "postgres",
+            5432,
+            false,
+        );
+        assert!(!pg.contains("enable_transactions"), "postgres has no such setting: {pg}");
+
+        // A source ATTACH is read-only and writes nothing, so it has no
+        // transaction behaviour worth changing.
+        let src = crate::plan::builders::db_attach(
+            &serde_json::json!({ "host": "h", "database": "d", "transactions": false }),
+            "mysql",
+            3306,
+            true,
+        );
+        assert!(!src.contains("enable_transactions"), "a source needs no write transaction: {src}");
+    }
+}
+
+/// The engine is shared by the desktop app, the headless runner and the
+/// console, so its errors have to be actionable in all three.
+///
+/// Measured on a clean Arch container with `duckle-runner` installed from a
+/// package: a pipeline failed with "DuckDB engine isn't installed yet. Open
+/// Setup to install it." There is no Setup on a headless install - it is a
+/// window only the desktop app can show - so the one instruction given was the
+/// one thing that reader could not do. The same run succeeded immediately once
+/// a duckdb was on PATH, which is what the message should have said.
+#[test]
+fn the_missing_duckdb_message_helps_a_reader_with_no_desktop_app() {
+    let msg = crate::duckdb_missing_message(std::path::Path::new("/opt/duckle/bin/duckdb"));
+
+    assert!(
+        msg.contains("/opt/duckle/bin/duckdb"),
+        "it must name the path it looked in: {msg}"
+    );
+    assert!(
+        msg.contains("DUCKLE_DUCKDB_BIN"),
+        "it must name the environment variable that fixes it headlessly: {msg}"
+    );
+    assert!(
+        msg.contains("PATH"),
+        "installing a duckdb on PATH is the other fix, and the one a package \
+         manager performs: {msg}"
+    );
+}
+
+/// #335: a SQLite source with no table produced `sqlite_scan(db, '')`, and
+/// DuckDB answered with an internal assertion:
+///
+///   SQLite: INTERNAL Error: GetTableInfo - table "" not found
+///   This error signals an assertion failure within DuckDB
+///
+/// Reported against "standard node configuration", which is exactly right: the
+/// form marks neither `tableName` nor `sql` required, because either will do,
+/// so a node with neither is accepted, validates ok, and fails at run time
+/// with a message about DuckDB's internals rather than about the node.
+///
+/// `build_duckdb_source` had the same hole in a quieter form - it returned a
+/// placeholder SELECT and the run reported ok - and is fixed alongside.
+#[test]
+fn a_sqlite_source_with_no_table_says_so_instead_of_asserting() {
+    use crate::plan::builders::build_sqlite_source;
+
+    let err = build_sqlite_source(&serde_json::json!({ "database": "/tmp/north.db" }))
+        .expect_err("a source with nothing to read from must refuse");
+    assert!(
+        err.to_lowercase().contains("table"),
+        "the message must name what is missing: {err}"
+    );
+    assert!(
+        !err.contains("GetTableInfo"),
+        "and must not be DuckDB's assertion: {err}"
+    );
+
+    // Blank is the same as absent - the form writes "" for a touched-then-
+    // cleared box.
+    assert!(build_sqlite_source(&serde_json::json!({ "database": "d", "tableName": "" })).is_err());
+    assert!(build_sqlite_source(
+        &serde_json::json!({ "database": "d", "tableName": "  ", "sql": "" })
+    )
+    .is_err());
+
+    // Either one on its own is enough, and both still build.
+    let by_table = build_sqlite_source(
+        &serde_json::json!({ "database": "d", "tableName": "Orders" }),
+    )
+    .expect("a table is enough");
+    assert!(by_table.contains("Orders"), "{by_table}");
+
+    let by_sql = build_sqlite_source(
+        &serde_json::json!({ "database": "d", "sql": "SELECT 1" }),
+    )
+    .expect("a query is enough");
+    assert!(by_sql.contains("SELECT 1"), "{by_sql}");
+}
+
+/// The same shape as #335, in its worse flavour: not an error, a green run.
+///
+/// `src.duckdb` with neither a table nor a query returned
+/// `SELECT 1 AS placeholder LIMIT 0`. Measured through the runner: status ok,
+/// and the sink wrote a file whose only column was literally named
+/// `placeholder`. Nothing failed, so nothing said the node had not been
+/// configured - the pipeline just quietly produced a wrong-schema empty file.
+///
+/// The rest of the family already refuses: `build_relational_source` answers
+/// "table name is required" for ducklake / motherduck / quack. src.duckdb and
+/// src.sqlite were the two that did not.
+#[test]
+fn a_duckdb_source_with_no_table_refuses_instead_of_returning_a_placeholder() {
+    use crate::plan::builders::build_duckdb_source;
+
+    let err = build_duckdb_source(&serde_json::json!({ "database": "/tmp/a.duckdb" }))
+        .expect_err("a source with nothing to read from must refuse");
+    assert!(err.to_lowercase().contains("table"), "name what is missing: {err}");
+    assert!(!err.contains("placeholder"), "{err}");
+
+    assert!(build_duckdb_source(&serde_json::json!({ "tableName": "  " })).is_err());
+
+    // Either field on its own still builds, and the schema form still works.
+    assert!(build_duckdb_source(&serde_json::json!({ "tableName": "Orders" }))
+        .expect("a table is enough")
+        .contains("Orders"));
+    assert!(build_duckdb_source(&serde_json::json!({ "sql": "SELECT 1" }))
+        .expect("a query is enough")
+        .contains("SELECT 1"));
+    assert!(build_duckdb_source(&serde_json::json!({ "tableName": "t", "schema": "main" }))
+        .expect("schema-qualified")
+        .contains("main"));
+}
+
+/// Third instance of the shape #335 reported, found by sweeping for source
+/// components whose form marks nothing required.
+///
+/// `src.filelist` takes either a folder to list or a single file path, so
+/// neither is required - and with neither, `directory` defaulted to "" and the
+/// glob became `/*`, the filesystem root. Measured on Windows: the run
+/// reported ok and produced zero rows, so a user who forgot the folder got an
+/// empty result and nothing saying why. A root that is not empty would be a
+/// different surprise.
+#[test]
+fn a_file_list_with_no_folder_and_no_path_refuses() {
+    use crate::plan::builders::build_filelist_source;
+
+    let err = build_filelist_source(&serde_json::json!({}))
+        .expect_err("nothing to list must refuse");
+    assert!(
+        err.to_lowercase().contains("folder") || err.to_lowercase().contains("file"),
+        "name what is missing: {err}"
+    );
+    // Whitespace is the same omission with a space in it.
+    assert!(build_filelist_source(&serde_json::json!({ "directory": "   " })).is_err());
+    // And it must never build a glob rooted at the filesystem root.
+    for props in [serde_json::json!({}), serde_json::json!({ "directory": "" })] {
+        if let Ok(sql) = build_filelist_source(&props) {
+            assert!(!sql.contains("glob('/"), "globbed the root: {sql}");
+        }
+    }
+
+    // Either field on its own still works, including the recursive form.
+    assert!(build_filelist_source(&serde_json::json!({ "path": "/data/today.csv" }))
+        .expect("a single path is enough")
+        .contains("today.csv"));
+    let deep = build_filelist_source(
+        &serde_json::json!({ "directory": "/data/in", "recursive": true, "pattern": "*.csv" }),
+    )
+    .expect("a folder is enough");
+    assert!(deep.contains("/data/in/**/*.csv"), "{deep}");
+}

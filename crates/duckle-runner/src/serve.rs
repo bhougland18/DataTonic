@@ -131,12 +131,27 @@ fn parse_serve_args() -> Result<ServeArgs, String> {
 struct RunGate {
     /// Permits currently free. Guarded by the mutex, waited on via the condvar.
     free: Mutex<usize>,
+    /// How many there were to begin with, so `free` can be read as saturation
+    /// rather than as a bare number (#300).
+    total: usize,
     ready: Condvar,
 }
 
 impl RunGate {
     fn new(permits: usize) -> Self {
-        RunGate { free: Mutex::new(permits.max(1)), ready: Condvar::new() }
+        let permits = permits.max(1);
+        RunGate { free: Mutex::new(permits), total: permits, ready: Condvar::new() }
+    }
+
+    /// Permits free right now, and how many there are in total (#300).
+    ///
+    /// A gauge, read without blocking: an operator alerting on "runs are
+    /// queueing" needs to see saturation while it is happening, and a metrics
+    /// scrape that waited for a permit would be the one thing guaranteed to
+    /// make it worse.
+    fn permits(&self) -> (usize, usize) {
+        let free = *self.free.lock().unwrap_or_else(|p| p.into_inner());
+        (free, self.total)
     }
 
     /// Block until a permit is free, then hold it until the guard drops.
@@ -172,12 +187,17 @@ fn max_concurrent_runs() -> usize {
         .unwrap_or(1)
 }
 
+// #289/#295: the gate lives in the engine's `pools` module now, so the console
+// and a backfill admit runs through one implementation rather than two that
+// drift.
+use duckle_duckdb_engine::pools::Gates;
+
 struct State {
     workspace: PathBuf,
     duckdb: PathBuf,
     /// Bounds concurrent pipeline execution. Defaults to one at a time; raise
     /// with DUCKLE_MAX_CONCURRENT_RUNS. See [`RunGate`].
-    run_lock: RunGate,
+    run_lock: Gates,
     /// Pipeline ids currently executing, so the console can show a live
     /// "Running" status (discussion #155). Populated for the duration of a run.
     running: Mutex<std::collections::HashSet<String>>,
@@ -193,6 +213,15 @@ struct State {
     /// Scheduler poll cadence (issue #135). Default 15s; overridable via
     /// --tick-interval or DUCKLE_TICK_INTERVAL.
     tick_interval: Duration,
+    /// #310: OIDC login, when this deployment configured one. `None` leaves
+    /// every route below exactly as it was.
+    oidc: Option<crate::oidc::Config>,
+    /// Discovered once and reused. Behind a lock rather than resolved at
+    /// startup so a provider that is briefly down delays a login instead of
+    /// stopping the server from starting.
+    oidc_endpoints: Mutex<Option<crate::oidc::Endpoints>>,
+    /// Logins between the redirect and the callback.
+    oidc_logins: Mutex<crate::oidc::PendingLogins>,
     /// #259: runs accepted through POST /api/run/async, by run id. Holds the
     /// engine handle so the run can be cancelled, and the result once it is
     /// done. `running` above is pipeline ids only and cannot answer "how is
@@ -249,6 +278,36 @@ pub fn run() -> Result<(), String> {
     std::env::set_var("DUCKLE_LOG_DIR", workspace.join("logs"));
     apply_workspace_memory_limit(&workspace);
 
+    // #259: anything still marked `running` was not finished by a process that
+    // is alive now, because this one is starting. Say so, rather than leaving a
+    // receipt claiming a run is in progress forever. `interrupted` is
+    // deliberately distinct from `error`: the run did not fail, it stopped
+    // being observed, and a caller that conflates them retries work that may
+    // well have completed.
+    let reclaimed =
+        duckle_duckdb_engine::retry::reconcile(&workspace, &|pid| pid == std::process::id());
+    if !reclaimed.is_empty() {
+        eprintln!(
+            "duckle: {} run(s) were still marked running and are now interrupted: {}",
+            reclaimed.len(),
+            reclaimed.join(", ")
+        );
+    }
+    // #295: and the same for a backfill's slices, which had the reconciler but
+    // no caller. A slice left `running` by a killed process is not claimable
+    // (only `requested` is) and `retry` only moves `failed` and `interrupted`,
+    // so nothing could ever pick it up again and the backfill was stuck for
+    // good. This is the one call that makes it recoverable.
+    let slices =
+        duckle_duckdb_engine::backfill::reconcile(&workspace, &|pid| pid == std::process::id());
+    if !slices.is_empty() {
+        eprintln!(
+            "duckle: {} backfill(s) had slices still marked running and are now interrupted: {}",
+            slices.len(),
+            slices.join(", ")
+        );
+    }
+
     // Decide who may use this console before binding anything. An exposed bind
     // with no credential does not refuse to start any more - it comes up
     // unclaimed, so setup can be finished in a browser - but it then spends
@@ -265,7 +324,7 @@ pub fn run() -> Result<(), String> {
     let supplied = args.token.clone().or_else(|| std::env::var("DUCKLE_CONSOLE_TOKEN").ok());
     if supplied.as_deref().is_some_and(|t| t.trim().is_empty()) {
         return Err(
-            "a console credential was supplied but is empty. Set DUCKLE_CONSOLE_TOKEN (or              --token) to a real value, or remove it entirely to set the server up from a              browser. Refusing to start rather than opening an administrator claim window."
+            "a console credential was supplied but is empty. Set DUCKLE_CONSOLE_TOKEN (or              --token) to a real value, or remove it entirely to set the server up from a browser. Refusing to start rather than opening an administrator claim window."
                 .to_string(),
         );
     }
@@ -276,12 +335,24 @@ pub fn run() -> Result<(), String> {
     let state = Arc::new(State {
         workspace: workspace.clone(),
         duckdb: duckdb.clone(),
-        run_lock: RunGate::new(max_concurrent_runs()),
+        run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::load(&workspace)),
         running: Mutex::new(std::collections::HashSet::new()),
         runs: Mutex::new(std::collections::HashMap::new()),
         console,
         host: args.host.clone(),
         tick_interval: args.tick_interval,
+        // #310: absent leaves every route exactly as it was. A config that
+        // exists and cannot be read stops the server rather than quietly
+        // falling back to local accounts while an operator believes SSO is on.
+        oidc: match crate::oidc::load(&workspace) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("duckle-runner: {e}");
+                std::process::exit(2);
+            }
+        },
+        oidc_endpoints: Mutex::new(None),
+        oidc_logins: Mutex::new(Default::default()),
     });
 
     // Fold any pre-unification console store into schedules.json before the
@@ -382,7 +453,7 @@ struct WebState {
     host: String,
     /// Bounds concurrent runs from the browser. One at a time by default; raise
     /// with DUCKLE_MAX_CONCURRENT_RUNS. See [`RunGate`].
-    run_lock: RunGate,
+    run_lock: Gates,
     /// Who may use this editor. Same policy object the console uses, so one
     /// set of accounts covers both.
     console: console_auth::Console,
@@ -403,6 +474,36 @@ pub fn run_web() -> Result<(), String> {
     std::env::set_var("DUCKLE_WORKSPACE", &workspace);
     std::env::set_var("DUCKLE_LOG_DIR", workspace.join("logs"));
     apply_workspace_memory_limit(&workspace);
+
+    // #259: anything still marked `running` was not finished by a process that
+    // is alive now, because this one is starting. Say so, rather than leaving a
+    // receipt claiming a run is in progress forever. `interrupted` is
+    // deliberately distinct from `error`: the run did not fail, it stopped
+    // being observed, and a caller that conflates them retries work that may
+    // well have completed.
+    let reclaimed =
+        duckle_duckdb_engine::retry::reconcile(&workspace, &|pid| pid == std::process::id());
+    if !reclaimed.is_empty() {
+        eprintln!(
+            "duckle: {} run(s) were still marked running and are now interrupted: {}",
+            reclaimed.len(),
+            reclaimed.join(", ")
+        );
+    }
+    // #295: and the same for a backfill's slices, which had the reconciler but
+    // no caller. A slice left `running` by a killed process is not claimable
+    // (only `requested` is) and `retry` only moves `failed` and `interrupted`,
+    // so nothing could ever pick it up again and the backfill was stuck for
+    // good. This is the one call that makes it recoverable.
+    let slices =
+        duckle_duckdb_engine::backfill::reconcile(&workspace, &|pid| pid == std::process::id());
+    if !slices.is_empty() {
+        eprintln!(
+            "duckle: {} backfill(s) had slices still marked running and are now interrupted: {}",
+            slices.len(),
+            slices.join(", ")
+        );
+    }
     // The editor writes files, edits connections and runs pipelines, so it is
     // at least as powerful as the console and gets the same rule: loopback is
     // open, anything else needs a credential before the socket is bound.
@@ -419,7 +520,7 @@ pub fn run_web() -> Result<(), String> {
         duckdb: duckdb.clone(),
         dist: dist.clone(),
         host: args.host.clone(),
-        run_lock: RunGate::new(max_concurrent_runs()),
+        run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::load(&workspace)),
         console,
     });
     let addr = format!("{}:{}", args.host, args.port);
@@ -467,14 +568,8 @@ fn web_sign_in(state: &WebState, req: &Request) -> Reply {
     match state.console.sign_in(token) {
         Some((sid, who)) => {
             audit::record(&state.workspace, Some(&who), "session.sign_in", "editor", audit::Outcome::Allowed);
-            respond_json(&json!({ "label": who.label, "role": who.role.as_str() })).with_header(
-                format!(
-                    "Set-Cookie: {}={}{}",
-                    console_auth::SESSION_COOKIE,
-                    sid,
-                    cookie_attributes(req.forwarded_proto.as_deref())
-                ),
-            )
+            respond_json(&json!({ "label": who.label, "role": who.role.as_str() }))
+                .with_header(session_cookie_header(&sid, req.forwarded_proto.as_deref()))
         }
         None => {
             audit::record(&state.workspace, None, "session.sign_in", "editor", audit::Outcome::Unauthenticated);
@@ -553,8 +648,8 @@ fn route_web(req: &Request, state: &WebState) -> Reply {
         return respond_403("blocked: cross-origin or non-local request");
     }
     if is_public_route(&req.method, &req.path) {
-        if req.path == HEALTH_PATH {
-            return respond("200 OK", "text/plain; charset=utf-8", b"ok");
+        if let Some(reply) = probe_reply(&req.path, &state.workspace) {
+            return reply;
         }
         return web_sign_in(state, &req);
     }
@@ -819,9 +914,17 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
             duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
             duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
             let name = args.get("pipelineName").and_then(|v| v.as_str()).unwrap_or("web").to_string();
-            let _guard = state.run_lock.acquire();
+            let (_guard, pool, queued_ms) = state.run_lock.acquire(&doc.resource_pool);
             let engine = DuckdbEngine::new(state.duckdb.clone());
+            let receipt =
+                begin_editor_run(&state.workspace, &doc, &name, "web", Some((pool, queued_ms)));
             let result = engine.execute_pipeline_named(&doc, &name);
+            duckle_duckdb_engine::retry::finish(
+                &state.workspace,
+                receipt,
+                &result.status,
+                duckle_duckdb_engine::retry::nodes_of(&result),
+            );
             match serde_json::to_value(&result) {
                 Ok(v) => respond_json(&v),
                 Err(e) => respond_err("500 Internal Server Error", &e.to_string()),
@@ -836,6 +939,71 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
         //
         // The workspace the desktop sends is ignored: this process knows the only workspace
         // it serves, and a browser must not be able to name a directory on the server.
+        // Backfill, for the shared editor's Backfill panel. Without these the
+        // panel is dead in the web edition while working on the desktop - the
+        // parity gap #75 exists to prevent. The argument names match the Tauri
+        // commands, because the same React code calls both.
+        //
+        // The workspace is ALWAYS this server's, never the one in the payload:
+        // a browser must not be able to point a state edit at another folder.
+        "watermark_list" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            match args.get("pipelineName").and_then(|v| v.as_str()) {
+                Some(name) => {
+                    let entries = duckle_duckdb_engine::watermark::list(&state.workspace, name);
+                    respond_json(&serde_json::to_value(&entries).unwrap_or(json!([])))
+                }
+                None => respond_err("400 Bad Request", "missing pipelineName"),
+            }
+        }
+        "watermark_set" => {
+            use duckle_duckdb_engine::watermark as wm;
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let name = args.get("pipelineName").and_then(|v| v.as_str());
+            let node = args.get("nodeId").and_then(|v| v.as_str());
+            let (name, node) = match (name, node) {
+                (Some(n), Some(d)) => (n, d),
+                _ => return respond_err("400 Bad Request", "missing pipelineName or nodeId"),
+            };
+            // Same engine guard as every other surface: a write that would
+            // replace a different kind of state is refused, not applied.
+            let done = if args.get("kind").and_then(|v| v.as_str()) == Some("snapshot") {
+                match args.get("value").and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(id) => wm::set_snapshot(&state.workspace, name, node, id),
+                    None => return respond_err("400 Bad Request", "snapshot value must be a number"),
+                }
+            } else {
+                match args.get("value").and_then(|v| v.as_str()) {
+                    Some(v) => wm::set_incremental(
+                        &state.workspace,
+                        name,
+                        node,
+                        v,
+                        args.get("valueType").and_then(|t| t.as_str()),
+                    ),
+                    None => return respond_err("400 Bad Request", "missing value"),
+                }
+            };
+            match done {
+                Ok(()) => respond_json(&json!({ "ok": true })),
+                Err(e) => respond_err("400 Bad Request", &e.to_string()),
+            }
+        }
+        "watermark_clear" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            match (
+                args.get("pipelineName").and_then(|v| v.as_str()),
+                args.get("nodeId").and_then(|v| v.as_str()),
+            ) {
+                (Some(name), Some(node)) => {
+                    match duckle_duckdb_engine::watermark::clear(&state.workspace, name, node) {
+                        Ok(()) => respond_json(&json!({ "ok": true })),
+                        Err(e) => respond_err("400 Bad Request", &e.to_string()),
+                    }
+                }
+                _ => respond_err("400 Bad Request", "missing pipelineName or nodeId"),
+            }
+        }
         "plans_list" => match duckle_duckdb_engine::plans::load(&state.workspace) {
             Ok(list) => respond_json(&serde_json::to_value(&list).unwrap_or(json!([]))),
             Err(e) => respond_err("500 Internal Server Error", &e),
@@ -883,6 +1051,75 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
                     Ok(v) => respond_json(&v),
                     Err(e) => respond_err("500 Internal Server Error", &e.to_string()),
                 },
+                Err(e) => respond_err("400 Bad Request", &e.to_string()),
+            }
+        }
+        // #314. The web editor had none of the binder primitive at all: an
+        // unknown command 404s and the web shim turns a 404 into a null no-op,
+        // so the whole feature was silently dead here while the desktop had it.
+        // `apply_workspace_context` first, like every other command on this
+        // path and unlike the desktop one - without it a `${workspace}` in SQL
+        // binds differently on the two surfaces.
+        "analyze_node_sql" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let mut doc: PipelineDoc = match serde_json::from_value(args.get("pipeline").cloned().unwrap_or(Value::Null)) {
+                Ok(d) => d,
+                Err(e) => return respond_err("400 Bad Request", &format!("bad pipeline: {}", e)),
+            };
+            duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
+            let engine = DuckdbEngine::new(state.duckdb.clone());
+            // One node, with the upstream columns the EDITOR resolved - the
+            // same call and the same arguments the desktop command makes.
+            // Deriving them here instead would answer a subtly different
+            // question on the two surfaces, which is the divergence #75 exists
+            // to stop.
+            let node_id = args
+                .get("nodeId")
+                .or_else(|| args.get("node"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let inputs: Vec<(String, Vec<duckle_duckdb_engine::Column>)> =
+                serde_json::from_value(args.get("inputs").cloned().unwrap_or(json!([])))
+                    .unwrap_or_default();
+            match engine.analyze_node_sql(&doc, &node_id, &inputs) {
+                Ok(analysis) => match serde_json::to_value(&analysis) {
+                    Ok(v) => respond_json(&v),
+                    Err(e) => respond_err("500 Internal Server Error", &e.to_string()),
+                },
+                Err(e) => respond_err("400 Bad Request", &e.to_string()),
+            }
+        }
+        // #307: the same list the desktop gets, so an external component appears
+        // in the web editor's palette too. Read from manifests; nothing runs.
+        "external_components" => {
+            let (found, problems) = duckle_duckdb_engine::plugin::discover(&state.workspace);
+            respond_json(&json!({
+                "components": found
+                    .iter()
+                    .map(duckle_duckdb_engine::plugin::as_catalog_entry)
+                    .collect::<Vec<_>>(),
+                "problems": problems,
+            }))
+        }
+        // #314: the same completion the desktop gets, so the web editor is not
+        // a lesser place to write SQL.
+        "complete_node_sql" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let mut doc: PipelineDoc = match serde_json::from_value(args.get("pipeline").cloned().unwrap_or(Value::Null)) {
+                Ok(d) => d,
+                Err(e) => return respond_err("400 Bad Request", &format!("bad pipeline: {}", e)),
+            };
+            duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
+            let node_id = args.get("nodeId").and_then(Value::as_str).unwrap_or_default().to_string();
+            let inputs: Vec<(String, Vec<duckle_duckdb_engine::Column>)> =
+                serde_json::from_value(args.get("inputs").cloned().unwrap_or(json!([])))
+                    .unwrap_or_default();
+            let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(12) as usize;
+            let engine = DuckdbEngine::new(state.duckdb.clone());
+            match engine.complete_node_sql(&doc, &node_id, &inputs, cursor, limit) {
+                Ok(items) => respond_json(&serde_json::to_value(&items).unwrap_or_default()),
                 Err(e) => respond_err("400 Bad Request", &e.to_string()),
             }
         }
@@ -955,6 +1192,56 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
 
 /// Run a pipeline and STREAM its progress to the browser as Server-Sent Events:
 /// each engine PipelineEvent is a `data:` line; the final RunResult is an
+
+/// #259: record a run the web editor started.
+///
+/// The editor's Run button does not go through `execute_one_with` - it streams,
+/// and run-to-here needs a target - so without this the two most-used console
+/// run paths recorded nothing addressable. Returns the receipt to finish with.
+fn begin_editor_run(
+    workspace: &std::path::Path,
+    doc: &PipelineDoc,
+    name: &str,
+    trigger: &str,
+    // #289: recorded on the receipt so an editor or streaming run answers the
+    // same "which pool, and how long did it wait" as a scheduled one.
+    admission: Option<(String, u64)>,
+) -> duckle_duckdb_engine::retry::RunReceipt {
+    let hash = duckle_duckdb_engine::retry::pipeline_hash(doc);
+    let run_id = duckle_duckdb_engine::retry::new_run_id(name, trigger);
+    let receipt = duckle_duckdb_engine::retry::begin(
+        workspace,
+        &run_id,
+        trigger,
+        name,
+        &workspace.join("pipelines").join(format!("{name}.json")).display().to_string(),
+        &hash,
+        None,
+    );
+    let receipt = duckle_duckdb_engine::retry::RunReceipt {
+        components: duckle_duckdb_engine::plugin::used_by(
+            workspace,
+            &serde_json::to_value(doc).unwrap_or_default(),
+        ),
+        ..receipt
+    };
+    match admission {
+        None => {
+            let _ = duckle_duckdb_engine::retry::write(workspace, &receipt);
+            receipt
+        }
+        Some((pool, queue_ms)) => {
+            let receipt = duckle_duckdb_engine::retry::RunReceipt {
+                resource_pool: Some(pool),
+                queue_ms: Some(queue_ms),
+                ..receipt
+            };
+            let _ = duckle_duckdb_engine::retry::write(workspace, &receipt);
+            receipt
+        }
+    }
+}
+
 /// `event: result` line. The frontend turns these back into the same live
 /// per-node animation the desktop gets from the Tauri Channel.
 fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(), String> {
@@ -994,17 +1281,32 @@ fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(
     stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
 
-    let _guard = state.run_lock.acquire();
+    let (_guard, pool, queued_ms) = state.run_lock.acquire(&doc.resource_pool);
     // A second handle to the same socket for the event callback (the run is
     // synchronous, so events stream first, the result line follows).
     let mut ev = stream.try_clone().map_err(|e| e.to_string())?;
     let engine = DuckdbEngine::new(state.duckdb.clone());
+    // Run-to-here is still a run, and the one an operator is most likely to
+    // want to find again.
+    let receipt = begin_editor_run(
+        &state.workspace,
+        &doc,
+        &name,
+        if target.is_some() { "web-partial" } else { "web" },
+        Some((pool, queued_ms)),
+    );
     let result = engine.execute_pipeline_with_events(&doc, target.as_deref(), Some(&name), |evt| {
         if let Ok(j) = serde_json::to_string(&evt) {
             let _ = ev.write_all(format!("data: {}\n\n", j).as_bytes());
             let _ = ev.flush();
         }
     });
+    duckle_duckdb_engine::retry::finish(
+        &state.workspace,
+        receipt,
+        &result.status,
+        duckle_duckdb_engine::retry::nodes_of(&result),
+    );
     let rj = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string());
     stream
         .write_all(format!("event: result\ndata: {}\n\n", rj).as_bytes())
@@ -1242,6 +1544,16 @@ fn cookie_attributes(forwarded_proto: Option<&str>) -> &'static str {
 /// The liveness route. Unauthenticated by design, and it answers with two bytes.
 pub const HEALTH_PATH: &str = "/healthz";
 
+/// The readiness route (#300).
+///
+/// Separate from liveness because they fail differently and an orchestrator
+/// acts differently on each: a process that is alive but not ready should stop
+/// receiving traffic, not be restarted. Readiness here means the state store is
+/// usable and the server can accept a run. It deliberately checks nothing
+/// external - a source being down is not this server being unready, and probing
+/// sources on every scrape would turn a health check into load.
+pub const READY_PATH: &str = "/readyz";
+
 /// The routes an unauthenticated caller may reach, in one place so the console and the
 /// editor cannot drift apart on it.
 ///
@@ -1250,14 +1562,27 @@ pub const HEALTH_PATH: &str = "/healthz";
 /// credential: every route needing one means a Kubernetes HTTP probe gets 401 and the pod
 /// is marked unhealthy forever. `/healthz` answers `ok` and nothing else, so it can say the
 /// process is up without telling an anonymous caller anything about what is in it.
+/// Where a browser starts an OIDC login, and where the provider sends it back.
+///
+/// Public because signing in cannot require being signed in - the same reason
+/// `POST /api/session` is. Neither route trusts anything it is handed: the
+/// callback is worthless without a `state` this process issued and is still
+/// holding.
+pub const OIDC_LOGIN_PATH: &str = "/auth/oidc/login";
+pub const OIDC_CALLBACK_PATH: &str = "/auth/oidc/callback";
+
+pub const PUBLIC_ROUTES: [(&str, &str); 7] = [
+    ("POST", "/api/session"),
+    ("GET", HEALTH_PATH),
+    ("GET", READY_PATH),
+    ("GET", SETUP_PATH),
+    ("POST", SETUP_CLAIM_PATH),
+    ("GET", OIDC_LOGIN_PATH),
+    ("GET", OIDC_CALLBACK_PATH),
+];
+
 pub fn is_public_route(method: &str, path: &str) -> bool {
-    matches!(
-        (method, path),
-        ("POST", "/api/session")
-            | ("GET", HEALTH_PATH)
-            | ("GET", SETUP_PATH)
-            | ("POST", SETUP_CLAIM_PATH)
-    )
+    PUBLIC_ROUTES.contains(&(method, path))
 }
 
 fn is_loopback_host(h: &str) -> bool {
@@ -1392,6 +1717,216 @@ fn write_reply(stream: &mut TcpStream, reply: &Reply) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether this server could accept a run right now (#300).
+///
+/// One write and one delete under `.duckle/`, which is where run state lives.
+/// Cheap enough to run on every probe, and it fails for the reasons that
+/// actually stop runs being recorded: a read-only mount, a full disk, a
+/// workspace that has gone away underneath the process.
+fn probe_ready(workspace: &Path) -> Result<(), String> {
+    let dir = workspace.join(".duckle");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{} is not writable: {e}", dir.display()))?;
+    let probe = dir.join(".readyz");
+    std::fs::write(&probe, b"ok").map_err(|e| format!("{} is not writable: {e}", dir.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// The Prometheus exposition body (#300).
+///
+/// The run-history half is rendered by the engine, so the endpoint and the
+/// textfile exporter cannot come to disagree about what a series means. What is
+/// added here is the half a file cannot carry: what this process is doing right
+/// now.
+fn metrics_body(state: &State) -> String {
+    let mut out = duckle_duckdb_engine::history::render_metrics(&state.workspace)
+        .unwrap_or_else(|_| {
+            // A workspace with no runs yet has no `runs/` directory. That is a
+            // server with nothing to report, not a broken scrape - returning an
+            // error here would make a fresh deployment look down.
+            String::new()
+        });
+    let per_pool = state.run_lock.permits();
+    // Permits in use, not distinct pipeline ids. `state.running` is a set of
+    // ids for the console's "Running" badge, so two runs of one pipeline count
+    // once and the first to finish removes the id while the other is still
+    // going. Saturation is what an operator alerts on, and the gate knows it
+    // exactly.
+    let in_flight: usize = per_pool.iter().map(|(_, free, total)| total.saturating_sub(*free)).sum();
+    let named = state.running.lock().map(|s| s.len()).unwrap_or(0);
+    let accepted = state.runs.lock().map(|r| r.len()).unwrap_or(0);
+    // Written line by line rather than as one continued string literal: a `\`
+    // continuation keeps the indentation of the following source line, which
+    // put nine spaces in front of every `# TYPE` and left the document invalid.
+    // Prometheus requires each line to start in column zero.
+    for (name, help, value) in [
+        ("duckle_runs_in_flight", "Run slots in use right now.", in_flight),
+        (
+            "duckle_pipelines_running",
+            "Distinct pipelines with at least one run in flight.",
+            named,
+        ),
+        (
+            "duckle_run_permits_total",
+            "Run slots across every pool.",
+            per_pool.iter().map(|(_, _, total)| *total).sum::<usize>(),
+        ),
+        (
+            "duckle_run_permits_free",
+            "Slots available. Zero for any length of time means runs are queueing.",
+            per_pool.iter().map(|(_, free, _)| *free).sum::<usize>(),
+        ),
+        (
+            "duckle_runs_tracked",
+            "Async runs this process is still holding, finished or not.",
+            accepted,
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name} {help}
+# TYPE {name} gauge
+{name} {value}
+"));
+    }
+    // #289: per-pool, labelled. The totals above cannot answer "which pool is
+    // saturated", which is the only question worth asking once there is more
+    // than one - a network pool at 8/8 and a heavy pool idle sum to something
+    // that looks half busy.
+    out.push_str("# HELP duckle_pool_permits_total Run slots in this pool.
+# TYPE duckle_pool_permits_total gauge
+");
+    for (pool, _, total) in &per_pool {
+        out.push_str(&format!("duckle_pool_permits_total{{pool=\"{pool}\"}} {total}
+"));
+    }
+    out.push_str("# HELP duckle_pool_permits_free Slots free in this pool. Zero for any length of time means runs are queueing here.
+# TYPE duckle_pool_permits_free gauge
+");
+    for (pool, free, _) in &per_pool {
+        out.push_str(&format!("duckle_pool_permits_free{{pool=\"{pool}\"}} {free}
+"));
+    }
+    out
+}
+
+/// #295: create, retry or cancel a backfill over the API.
+///
+/// Create and retry EXECUTE, which can take hours, so they are accepted and run
+/// on a thread while the response returns the plan id immediately - the same
+/// shape as an asynchronous run, for the same reason: an operator should get
+/// something addressable rather than a held-open connection.
+fn api_backfill_action(state: &Arc<State>, req: &Request) -> Reply {
+    use duckle_duckdb_engine::backfill;
+    let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    let action = body.get("action").and_then(Value::as_str).unwrap_or_default();
+    let ws = state.workspace.clone();
+    let duckdb = state.duckdb.clone();
+
+    match action {
+        "create" => {
+            let Some(file) = body.get("pipeline").and_then(Value::as_str) else {
+                return respond_err("400 Bad Request", "create needs a pipeline path");
+            };
+            let path = match resolve_in_workspace(&ws, file) {
+                Ok(p) => p,
+                Err(e) => return respond_err("400 Bad Request", &e),
+            };
+            let plan = match duckle_duckdb_engine::backfill_exec::plan_for(
+                &ws,
+                &path,
+                body.get("from").and_then(Value::as_str).unwrap_or_default(),
+                body.get("to").and_then(Value::as_str).unwrap_or_default(),
+                body.get("maxConcurrent").and_then(Value::as_u64).unwrap_or(4) as usize,
+                body.get("occurrence").and_then(Value::as_str),
+            ) {
+                Ok(p) => p,
+                Err(e) => return respond_err("400 Bad Request", &e),
+            };
+            // A dry run writes nothing. "What would this queue" must not be a
+            // question that queues anything.
+            if body.get("dryRun").and_then(Value::as_bool).unwrap_or(false) {
+                return respond_json(&json!({
+                    "dryRun": true,
+                    "count": plan.partitions.len(),
+                    "partitions": plan.partitions.iter().map(|p| &p.key).collect::<Vec<_>>(),
+                }));
+            }
+            if let Err(e) = backfill::save(&ws, &plan) {
+                return respond_err("500 Internal Server Error", &e);
+            }
+            let id = plan.id.clone();
+            let logged = id.clone();
+            let count = plan.partitions.len();
+            let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
+            std::thread::spawn(move || {
+                if let Err(e) =
+                    duckle_duckdb_engine::backfill_exec::execute_ledger(&ws, &duckdb, plan, force, &|doc| duckle_secrets::resolve_connection_refs(&ws, &mut doc.nodes), &|_| {})
+                {
+                    // Accepted-then-failed is still a failure, and a background
+                    // thread that swallows it leaves the ledger as the only
+                    // evidence.
+                    eprintln!("backfill {logged}: {e}");
+                }
+            });
+            respond_json(&json!({ "accepted": true, "id": id, "partitions": count }))
+        }
+        "retry" => {
+            let Some(id) = body.get("id").and_then(Value::as_str) else {
+                return respond_err("400 Bad Request", "retry needs an id");
+            };
+            let mut plan = match backfill::load(&ws, id) {
+                Ok(p) => p,
+                Err(e) => return respond_err("404 Not Found", &e),
+            };
+            let only = body
+                .get("partition")
+                .and_then(Value::as_str)
+                .map(|k| vec![k.to_string()]);
+            let n = plan.retry_open(only.as_deref());
+            if n == 0 {
+                return respond_json(&json!({ "retried": 0, "id": id }));
+            }
+            plan.pid = Some(std::process::id());
+            if let Err(e) = backfill::save(&ws, &plan) {
+                return respond_err("500 Internal Server Error", &e);
+            }
+            let id = id.to_string();
+            let logged = id.clone();
+            std::thread::spawn(move || {
+                // A retry is explicit: the operator decided this slice should
+                // run, so it is not skipped as already-done.
+                if let Err(e) =
+                    duckle_duckdb_engine::backfill_exec::execute_ledger(&ws, &duckdb, plan, true, &|doc| duckle_secrets::resolve_connection_refs(&ws, &mut doc.nodes), &|_| {})
+                {
+                    // Accepted-then-failed is still a failure, and a background
+                    // thread that swallows it leaves the ledger as the only
+                    // evidence.
+                    eprintln!("backfill {logged}: {e}");
+                }
+            });
+            respond_json(&json!({ "accepted": true, "id": id, "retried": n }))
+        }
+        // Cancel is immediate: it only marks the open slices, so there is
+        // nothing to wait for and an operator gets the answer rather than an
+        // acceptance.
+        "cancel" => {
+            let Some(id) = body.get("id").and_then(Value::as_str) else {
+                return respond_err("400 Bad Request", "cancel needs an id");
+            };
+            let mut plan = match backfill::load(&ws, id) {
+                Ok(p) => p,
+                Err(e) => return respond_err("404 Not Found", &e),
+            };
+            let n = plan.cancel();
+            plan.pid = None;
+            if let Err(e) = backfill::save(&ws, &plan) {
+                return respond_err("500 Internal Server Error", &e);
+            }
+            respond_json(&json!({ "cancelled": n, "id": id }))
+        }
+        other => respond_err("400 Bad Request", &format!("unknown action {other:?}")),
+    }
+}
+
 fn respond(status: &str, content_type: &str, body: &[u8]) -> Reply {
     Reply {
         status: status.to_string(),
@@ -1413,6 +1948,7 @@ fn respond_403(msg: &str) -> Reply {
     respond("403 Forbidden", "text/plain", msg.as_bytes())
 }
 
+#[allow(dead_code)]
 fn handle(mut stream: TcpStream, state: &Arc<State>) -> Result<(), String> {
     let req = read_request(&mut stream)?;
     let reply = route_console(&req, state);
@@ -1468,7 +2004,15 @@ fn authorize(req: &Request, state: &State) -> Access {
     // machine. The editor has blocked cross-origin state changes since it shipped and the
     // console did not, so `fetch('http://127.0.0.1:8080/api/run', ...)` from a random site
     // ran a workspace pipeline. Same guard, same place in the request.
-    if req.method != "GET" && req.path.starts_with("/api/") && !guard_local(req, &state.host) {
+    //
+    // GHSA-c3jh-48x5-mhpw: and it covers GET too. It did not, because the threat
+    // modelled was a state change - but the exposure in Local mode is READING.
+    // DNS rebinding makes an attacker's page same-origin with the loopback
+    // console, and every GET then answers as a local admin: the audit log names
+    // people, pipelines carry SQL and connection references, logs carry whatever
+    // ran. A guard that stops the writes and serves the reads stops nothing that
+    // matters here.
+    if req.path.starts_with("/api/") && !guard_local(req, &state.host) {
         return Access::Refused(respond_403("blocked: cross-origin or non-local request"));
     }
 
@@ -1514,9 +2058,162 @@ fn authorize(req: &Request, state: &State) -> Access {
 ///
 /// Kept in one function so the socket path and the framework path answer identically, and
 /// so the list of what needs no credential is somewhere a person can read in one go.
+/// The OIDC login and callback (#310).
+///
+/// Both halves in one function because they are two steps of one exchange and
+/// splitting them would put the state handling in two places.
+fn oidc_route(req: &Request, state: &State) -> Reply {
+    let Some(cfg) = state.oidc.as_ref() else {
+        // Not configured is 404 and not 401: there is no such login here, and
+        // saying "unauthorised" would suggest there is one to get past.
+        return respond_err("404 Not Found", "this server has no OIDC login configured");
+    };
+    // Discovered lazily and cached, so a provider that is briefly unavailable
+    // delays a login rather than preventing the server from starting.
+    let endpoints = {
+        let mut slot = state.oidc_endpoints.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            match crate::oidc::discover(&cfg.issuer) {
+                Ok(e) => *slot = Some(e),
+                Err(e) => return respond_err("502 Bad Gateway", &e),
+            }
+        }
+        slot.clone().expect("just discovered")
+    };
+
+    if req.path == OIDC_LOGIN_PATH {
+        let (url, pending) = crate::oidc::begin(cfg, &endpoints);
+        let browser = pending.browser.clone();
+        state
+            .oidc_logins
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(pending);
+        return Reply {
+            status: "302 Found".into(),
+            content_type: "text/plain; charset=utf-8".into(),
+            body: Vec::new(),
+            headers: vec![
+                format!("Location: {url}"),
+                // Ties the callback to THIS browser. Without it the state is a
+                // bearer token: an attacker starts a login, takes the callback
+                // URL for their own identity, and gets a victim to visit it -
+                // the victim is then signed in as the attacker.
+                format!(
+                    "Set-Cookie: {}={browser}{}",
+                    crate::oidc::LOGIN_COOKIE,
+                    cookie_attributes(req.forwarded_proto.as_deref())
+                ),
+            ],
+        };
+    }
+
+    // The callback. Everything here is attacker-supplied until proven
+    // otherwise, which is why the state is checked before anything is fetched.
+    let (Some(code), Some(returned_state)) =
+        (req.query.get("code"), req.query.get("state"))
+    else {
+        // A provider error comes back as ?error=..., and echoing it verbatim
+        // would put attacker text on the page.
+        return respond_err("400 Bad Request", "the OIDC callback carried no code");
+    };
+    let browser = req
+        .cookie
+        .as_deref()
+        .and_then(|c| console_auth::cookie_value(c, crate::oidc::LOGIN_COOKIE));
+    let Some(pending) = state
+        .oidc_logins
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take(returned_state, browser.as_deref())
+    else {
+        return respond_err(
+            "400 Bad Request",
+            "this callback does not match a login this server started, or it took too long",
+        );
+    };
+
+    let id_token = match crate::oidc::exchange(cfg, &endpoints, code, &pending.verifier) {
+        Ok(t) => t,
+        Err(e) => return respond_err("502 Bad Gateway", &e),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let identity = match crate::oidc::verify(cfg, &endpoints, &id_token, &pending.nonce, now) {
+        Ok(i) => i,
+        // 403 and not 502: the provider answered, and the answer was that this
+        // person does not get in.
+        Err(e) => {
+            audit::record(&state.workspace, None, "oidc.refused", &e, audit::Outcome::Denied);
+            return respond_err("403 Forbidden", &e);
+        }
+    };
+
+    // Audit carries the provider's STABLE subject, not the display name: a
+    // name or an email can be reassigned to a different person, and an audit
+    // trail that follows the label rather than the identity is worse than none.
+    audit::record(
+        &state.workspace,
+        None,
+        "oidc.signin",
+        &format!("{} as {}", identity.actor(), identity.role.as_str()),
+        audit::Outcome::Allowed,
+    );
+    let sid = state.console.sign_in_external(&identity.actor(), identity.role);
+    Reply {
+        status: "302 Found".into(),
+        content_type: "text/plain; charset=utf-8".into(),
+        body: Vec::new(),
+        headers: vec![
+            "Location: /".to_string(),
+            session_cookie_header(&sid, req.forwarded_proto.as_deref()),
+            // And the login cookie is spent.
+            format!(
+                "Set-Cookie: {}=; Max-Age=0{}",
+                crate::oidc::LOGIN_COOKIE,
+                cookie_attributes(req.forwarded_proto.as_deref())
+            ),
+        ],
+    }
+}
+
+/// Liveness and readiness, for whichever server is asking.
+///
+/// Shared by the console and the editor because both are processes an
+/// orchestrator probes, and a probe that answers on one and redirects to a
+/// sign-in page on the other is worse than not having it.
+fn probe_reply(path: &str, workspace: &Path) -> Option<Reply> {
+    if path == HEALTH_PATH {
+        return Some(respond("200 OK", "text/plain; charset=utf-8", b"ok"));
+    }
+    if path == READY_PATH {
+        // Writable, not merely present: a workspace mounted read-only, or one
+        // whose disk has filled, answers every read fine and cannot record a
+        // single run. That is exactly the state readiness exists to catch.
+        return Some(match probe_ready(workspace) {
+            Ok(()) => respond("200 OK", "text/plain; charset=utf-8", b"ready"),
+            // 503, so a load balancer takes it out of rotation rather than
+            // restarting it: the process is fine, its storage is not.
+            Err(why) => respond(
+                "503 Service Unavailable",
+                "text/plain; charset=utf-8",
+                format!("not ready: {why}
+").as_bytes(),
+            ),
+        });
+    }
+    None
+}
+
 fn public_route(req: &Request, state: &State) -> Reply {
-    if req.path == HEALTH_PATH {
-        return respond("200 OK", "text/plain; charset=utf-8", b"ok");
+    if let Some(reply) = probe_reply(&req.path, &state.workspace) {
+        return reply;
+    }
+    // Before the sign-in fallthrough below. A path in PUBLIC_ROUTES with no
+    // branch here does not 404 - it is treated as a token sign-in attempt and
+    // answered 401, which for a login route is a bug that looks like a
+    // misconfigured provider.
+    if req.path == OIDC_LOGIN_PATH || req.path == OIDC_CALLBACK_PATH {
+        return oidc_route(req, state);
     }
     if req.method == "GET" && req.path == SETUP_PATH {
         // A console that is already set up has no setup page, and saying so is friendlier
@@ -1529,7 +2226,11 @@ fn public_route(req: &Request, state: &State) -> Reply {
     if req.method == "POST" && req.path == SETUP_CLAIM_PATH {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
         let label = body.get("label").and_then(|v| v.as_str()).unwrap_or("");
-        return match state.console.claim(label) {
+        // GHSA-x7pg-4h32-8r25: the code this process printed to its own output.
+        // Reaching the port is not enough; reading the log is what proves the
+        // claimant is the operator.
+        let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        return match state.console.claim(label, code) {
             Ok(token) => {
                 // Worth an audit line of its own: this is the moment the server acquired
                 // an owner, and it is the one event with nobody to attribute it to yet.
@@ -1537,12 +2238,25 @@ fn public_route(req: &Request, state: &State) -> Reply {
                 eprintln!("duckle-runner: claimed by '{label}'; setup is closed");
                 respond_json(&json!({ "token": token, "label": label, "role": "admin" }))
             }
-            Err(e) => respond_err("409 Conflict", &e),
+            // A refused claim is recorded too. Repeated lines here are someone
+            // guessing at the setup code, and that is the one thing an operator
+            // would want to see in the audit log rather than infer from silence.
+            Err(e) => {
+                audit::record(
+                    &state.workspace,
+                    None,
+                    "console.claim_refused",
+                    label,
+                    audit::Outcome::Denied,
+                );
+                respond_err("409 Conflict", &e)
+            }
         };
     }
     sign_in(state, req)
 }
 
+#[allow(dead_code)]
 fn route_console(req: &Request, state: &Arc<State>) -> Reply {
     match authorize(req, state) {
         Access::Refused(reply) => reply,
@@ -1571,6 +2285,17 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
         ("GET", "/") | ("GET", "/index.html") => {
             respond("200 OK", "text/html; charset=utf-8", PANEL_HTML.as_bytes())
         }
+        // #300. Authenticated, unlike /healthz and /readyz: pipeline names are
+        // the shape of someone's business, and a probe saying "this process is
+        // up" gives an anonymous caller nothing. A scraper sends the same
+        // bearer token any other API client does.
+        ("GET", "/metrics") => respond(
+            "200 OK",
+            // The version Prometheus negotiates for the text exposition format;
+            // without it some scrapers fall back to guessing.
+            "text/plain; version=0.0.4; charset=utf-8",
+            metrics_body(state).as_bytes(),
+        ),
         ("GET", "/api/summary") => respond_json(&api_summary(state)),
         ("GET", "/api/pipelines") => respond_json(&api_pipelines(state)),
         ("GET", "/api/pipeline") => match req.query.get("file") {
@@ -1581,6 +2306,18 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
             None => respond_err("400 Bad Request", "missing file"),
         },
         ("GET", "/api/runs") => respond_json(&api_runs(state, req.query.get("id").map(|s| s.as_str()))),
+        // #295: the persisted backfill plan, addressable over the server rather
+        // than only by an in-process CLI invocation.
+        ("GET", "/api/backfills") => match req.query.get("id") {
+            Some(id) => match duckle_duckdb_engine::backfill::load(&state.workspace, id) {
+                Ok(b) => respond_json(&serde_json::to_value(&b).unwrap_or_default()),
+                Err(e) => respond_err("404 Not Found", &e),
+            },
+            None => respond_json(
+                &json!({ "backfills": duckle_duckdb_engine::backfill::list(&state.workspace) }),
+            ),
+        },
+        ("POST", "/api/backfills") => api_backfill_action(state, req),
         ("GET", "/api/log") => respond_json(&api_log(state, &req.query)),
         ("GET", "/api/catalog") => respond_json(&api_catalog(state)),
         ("GET", "/api/batches") => respond_json(&json!({ "batches": duckle_duckdb_engine::batch::statuses(&state.workspace) }),
@@ -1610,6 +2347,73 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
                 None => respond_err("400 Bad Request", "missing id"),
             }
         }
+        // Backfill: the saved state a pipeline resumes from. Same operations
+        // the desktop Backfill panel and `duckle-runner backfill` use, so the
+        // three surfaces cannot disagree about what a run will read.
+        //
+        // The pipeline is named by ?file=, resolved inside the workspace and
+        // reduced to its file stem - exactly what execute_one hands to
+        // execute_pipeline_named - so what this reports is what a run reads.
+        ("GET", "/api/watermarks") => match watermark_target(state, req) {
+            Ok((ws, name)) => {
+                let entries = duckle_duckdb_engine::watermark::list(&ws, &name);
+                respond_json(&json!({ "pipeline": name, "entries": entries }))
+            }
+            Err(e) => respond_err("400 Bad Request", &e),
+        },
+        ("POST", "/api/watermarks") => {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+            match watermark_target(state, req) {
+                Err(e) => respond_err("400 Bad Request", &e),
+                Ok((ws, name)) => match body.get("node").and_then(|v| v.as_str()) {
+                    None => respond_err("400 Bad Request", "missing node"),
+                    Some(node) => {
+                        use duckle_duckdb_engine::watermark as wm;
+                        // A wrong-kind write is refused by the engine, not here:
+                        // one guard, so this route cannot drift from the CLI.
+                        let done = match (
+                            body.get("value").and_then(|v| v.as_str()),
+                            body.get("snapshot_id").and_then(|v| v.as_u64()),
+                        ) {
+                            (Some(v), None) => wm::set_incremental(
+                                &ws,
+                                &name,
+                                node,
+                                v,
+                                body.get("type").and_then(|t| t.as_str()),
+                            ),
+                            (None, Some(id)) => wm::set_snapshot(&ws, &name, node, id),
+                            (Some(_), Some(_)) => {
+                                return respond_err(
+                                    "400 Bad Request",
+                                    "give value or snapshot_id, not both",
+                                )
+                            }
+                            (None, None) => {
+                                return respond_err(
+                                    "400 Bad Request",
+                                    "missing value or snapshot_id",
+                                )
+                            }
+                        };
+                        match done {
+                            Ok(()) => respond_json(&json!({ "ok": true, "node": node })),
+                            Err(e) => respond_err("400 Bad Request", &e.to_string()),
+                        }
+                    }
+                },
+            }
+        }
+        ("DELETE", "/api/watermarks") => match watermark_target(state, req) {
+            Ok((ws, name)) => match req.query.get("node") {
+                Some(node) => match duckle_duckdb_engine::watermark::clear(&ws, &name, node) {
+                    Ok(()) => respond_json(&json!({ "ok": true, "cleared": node })),
+                    Err(e) => respond_err("400 Bad Request", &e.to_string()),
+                },
+                None => respond_err("400 Bad Request", "missing node"),
+            },
+            Err(e) => respond_err("400 Bad Request", &e),
+        },
         ("GET", "/api/audit") => {
             let filter = audit::Filter {
                 actor: req.query.get("actor").cloned(),
@@ -1845,6 +2649,16 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "pipeline".into());
+            // The same per-pipeline lock a scheduled run takes, claimed BEFORE
+            // the 202 for the reason the comment above gives: answering "accepted"
+            // and then refusing on a background thread leaves the caller polling
+            // a run that will never appear. A conflict is the honest answer.
+            let run_lock =
+                match duckle_duckdb_engine::runlock::claim_for_run(&state.workspace, &pipeline_id)
+                {
+                    Ok(l) => l,
+                    Err(e) => return respond_err("409 Conflict", &e),
+                };
             let run_id = new_run_id(&pipeline_id);
             let engine = DuckdbEngine::new(state.duckdb.clone());
             if let Ok(mut runs) = state.runs.lock() {
@@ -1861,8 +2675,13 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
             let bg = Arc::clone(state);
             let rid = run_id.clone();
             std::thread::spawn(move || {
-                let outcome =
-                    execute_one_with(&bg, &file, "manual", &params, Some(engine), Some(&rid));
+                // Moved in so it is held for the whole run and released by
+                // dropping, however the run ends - the kernel owns the lock, so
+                // a panic or a kill releases it too.
+                let _run_lock = run_lock;
+                let outcome = outcome_or_panic_error("the run", || {
+                    execute_one_with(&bg, &file, "manual", &params, Some(engine), Some(&rid))
+                });
                 if let Ok(mut runs) = bg.runs.lock() {
                     let pid = runs.get(&rid).map(|r| r.pipeline_id.clone()).unwrap_or_default();
                     if let Some(live) = runs.get_mut(&rid) {
@@ -1943,25 +2762,35 @@ fn audit_target(req: &Request) -> String {
 ///
 /// The token arrives in the body, never in the URL: a query string reaches the
 /// server log, the browser history and any proxy in between.
+/// The `Set-Cookie` line that hands a browser its session (#310).
+///
+/// One constructor for all three login paths - the console token, the editor
+/// token and OIDC. There were three copies of this and the third spelled the
+/// cookie name as a literal that did not match the one the console reads, so a
+/// completed SSO login authenticated nobody: the session row was written, the
+/// browser held a cookie under a name nothing looks at, and the audit log said
+/// the user had signed in.
+fn session_cookie_header(sid: &str, forwarded_proto: Option<&str>) -> String {
+    // HttpOnly so page scripts cannot read it, SameSite=Strict so another site
+    // cannot ride it, and Secure exactly when the browser's own hop is https.
+    // Always setting it would stop the cookie being stored at all on plain-HTTP
+    // local use; never setting it lets a session cookie travel in clear behind
+    // a proxy that does terminate TLS.
+    format!(
+        "Set-Cookie: {}={sid}{}",
+        console_auth::SESSION_COOKIE,
+        cookie_attributes(forwarded_proto)
+    )
+}
+
 fn sign_in(state: &State, req: &Request) -> Reply {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
     let token = body.get("token").and_then(|v| v.as_str()).unwrap_or("");
     match state.console.sign_in(token) {
         Some((sid, who)) => {
             audit::record(&state.workspace, Some(&who), "session.sign_in", "-", audit::Outcome::Allowed);
-            // HttpOnly so page scripts cannot read it, SameSite=Strict so another site
-            // cannot ride it, and Secure exactly when the browser's own hop is https.
-            // Always setting it would stop the cookie being stored at all on plain-HTTP
-            // local use; never setting it lets a session cookie travel in clear behind a
-            // proxy that does terminate TLS.
-            let cookie = format!(
-                "{}={}{}",
-                console_auth::SESSION_COOKIE,
-                sid,
-                cookie_attributes(req.forwarded_proto.as_deref())
-            );
             respond_json(&json!({ "label": who.label, "role": who.role.as_str() }))
-                .with_header(format!("Set-Cookie: {cookie}"))
+                .with_header(session_cookie_header(&sid, req.forwarded_proto.as_deref()))
         }
         None => {
             audit::record(
@@ -2341,6 +3170,26 @@ fn deploy_into(workspace: &Path, body: &Value) -> Result<Value, String> {
 
 /// Resolve a workspace-relative path and refuse anything that escapes the
 /// workspace (no `..` traversal beyond the root).
+/// Workspace + pipeline NAME for a backfill request, from `?file=`.
+///
+/// The name has to be derived exactly the way a run derives it, or the API
+/// reports one folder's state while runs read another. `execute_one` resolves
+/// the file inside the workspace and hands `execute_pipeline_named` the file
+/// stem; this does the same, and goes through `resolve_in_workspace` so a
+/// `?file=../../etc` cannot read state outside the workspace.
+fn watermark_target(state: &Arc<State>, req: &Request) -> Result<(PathBuf, String), String> {
+    let file = req
+        .query
+        .get("file")
+        .ok_or_else(|| "missing file".to_string())?;
+    let path = resolve_in_workspace(&state.workspace, file)?;
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| "cannot read a pipeline name from that path".to_string())?;
+    Ok((state.workspace.clone(), name))
+}
+
 fn resolve_in_workspace(workspace: &Path, file: &str) -> Result<PathBuf, String> {
     let candidate = workspace.join(file);
     let canon = candidate.canonicalize().map_err(|_| format!("not found: {}", file))?;
@@ -2455,6 +3304,20 @@ fn load_schedules(state: &State) -> Result<Value, String> {
                 // named a plan fired the pipeline it was keyed by instead, and failed
                 // looking for a file nobody had written.
                 "planId": s.plan_id,
+                // #318 and #296, for the same reason and after the same bug.
+                // Both were stored, both were honoured by the desktop
+                // scheduler, and NEITHER reached this projection - so `duckle
+                // serve` fired a `Europe/Brussels` schedule at the container's
+                // UTC clock, and ran on a date the operator had excluded. The
+                // console's own next-run display read them from here too, so it
+                // agreed with the wrong answer.
+                "timezone": s.timezone,
+                "exclude": s.exclude,
+                // #296: and the misfire policy, for the same reason - the tick
+                // loop reads this projection, so a policy that stops here is a
+                // policy that does nothing.
+                "misfire": s.misfire,
+                "catchup": s.catchup,
             }),
         );
     }
@@ -2501,6 +3364,27 @@ fn migrate_legacy_schedules(workspace: &Path) {
                 plan_id: None,
                 enabled: cfg.get("enabled").and_then(Value::as_bool).unwrap_or(false),
                 kind,
+                timezone: cfg
+                    .get("timezone")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string),
+                exclude: cfg
+                    .get("exclude")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default(),
+                misfire: cfg
+                    .get("misfire")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default(),
+                catchup: cfg
+                    .get("catchup")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default(),
                 last_run_at: None,
                 last_run_status: None,
                 last_run_duration_ms: None,
@@ -2541,8 +3425,25 @@ fn next_run_at(sched: &Value, last_at: Option<&str>) -> Option<String> {
     }
     let cron = sched.get("cron").and_then(Value::as_str).unwrap_or("").trim();
     if !cron.is_empty() {
-        let schedule = normalize_cron(cron).and_then(|e| e.parse::<cron::Schedule>().ok())?;
-        return schedule.after(&chrono::Local::now()).next().map(|dt| dt.to_rfc3339());
+        // #318: through the shared evaluator, so this console and the embedded
+        // scheduler read the same expression as the same instant. They did not
+        // once (#194), and the way that showed up was a job firing at two
+        // different times depending on which surface owned it.
+        let tz = sched.get("timezone").and_then(Value::as_str);
+        let zone = duckle_duckdb_engine::cronzone::resolve_zone(tz).ok()?;
+        let exclude: duckle_duckdb_engine::cronzone::Exclusions = sched
+            .get("exclude")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let (occ, _skipped) = duckle_duckdb_engine::cronzone::next_after_excluding(
+            cron,
+            &zone,
+            &exclude,
+            chrono::Utc::now(),
+        )
+        .ok()?;
+        return occ.map(|o| o.at.to_rfc3339());
     }
     let interval = sched.get("intervalSeconds").and_then(Value::as_u64).unwrap_or(0);
     if interval == 0 {
@@ -2590,6 +3491,26 @@ fn save_schedule_at(workspace: &Path, body: &Value) -> Result<Value, String> {
     {
         return Err("Invalid cron expression (use 5 fields, e.g. `0 9 * * 1`)".to_string());
     }
+    // #318: a zone typo is refused here, in front of whoever typed it, rather
+    // than becoming a job that quietly runs on the container's UTC clock.
+    if let Some(tz) = body.get("timezone").and_then(|v| v.as_str()) {
+        duckle_duckdb_engine::cronzone::resolve_zone(Some(tz))?;
+    }
+    let timezone: Option<String> = body
+        .get("timezone")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    // #296: a maintenance calendar is checked where it is written. A misspelled
+    // weekday excludes nothing, which looks exactly like no exclusion at all
+    // until the day it was supposed to cover arrives.
+    let exclude: duckle_duckdb_engine::cronzone::Exclusions = match body.get("exclude").cloned() {
+        Some(v) => serde_json::from_value(v)
+            .map_err(|e| format!("Invalid exclude calendar: {e}"))?,
+        None => Default::default(),
+    };
+    exclude.validate()?;
     // Seconds are what the store holds. A console that sends only minutes is
     // still honoured, but one that echoes back the intervalSeconds it was given
     // keeps a sub-minute schedule exactly as the desktop editor set it.
@@ -2639,6 +3560,13 @@ fn save_schedule_at(workspace: &Path, body: &Value) -> Result<Value, String> {
                 enabled,
                 plan_id: plan_id.clone().flatten(),
                 kind,
+                timezone: timezone.clone(),
+                exclude: exclude.clone(),
+                // #296: this route does not edit the misfire policy, so a
+                // schedule it CREATES takes the default (skip), which is the
+                // behaviour every schedule had before the policy existed.
+                misfire: Default::default(),
+                catchup: Default::default(),
                 last_run_at: None,
                 last_run_status: None,
                 last_run_duration_ms: None,
@@ -2739,6 +3667,185 @@ fn run_scheduled(state: &State, id: &str, file: &str) {
     }
 }
 
+/// What a publication-triggered run is given.
+///
+/// #325: the subscription's explicit bindings, plus - where the producer and
+/// consumer declare the SAME partition definition - the partition the producer
+/// published, regenerated from that definition rather than copied.
+///
+/// Inheritance is filtered to parameters the consumer actually DECLARES, and
+/// that filter is load-bearing rather than tidiness: an undeclared parameter is
+/// a hard `param:unknown` error, so injecting a window into a consumer that
+/// never asked for one would turn a working delivery into a failing run. What
+/// is not declared is not sent.
+///
+/// An explicit binding wins over an inherited one. The operator wrote it down.
+fn delivery_params(
+    workspace: &Path,
+    pipes: &HashMap<String, PathBuf>,
+    events: &HashMap<String, duckle_duckdb_engine::materialize::Event>,
+    delivery: &duckle_duckdb_engine::subscribe::Delivery,
+    consumer_file: &str,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let _ = workspace;
+    if let Some(event) = events.get(&delivery.event_id) {
+        let read = |p: &Path| -> Option<serde_json::Value> {
+            serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+        };
+        let consumer = read(Path::new(consumer_file));
+        let producer = pipes.get(&event.pipeline_id).and_then(|p| read(p));
+        if let (Some(consumer), Some(producer)) = (&consumer, &producer) {
+            let declared: std::collections::BTreeSet<String> = consumer
+                .get("parameters")
+                .and_then(|v| v.as_object())
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            let inherited = duckle_duckdb_engine::subscribe::inherited_partition(
+                duckle_duckdb_engine::partition::of(producer).as_ref(),
+                duckle_duckdb_engine::partition::of(consumer).as_ref(),
+                event.partition_key.as_deref(),
+            );
+            for (k, v) in inherited {
+                if declared.contains(&k) {
+                    out.insert(k, v);
+                }
+            }
+        }
+    }
+    for (k, v) in &delivery.parameters {
+        out.insert(k.clone(), v.clone());
+    }
+    out
+}
+
+
+/// #325: run what a publication triggered.
+///
+/// The pump, deliberately separate from the clock scheduler: a subscription is
+/// not a clock, and the scheduler reads a flattened projection that cannot
+/// express one. What it creates is an ORDINARY run through `execute_one`, so
+/// the resource pool, the policy, the receipt and the logs are the same ones a
+/// scheduled run gets - the trigger is new, the execution is not.
+///
+/// Every outcome is recorded against the delivery, including "could not start",
+/// which is the state that otherwise looks identical to "never triggered".
+fn pump_deliveries(state: &State) {
+    use duckle_duckdb_engine::subscribe::{self, DeliveryState};
+    let now = chrono::Utc::now().to_rfc3339();
+    let pending = subscribe::pending(&state.workspace, &now);
+    if pending.is_empty() {
+        return;
+    }
+    let pipes: HashMap<String, PathBuf> =
+        discover_pipelines(&state.workspace).into_iter().map(|(p, id, _)| (id, p)).collect();
+    // #325 criterion 7, as the last line of defence. `validate` refuses a loop
+    // statically, but a workspace can be edited into one between validations,
+    // and a loop that reaches the pump is not a slow bug - it is every pipeline
+    // in the ring running forever. Deliveries into a ring are FAILED with the
+    // loop named rather than skipped: skipping looks exactly like nothing was
+    // published, which is the wrong thing to be told about a trigger storm that
+    // was just prevented.
+    let looping: HashMap<String, String> = match subscribe::load(&state.workspace) {
+        Ok(subs) if !subs.is_empty() => {
+            match duckle_duckdb_engine::catalog::load_or_rebuild(&state.workspace) {
+                Ok(cat) => subscribe::cycles(&cat, &subs)
+                    .iter()
+                    .flat_map(|c| {
+                        let described = c.describe();
+                        c.path.clone().into_iter().map(move |p| (p, described.clone()))
+                    })
+                    .collect(),
+                Err(_) => HashMap::new(),
+            }
+        }
+        _ => HashMap::new(),
+    };
+    // #325: the publication a delivery came from, for the parameters it binds.
+    // Read once rather than per delivery - one tick can carry many.
+    let events: HashMap<String, duckle_duckdb_engine::materialize::Event> =
+        duckle_duckdb_engine::materialize::read(&state.workspace)
+            .into_iter()
+            .map(|e| (e.event_id.clone(), e))
+            .collect();
+    for mut delivery in pending {
+        delivery.attempts += 1;
+        // A subscription binding a field the publication does not carry is a
+        // standing misconfiguration, and it fails HERE - before a run exists -
+        // which is the property the issue asks for.
+        if let Some(why) = delivery.parameter_error.clone() {
+            delivery.state = DeliveryState::Failed;
+            delivery.last_error = Some(format!("parameters could not be bound: {why}"));
+            let _ = subscribe::record(&state.workspace, delivery);
+            continue;
+        }
+        if let Some(loop_path) = looping.get(&delivery.pipeline_id) {
+            delivery.state = DeliveryState::Failed;
+            delivery.last_error = Some(format!(
+                "not delivered: {loop_path} would trigger each other forever. Narrow the assets                  this subscription matches, or set a producer."
+            ));
+            let _ = subscribe::record(&state.workspace, delivery);
+            continue;
+        }
+        let Some(file) = pipes.get(&delivery.pipeline_id).map(|p| p.display().to_string()) else {
+            // Recorded rather than skipped: a subscription naming a pipeline
+            // that no longer exists is a broken subscription, and silence would
+            // make it look like nothing was ever published.
+            delivery.state = DeliveryState::Failed;
+            delivery.last_error =
+                Some(format!("no pipeline {:?} in this workspace", delivery.pipeline_id));
+            let _ = subscribe::record(&state.workspace, delivery);
+            continue;
+        };
+        // The same on-disk lock a scheduled run takes. Two runs of one pipeline
+        // race on its sink and on its watermark, and a publication arriving
+        // while the consumer is already running is exactly when that happens.
+        let _lock = match duckle_duckdb_engine::runlock::try_acquire(
+            &state.workspace,
+            &delivery.pipeline_id,
+        ) {
+            Some(l) => l,
+            None => {
+                // Left PENDING on purpose, not failed: it was not delivered and
+                // the next tick will offer it again. Recording a failure here
+                // would need a human to retry something that only needed a
+                // minute.
+                continue;
+            }
+        };
+        let params = delivery_params(&state.workspace, &pipes, &events, &delivery, &file);
+        match execute_one(state, &file, "materialization", &params) {
+            Ok(v) => {
+                let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                delivery.run_id =
+                    v.get("runId").and_then(|r| r.as_str()).map(str::to_string);
+                // Delivered means the consumer RAN. A consumer that ran and
+                // failed is a failed run, reachable by its run id - a different
+                // problem from the delivery never arriving, which is the whole
+                // reason these are separate states.
+                delivery.state = DeliveryState::Delivered;
+                delivery.last_error = match status {
+                    "ok" => None,
+                    other => Some(format!("the consumer run finished {other}")),
+                };
+                eprintln!(
+                    "duckle-runner: {} triggered by {} -> {}",
+                    delivery.pipeline_id, delivery.event_id, status
+                );
+            }
+            Err(e) => {
+                delivery.state = DeliveryState::Failed;
+                delivery.last_error = Some(e.clone());
+                eprintln!(
+                    "duckle-runner: {} could not be triggered by {}: {e}",
+                    delivery.pipeline_id, delivery.event_id
+                );
+            }
+        }
+        let _ = subscribe::record(&state.workspace, delivery);
+    }
+}
+
 /// Write a scheduled run's outcome back to the shared schedule store.
 ///
 /// Only the desktop app used to do this, and once both products moved to one
@@ -2770,7 +3877,14 @@ fn record_schedule_outcome(
 /// where the ordinary path already reports from.
 fn alerts_notify(state: &State, pipeline_id: &str, status: &str, duration_ms: u64, error: Option<String>) {
     let result = duckle_duckdb_engine::RunResult {
+        cache_keys: Default::default(),
         status: status.to_string(),
+        // Synthesised for an alert about something outside a run.
+        unchanged: false,
+        incomplete: false,
+        incomplete_reason: None,
+        artifacts: Vec::new(),
+        artifacts_truncated: false,
         duration_ms,
         nodes: Default::default(),
         preview: Vec::new(),
@@ -2828,7 +3942,6 @@ fn execute_one_with(
 
     let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "pipeline".into());
 
-    let _guard = state.run_lock.acquire();
 
     // Mark this pipeline as running for the duration of the execution so the
     // console can show a live "Running" status (discussion #155). The guard
@@ -2852,19 +3965,95 @@ fn execute_one_with(
     // Refused rather than substituted when a parameter would inject shell syntax
     // into an executed property: /api/run needs only operator, and quietly allowing
     // that would hand an operator the execution /api/deploy reserves for admin.
-    duckle_duckdb_engine::context::apply_params(&mut doc, params)?;
+    // #309: what the run was actually given, secrets already replaced. Taken
+    // from the substitution boundary rather than from `params` here, because
+    // that is the only place that knows the effective set (declared defaults
+    // included) and which of them the pipeline declared secret.
+    // #317: named, so the receipt can later say where a value came from. There
+    // is one source on this path today, which is why nothing here ever reports
+    // an override - but a schedule that binds parameters is the obvious second,
+    // and the difference between a deliberate override and an accidental
+    // double binding has to be recoverable the first time it happens, not
+    // after someone notices it did not get recorded.
+    let supplied: Vec<duckle_duckdb_engine::params::Supplied> = params
+        .iter()
+        .map(|(name, value)| duckle_duckdb_engine::params::Supplied {
+            name: name.clone(),
+            value: value.clone(),
+            source: "run input".to_string(),
+        })
+        .collect();
+    let (recorded_params, parameter_sources) =
+        duckle_duckdb_engine::context::apply_params_from(&mut doc, &supplied)?;
     // Match the web cmd paths and headless `duckle-runner --pipeline`: resolve
     // ${workspace}/${projectroot} and workspace-relative file paths before run,
     // so file-loaded pipelines (manual /api/run + scheduled runs) work too.
     duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
 
     let engine = engine.unwrap_or_else(|| DuckdbEngine::new(state.duckdb.clone()));
-    let result = engine.execute_pipeline_named(&doc, &id);
+    // #259: every console execution is addressable, not only the async one.
+    // `execute_one` passed None, so a synchronous run, a scheduled step and a
+    // plan step each recorded no id at all - which is what made "which run was
+    // that?" unanswerable for most of the ways a run actually starts. Minted
+    // here because all of them come through this function.
+    let owned_id = run_id
+        .map(str::to_string)
+        .unwrap_or_else(|| duckle_duckdb_engine::retry::new_run_id(&id, trigger));
+    let hash = duckle_duckdb_engine::retry::pipeline_hash(&doc);
+    let receipt = duckle_duckdb_engine::retry::begin(
+        &state.workspace,
+        &owned_id,
+        trigger,
+        &id,
+        &path.display().to_string(),
+        &hash,
+        None,
+    );
+    // Written again straight away rather than only at `finish`: a run that is
+    // killed still leaves a receipt, and "what was that run given?" is exactly
+    // the question asked of a run that did not come back.
+    let receipt = duckle_duckdb_engine::retry::RunReceipt {
+        parameters: recorded_params,
+        parameter_sources,
+        // #307: the external components this pipeline names, with their hashes.
+        components: duckle_duckdb_engine::plugin::used_by(
+            &state.workspace,
+            &serde_json::to_value(&doc).unwrap_or_default(),
+        ),
+        ..receipt
+    };
+    let _ = duckle_duckdb_engine::retry::write(&state.workspace, &receipt);
+    // #259: log lines carry the id the receipt was written with.
+    // #289: the receipt exists BEFORE the wait, so an API caller has a durable
+    // id to inspect or cancel while capacity is unavailable rather than holding
+    // the request open. `queued` is a real state - nothing has started, so
+    // there is nothing to undo if it is cancelled here.
+    let mut receipt = receipt;
+    let asked = state.run_lock.pool_for(&doc.resource_pool);
+    if state.run_lock.is_saturated(&asked) {
+        duckle_duckdb_engine::retry::enqueue(
+            &state.workspace,
+            &mut receipt,
+            &asked,
+            "resource_pool_capacity",
+        );
+    }
+    let (_guard, pool, queued_ms) = state.run_lock.acquire(&doc.resource_pool);
+    duckle_duckdb_engine::retry::admitted(&state.workspace, &mut receipt, queued_ms);
+    let receipt = duckle_duckdb_engine::retry::RunReceipt { resource_pool: Some(pool), ..receipt };
+
+    let result = engine.with_run_id(&receipt.run_id).execute_pipeline_named(&doc, &id);
+    duckle_duckdb_engine::retry::finish(
+        &state.workspace,
+        receipt,
+        &result.status,
+        duckle_duckdb_engine::retry::nodes_of(&result),
+    );
 
     let mut record = RunRecord::from_result_in(&state.workspace, &id, &result, trigger);
     // #259: stamp the id the caller was handed, so a finished async run is
     // still answerable once it has left memory.
-    record.run_id = run_id.map(str::to_string);
+    record.run_id = Some(owned_id.clone());
     let _ = append_run_record(&state.workspace, &id, record);
     // After the run is recorded, so an unreachable channel can never cost a
     // run its history entry, and never changes the outcome reported below.
@@ -2872,6 +4061,12 @@ fn execute_one_with(
 
     Ok(json!({
         "id": id,
+        // #325: the run this WAS, not only the pipeline it was of. It is minted
+        // here and was kept here, so a caller could not say which run it had
+        // just started - which is the same "which run was that?" the comment
+        // above says was unanswerable, and what a delivery needs to point at
+        // when the consumer it triggered fails.
+        "runId": owned_id,
         "status": result.status,
         "durationMs": result.duration_ms,
         "error": result.error,
@@ -2919,13 +4114,26 @@ fn plan_step_outcome(result: Result<Value, String>) -> Result<(), String> {
 /// until the OLD occurrence came round: a schedule moved from 03:00 to 09:00
 /// skipped 09:00 entirely and then fired at 03:00 the next morning, at the one
 /// time it had just been moved away from.
+///
+/// #296/#318: the next occurrence comes from the SHARED evaluator, so the zone
+/// and the exclusion calendar are read here rather than only displayed. Before
+/// this it used `cron::Schedule::after` against `chrono::Local`, which meant a
+/// schedule saying `Europe/Brussels` fired at the container's clock and a date
+/// the operator had excluded was fired anyway - on the server, which is the
+/// deployment those two features exist for.
 fn cron_decision(
-    armed: Option<&(String, chrono::DateTime<chrono::Local>)>,
+    armed: Option<&(String, chrono::DateTime<chrono::Utc>)>,
     expr: &str,
-    sched: &cron::Schedule,
-    now: chrono::DateTime<chrono::Local>,
-) -> (bool, Option<(String, chrono::DateTime<chrono::Local>)>) {
-    let next_after_now = || sched.after(&now).next().map(|t| (expr.to_string(), t));
+    zone: &duckle_duckdb_engine::cronzone::Zone,
+    exclude: &duckle_duckdb_engine::cronzone::Exclusions,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (bool, Option<(String, chrono::DateTime<chrono::Utc>)>) {
+    let next_after_now = || {
+        duckle_duckdb_engine::cronzone::next_after_excluding(expr, zone, exclude, now)
+            .ok()
+            .and_then(|(occ, _skipped)| occ)
+            .map(|o| (expr.to_string(), o.at))
+    };
     match armed {
         // Armed from this very expression, and its moment has come.
         Some((e, at)) if e == expr && now >= *at => (true, next_after_now()),
@@ -2935,6 +4143,234 @@ fn cron_decision(
         // Never seen before, or the expression changed underneath us. Arm what
         // it says NOW, and do not fire: the edit is not itself an occurrence.
         _ => (false, next_after_now()),
+    }
+}
+
+
+/// #296: run and record whatever this schedule missed.
+///
+/// The policy decides; this only carries it out. Every overdue occurrence gets
+/// a recorded outcome whether or not it runs, which is AC1 - "it was skipped"
+/// and "nothing happened" are different states and a moved pointer renders them
+/// the same.
+fn catch_up_schedule(
+    state: &Arc<State>,
+    in_flight: &Arc<Mutex<std::collections::HashSet<String>>>,
+    schedule_id: &str,
+    cfg: &Value,
+    zone: &duckle_duckdb_engine::cronzone::Zone,
+    exclude: &duckle_duckdb_engine::cronzone::Exclusions,
+    now: chrono::DateTime<chrono::Utc>,
+    pipes: &HashMap<String, PathBuf>,
+) {
+    use duckle_duckdb_engine::occurrences::{self, Decision};
+    let expr = cfg.get("cron").and_then(|v| v.as_str()).unwrap_or_default();
+    let misfire = cfg
+        .get("misfire")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let bounds = cfg
+        .get("catchup")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let overdue = match occurrences::catch_up(
+        &state.workspace, schedule_id, expr, zone, exclude, misfire, &bounds, now,
+    ) {
+        Ok(o) if o.is_empty() => return,
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("duckle-runner: schedule {schedule_id}: catch-up: {e}");
+            return;
+        }
+    };
+    for (occ, decision) in overdue {
+        let run = decision == Decision::Fired;
+        // Recorded BEFORE running, so a crash mid-catch-up leaves the
+        // occurrence decided rather than due again - the same ordering the
+        // ledger uses everywhere else.
+        let entry = occurrences::entry(
+            schedule_id,
+            &occ,
+            cfg.get("timezone").and_then(|v| v.as_str()),
+            decision,
+            None,
+            &now.to_rfc3339(),
+        );
+        if let Err(e) = occurrences::record(&state.workspace, &entry) {
+            eprintln!("duckle-runner: schedule {schedule_id}: occurrence not recorded ({e})");
+        }
+        if run {
+            eprintln!("duckle-runner: {schedule_id}: catching up {}", occ.at.to_rfc3339());
+            // #329: on its own thread, like every other firing. A catch-up is
+            // the LONGEST thing this loop does - it is N runs, not one - so
+            // executing it inline is the worst case of the stall, not an
+            // exception to it.
+            dispatch(state, in_flight, schedule_id, cfg, pipes);
+        }
+    }
+}
+
+/// #296: write the occurrence this tick is firing into the durable ledger.
+///
+/// Best effort, and deliberately: a ledger that could not be written is a gap
+/// in the record, and refusing to run the schedule because of it would turn a
+/// bookkeeping failure into a missed job. The record is what makes "did this
+/// occurrence already run" answerable across a restart, which the serve
+/// scheduler could not answer at all - its arming state is in memory.
+fn record_occurrence(
+    state: &State,
+    schedule_id: &str,
+    cfg: &Value,
+    due: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    use duckle_duckdb_engine::occurrences;
+    let timezone = cfg.get("timezone").and_then(|v| v.as_str());
+    let local = duckle_duckdb_engine::cronzone::resolve_zone(timezone)
+        .map(|z| duckle_duckdb_engine::cronzone::local_reading(&z, due))
+        .unwrap_or_default();
+    let entry = occurrences::Occurrence {
+        occurrence_id: occurrences::occurrence_id(schedule_id, &due.to_rfc3339()),
+        schedule_id: schedule_id.to_string(),
+        scheduled_for: due.to_rfc3339(),
+        local,
+        timezone: timezone.map(str::to_string),
+        decision: occurrences::Decision::Fired,
+        run_id: None,
+        decided_at: now.to_rfc3339(),
+    };
+    if let Err(e) = occurrences::record(&state.workspace, &entry) {
+        eprintln!("duckle-runner: schedule {schedule_id}: occurrence not recorded ({e})");
+    }
+}
+
+/// #329: hand a due schedule to its own thread and return.
+///
+/// The tick loop used to CALL `fire_schedule` and wait for the pipeline to
+/// finish. Because that loop also polls every other schedule and pumps
+/// materialization deliveries, one slow run stopped all of it: measured, a
+/// five-second schedule fired 9 times in a minute alone and 2 times with a
+/// single ~25s run beside it.
+///
+/// Three things made it worse than "one run is slow". `Gates::acquire` is an
+/// untimed condvar wait, so a saturated pool held the loop as effectively as a
+/// long run. A catch-up is N runs rather than one. And the freshness sweep in
+/// the same loop had already been moved off-thread for exactly this reason -
+/// the runs themselves are unboundedly slower than an SLA sweep.
+///
+/// A thread per firing rather than a pool, because what bounds concurrency is
+/// already elsewhere and would be duplicated here: the resource pool bounds
+/// what RUNS, the on-disk run lock stops one pipeline running twice, and
+/// `in_flight` stops this handing the same schedule out again while it is
+/// going. What is left to bound is the number of schedules an operator wrote,
+/// and a parked thread per one of those is not the cost worth engineering away.
+///
+/// Not a durable queue. That is what `overlapPolicy: queue` needs (#296) and it
+/// is a larger piece; this makes the scheduler responsive, which is true
+/// regardless of which overlap policy a schedule chooses.
+fn dispatch(
+    state: &Arc<State>,
+    in_flight: &Arc<Mutex<std::collections::HashSet<String>>>,
+    id: &str,
+    cfg: &Value,
+    pipes: &HashMap<String, PathBuf>,
+) {
+    {
+        let mut held = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if !held.insert(id.to_string()) {
+            // Already going. The run lock would refuse the second one anyway,
+            // but only after a thread had been spawned to find that out.
+            eprintln!("duckle-runner: scheduled {id} is still running, not started again");
+            return;
+        }
+    }
+    let (state, in_flight) = (Arc::clone(state), Arc::clone(in_flight));
+    let (id, cfg, pipes) = (id.to_string(), cfg.clone(), pipes.clone());
+    // Detached: nothing joins it. The run records itself through the ordinary
+    // durable path, so there is no result for the tick to collect - which is
+    // the point of handing it over.
+    std::thread::spawn(move || {
+        let _clear = InFlight::hold(in_flight, id.clone());
+        fire_schedule(&state, &id, &cfg, &pipes);
+    });
+}
+
+/// Run `f`, turning a panic into an ordinary `Err` so the caller always has an
+/// outcome to record.
+///
+/// A manual run executes on its own thread and reports by writing `finished`
+/// into the shared run map afterwards. An unwind skips that write, and nothing
+/// else ever performs it: `forget_oldest_finished_runs` only reaps entries that
+/// finished, so the run stays `finished: None` for the life of the process and
+/// the editor polls an outcome that never arrives.
+///
+/// The same reasoning as the `catch_unwind` already around command dispatch in
+/// this file - a source that misbehaves should fail one run with a message,
+/// not leave the caller waiting.
+fn outcome_or_panic_error<T>(what: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(format!("{what} failed unexpectedly")))
+}
+
+/// Clears a schedule from `in_flight` however its run ends, including a panic.
+///
+/// Removing it on the line after `fire_schedule` looks equivalent and is not: a
+/// panic anywhere in the engine unwinds past it, and the id then stays in the
+/// set for the life of the process. The schedule reports "still running" on
+/// every tick from then on and never fires again.
+///
+/// What makes that the wrong failure is the asymmetry. `in_flight` exists only
+/// to save spawning a thread that the on-disk run lock would turn away anyway -
+/// and that lock is released by unwinding, because it is held through a guard
+/// (`run_scheduled`'s `_lock`). So on a panic the cheap pre-check outlives the
+/// durable thing it stands in for, and becomes permanently stricter than it.
+///
+/// Panics here are not hypothetical: this file already wraps command dispatch
+/// in `catch_unwind` because a source that misbehaves would otherwise unwind
+/// the connection thread, and the PDF source catches them for the same reason.
+struct InFlight {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    id: String,
+}
+
+impl InFlight {
+    fn hold(set: Arc<Mutex<std::collections::HashSet<String>>>, id: String) -> Self {
+        Self { set, id }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
+    }
+}
+
+/// Holds an "already running" flag for work the tick hands to another thread,
+/// and clears it however that work ends.
+///
+/// The same hazard as `InFlight`, and it was live in the freshness sweep:
+/// storing `false` on the line after the call is skipped by an unwind, and the
+/// sweep then never runs again for the life of the process. Freshness is the
+/// thing that notices a schedule which stopped producing, so losing it silently
+/// costs exactly the alerts it exists to raise.
+struct Busy(Arc<std::sync::atomic::AtomicBool>);
+
+impl Busy {
+    /// Claim the flag, or `None` when the previous run has not finished.
+    fn claim(flag: &Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self(Arc::clone(flag)))
+        }
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -3005,14 +4441,91 @@ fn fire_plan(state: &State, plan_id: &str) {
     );
 }
 
+/// How often freshness is judged (#304).
+///
+/// Its own cadence rather than the scheduler's: an asset's age does not change
+/// meaningfully between two scheduler ticks, and evaluating reads run history
+/// for every asset, so doing it every tick would spend real work to learn
+/// nothing. A minute is far finer than any freshness limit anyone declares -
+/// they are written in hours - and coarse enough to be free.
+const FRESHNESS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn spawn_scheduler(state: Arc<State>) {
     std::thread::spawn(move || {
         let mut last_fired: HashMap<String, Instant> = HashMap::new();
         // The armed occurrence AND the expression it came from. See cron_decision.
-        let mut cron_next: HashMap<String, (String, chrono::DateTime<chrono::Local>)> =
+        // UTC, not Local: the armed instant now comes from the shared
+        // evaluator, which resolves the schedule's own zone. Keeping it in the
+        // machine's zone would convert it back on every comparison for no
+        // reason and reintroduce the local-clock assumption being removed.
+        let mut cron_next: HashMap<String, (String, chrono::DateTime<chrono::Utc>)> =
             HashMap::new();
+        // #304: checked on a clock, because the failures freshness exists for
+        // produce no run at all - a schedule switched off, a server that was
+        // down, a source that stopped publishing. Nothing here can be reached
+        // from the end of a run.
+        let mut last_freshness: Option<Instant> = None;
+        let freshness_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // #329: the delivery pump runs pipelines too, so it belongs off this
+        // thread for the same reason schedules do. Guarded so two pumps never
+        // overlap, which keeps deliveries sequential exactly as they were.
+        let deliveries_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // #329: schedules with a run in flight. The tick hands a run to its own
+        // thread and moves on, so this is what stops it handing the SAME
+        // schedule out twice - the on-disk run lock would refuse the second
+        // one, but only after paying for a thread to find out.
+        let in_flight: Arc<Mutex<std::collections::HashSet<String>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         loop {
             std::thread::sleep(state.tick_interval);
+            // #325: publications are checked every tick. Unlike freshness this
+            // is cheap - the log is append-only and the delivery ledger is a
+            // map - and unlike freshness it is latency that matters: the point
+            // of a data trigger is that the consumer runs when the data lands,
+            // not up to a minute later.
+            // #329: handed off, not called. A delivered run is an ordinary
+            // pipeline run and just as unboundedly slow, and this sits BEFORE
+            // the schedules are even loaded - so a slow consumer stalled every
+            // schedule exactly as a slow scheduled run used to, which is the
+            // same bug reached through the other trigger.
+            if let Some(busy) = Busy::claim(&deliveries_running) {
+                let st = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    let _busy = busy;
+                    pump_deliveries(&st);
+                });
+            }
+            if last_freshness.is_none_or(|t| t.elapsed() >= FRESHNESS_EVERY) {
+                last_freshness = Some(Instant::now());
+                // Off the scheduler's thread, so a slow evaluation delays no
+                // schedule, and guarded so two can never overlap on a workspace
+                // where it takes longer than the interval.
+                if let Some(busy) = Busy::claim(&freshness_running) {
+                    let ws = state.workspace.clone();
+                    std::thread::spawn(move || {
+                        // Cleared by dropping, so a panic in the sweep does not
+                        // wedge the flag and stop freshness for good.
+                        let _busy = busy;
+                        let (assets, sent) = duckle_duckdb_engine::sla::check_and_alert(
+                            &ws,
+                            chrono::Utc::now(),
+                        );
+                        let stale: Vec<&str> = assets
+                            .iter()
+                            .filter(|a| a.state == duckle_duckdb_engine::sla::State::Stale)
+                            .map(|a| a.asset.as_str())
+                            .collect();
+                        if !stale.is_empty() {
+                            eprintln!(
+                                "duckle: {} asset(s) past their freshness limit ({} alert(s) sent): {}",
+                                stale.len(),
+                                sent,
+                                stale.join(", ")
+                            );
+                        }
+                    });
+                }
+            }
             let scheds = match load_schedules(&state) {
                 Ok(v) => v,
                 // Already reported to stderr by load_schedules. Firing nothing
@@ -3034,19 +4547,63 @@ fn spawn_scheduler(state: Arc<State>) {
                     let cron = cfg.get("cron").and_then(|v| v.as_str()).unwrap_or("").trim();
                     if enabled && !cron.is_empty() {
                         last_fired.remove(id);
-                        match normalize_cron(cron).and_then(|e| e.parse::<cron::Schedule>().ok()) {
-                            None => {
+                        // Zone and exclusions come off the projection, which
+                        // now carries them. Absent means the machine's zone and
+                        // no exclusions, which is what every schedule written
+                        // before #318 and #296 means.
+                        let zone = cfg
+                            .get("timezone")
+                            .and_then(|v| v.as_str())
+                            .map(|t| duckle_duckdb_engine::cronzone::resolve_zone(Some(t)))
+                            .unwrap_or_else(|| {
+                                duckle_duckdb_engine::cronzone::resolve_zone(None)
+                            });
+                        let exclude: duckle_duckdb_engine::cronzone::Exclusions = cfg
+                            .get("exclude")
+                            .cloned()
+                            .and_then(|v| serde_json::from_value(v).ok())
+                            .unwrap_or_default();
+                        match zone {
+                            // A zone the machine cannot resolve is a refusal,
+                            // not a silent fall back to local: firing a
+                            // `Europe/Brussels` schedule at UTC because the
+                            // name was misspelled is the bug this is fixing.
+                            Err(e) => {
+                                eprintln!("duckle-runner: schedule {id}: {e}; not firing");
                                 cron_next.remove(id);
                             }
-                            Some(sched) => {
+                            Ok(zone) => {
+                                let now = chrono::Utc::now();
+                                // #296: occurrences that came due while nobody
+                                // was listening. Decided over the ledger, so a
+                                // restart measures from what was recorded
+                                // rather than re-arming from "now" and losing
+                                // the window - which is what this loop did,
+                                // because its arming state is in memory.
+                                catch_up_schedule(
+                                    &state, &in_flight, id, cfg, &zone, &exclude, now, &pipes,
+                                );
+                                // What was armed IS the occurrence that comes
+                                // due, so it is recorded before the decision
+                                // moves past it. Read out first for that reason.
+                                let due = cron_next.get(id).map(|(_, at)| *at);
                                 let (fire, rearm) = cron_decision(
                                     cron_next.get(id),
                                     cron,
-                                    &sched,
-                                    chrono::Local::now(),
+                                    &zone,
+                                    &exclude,
+                                    now,
                                 );
                                 if fire {
-                                    fire_schedule(&state, id, cfg, &pipes);
+                                    // #296: the occurrence is recorded whether
+                                    // or not anything downstream succeeds. A
+                                    // schedule that fired and a schedule that
+                                    // did not are otherwise the same silence
+                                    // once the tick loop has moved on.
+                                    if let Some(at) = due {
+                                        record_occurrence(&state, id, cfg, at, now);
+                                    }
+                                    dispatch(&state, &in_flight, id, cfg, &pipes);
                                 }
                                 match rearm {
                                     Some(next) => {
@@ -3093,7 +4650,7 @@ fn spawn_scheduler(state: Arc<State>) {
                     // re-evaluated on every tick, silently, for as long as the
                     // process lived.
                     last_fired.insert(id.clone(), now);
-                    fire_schedule(&state, id, cfg, &pipes);
+                    dispatch(&state, &in_flight, id, cfg, &pipes);
                 }
             }
         }
@@ -3226,13 +4783,30 @@ async fn console_public(
 }
 
 fn console_router(state: Arc<State>) -> axum::Router {
-    axum::Router::new()
-        .route(HEALTH_PATH, axum::routing::get(console_public))
-        .route("/api/session", axum::routing::post(console_public))
-        // Setup is reachable without a credential because there is not yet a credential to
-        // have. `claim` refuses once the console has an owner, so this cannot be replayed.
-        .route(SETUP_PATH, axum::routing::get(console_public))
-        .route(SETUP_CLAIM_PATH, axum::routing::post(console_public))
+    // Built FROM `PUBLIC_ROUTES` rather than beside it. Listing them twice is
+    // how `/readyz` came to be public to the authoriser and unknown to the
+    // router: the fallback then ran the authorised handler, whose extractor
+    // sees a public route and can only answer 500. Every hand-rolled test
+    // passed, because those go through `route_console` and never touch this.
+    //
+    // Setup is reachable without a credential because there is not yet a
+    // credential to have. `claim` refuses once the console has an owner, so it
+    // cannot be replayed.
+    let mut router = axum::Router::new();
+    for (method, path) in PUBLIC_ROUTES {
+        let handler = match method {
+            "POST" => axum::routing::post(console_public),
+            _ => axum::routing::get(console_public),
+        };
+        // `.fallback` on the METHOD router, not just on the Router. A path
+        // registered for one method answers 405 to every other method itself,
+        // and the Router-level fallback never runs - which took `DELETE
+        // /api/session` out of service and made the console's Sign out button
+        // a no-op, because `/api/session` is public for POST and authorised
+        // for DELETE.
+        router = router.route(path, handler.fallback(console_authed));
+    }
+    router
         // Everything else goes through the extractor, so a route added later is
         // authorised by existing, rather than by someone remembering to ask.
         .fallback(console_authed)
@@ -3247,6 +4821,9 @@ mod tests {
         scheduler_notice, Request,
         migrate_legacy_schedules, normalize_cron, read_pipeline_file, read_request,
         save_schedule_at, web_gate, confine_to_workspace, RunGate, State, WebState, HEALTH_PATH, MAX_BODY,
+        OIDC_CALLBACK_PATH, OIDC_LOGIN_PATH,
+        Gates,
+        route_web,
     };
     use std::sync::Mutex;
     use duckle_duckdb_engine::schedules::{self, ScheduleKind};
@@ -3354,6 +4931,104 @@ mod tests {
     /// it needs has to be in the projection. Leaving the plan out meant a schedule that
     /// named a plan fired the pipeline it happened to be keyed by, and failed looking for a
     /// file nobody had written.
+    /// #329. The tick now hands each firing to its own thread and keeps an
+    /// `in_flight` set so it does not hand the same schedule out twice. Clearing
+    /// that entry on the line after the run looks equivalent to clearing it in a
+    /// guard, and is not: a panic in the engine unwinds past the plain line, and
+    /// the schedule is then marked "still running" for the life of the process.
+    ///
+    /// This drives the real guard through a real unwind. It does not run a
+    /// pipeline - what it pins is the contract the dispatch thread relies on,
+    /// which is the half that a panic breaks.
+    #[test]
+    fn a_panicking_run_does_not_leave_its_schedule_wedged_forever() {
+        let in_flight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert("nightly".to_string());
+
+        let held = std::sync::Arc::clone(&in_flight);
+        let panicked = std::thread::spawn(move || {
+            let _clear = super::InFlight::hold(held, "nightly".to_string());
+            // Stands in for anything the engine can do on the way down; this
+            // file already catches these on the HTTP path for the same reason.
+            panic!("a source misbehaved mid-run");
+        })
+        .join();
+        assert!(panicked.is_err(), "the run under test has to actually panic");
+
+        assert!(
+            !in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains("nightly"),
+            "the schedule is still marked in flight after a panic, so the tick \
+             would refuse to start it again for the life of the process - and the \
+             on-disk run lock it stands in for was released by the same unwind"
+        );
+    }
+
+    /// #329, the same hazard one branch over. The freshness sweep and the
+    /// delivery pump are handed to their own threads under an "already running"
+    /// flag, and that flag was stored back to `false` on the line after the
+    /// work. An unwind skips it, and then the flag is never free again: no
+    /// freshness evaluation and no deliveries for the life of the process.
+    ///
+    /// Freshness is what notices a schedule that quietly stopped producing, so
+    /// losing it costs exactly the alerts it exists to raise.
+    /// A manual run reports by writing `finished` into the shared run map after
+    /// `execute_one_with` returns. An unwind skips that write, and nothing else
+    /// performs it - `forget_oldest_finished_runs` only reaps entries that
+    /// finished - so the run stays `finished: None` for the life of the process
+    /// and the editor polls an outcome that never arrives.
+    #[test]
+    fn a_panicking_manual_run_still_produces_an_outcome_to_record() {
+        let ok: Result<u8, String> = super::outcome_or_panic_error("the run", || Ok(7));
+        assert_eq!(ok, Ok(7), "a run that succeeds is passed through untouched");
+
+        let failed: Result<u8, String> =
+            super::outcome_or_panic_error("the run", || Err("could not start".into()));
+        assert_eq!(
+            failed,
+            Err("could not start".into()),
+            "an ordinary failure keeps its own message"
+        );
+
+        let panicked: Result<u8, String> = super::outcome_or_panic_error("the run", || {
+            panic!("a source misbehaved mid-run");
+        });
+        assert!(
+            panicked.is_err(),
+            "a panic has to become an outcome, or the run is never marked finished \
+             and the entry is never reaped"
+        );
+    }
+
+    #[test]
+    fn a_panicking_sweep_does_not_wedge_its_busy_flag_forever() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let claimed = super::Busy::claim(&flag).expect("a free flag can be claimed");
+        assert!(
+            super::Busy::claim(&flag).is_none(),
+            "a claimed flag must refuse a second holder, or two sweeps overlap"
+        );
+
+        let panicked = std::thread::spawn(move || {
+            let _busy = claimed;
+            panic!("the sweep hit something on the way down");
+        })
+        .join();
+        assert!(panicked.is_err(), "the sweep under test has to actually panic");
+
+        assert!(
+            super::Busy::claim(&flag).is_some(),
+            "the flag is still held after a panic, so this sweep never runs again"
+        );
+    }
+
     #[test]
     fn a_schedule_that_names_a_plan_tells_the_scheduler_so() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3542,17 +5217,694 @@ mod tests {
         }
     }
 
+
+    /// A console bound to loopback with nothing configured, which is what
+    /// `duckle-runner serve` does by default.
+    fn local_state(ws: &std::path::Path) -> std::sync::Arc<State> {
+        std::sync::Arc::new(State {
+            workspace: ws.to_path_buf(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(
+                Default::default(),
+            )),
+            running: Mutex::new(std::collections::HashSet::new()),
+            runs: Mutex::new(std::collections::HashMap::new()),
+            console: console_auth::Console::configure(ws, "127.0.0.1", None).unwrap(),
+            host: "127.0.0.1".into(),
+            tick_interval: std::time::Duration::from_secs(15),
+            oidc: None,
+            oidc_endpoints: Mutex::new(None),
+            oidc_logins: Mutex::new(Default::default()),
+        })
+    }
+
+    /// A request that reached a loopback console under an attacker's hostname,
+    /// which is what DNS rebinding produces: the socket is 127.0.0.1, the Host
+    /// header is not.
+    fn rebound(method: &str, path: &str) -> Request {
+        Request {
+            method: method.into(),
+            path: path.into(),
+            query: std::collections::HashMap::new(),
+            origin: Some("http://rebind.attacker.example".into()),
+            host: Some("rebind.attacker.example:8080".into()),
+            authorization: None,
+            cookie: None,
+            forwarded_proto: None,
+            body: Vec::new(),
+        }
+    }
+
+    /// GHSA-c3jh-48x5-mhpw: the rebinding guard skipped GET.
+    ///
+    /// A loopback console with nothing configured is `Mode::Local`, where every
+    /// caller is a local Admin - the reasoning being that reaching the socket
+    /// means already being on the machine. A rebound DNS name breaks that: the
+    /// browser treats the attacker's page as same-origin with 127.0.0.1, so its
+    /// GETs arrive from a page the operator merely visited.
+    ///
+    /// The guard existed and was sound; it was applied only to non-GET, because
+    /// the threat modelled was a state change rather than a read. Reads are the
+    /// whole exposure here: the audit log names people, and pipelines carry SQL
+    /// and connection references.
+    #[test]
+    fn a_rebound_get_cannot_read_a_local_console() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = local_state(tmp.path());
+
+        for path in [
+            "/api/audit",
+            "/api/admin/users",
+            "/api/pipelines",
+            "/api/runs",
+            "/api/log",
+        ] {
+            let reply = route_console(&rebound("GET", path), &state);
+            assert_eq!(
+                reply.code(),
+                403,
+                "{path} answered a request that arrived under an attacker's hostname",
+            );
+        }
+    }
+
+    /// The other half, so the fix is not "refuse everything": the console's own
+    /// GETs still work. Same socket, honest Host.
+    #[test]
+    fn a_local_get_from_the_console_itself_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = local_state(tmp.path());
+        let reply = route_console(&request("GET", "/api/runs", None), &state);
+        assert_ne!(
+            reply.code(),
+            403,
+            "a loopback GET with a loopback Host is the ordinary local case",
+        );
+    }
+
+    /// And the health check, which orchestrators call without a credential and
+    /// which is not under /api at all, is unaffected either way.
+    #[test]
+    fn the_health_check_is_not_caught_by_the_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = local_state(tmp.path());
+        assert_eq!(route_console(&request("GET", HEALTH_PATH, None), &state).code(), 200);
+    }
+
     fn guarded_state(ws: &std::path::Path) -> std::sync::Arc<State> {
         std::sync::Arc::new(State {
             workspace: ws.to_path_buf(),
             duckdb: std::path::PathBuf::from("duckdb"),
-            run_lock: RunGate::new(1),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
             running: Mutex::new(std::collections::HashSet::new()),
             runs: Mutex::new(std::collections::HashMap::new()),
             console: console_auth::Console::configure(ws, "0.0.0.0", Some("s3cret")).unwrap(),
             host: "0.0.0.0".into(),
             tick_interval: std::time::Duration::from_secs(15),
+            oidc: None,
+            oidc_endpoints: Mutex::new(None),
+            oidc_logins: Mutex::new(Default::default()),
         })
+    }
+
+    /// #300: an operator can alert on failed and queued runs without the UI.
+    #[test]
+    fn metrics_serves_run_history_and_what_this_process_is_doing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::create_dir_all(ws.join("runs")).unwrap();
+        std::fs::write(
+            ws.join("runs").join("nightly.json"),
+            // snake_case, which is what append_run_record writes: RunRecord
+            // carries no rename attribute.
+            r#"[{"at":"2026-09-01T00:00:00Z","status":"error","duration_ms":1200,"rows":0,
+                 "node_count":2,"trigger":"scheduled"}]"#,
+        )
+        .unwrap();
+        let state = guarded_state(&ws);
+        let reply = route_console(&request("GET", "/metrics", Some("Bearer s3cret")), &state);
+        assert_eq!(reply.code(), 200);
+        assert!(
+            reply.content_type.starts_with("text/plain; version=0.0.4"),
+            "a scraper negotiates on this: {}",
+            reply.content_type
+        );
+        let body = String::from_utf8_lossy(&reply.body).into_owned();
+        // The failed run, from history.
+        assert!(
+            body.contains("duckle_run_last_status{pipeline=\"nightly\"} 0"),
+            "no failed-run series: {body}"
+        );
+        // And saturation, which no textfile can carry.
+        assert!(body.contains("duckle_run_permits_total 1"), "{body}");
+        assert!(body.contains("duckle_run_permits_free 1"), "{body}");
+        assert!(body.contains("duckle_runs_in_flight 0"), "{body}");
+    }
+
+    /// Through the REAL axum Router, not the hand-rolled path.
+    ///
+    /// The regression this pins lived only in the router: `/api/session` is
+    /// public for POST and authorised for DELETE, and registering the path for
+    /// POST alone made axum's own method router answer 405 to DELETE, so the
+    /// Router fallback never ran and the console's Sign out did nothing. Every
+    /// existing test went through `route_console` and stayed green.
+    #[tokio::test]
+    async fn the_router_serves_every_method_a_public_path_also_has() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let router = super::console_router(guarded_state(tmp.path()));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/session")
+                    .header("authorization", "Bearer s3cret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::METHOD_NOT_ALLOWED,
+            "the method router answered 405 and the fallback never ran"
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn a_scraper_does_not_need_an_admin_token() {
+        // Handing a monitoring agent a credential that can also add users and
+        // deploy pipelines is a worse trade than not scraping.
+        let (role, action) = crate::audit::requirement("GET", "/metrics");
+        assert_eq!(action, "metrics.read", "left to the fallback, which demands admin");
+        assert!(
+            crate::console_auth::Role::Viewer.allows(role),
+            "a viewer cannot scrape; requirement is {role:?}"
+        );
+    }
+
+    /// #289: a pool of one admits one run at a time, and a bigger pool admits
+    /// more - measured on the real gate, not asserted from the config.
+    #[test]
+    fn a_pool_bounds_what_runs_at_once() {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut limits = BTreeMap::new();
+        limits.insert("heavy".to_string(), 1usize);
+        limits.insert("network".to_string(), 4usize);
+        let gates = std::sync::Arc::new(super::Gates::new(
+            duckle_duckdb_engine::pools::Pools::from_limits(limits),
+        ));
+
+        for (pool, cap) in [("heavy", 1usize), ("network", 4usize)] {
+            // Two properties, measured separately, because only one of them can
+            // be observed by counting and the other cannot be observed by
+            // waiting.
+            //
+            // 1. NEVER MORE than the cap. This is the guarantee, and a counter
+            //    sees it whenever it is violated - so more contenders than
+            //    permits is the right shape, and never seeing an overrun is the
+            //    correct outcome rather than a weak one.
+            let peak = std::sync::Arc::new(AtomicUsize::new(0));
+            let live = std::sync::Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..cap * 2 + 2 {
+                let (gates, peak, live) = (gates.clone(), peak.clone(), live.clone());
+                handles.push(std::thread::spawn(move || {
+                    let (_permit, got, _waited) = gates.acquire(pool);
+                    assert_eq!(got, pool);
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    live.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            let seen = peak.load(Ordering::SeqCst);
+            assert!(seen <= cap, "pool {pool} admitted {seen} at once, over its cap of {cap}");
+
+            // 2. THE CAP IS REACHABLE - the gate bounds rather than serialises.
+            //    Asserted with a barrier of exactly `cap` threads rather than by
+            //    hoping the OS overlaps them: every one has to ARRIVE before any
+            //    leaves, so the barrier releases only if the gate really held
+            //    `cap` permits at the same moment. The previous version asserted
+            //    peak == cap after a sleep, which is a scheduling coincidence -
+            //    on a loaded runner the threads serialise, the peak comes out
+            //    under the cap, and the test fails while the gate is behaving
+            //    perfectly. That reddened CI.
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(cap));
+            let together = std::sync::Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..cap {
+                let (gates, barrier, together) =
+                    (gates.clone(), barrier.clone(), together.clone());
+                handles.push(std::thread::spawn(move || {
+                    let (_permit, _got, _waited) = gates.acquire(pool);
+                    barrier.wait();
+                    together.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                together.load(Ordering::SeqCst),
+                cap,
+                "pool {pool} never held {cap} permits at the same time"
+            );
+        }
+    }
+
+    /// A pipeline naming a pool nobody defined is admitted to the default
+    /// rather than to a new unbounded one.
+    #[test]
+    fn an_invented_pool_does_not_escape_admission_control() {
+        use std::collections::BTreeMap;
+        let mut limits = BTreeMap::new();
+        limits.insert("heavy".to_string(), 1usize);
+        let gates = super::Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(limits));
+        let (_permit, got, _) = gates.acquire("i-made-this-up");
+        assert_eq!(got, duckle_duckdb_engine::pools::DEFAULT);
+    }
+
+    /// Every entry point that starts a run goes through a pool.
+    ///
+    /// The issue's own warning: a pool applied to scheduled runs but not to the
+    /// API would let an agent bypass exactly the protection it exists for. This
+    /// reads the source rather than trusting a review, because the failure is
+    /// an acquire site that was never edited.
+    #[test]
+    fn no_run_path_acquires_without_naming_a_pool() {
+        let src = include_str!("serve.rs");
+        for (n, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // `let ... = state.run_lock.acquire(...)`, so the test does not
+            // match its own assertion text below.
+            if trimmed.starts_with("let ") && line.contains("run_lock.acquire(") {
+                assert!(
+                    line.contains("resource_pool"),
+                    "serve.rs:{}: a run is admitted without naming a pool: {}",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    /// Whatever a login hands the browser, the console must find it.
+    ///
+    /// Reads the header the SERVER builds rather than one the test writes -
+    /// which is the difference that matters: the bug that shipped was a login
+    /// path spelling the cookie name itself, and a test that spells it too
+    /// agrees with the bug.
+    #[test]
+    fn the_cookie_a_login_sets_is_the_cookie_the_console_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let console =
+            console_auth::Console::configure(tmp.path(), "0.0.0.0", Some("s3cret")).unwrap();
+        let sid = console.sign_in_external("user-123 (Ada)", console_auth::Role::Operator);
+
+        let header = super::session_cookie_header(&sid, None);
+        let sent_back = header
+            .strip_prefix("Set-Cookie: ")
+            .and_then(|c| c.split(';').next())
+            .expect("a cookie");
+        let who = console
+            .identify(None, Some(sent_back))
+            .expect("the console must find the session its own login just set");
+        assert_eq!(who.role, console_auth::Role::Operator);
+        assert!(header.contains("HttpOnly") && header.contains("SameSite=Strict"), "{header}");
+    }
+
+    /// The session an OIDC login mints must be one the console can actually
+    /// find.
+    ///
+    /// This is the bug that shipped: the callback set `Set-Cookie: duckle_sid=`
+    /// while the console reads `duckle_console`, so a completed SSO login
+    /// authenticated nobody - the row was written, the browser held a cookie
+    /// under a name nothing looks at, and the user landed back on the sign-in
+    /// form while the audit log said they had signed in. Every existing test
+    /// stopped at the 302 or the 400 and never reached the success path.
+    #[test]
+    fn a_session_minted_for_an_external_identity_is_one_the_console_finds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let console =
+            console_auth::Console::configure(tmp.path(), "0.0.0.0", Some("s3cret")).unwrap();
+        let sid = console.sign_in_external("user-123 (Ada)", console_auth::Role::Operator);
+
+        // Exactly the header the browser will send back, built from the same
+        // constant the callback must use.
+        let cookie = format!("{}={sid}", console_auth::SESSION_COOKIE);
+        let who = console
+            .identify(None, Some(&cookie))
+            .expect("the console must find the session its own login minted");
+        assert_eq!(who.role, console_auth::Role::Operator);
+        assert_eq!(who.label, "user-123 (Ada)", "the audited actor must survive");
+
+        // And the name that did not work finds nothing, which is what makes
+        // this test about the name rather than about sessions in general.
+        assert!(console.identify(None, Some(&format!("duckle_sid={sid}"))).is_none());
+    }
+
+    /// #314: the web editor can complete SQL, the same way the desktop does.
+    #[test]
+    fn the_web_editor_completes_a_nodes_sql() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            dist: ws.clone(),
+            host: "0.0.0.0".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+        };
+        let mut req = request("POST", "/api/cmd/complete_node_sql", Some("Bearer s3cret"));
+        req.body = serde_json::to_vec(&serde_json::json!({
+            "pipeline": { "nodes": [
+                { "id": "q", "type": "transform", "position": {"x":0,"y":0},
+                  "data": { "label": "sql", "componentId": "code.sql",
+                            // A statement where the answer DEPENDS on the
+                            // cursor: a column belongs at the start and a
+                            // relation after FROM, so a request that ignored
+                            // the position could not pass both halves.
+                            "properties": { "sql": "SELECT region FROM " } } }
+            ], "edges": [] },
+            "nodeId": "q",
+            "inputs": [["src", [{ "name": "region", "type": "string" }]]],
+            "cursor": 19
+        }))
+        .unwrap();
+        let reply = route_web(&req, &state);
+        assert_eq!(reply.code(), 200, "{}", String::from_utf8_lossy(&reply.body));
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let items = body.as_array().expect("a list");
+        // After FROM, only relations belong.
+        assert_eq!(items[0]["kind"], "relation", "{body}");
+        assert!(
+            items.iter().all(|i| i["kind"] == "relation"),
+            "a column was offered where a relation belongs: {body}"
+        );
+
+        // The same request at the start of the statement answers differently,
+        // which is what makes the cursor load-bearing rather than decorative.
+        let mut payload: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        payload["cursor"] = serde_json::json!(7);
+        let mut at_start = request("POST", "/api/cmd/complete_node_sql", Some("Bearer s3cret"));
+        at_start.body = serde_json::to_vec(&payload).unwrap();
+        let early = route_web(&at_start, &state);
+        let early: serde_json::Value = serde_json::from_slice(&early.body).unwrap();
+        assert_eq!(early[0]["kind"], "column", "{early}");
+    }
+
+    /// #295: the backfill plan is addressable over the API, and a dry run
+    /// queues nothing.
+    #[test]
+    fn a_backfill_dry_run_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonical, because resolve_in_workspace compares canonical paths and
+        // a temp dir is a symlink on some platforms.
+        let ws = &tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(ws.join("pipelines")).unwrap();
+        std::fs::write(
+            ws.join("pipelines/daily.json"),
+            r#"{"formatVersion":1,"name":"daily",
+                "partition":{"type":"time","cadence":"day","timezone":"UTC"},
+                "nodes":[{"id":"s","type":"source","position":{"x":0,"y":0},
+                  "data":{"label":"In","componentId":"src.csv",
+                          "properties":{"path":"in.csv","hasHeader":true}}}],
+                "edges":[]}"#,
+        )
+        .unwrap();
+        let state = guarded_state(ws);
+        let mut req = request("POST", "/api/backfills", Some("Bearer s3cret"));
+        req.body = serde_json::to_vec(&serde_json::json!({
+            "action": "create", "pipeline": "pipelines/daily.json",
+            "from": "2020-01-01", "to": "2020-01-03", "dryRun": true
+        }))
+        .unwrap();
+        let reply = route_console(&req, &state);
+        assert_eq!(reply.code(), 200, "{}", String::from_utf8_lossy(&reply.body));
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["count"], 3);
+        assert_eq!(body["partitions"][0], "2020-01-01");
+        // "What would this queue" must not be a question that queues anything.
+        assert!(
+            duckle_duckdb_engine::backfill::list(ws).is_empty(),
+            "a dry run persisted a plan"
+        );
+    }
+
+    /// Reading a backfill is a viewer's business; changing one is an
+    /// operator's. Left to the catch-all both would need admin, and every
+    /// operator would get a 403 with the action logged as "unknown".
+    #[test]
+    fn backfill_routes_ask_for_the_right_role() {
+        let (read, read_action) = crate::audit::requirement("GET", "/api/backfills");
+        assert_eq!(read_action, "backfills.read");
+        assert!(console_auth::Role::Viewer.allows(read));
+        let (write, write_action) = crate::audit::requirement("POST", "/api/backfills");
+        assert_eq!(write_action, "backfill.write");
+        assert!(console_auth::Role::Operator.allows(write));
+        assert!(!console_auth::Role::Viewer.allows(write), "a viewer must not start a backfill");
+    }
+
+    /// #314: the web editor gets the same analysis shape the desktop does.
+    ///
+    /// One object for one node, using the upstream columns the EDITOR resolved
+    /// - not an array, and not inputs this side derived. The two surfaces
+    /// answering subtly different questions is the divergence #75 exists to
+    /// stop, and it is invisible until someone compares them.
+    #[test]
+    fn the_web_editor_analyses_one_node_the_way_the_desktop_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            dist: ws.clone(),
+            host: "0.0.0.0".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+        };
+        let mut req = request("POST", "/api/cmd/analyze_node_sql", Some("Bearer s3cret"));
+        req.body = serde_json::to_vec(&serde_json::json!({
+            "pipeline": { "nodes": [
+                { "id": "s", "type": "source", "position": {"x":0,"y":0},
+                  "data": { "label": "in", "componentId": "src.postgres",
+                            "properties": { "mode": "sql", "sql": "SELECT 1" } } }
+            ], "edges": [] },
+            "nodeId": "s",
+            "inputs": []
+        }))
+        .unwrap();
+        let reply = route_web(&req, &state);
+        assert_eq!(reply.code(), 200, "{}", String::from_utf8_lossy(&reply.body));
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert!(body.is_object(), "one node's analysis, not an array: {body}");
+        assert_eq!(body["nodeId"], "s");
+        // A source's SQL is remote, so it is reported as not validated rather
+        // than checked against DuckDB - the same answer the desktop gives.
+        assert_eq!(body["dialect"], "remote");
+        assert_eq!(body["validated"], false);
+    }
+
+    /// #307: the web editor gets the same external components the desktop
+    /// does, so a workspace's palette is not different in the two editors.
+    #[test]
+    fn the_web_console_serves_the_external_component_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let d = ws.join("components").join("upper");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("duckle-component.json"),
+            r#"{"id":"ext.upper","version":"1.0.0","label":"Uppercase",
+                "inputs":[{"name":"main"}],"outputs":[{"name":"main"}],
+                "runtime":{"command":["python","run.py"]}}"#,
+        )
+        .unwrap();
+        // The EDITOR server, which is where the palette lives and where the
+        // /api/cmd/ dispatcher is - the console has its own routes.
+        let ws = ws.canonicalize().unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            dist: ws.clone(),
+            host: "0.0.0.0".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+        };
+        let mut req = request("POST", "/api/cmd/external_components", Some("Bearer s3cret"));
+        req.body = b"{}".to_vec();
+        let reply = route_web(&req, &state);
+        assert_eq!(reply.code(), 200, "{}", String::from_utf8_lossy(&reply.body));
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let items = body["components"].as_array().expect("components");
+        assert_eq!(items.len(), 1, "{body}");
+        assert_eq!(items[0]["id"], "ext.upper");
+        assert_eq!(items[0]["kind"], "transform", "derived from its ports");
+        assert_eq!(items[0]["external"], true);
+        // The form travels with it, or the tile cannot be configured.
+        assert!(items[0]["manifest"].get("sections").is_some(), "{}", items[0]);
+    }
+
+    /// #310: the login routes are public, and a server with no OIDC config
+    /// answers 404 rather than 401.
+    #[test]
+    fn the_oidc_routes_are_public_and_absent_when_unconfigured() {
+        assert!(is_public_route("GET", OIDC_LOGIN_PATH), "signing in cannot require being signed in");
+        assert!(is_public_route("GET", OIDC_CALLBACK_PATH));
+        let tmp = tempfile::tempdir().unwrap();
+        let state = guarded_state(tmp.path());
+        for path in [OIDC_LOGIN_PATH, OIDC_CALLBACK_PATH] {
+            let reply = route_console(&request("GET", path, None), &state);
+            // 404 and not 401: there is no such login here, and "unauthorised"
+            // would suggest there is one to get past. And NOT 401 by accident
+            // either - a public path with no branch falls through to the token
+            // sign-in and answers 401, which for a login route is a bug that
+            // looks like a misconfigured provider.
+            assert_eq!(reply.code(), 404, "{path} answered {}", reply.code());
+        }
+    }
+
+    /// A callback with no login behind it is refused before anything is
+    /// fetched, so an attacker cannot make this server talk to a provider.
+    #[test]
+    fn a_callback_without_a_matching_state_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::create_dir_all(ws.join(".duckle")).unwrap();
+        std::fs::write(
+            crate::oidc::config_path(&ws),
+            r#"{"issuer":"https://idp.invalid","clientId":"c",
+                "redirectUri":"https://console.invalid/auth/oidc/callback"}"#,
+        )
+        .unwrap();
+        let mut state = guarded_state(&ws);
+        std::sync::Arc::get_mut(&mut state).unwrap().oidc =
+            crate::oidc::load(&ws).unwrap();
+        // Endpoints pre-seeded so the test never touches the network: the point
+        // is that the state check happens BEFORE the exchange.
+        *std::sync::Arc::get_mut(&mut state).unwrap().oidc_endpoints.get_mut().unwrap() =
+            Some(crate::oidc::Endpoints {
+                authorization: "https://idp.invalid/authorize".into(),
+                token: "https://idp.invalid/token".into(),
+                jwks: "https://idp.invalid/jwks".into(),
+                issuer: "https://idp.invalid".into(),
+            });
+        let state = state;
+
+        let mut req = request("GET", OIDC_CALLBACK_PATH, None);
+        req.query.insert("code".into(), "stolen".into());
+        req.query.insert("state".into(), "never-issued".into());
+        let reply = route_console(&req, &state);
+        assert_eq!(reply.code(), 400);
+        let body = String::from_utf8_lossy(&reply.body);
+        assert!(body.contains("does not match a login"), "{body}");
+    }
+
+    /// The redirect carries a state this process is holding, and never the
+    /// PKCE verifier.
+    #[test]
+    fn a_login_issues_a_state_and_keeps_the_verifier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::create_dir_all(ws.join(".duckle")).unwrap();
+        std::fs::write(
+            crate::oidc::config_path(&ws),
+            r#"{"issuer":"https://idp.invalid","clientId":"c",
+                "redirectUri":"https://console.invalid/auth/oidc/callback"}"#,
+        )
+        .unwrap();
+        let mut state = guarded_state(&ws);
+        std::sync::Arc::get_mut(&mut state).unwrap().oidc = crate::oidc::load(&ws).unwrap();
+        *std::sync::Arc::get_mut(&mut state).unwrap().oidc_endpoints.get_mut().unwrap() =
+            Some(crate::oidc::Endpoints {
+                authorization: "https://idp.invalid/authorize".into(),
+                token: "https://idp.invalid/token".into(),
+                jwks: "https://idp.invalid/jwks".into(),
+                issuer: "https://idp.invalid".into(),
+            });
+        let state = state;
+
+        let reply = route_console(&request("GET", OIDC_LOGIN_PATH, None), &state);
+        assert_eq!(reply.code(), 302);
+        let location = reply
+            .headers
+            .iter()
+            .find(|h| h.starts_with("Location: "))
+            .expect("a redirect");
+        assert!(location.contains("code_challenge_method=S256"), "{location}");
+        assert!(location.contains("state="), "{location}");
+        assert_eq!(
+            state.oidc_logins.lock().unwrap().len(),
+            1,
+            "the login must be held, or the callback has nothing to match"
+        );
+    }
+
+    #[test]
+    fn metrics_is_not_public() {
+        // Pipeline names are the shape of someone's business. /healthz says the
+        // process is up and tells an anonymous caller nothing else; this would
+        // tell them everything.
+        assert!(!is_public_route("GET", "/metrics"));
+        let tmp = tempfile::tempdir().unwrap();
+        let state = guarded_state(tmp.path());
+        let reply = route_console(&request("GET", "/metrics", None), &state);
+        assert_ne!(reply.code(), 200, "served metrics to an unauthenticated caller");
+    }
+
+    #[test]
+    fn metrics_on_a_workspace_that_has_never_run_is_not_an_error() {
+        // A fresh deployment has no runs/ directory. Reporting a broken scrape
+        // for it would make every new install look down.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = guarded_state(tmp.path());
+        let reply = route_console(&request("GET", "/metrics", Some("Bearer s3cret")), &state);
+        assert_eq!(reply.code(), 200);
+        assert!(String::from_utf8_lossy(&reply.body).contains("duckle_run_permits_total"));
+    }
+
+    /// #300: liveness and readiness fail differently and are acted on
+    /// differently, so they are separate routes.
+    #[test]
+    fn readyz_is_public_and_reports_a_workspace_it_cannot_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        assert!(is_public_route("GET", "/readyz"), "an orchestrator probe holds no credential");
+        let state = guarded_state(&ws);
+        let ok = route_console(&request("GET", "/readyz", None), &state);
+        assert_eq!(ok.code(), 200);
+        assert_eq!(String::from_utf8_lossy(&ok.body), "ready");
+
+        // Liveness is a different question and must not move with it.
+        assert_eq!(route_console(&request("GET", "/healthz", None), &state).code(), 200);
+    }
+
+    #[test]
+    fn readiness_fails_on_a_workspace_that_cannot_be_written() {
+        // The probe itself rather than the route, because a State cannot be
+        // built on an unwritable workspace at all - configuring the console is
+        // the first thing that writes there. The route maps Err to 503 in three
+        // lines above; what needs proving is that the probe says Err for a
+        // workspace that genuinely cannot record a run.
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_directory = tmp.path().join("workspace-is-a-file");
+        std::fs::write(&not_a_directory, b"x").unwrap();
+        let why = crate::serve::probe_ready(&not_a_directory).unwrap_err();
+        assert!(why.contains("not writable"), "{why}");
+
+        // And a workspace that is fine says so, so the check is not simply
+        // always failing.
+        assert!(crate::serve::probe_ready(tmp.path()).is_ok());
     }
 
     /// #259: the whole asynchronous contract, end to end without a socket.
@@ -3735,7 +6087,7 @@ mod tests {
             duckdb: std::path::PathBuf::from("duckdb"),
             dist: ws.clone(),
             host: "0.0.0.0".into(),
-            run_lock: RunGate::new(1),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
             console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
         };
 
@@ -3806,6 +6158,39 @@ mod tests {
 
     /// The other half, and the more important one: opening a hole for probes must not open
     /// one for anything else.
+        /// The console's ENTIRE unauthenticated surface, asserted as an exact set.
+    ///
+    /// `nothing_else_is_reachable_without_signing_in` below is a denylist: it
+    /// proves a handful of named routes are not public. It cannot notice a
+    /// route being ADDED to PUBLIC_ROUTES, which is the change that actually
+    /// costs something - and the one most likely to be made in passing, while
+    /// making a probe or a callback work.
+    ///
+    /// So this asserts the whole list. An eighth entry fails here, and whoever
+    /// adds it has to come to this test and say what it is and why it cannot
+    /// hold a credential.
+    #[test]
+    fn the_unauthenticated_surface_is_exactly_these_seven_routes() {
+        let mut got: Vec<String> =
+            super::PUBLIC_ROUTES.iter().map(|(m, p)| format!("{m} {p}")).collect();
+        got.sort();
+        let mut want = vec![
+            // Signing in cannot require being signed in.
+            "POST /api/session".to_string(),
+            format!("GET {}", OIDC_LOGIN_PATH),
+            format!("GET {}", OIDC_CALLBACK_PATH),
+            // An orchestrator probe holds no credential, and a probe that 401s
+            // gets the pod killed and restarted forever.
+            format!("GET {}", super::HEALTH_PATH),
+            format!("GET {}", super::READY_PATH),
+            // Claiming a server nobody administers yet. Refused once claimed.
+            format!("GET {}", super::SETUP_PATH),
+            format!("POST {}", super::SETUP_CLAIM_PATH),
+        ];
+        want.sort();
+        assert_eq!(got, want, "the unauthenticated surface changed");
+    }
+
     #[test]
     fn nothing_else_is_reachable_without_signing_in() {
         for (method, path) in [
@@ -3942,12 +6327,15 @@ mod tests {
         let state = State {
             workspace: ws_canon.clone(),
             duckdb: std::path::PathBuf::from("duckdb"),
-            run_lock: RunGate::new(1),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
             running: Mutex::new(std::collections::HashSet::new()),
             runs: Mutex::new(std::collections::HashMap::new()),
             console: console_auth::Console::configure(&ws_canon, "127.0.0.1", None).unwrap(),
             host: "127.0.0.1".into(),
             tick_interval: std::time::Duration::from_secs(15),
+            oidc: None,
+            oidc_endpoints: Mutex::new(None),
+            oidc_logins: Mutex::new(Default::default()),
         };
 
         let leaked = read_pipeline_file(&state, "connections/prod-db.json");
@@ -4087,16 +6475,17 @@ mod tests {
     #[test]
     fn an_edited_cron_expression_is_armed_from_the_new_one() {
         use chrono::{Datelike, TimeZone, Timelike};
-        let parse = |e: &str| {
-            normalize_cron(e).and_then(|x| x.parse::<cron::Schedule>().ok()).expect("bad cron")
-        };
+        use duckle_duckdb_engine::cronzone::Exclusions;
+        // A fixed zone, so the test reads the same clock wherever it runs. UTC
+        // is the honest choice now the decision is made in UTC.
+        let zone = duckle_duckdb_engine::cronzone::resolve_zone(Some("UTC")).unwrap();
+        let none = Exclusions::default();
         let at = |h: u32, m: u32| {
-            chrono::Local.with_ymd_and_hms(2026, 8, 15, h, m, 0).single().expect("ambiguous local time")
+            chrono::Utc.with_ymd_and_hms(2026, 8, 15, h, m, 0).single().expect("one instant")
         };
 
         // 03:00 daily, first seen at 08:00: arm tomorrow, do not fire.
-        let daily_3am = parse("0 3 * * *");
-        let (fire, armed) = cron_decision(None, "0 3 * * *", &daily_3am, at(8, 0));
+        let (fire, armed) = cron_decision(None, "0 3 * * *", &zone, &none, at(8, 0));
         assert!(!fire, "a schedule fired the moment it was first seen");
         let armed = armed.expect("nothing was armed");
         assert_eq!(armed.0, "0 3 * * *");
@@ -4104,8 +6493,7 @@ mod tests {
 
         // Now it is edited to 09:00. The next tick must re-arm from the NEW
         // expression rather than keep waiting for tomorrow's 03:00.
-        let daily_9am = parse("0 9 * * *");
-        let (fire, rearmed) = cron_decision(Some(&armed), "0 9 * * *", &daily_9am, at(8, 0));
+        let (fire, rearmed) = cron_decision(Some(&armed), "0 9 * * *", &zone, &none, at(8, 0));
         assert!(!fire, "the edit itself fired a run");
         let rearmed = rearmed.expect("nothing was armed after the edit");
         assert_eq!(rearmed.0, "0 9 * * *", "still armed by the old expression");
@@ -4113,14 +6501,14 @@ mod tests {
         assert_eq!(rearmed.1.day(), 15, "the edit was pushed to tomorrow");
 
         // And at 09:00 it fires, then arms the following day.
-        let (fire, next) = cron_decision(Some(&rearmed), "0 9 * * *", &daily_9am, at(9, 0));
+        let (fire, next) = cron_decision(Some(&rearmed), "0 9 * * *", &zone, &none, at(9, 0));
         assert!(fire, "the edited schedule did not fire at its new time");
         let next = next.expect("nothing was armed after firing");
         assert_eq!(next.1.day(), 16, "re-armed on the same day, so it would fire twice");
 
         // An unchanged expression that is not due yet is left exactly alone,
         // or the occurrence would be pushed away on every tick and never come.
-        let (fire, held) = cron_decision(Some(&next), "0 9 * * *", &daily_9am, at(9, 1));
+        let (fire, held) = cron_decision(Some(&next), "0 9 * * *", &zone, &none, at(9, 1));
         assert!(!fire);
         assert_eq!(held.unwrap().1, next.1, "an armed occurrence was moved by a tick");
     }
@@ -4175,5 +6563,327 @@ mod tests {
             "the connection has no read deadline, so a stalled caller pins the thread"
         );
         sender.join().unwrap();
+    }
+
+    /// #295: a killed process must not strand a backfill forever.
+    ///
+    /// A slice left `running` is not claimable - only `requested` is - and
+    /// `retry` moves only `failed` and `interrupted`, so nothing could ever
+    /// pick it up and the backfill was stuck for good. `backfill::reconcile`
+    /// existed for exactly this and had NO production caller anywhere in the
+    /// repo; its twin for run receipts was called here twice.
+    ///
+    /// Read from the source because the symptom is invisible until someone
+    /// kills a backfill and tries to resume it days later. The needle is built
+    /// from pieces so it cannot match itself in this file.
+    #[test]
+    fn a_killed_backfill_is_reconciled_when_the_server_starts() {
+        let src = include_str!("serve.rs");
+        let needle = format!("backfill::{}(&workspace", "reconcile");
+        let calls = src
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| l.contains(&needle))
+            .count();
+        assert!(
+            calls >= 2,
+            "backfill slices are reconciled at {calls} of the two server start paths, so a              backfill killed mid-run stays stuck in `running` and can never be retried"
+        );
+        // And the run-receipt twin is still there, so this test cannot pass by
+        // one having replaced the other.
+        assert!(
+            src.contains(&format!("retry::{}(&workspace", "reconcile")),
+            "run receipts are no longer reconciled at startup"
+        );
+    }
+
+}
+
+#[cfg(test)]
+mod freshness_tick {
+    /// #304 asks for freshness to be evaluated "periodically in the
+    /// server/scheduler, not only at the end of a run", and the module that
+    /// does the evaluating had exactly one caller in the whole repo: a CLI
+    /// subcommand. So the feature existed as a computation nobody performed -
+    /// an SLA that only holds while an operator remembers to ask about it is
+    /// not one.
+    ///
+    /// Read from the source because the symptom is silence: nothing fails, no
+    /// alert arrives, and the asset that went stale looks exactly like the ones
+    /// that did not. Needles are built from pieces so they cannot match
+    /// themselves in this file.
+    #[test]
+    fn the_server_judges_freshness_on_a_clock() {
+        let src = include_str!("serve.rs");
+        let call = format!("sla::{}(", "check_and_alert");
+        assert!(
+            src.contains(&call),
+            "the server never evaluates freshness, so a declared SLA is only checked when \
+             someone runs the CLI by hand"
+        );
+        // And on its own cadence rather than every scheduler tick, which would
+        // read run history for every asset several times a minute to learn
+        // nothing.
+        assert!(
+            src.contains("FRESHNESS_EVERY"),
+            "freshness is evaluated without a cadence of its own"
+        );
+        // Alerting is what makes it visible; evaluating and discarding would be
+        // the same silence with more CPU.
+        assert!(
+            src.contains("past their freshness limit"),
+            "a stale asset is found and then not reported anywhere"
+        );
+    }
+}
+
+/// #325: what a publication-triggered run is actually given.
+#[cfg(test)]
+mod delivery_parameters {
+    use super::*;
+    use duckle_duckdb_engine::materialize::Event;
+    use duckle_duckdb_engine::subscribe::{Delivery, DeliveryState};
+
+    fn day_partitioned(declares: &str) -> String {
+        format!(
+            r#"{{"partition":{{"type":"time","cadence":"day","timezone":"UTC"}},
+                "parameters":{{{declares}}},"nodes":[],"edges":[]}}"#
+        )
+    }
+
+    fn event() -> Event {
+        Event {
+            event_id: "mat-1".into(),
+            pipeline_id: "producer".into(),
+            run_id: Some("run-7".into()),
+            release_id: None,
+            partition_key: Some("2026-09-03".into()),
+            trigger: "scheduled".into(),
+            committed_at: "2026-09-03T04:00:00Z".into(),
+            assets: vec!["/data/a.parquet".into()],
+        }
+    }
+
+    fn delivery(params: &[(&str, &str)]) -> Delivery {
+        Delivery {
+            delivery_id: "dlv-1".into(),
+            subscription_id: "s1".into(),
+            event_id: "mat-1".into(),
+            pipeline_id: "consumer".into(),
+            state: DeliveryState::Pending,
+            attempts: 0,
+            last_error: None,
+            run_id: None,
+            at: "2026-09-03T05:00:00Z".into(),
+            parameters: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            parameter_error: None,
+        }
+    }
+
+    /// Builds a workspace with a producer and a consumer, and returns what
+    /// `delivery_params` would hand the consumer.
+    fn bound(producer_doc: &str, consumer_doc: &str, d: &Delivery) -> HashMap<String, String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("producer.json");
+        let c = tmp.path().join("consumer.json");
+        std::fs::write(&p, producer_doc).unwrap();
+        std::fs::write(&c, consumer_doc).unwrap();
+        let pipes: HashMap<String, PathBuf> =
+            [("producer".to_string(), p), ("consumer".to_string(), c.clone())].into();
+        let events: HashMap<String, Event> = [("mat-1".to_string(), event())].into();
+        delivery_params(tmp.path(), &pipes, &events, d, &c.display().to_string())
+    }
+
+    /// The safety property. An undeclared parameter is a hard `param:unknown`
+    /// error, so inheriting a window into a consumer that never asked for one
+    /// would turn a working delivery into a failing run.
+    #[test]
+    fn nothing_is_inherited_that_the_consumer_does_not_declare() {
+        let out = bound(&day_partitioned(""), &day_partitioned(""), &delivery(&[]));
+        assert!(out.is_empty(), "the consumer declares no parameters: {out:?}");
+    }
+
+    #[test]
+    fn a_declared_partition_parameter_is_inherited() {
+        let declares = r#""partition_key":{"type":"string"}"#;
+        let out = bound(&day_partitioned(declares), &day_partitioned(declares), &delivery(&[]));
+        assert_eq!(out.get("partition_key").map(String::as_str), Some("2026-09-03"));
+        assert!(!out.contains_key("window_start"), "not declared, not sent: {out:?}");
+    }
+
+    #[test]
+    fn declaring_the_window_gets_the_window() {
+        let declares = r#""window_start":{"type":"datetime"},"window_end":{"type":"datetime"}"#;
+        let out = bound(&day_partitioned(declares), &day_partitioned(declares), &delivery(&[]));
+        assert!(out["window_start"].starts_with("2026-09-03T00:00:00+00"), "{out:?}");
+        assert!(out["window_end"].starts_with("2026-09-04T00:00:00+00"), "{out:?}");
+    }
+
+    /// Different definitions describe different slices. Nothing crosses.
+    #[test]
+    fn a_different_cadence_inherits_nothing() {
+        let declares = r#""partition_key":{"type":"string"}"#;
+        let monthly = format!(
+            r#"{{"partition":{{"type":"time","cadence":"month","timezone":"UTC"}},
+                "parameters":{{{declares}}},"nodes":[],"edges":[]}}"#
+        );
+        let out = bound(&day_partitioned(declares), &monthly, &delivery(&[]));
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn an_explicit_binding_reaches_the_run_and_wins() {
+        let declares = r#""partition_key":{"type":"string"}"#;
+        let out = bound(
+            &day_partitioned(declares),
+            &day_partitioned(declares),
+            &delivery(&[("partition_key", "2026-01-01"), ("other", "x")]),
+        );
+        assert_eq!(out["partition_key"], "2026-01-01", "the operator wrote it down");
+        assert_eq!(out["other"], "x");
+    }
+
+    /// An unpartitioned producer publishes nothing to inherit, and the
+    /// delivery still carries what it bound explicitly.
+    #[test]
+    fn an_unpartitioned_producer_still_binds_explicitly() {
+        let plain = r#"{"nodes":[],"edges":[]}"#;
+        let declares = r#""partition_key":{"type":"string"}"#;
+        let out = bound(plain, &day_partitioned(declares), &delivery(&[("x", "1")]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out["x"], "1");
+    }
+}
+
+/// #296/#318: the server must honour the zone and the exclusion calendar it
+/// was told about, not only display them.
+#[cfg(test)]
+mod serve_honours_the_schedule {
+    use super::*;
+    use chrono::TimeZone;
+    use duckle_duckdb_engine::cronzone::{resolve_zone, Exclusions};
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).single().expect("one instant")
+    }
+
+    /// The bug: `duckle serve` armed from `cron::Schedule::after` against the
+    /// machine's clock, so "03:00 Europe/Brussels" fired at 03:00 UTC in a
+    /// container - two hours early in summer, and on the wrong side of
+    /// midnight for anything near it.
+    #[test]
+    fn a_zoned_expression_is_armed_at_the_zones_clock() {
+        let brussels = resolve_zone(Some("Europe/Brussels")).unwrap();
+        let none = Exclusions::default();
+        // Mid-August: Brussels is UTC+2, so 03:00 there is 01:00 UTC.
+        let (fire, armed) = cron_decision(None, "0 3 * * *", &brussels, &none, utc(2026, 8, 15, 0, 0));
+        assert!(!fire, "first sighting must arm, not fire");
+        let armed = armed.expect("armed");
+        assert_eq!(
+            armed.1,
+            utc(2026, 8, 15, 1, 0),
+            "03:00 Brussels in August is 01:00 UTC; armed at {:?}",
+            armed.1
+        );
+
+        // And it fires there, not at 03:00 UTC.
+        let (early, _) = cron_decision(Some(&armed), "0 3 * * *", &brussels, &none, utc(2026, 8, 15, 0, 59));
+        assert!(!early, "fired before its own clock reached it");
+        let (fire, _) = cron_decision(Some(&armed), "0 3 * * *", &brussels, &none, utc(2026, 8, 15, 1, 0));
+        assert!(fire, "did not fire when Brussels reached 03:00");
+    }
+
+    /// The other half, and the one that shipped broken: an excluded date was
+    /// honoured by the desktop scheduler and ignored by the server, which is
+    /// the deployment a maintenance window exists for.
+    #[test]
+    fn an_excluded_date_is_not_fired_on_the_server() {
+        let utc_zone = resolve_zone(Some("UTC")).unwrap();
+        let christmas: Exclusions =
+            serde_json::from_value(serde_json::json!({ "dates": ["2026-12-25"] })).unwrap();
+
+        // Armed on the 24th, looking for the next 03:00.
+        let (_, armed) =
+            cron_decision(None, "0 3 * * *", &utc_zone, &christmas, utc(2026, 12, 24, 12, 0));
+        let armed = armed.expect("armed");
+        assert_eq!(
+            armed.1,
+            utc(2026, 12, 26, 3, 0),
+            "the 25th was excluded, so the next occurrence is the 26th; got {:?}",
+            armed.1
+        );
+
+        // Nothing fires while the excluded day passes.
+        let (fire, _) =
+            cron_decision(Some(&armed), "0 3 * * *", &utc_zone, &christmas, utc(2026, 12, 25, 3, 0));
+        assert!(!fire, "fired on a date the operator excluded");
+    }
+
+    /// An excluded WEEKDAY, and in the schedule's own zone rather than UTC.
+    #[test]
+    fn an_excluded_weekday_is_read_in_the_schedules_zone() {
+        let brussels = resolve_zone(Some("Europe/Brussels")).unwrap();
+        let sundays: Exclusions =
+            serde_json::from_value(serde_json::json!({ "weekdays": ["sunday"] })).unwrap();
+        // 2026-08-16 is a Sunday. A 00:30 Brussels occurrence on that Sunday is
+        // 22:30 UTC on the SATURDAY, so a UTC-based check would keep it.
+        let (_, armed) =
+            cron_decision(None, "30 0 * * *", &brussels, &sundays, utc(2026, 8, 15, 12, 0));
+        let armed = armed.expect("armed");
+        assert_ne!(
+            armed.1,
+            utc(2026, 8, 15, 22, 30),
+            "that instant is Sunday 00:30 in Brussels and must be excluded"
+        );
+        assert_eq!(armed.1, utc(2026, 8, 16, 22, 30), "the next one is Monday 00:30 Brussels");
+    }
+
+    /// The projection is what the scheduler reads, so anything it needs has to
+    /// be in it. Both of these were stored and neither arrived.
+    #[test]
+    fn the_projection_carries_what_the_scheduler_needs() {
+        let s = duckle_duckdb_engine::schedules::Schedule {
+            id: "s1".into(),
+            pipeline_id: "p".into(),
+            name: "nightly".into(),
+            enabled: true,
+            plan_id: None,
+            kind: duckle_duckdb_engine::schedules::ScheduleKind::Cron { expr: "0 3 * * *".into() },
+            timezone: Some("Europe/Brussels".into()),
+            exclude: serde_json::from_value(serde_json::json!({ "dates": ["2026-12-25"] })).unwrap(),
+            misfire: Default::default(),
+            catchup: Default::default(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_duration_ms: None,
+            last_run_error: None,
+            next_run_at: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        duckle_duckdb_engine::schedules::update(&ws, |all| all.push(s)).unwrap();
+        let state = State {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(
+                Default::default(),
+            )),
+            running: Mutex::new(std::collections::HashSet::new()),
+            runs: Mutex::new(std::collections::HashMap::new()),
+            console: console_auth::Console::configure(&ws, "127.0.0.1", None).unwrap(),
+            host: "127.0.0.1".into(),
+            tick_interval: std::time::Duration::from_secs(15),
+            oidc: None,
+            oidc_endpoints: Mutex::new(None),
+            oidc_logins: Mutex::new(Default::default()),
+        };
+        let projected = load_schedules(&state).expect("a projection");
+        let one = projected.get("p").expect("the schedule");
+        assert_eq!(one.get("timezone").and_then(|v| v.as_str()), Some("Europe/Brussels"));
+        assert_eq!(
+            one.get("exclude").and_then(|v| v.get("dates")).and_then(|v| v.as_array()).map(Vec::len),
+            Some(1),
+            "the exclusion calendar has to reach the scheduler: {one}"
+        );
     }
 }

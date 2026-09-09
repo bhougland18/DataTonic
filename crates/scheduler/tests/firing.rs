@@ -58,6 +58,10 @@ async fn run_now_executes_pipeline_from_disk_and_records_history() {
 
     let s = sched
         .upsert(Schedule {
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             id: String::new(),
             pipeline_id: "pipe1".into(),
             plan_id: None,
@@ -95,4 +99,75 @@ async fn run_now_executes_pipeline_from_disk_and_records_history() {
     let updated = after.iter().find(|x| x.id == s.id).unwrap();
     assert_eq!(updated.last_run_status.as_deref(), Some("ok"));
     assert!(updated.last_run_at.is_some());
+}
+
+/// "Run now" is a run of the pipeline, so it takes the lock a run takes.
+///
+/// The scheduled path already does: `fire_due` and the file-watch fire both
+/// claim before calling through, and hold it for the duration. The button did
+/// not, so pressing it while the same pipeline's occurrence was firing - from
+/// this scheduler, from `duckle-runner serve`, or from a follower - started a
+/// second concurrent run of one pipeline. Two runs write the same sink and
+/// advance the same `xf.incremental` watermark, which is how a load silently
+/// skips rows.
+#[tokio::test]
+async fn run_now_is_refused_while_the_pipeline_is_already_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+
+    let engine = match std::env::var("DUCKLE_DUCKDB_BIN").ok() {
+        Some(bin) if std::path::Path::new(&bin).exists() => {
+            DuckdbEngine::new(std::path::PathBuf::from(bin))
+        }
+        _ => {
+            eprintln!("skipping: set DUCKLE_DUCKDB_BIN to a duckdb CLI to run");
+            return;
+        }
+    };
+    let sched = Scheduler::new(engine);
+    sched.set_workspace(Some(ws.to_path_buf()));
+
+    let s = sched
+        .upsert(Schedule {
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
+            id: String::new(),
+            pipeline_id: "pipe1".into(),
+            plan_id: None,
+            name: "nightly".into(),
+            enabled: true,
+            kind: ScheduleKind::Interval { seconds: 3600 },
+            last_run_at: None,
+            last_run_status: None,
+            last_run_duration_ms: None,
+            last_run_error: None,
+            next_run_at: None,
+        })
+        .unwrap();
+
+    // Something else - a tick here, `serve`'s scheduler, a follower - is
+    // already running pipe1 in this workspace.
+    let held = duckle_duckdb_engine::runlock::try_acquire(ws, "pipe1")
+        .expect("nothing should be holding it yet");
+
+    let err = sched
+        .run_now(&s.id)
+        .await
+        .expect_err("a second run of one pipeline must be refused, not started beside it");
+    assert!(
+        err.contains("already running"),
+        "the refusal has to name the clash rather than whatever failed next: {err}"
+    );
+
+    // The refusal is a clash, not a permanent state: once the other run is over
+    // the button works again. There is no pipeline file, so it gets as far as
+    // looking for one and fails on that instead.
+    drop(held);
+    let err = sched.run_now(&s.id).await.expect_err("there is no pipeline file");
+    assert!(
+        !err.contains("already running"),
+        "with the lock free it must get past the claim: {err}"
+    );
 }

@@ -28,13 +28,53 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install
         run: npm --prefix frontend ci
       - name: Type-check + build
         run: npm --prefix frontend run build
+      # #313: the MCP server include_str!s crates/duckle-mcp/catalog.json, so a
+      # manifest change that is not exported leaves agents reading a component
+      # schema that no longer exists. That happened: removing a dead Encoding
+      # control from the file sinks left the catalog advertising it. The export
+      # is deterministic, so regenerating and diffing is the whole check.
+      # A field gated on a value its controlling dropdown cannot produce is
+      # invisible forever, and nothing else reports it: the form renders, the
+      # engine still reads the property, and the only symptom is a setting
+      # nobody can reach.
+      - name: Every visibleWhen condition is satisfiable
+        run: npm --prefix frontend run check-visible-when
+
+      # A value the engine redacts from logs and refuses on deploy must not sit
+      # on screen in the clear. The needles come from the Rust source, so the
+      # two cannot drift apart quietly.
+      - name: Every credential field is masked
+        run: npm --prefix frontend run check-secret-fields
+
+      - name: Catalog is in sync with the manifests
+        run: |
+          npm --prefix frontend run export-catalog
+          git diff --exit-code -- crates/duckle-mcp/catalog.json || {
+            echo "::error::crates/duckle-mcp/catalog.json is stale. Run:"
+            echo "::error::  npm --prefix frontend run export-catalog"
+            echo "::error::and commit the result in the same change as the manifest edit."
+            exit 1
+          }
+      # The site's llms.txt / llms-full.txt are generated FROM that catalog and
+      # are what an agent reads to answer "does Duckle support X". They had
+      # drifted too - 385 components against an actual 409 - so they are
+      # regenerated and diffed for the same reason.
+      - name: Site component index is in sync with the catalog
+        run: |
+          node website/scripts/build-llms.mjs
+          git diff --exit-code -- website/llms.txt website/llms-full.txt || {
+            echo "::error::website/llms.txt is stale. Run:"
+            echo "::error::  node website/scripts/build-llms.mjs"
+            echo "::error::and commit the result."
+            exit 1
+          }
 
   rust:
     strategy:
@@ -129,6 +169,23 @@ jobs:
 
       # Style checks are informational - they report problems without
       # failing the build.
+      # #313: generated FROM the registry, so it cannot disagree with the code -
+      # but only if nobody has to remember to regenerate it. Here rather than in
+      # a job of its own: this leg already has unixodbc-dev and a built
+      # workspace, and a standalone job had neither, so it failed to compile
+      # instead of checking anything.
+      - name: Capability matrix is in sync with the registry
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo run -q -p duckle-runner -- capabilities --markdown > docs/capability-matrix.md
+          git diff --exit-code -- docs/capability-matrix.md || {
+            echo "::error::docs/capability-matrix.md is stale. Run:"
+            echo "::error::  cargo run -p duckle-runner -- capabilities --markdown > docs/capability-matrix.md"
+            echo "::error::and commit it in the same change as the component edit."
+            exit 1
+          }
+
       - name: Format check
         continue-on-error: true
         run: cargo fmt --all --check
@@ -158,7 +215,7 @@ jobs:
           df -h /
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend deps

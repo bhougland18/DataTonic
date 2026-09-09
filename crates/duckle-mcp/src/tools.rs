@@ -40,12 +40,29 @@ pub fn list_tools() -> Value {
             "List Duckle components (sources, transforms, sinks, control, quality, custom code). Optionally filter by kind or a search query.",
             json!({ "type": "object", "properties": {
                 "kind": { "type": "string", "enum": ["source","transform","sink","control","quality","custom"], "description": "Filter to one kind." },
-                "query": { "type": "string", "description": "Case-insensitive substring over id/label/summary." }
+                "query": { "type": "string", "description": "Case-insensitive substring over id/label/summary." },
+                "workspace": { "type": "string", "description": "Workspace directory. Include it to also list the external components installed there (#307)." }
+            }})),
+        tool("asset_freshness",
+            "Which assets are stale, why, and when each was last successfully materialized. Judged against declared freshness limits rather than guessed from run history, so an asset nobody declared a limit for reports `unknown` instead of a reassuring `fresh`. Use it to answer 'is the data I am about to read current'.",
+            json!({ "type": "object", "properties": {
+                "workspace": { "type": "string", "description": "Workspace directory. Required." },
+                "asset": { "type": "string", "description": "One asset id, for its full verdict." },
+                "staleOnly": { "type": "boolean", "description": "Return only assets past their limit." }
+            }, "required": ["workspace"] })),
+        tool("component_capabilities",
+            "Answer capability questions about components without guessing from their names: which sources support custom SQL, incremental reads, pushdown or chunked extraction; which sinks offer which write modes; which components emit rejects, take a saved connection, or need a DuckDB extension. Derived from the same manifests the editor and the engine use.",
+            json!({ "type": "object", "properties": {
+                "kind": { "type": "string", "enum": ["source","transform","sink","control","quality","custom"], "description": "Filter to one kind." },
+                "component": { "type": "string", "description": "One component id, for its full record." },
+                "supports": { "type": "array", "items": { "type": "string", "enum": ["customSql","incremental","pushdown","chunking","rejectOutput","artifactIo","connectionRef","credentials","cacheable","writeModes","extensions"] }, "description": "Keep only components that have ALL of these." },
+                "workspace": { "type": "string", "description": "Workspace directory, to include the external components installed there." }
             }})),
         tool("get_component_schema",
             "Get the full property schema (form fields + input/output ports) for one component id, so you know which properties to set.",
             json!({ "type": "object", "properties": {
-                "componentId": { "type": "string", "description": "e.g. src.csv, xf.map, snk.postgres" }
+                "componentId": { "type": "string", "description": "e.g. src.csv, xf.map, snk.postgres" },
+                "workspace": { "type": "string", "description": "Workspace directory, for an external ext.* component installed there (#307)." }
             }, "required": ["componentId"] })),
         tool("create_pipeline",
             "Validate a pipeline and write it. Prefer 'workspace' (writes pipelines/<id>.json and registers it in repository.json so it shows in the GUI immediately); 'directory' writes a loose <name>.json (not GUI-listed). Fails (without writing) if it does not compile, unless validate=false.",
@@ -82,6 +99,14 @@ pub fn list_tools() -> Value {
                 "workspace": { "type": "string", "description": "Workspace root for run logs + child-job resolution." },
                 "target": { "type": "string", "description": "Node id to stop at. Only this node and what feeds it run, so nothing downstream executes and no sink past it writes. Its rows come back in 'preview'." }
             }})),
+        tool("run_tests",
+            "Run the workspace's pipeline tests and return each case's result. A test asserts the rows out of one node against a fixture, so this catches a transform that compiles and computes the wrong thing - which validate_pipeline cannot. Runs every *.test.json under the workspace's tests/ directory, or just the files named. Needs a DuckDB binary.",
+            json!({ "type": "object", "properties": {
+                "workspace": { "type": "string", "description": "Workspace root. Defaults to the current directory." },
+                "paths": { "type": "array", "items": { "type": "string" },
+                           "description": "Specific .test.json files to run. Omit to run every test in the workspace." },
+                "duckdb": { "type": "string", "description": "Path to the DuckDB CLI. Defaults to DUCKLE_DUCKDB_BIN or 'duckdb' on PATH." }
+            }})),
         tool("pipeline_lineage",
             "Resolve column-level lineage for a pipeline: for each node, map its output columns back to their root source columns. Read-only (writes nothing); needs a DuckDB binary.",
             json!({ "type": "object", "properties": {
@@ -96,6 +121,40 @@ pub fn list_tools() -> Value {
                 "path": { "type": "string", "description": "Path to a pipeline .json (use instead of 'pipeline')." },
                 "duckdb": { "type": "string", "description": "DuckDB CLI path for lineage resolution. Defaults to DUCKLE_DUCKDB_BIN or 'duckdb' on PATH." }
             }})),
+        tool("check_node_sql",
+            "Bind a pipeline's SQL against its upstream columns WITHOUT running it, and report what DuckDB said: the message, the position in the node's own SQL, and the column it suggests instead of a typo. Also returns each node's inferred output schema. Scope to one node with 'node'. A source's query is sent to a remote system and is reported as not validated rather than checked against DuckDB. Read-only; runs nothing with effects.",
+            json!({ "type": "object", "properties": {
+                "pipeline": { "type": "object", "description": "Inline pipeline object." },
+                "path": { "type": "string", "description": "Path to a pipeline .json (use instead of 'pipeline')." },
+                "node": { "type": "string", "description": "Only this node. Omit for the whole pipeline." },
+                "duckdb": { "type": "string", "description": "DuckDB CLI path. Defaults to DUCKLE_DUCKDB_BIN or 'duckdb' on PATH." }
+            }})),
+        tool("backfill",
+            "Create, inspect, retry or cancel a partitioned backfill (#295). action=create runs it (add dryRun to see the partitions without queueing anything); status with no id lists them; retry re-queues failed and interrupted slices, optionally one named partition; cancel stops everything still open. Each slice is an ordinary durable run with its own run id, and acquires its pipeline's resource pool like any other.",
+            json!({ "type": "object", "properties": {
+                "action": { "type": "string", "enum": ["create","status","retry","cancel"] },
+                "workspace": { "type": "string", "description": "Workspace directory." },
+                "path": { "type": "string", "description": "create: the partitioned pipeline .json." },
+                "from": { "type": "string", "description": "create: first date, YYYY-MM-DD." },
+                "to": { "type": "string", "description": "create: last date, inclusive." },
+                "maxConcurrent": { "type": "integer", "description": "create: the backfill's own ceiling (default 4). Resource pools still apply on top." },
+                "dryRun": { "type": "boolean", "description": "create: list the partitions and queue nothing." },
+                "id": { "type": "string", "description": "status/retry/cancel: the backfill id." },
+                "partition": { "type": "string", "description": "retry: only this partition key." },
+                "occurrence": { "type": "string", "description": "create: the schedule occurrence that caused this, so a re-fire does not repeat the work." },
+                "force": { "type": "boolean", "description": "create: run every slice even if an identical one already succeeded." },
+                "duckdb": { "type": "string", "description": "DuckDB CLI path. Defaults to DUCKLE_DUCKDB_BIN or 'duckdb'." }
+            }, "required": ["action","workspace"] })),
+        tool("complete_node_sql",
+            "What could come next at a cursor position in a node's SQL: upstream columns with their types, the relations it can read, the pipeline's declared parameters, DuckDB functions and keywords - ranked, best first. Never executes the SQL and never touches a source; the only thing read is DuckDB's own function list.",
+            json!({ "type": "object", "properties": {
+                "pipeline": { "type": "object", "description": "Inline pipeline object." },
+                "path": { "type": "string", "description": "Path to a pipeline .json (use instead of 'pipeline')." },
+                "node": { "type": "string", "description": "The node whose SQL is being edited." },
+                "cursor": { "type": "integer", "description": "Byte offset into that node's SQL. Defaults to the end." },
+                "limit": { "type": "integer", "description": "How many suggestions (default 12)." },
+                "duckdb": { "type": "string", "description": "DuckDB CLI path, for the function list. Without it, columns and keywords are still suggested." }
+            }, "required": ["node"] })),
         tool("suggest_contracts",
             "Profile a pipeline's columns and suggest data contracts to add: PII tags (heuristic, name-based) and source requireColumns anchors. Returns per-node suggestedContracts you can merge with update_pipeline, after which verify_pipeline enforces the PII-to-sink guard. Static; uses declared schemas, and column lineage too when a DuckDB binary is available.",
             json!({ "type": "object", "properties": {
@@ -153,7 +212,71 @@ pub fn list_tools() -> Value {
             json!({ "type": "object", "properties": {
                 "path": { "type": "string" }
             }, "required": ["path"] })),
-        tool("read_run_logs",
+        tool("backfill_list",
+            "List the saved state a pipeline resumes from: incremental watermarks, DuckLake snapshot ids, Kafka resume offsets, spool positions and tumbling-window buffers. Each entry says whether it can be set by hand (`editable`) or only cleared.",
+            json!({ "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "description": "Workspace folder" },
+                    "pipelineName": { "type": "string", "description": "Pipeline name (the file stem)" }
+                },
+                "required": ["workspace", "pipelineName"] })),
+        tool("backfill_set",
+            "Set an incremental watermark (`value` + optional `valueType`) or a DuckLake snapshot id (`snapshotId`) so the next run resumes from there. REFUSED when the node holds a different kind of state - a Kafka offset, a spool position or a tumbling window cannot be set by hand, because overwriting them destroys what they were holding. Clear those instead.",
+            json!({ "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" },
+                    "pipelineName": { "type": "string" },
+                    "nodeId": { "type": "string" },
+                    "value": { "type": "string", "description": "Watermark value" },
+                    "valueType": { "type": "string", "description": "SQL type, default VARCHAR" },
+                    "snapshotId": { "type": "integer", "description": "DuckLake snapshot id" }
+                },
+                "required": ["workspace", "pipelineName", "nodeId"] })),
+        tool("backfill_clear",
+            "Remove a node's saved state so it starts over. NOTE: this is not always a full reload - a Kafka source with startFrom `latest` skips whatever is already in the topic when it has no saved offset, so clearing it moves PAST that backlog rather than replaying it.",
+            json!({ "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" },
+                    "pipelineName": { "type": "string" },
+                    "nodeId": { "type": "string" }
+                },
+                "required": ["workspace", "pipelineName", "nodeId"] })),
+        tool("baseline_list",
+            "Every qa.baseline node in the workspace: how many profiles it has accepted, what the last run concluded, and whether a measured profile is waiting to be accepted.",
+            json!({ "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "description": "Workspace folder" }
+                },
+                "required": ["workspace"] })),
+        tool("baseline_inspect",
+            "What one qa.baseline node considers normal, against what the last run measured: the accepted median per metric, the observed value, the percentage change, and any violations that refused the run.",
+            json!({ "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" },
+                    "pipelineName": { "type": "string" },
+                    "nodeId": { "type": "string" }
+                },
+                "required": ["workspace", "pipelineName", "nodeId"] })),
+        tool("baseline_accept",
+            "Make the profile the LAST RUN measured the new accepted normal, for a source that legitimately changed shape. Promotes what a run saw - it cannot invent a number, so a node no run has measured has nothing to accept. Recorded in the audit log with the value it replaced. Refused when the workspace policy withholds state mutation.",
+            json!({ "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" },
+                    "pipelineName": { "type": "string" },
+                    "nodeId": { "type": "string" },
+                    "history": { "type": "integer", "description": "How many profiles to keep, default 10" }
+                },
+                "required": ["workspace", "pipelineName", "nodeId"] })),
+        tool("baseline_clear",
+            "Forget a node's accepted history so the next run starts it over and cannot fail against a baseline that no longer describes the source. Leaves the last observation alone - that is the evidence somebody is looking at. Audited, and refused when the policy withholds state mutation.",
+            json!({ "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" },
+                    "pipelineName": { "type": "string" },
+                    "nodeId": { "type": "string" }
+                },
+                "required": ["workspace", "pipelineName", "nodeId"] })),
+                tool("read_run_logs",
             "Read the tail of a pipeline's NDJSON run log (component-level events).",
             json!({ "type": "object", "properties": {
                 "pipelineName": { "type": "string" },
@@ -203,13 +326,19 @@ pub fn call_tool(params: Value) -> Result<Value, (i64, String)> {
 
     let result = match name {
         "list_components" => t_list_components(&args),
+        "asset_freshness" => t_asset_freshness(&args),
+        "component_capabilities" => t_component_capabilities(&args),
         "get_component_schema" => t_get_component_schema(&args),
         "create_pipeline" => t_create_pipeline(&args),
         "update_pipeline" => t_update_pipeline(&args),
         "validate_pipeline" => t_validate_pipeline(&args),
         "run_pipeline" => t_run_pipeline(&args),
+        "run_tests" => t_run_tests(&args),
         "pipeline_lineage" => t_pipeline_lineage(&args),
         "verify_pipeline" => t_verify_pipeline(&args),
+        "check_node_sql" => t_check_node_sql(&args),
+        "complete_node_sql" => t_complete_node_sql(&args),
+        "backfill" => t_backfill(&args),
         "suggest_contracts" => t_suggest_contracts(&args),
         "pipeline_impact" => t_pipeline_impact(&args),
         "workspace_impact" => t_workspace_impact(&args),
@@ -218,6 +347,13 @@ pub fn call_tool(params: Value) -> Result<Value, (i64, String)> {
         "schema_drift" => t_schema_drift(&args),
         "list_pipelines" => t_list_pipelines(&args),
         "read_pipeline" => t_read_pipeline(&args),
+        "backfill_list" => t_backfill_list(&args),
+        "backfill_set" => t_backfill_set(&args),
+        "backfill_clear" => t_backfill_clear(&args),
+        "baseline_list" => t_baseline_list(&args),
+        "baseline_inspect" => t_baseline_inspect(&args),
+        "baseline_accept" => t_baseline_accept(&args),
+        "baseline_clear" => t_baseline_clear(&args),
         "read_run_logs" => t_read_run_logs(&args),
         "build_pipeline" => t_build_pipeline(&args),
         "list_connections" => t_list_connections(&args),
@@ -244,12 +380,124 @@ fn content_err(msg: &str) -> Value {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
+/// #304: freshness, for an operating agent.
+///
+/// The three questions the issue names - which assets are stale, why, and when
+/// each was last materialized - are all one verdict, so this returns the whole
+/// record rather than three tools that could disagree. Read-only: it evaluates
+/// and does not record, because an agent asking a question must not move the
+/// stale/recovered state machine the alerting depends on.
+fn t_asset_freshness(args: &Value) -> Result<Value, String> {
+    let ws = arg_str(args, "workspace").ok_or("missing 'workspace'")?;
+    let assets =
+        duckle_duckdb_engine::sla::evaluate_now(std::path::Path::new(ws));
+    if let Some(id) = arg_str(args, "asset") {
+        return match assets.into_iter().find(|a| a.asset == id) {
+            Some(a) => Ok(serde_json::to_value(a).unwrap_or(Value::Null)),
+            None => Err(format!("no asset {id:?} in this workspace")),
+        };
+    }
+    let stale_only = args.get("staleOnly").and_then(Value::as_bool).unwrap_or(false);
+    let out: Vec<_> = assets
+        .into_iter()
+        .filter(|a| !stale_only || a.state == duckle_duckdb_engine::sla::State::Stale)
+        .collect();
+    Ok(json!({
+        "count": out.len(),
+        "stale": out.iter().filter(|a| a.state == duckle_duckdb_engine::sla::State::Stale).count(),
+        "assets": out,
+    }))
+}
+
+/// #313: the capability registry, for an agent.
+///
+/// The issue's own examples - "find sources that support S3-compatible
+/// storage", "find sinks with upsert", "find components that perform external
+/// network I/O" - are all questions an agent otherwise answers by guessing from
+/// a component name. The registry is derived in the engine, so this returns the
+/// same records `duckle-runner capabilities` prints rather than a second
+/// opinion about what a component supports.
+fn t_component_capabilities(args: &Value) -> Result<Value, String> {
+    use duckle_duckdb_engine::capabilities;
+    let all = match arg_str(args, "workspace") {
+        Some(ws) => capabilities::all_in(std::path::Path::new(ws)),
+        None => capabilities::all(),
+    };
+    if let Some(id) = arg_str(args, "component") {
+        let found = all.into_iter().find(|c| c.component == id);
+        return match found {
+            Some(c) => Ok(serde_json::to_value(c).unwrap_or(Value::Null)),
+            None => Err(format!("no component {id:?}")),
+        };
+    }
+    let kind = arg_str(args, "kind");
+    let wanted: Vec<String> = args
+        .get("supports")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let has = |c: &capabilities::Capabilities, what: &str| match what {
+        "customSql" => c.custom_sql,
+        "incremental" => c.incremental,
+        "pushdown" => c.pushdown,
+        "chunking" => !c.chunking.is_empty(),
+        "rejectOutput" => c.reject_output,
+        "artifactIo" => c.artifact_io,
+        "connectionRef" => c.connection_ref,
+        "credentials" => c.credentials,
+        "cacheable" => c.cacheable,
+        "writeModes" => !c.write_modes.is_empty(),
+        "extensions" => !c.extensions.is_empty(),
+        // An unknown capability name matches nothing rather than everything: a
+        // typo that quietly returned the whole catalog would read as an answer.
+        _ => false,
+    };
+    let out: Vec<capabilities::Capabilities> = all
+        .into_iter()
+        .filter(|c| kind.is_none_or(|k| c.kind == k))
+        .filter(|c| wanted.iter().all(|w| has(c, w)))
+        .collect();
+    Ok(json!({ "count": out.len(), "components": out }))
+}
+
 fn t_list_components(args: &Value) -> Result<Value, String> {
-    Ok(catalog::list(arg_str(args, "kind"), arg_str(args, "query")))
+    let mut listed = catalog::list(arg_str(args, "kind"), arg_str(args, "query"));
+    // #307: the workspace's external components too, when one is given. An
+    // agent asking what it can build with should see a component the workspace
+    // installed, not only the ones compiled in.
+    if let Some(ws) = arg_str(args, "workspace") {
+        let kind = arg_str(args, "kind");
+        let query = arg_str(args, "query").map(|q| q.to_lowercase());
+        let extra: Vec<Value> = duckle_duckdb_engine::plugin::catalog_entries(std::path::Path::new(ws))
+            .into_iter()
+            .filter(|c| kind.is_none_or(|want| c.get("kind").and_then(Value::as_str) == Some(want)))
+            .filter(|c| match &query {
+                None => true,
+                Some(q) => ["id", "label", "summary"].iter().any(|k| {
+                    c.get(*k)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| v.to_lowercase().contains(q.as_str()))
+                }),
+            })
+            .collect();
+        if !extra.is_empty() {
+            if let Some(items) = listed.get_mut("components").and_then(|v| v.as_array_mut()) {
+                items.extend(extra);
+            }
+        }
+    }
+    Ok(listed)
 }
 
 fn t_get_component_schema(args: &Value) -> Result<Value, String> {
     let id = arg_str(args, "componentId").ok_or("missing 'componentId'")?;
+    if let Some(ws) = arg_str(args, "workspace") {
+        if let Some(found) =
+            duckle_duckdb_engine::plugin::find(std::path::Path::new(ws), id)
+        {
+            return Ok(duckle_duckdb_engine::plugin::as_catalog_entry(&found));
+        }
+    }
     catalog::schema(id).ok_or_else(|| format!("unknown componentId: {id}"))
 }
 
@@ -376,14 +624,12 @@ fn t_pipeline_impact(args: &Value) -> Result<Value, String> {
 
 fn t_schema_drift(args: &Value) -> Result<Value, String> {
     let (v, _name) = load_pipeline_value(args)?;
-    let mut doc = to_doc(&v)?;
-    // Resolve ${workspace}/${date} placeholders in source paths when a
-    // workspace is supplied, so file paths point at the real data.
-    if let Some(ws) = arg_str(args, "workspace") {
-        let wsp = std::path::Path::new(ws);
-        duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
-        duckle_duckdb_engine::context::apply_workspace_context(&mut doc, wsp);
-    }
+    // The same resolution a run gets, rather than a shorter hand-written copy.
+    // This did time builtins and the workspace pass only, so a drift check
+    // against a source behind a saved connection or an ${ENV:...} host read a
+    // placeholder instead of the source - and reported drift, or nothing,
+    // about a thing it never reached.
+    let doc = prepare_run_doc(&v, arg_str(args, "workspace"))?;
     let duckdb = resolve_duckdb(arg_str(args, "duckdb"))
         .ok_or("no DuckDB binary found (set DUCKLE_DUCKDB_BIN or pass 'duckdb')")?;
     std::env::set_var("DUCKLE_DUCKDB_BIN", &duckdb);
@@ -428,22 +674,165 @@ fn t_trust_report(args: &Value) -> Result<Value, String> {
     if arg_bool(args, "checkDrift", false) {
         if let Some(duckdb) = resolve_duckdb(arg_str(args, "duckdb")) {
             std::env::set_var("DUCKLE_DUCKDB_BIN", &duckdb);
-            // Resolve ${workspace}/${date} placeholders before reading sources,
-            // so drift hits the real files rather than a literal path.
-            let resolved = match arg_str(args, "workspace") {
-                Some(ws) => {
-                    let wsp = std::path::Path::new(ws);
-                    duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
-                    duckle_duckdb_engine::context::apply_workspace_context(&mut doc, wsp);
-                    serde_json::to_value(&doc).map_err(|e| e.to_string())?
-                }
-                None => v.clone(),
-            };
+            // The same resolution a run gets, for the same reason as
+            // schema_drift above: this read a placeholder rather than the
+            // source whenever a host or path came from a saved connection, the
+            // environment or a vault.
+            let doc = prepare_run_doc(&v, arg_str(args, "workspace"))?;
+            let resolved = serde_json::to_value(&doc).map_err(|e| e.to_string())?;
             let engine = DuckdbEngine::new(duckdb);
             return Ok(duckle_duckdb_engine::trust::trust_report(&resolved, Some(&engine)));
         }
     }
     Ok(duckle_duckdb_engine::trust::trust_report(&v, None))
+}
+
+/// #314. Calls the same `analyze_pipeline_sql` the CLI and the editor call, so
+/// criterion 4 - identical diagnostics on every surface - holds by
+/// construction rather than by three implementations agreeing.
+fn t_check_node_sql(args: &Value) -> Result<Value, String> {
+    let (v, _name) = load_pipeline_value(args)?;
+    let doc = to_doc(&v)?;
+    let Some(duckdb) = resolve_duckdb(arg_str(args, "duckdb")) else {
+        // Said plainly rather than returning an empty, clean-looking report:
+        // "nothing was checked" and "nothing was wrong" must not look alike.
+        return Ok(json!({
+            "checked": false,
+            "reason": "no DuckDB binary; set DUCKLE_DUCKDB_BIN or pass 'duckdb'"
+        }));
+    };
+    let engine = duckle_duckdb_engine::DuckdbEngine::new(duckdb);
+    let mut nodes = engine.analyze_pipeline_sql(&doc).map_err(|e| e.to_string())?;
+    if let Some(only) = arg_str(args, "node") {
+        nodes.retain(|n| n.node_id == only);
+        if nodes.is_empty() {
+            return Err(format!("no node {only:?} in this pipeline"));
+        }
+    }
+    let problems: usize = nodes.iter().map(|n| n.diagnostics.len()).sum();
+    Ok(json!({
+        "checked": true,
+        "ok": problems == 0,
+        "problems": problems,
+        "nodes": nodes,
+    }))
+}
+
+/// #314. The same engine call the editor makes, so an agent writing SQL sees
+/// the columns an author would.
+fn t_complete_node_sql(args: &Value) -> Result<Value, String> {
+    let (v, _name) = load_pipeline_value(args)?;
+    let doc = to_doc(&v)?;
+    let node = arg_str(args, "node").ok_or("missing 'node'")?;
+    // Without a binary the function list is empty and everything else still
+    // works, which is better than refusing to suggest a column because DuckDB
+    // could not be found.
+    let engine = duckle_duckdb_engine::DuckdbEngine::new(
+        resolve_duckdb(arg_str(args, "duckdb")).unwrap_or_else(|| std::path::PathBuf::from("duckdb")),
+    );
+    // The upstream columns an agent has are whatever the declared schemas say;
+    // it is not editing in a canvas with a resolver behind it.
+    let upstream: Vec<(String, Vec<duckle_duckdb_engine::Column>)> = doc
+        .edges
+        .iter()
+        .filter(|e| e.target == node)
+        .filter_map(|e| {
+            let n = doc.nodes.iter().find(|n| n.id == e.source)?;
+            Some((e.source.clone(), n.data.schema.clone().unwrap_or_default()))
+        })
+        .collect();
+    let sql_len = doc
+        .nodes
+        .iter()
+        .find(|n| n.id == node)
+        .and_then(|n| n.data.properties.as_ref())
+        .and_then(|p| p.get("sql").or_else(|| p.get("query")))
+        .and_then(|v| v.as_str())
+        .map(str::len)
+        .unwrap_or(0);
+    let cursor = args
+        .get("cursor")
+        .and_then(Value::as_u64)
+        .map(|c| c as usize)
+        .unwrap_or(sql_len);
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(12) as usize;
+    let items = engine
+        .complete_node_sql(&doc, node, &upstream, cursor, limit)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "node": node, "cursor": cursor, "completions": items }))
+}
+
+/// #295: the persisted backfill plan, addressable without a CLI.
+///
+/// Every action goes through the same engine functions the command does, so an
+/// agent and an operator cannot get different behaviour - which is the whole
+/// reason the executor moved out of the CLI.
+fn t_backfill(args: &Value) -> Result<Value, String> {
+    use duckle_duckdb_engine::backfill;
+    let ws = std::path::PathBuf::from(arg_str(args, "workspace").ok_or("missing 'workspace'")?);
+    let action = arg_str(args, "action").ok_or("missing 'action'")?;
+    match action {
+        "create" => {
+            let path = std::path::PathBuf::from(arg_str(args, "path").ok_or("missing 'path'")?);
+            let plan = duckle_duckdb_engine::backfill_exec::plan_for(
+                &ws,
+                &path,
+                arg_str(args, "from").unwrap_or_default(),
+                arg_str(args, "to").unwrap_or_default(),
+                args.get("maxConcurrent").and_then(Value::as_u64).unwrap_or(4) as usize,
+                arg_str(args, "occurrence"),
+            )?;
+            // A dry run writes nothing: "what would this queue" must not be a
+            // question that queues anything.
+            if args.get("dryRun").and_then(Value::as_bool).unwrap_or(false) {
+                return Ok(json!({
+                    "dryRun": true,
+                    "partitions": plan.partitions.iter().map(|p| &p.key).collect::<Vec<_>>(),
+                    "count": plan.partitions.len(),
+                }));
+            }
+            backfill::save(&ws, &plan)?;
+            let Some(duckdb) = resolve_duckdb(arg_str(args, "duckdb")) else {
+                return Err("no DuckDB binary; set DUCKLE_DUCKDB_BIN or pass 'duckdb'".into());
+            };
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let done =
+                duckle_duckdb_engine::backfill_exec::execute_ledger(&ws, &duckdb, plan, force, &|doc| duckle_secrets::resolve_connection_refs(&ws, &mut doc.nodes), &|_| {})?;
+            Ok(serde_json::to_value(&done).unwrap_or(Value::Null))
+        }
+        "status" => match arg_str(args, "id") {
+            Some(id) => Ok(serde_json::to_value(backfill::load(&ws, id)?).unwrap_or(Value::Null)),
+            None => Ok(json!({ "backfills": backfill::list(&ws) })),
+        },
+        "retry" => {
+            let id = arg_str(args, "id").ok_or("missing 'id'")?;
+            let mut plan = backfill::load(&ws, id)?;
+            let only = arg_str(args, "partition").map(|k| vec![k.to_string()]);
+            let n = plan.retry_open(only.as_deref());
+            if n == 0 {
+                return Ok(json!({ "retried": 0, "note": "nothing was failed or interrupted" }));
+            }
+            plan.pid = Some(std::process::id());
+            backfill::save(&ws, &plan)?;
+            let Some(duckdb) = resolve_duckdb(arg_str(args, "duckdb")) else {
+                return Err("no DuckDB binary; set DUCKLE_DUCKDB_BIN or pass 'duckdb'".into());
+            };
+            // A retry is an explicit act: the operator has looked and decided
+            // this slice should run, so it is not skipped as already-done.
+            let done =
+                duckle_duckdb_engine::backfill_exec::execute_ledger(&ws, &duckdb, plan, true, &|doc| duckle_secrets::resolve_connection_refs(&ws, &mut doc.nodes), &|_| {})?;
+            Ok(json!({ "retried": n, "backfill": done }))
+        }
+        "cancel" => {
+            let id = arg_str(args, "id").ok_or("missing 'id'")?;
+            let mut plan = backfill::load(&ws, id)?;
+            let n = plan.cancel();
+            plan.pid = None;
+            backfill::save(&ws, &plan)?;
+            Ok(json!({ "cancelled": n, "backfill": plan }))
+        }
+        other => Err(format!("unknown action {other:?}")),
+    }
 }
 
 fn t_verify_pipeline(args: &Value) -> Result<Value, String> {
@@ -802,9 +1191,104 @@ fn t_update_pipeline(args: &Value) -> Result<Value, String> {
     Ok(json!({ "ok": true, "path": path.to_string_lossy(), "registeredInRepository": registered, "validation": validation }))
 }
 
+/// #250: run the workspace's pipeline tests.
+///
+/// This SHELLS OUT to `duckle-runner test --json` rather than reimplementing
+/// the harness, and that is the point rather than a shortcut. The runner owns
+/// what a case means - how a fixture is resolved, how types are compared, what
+/// counts as unique - and a second implementation here would be a second answer
+/// to the same question. Those drift. The agent still needs no shell: it calls
+/// a tool, and the server runs the binary it ships beside.
+fn t_run_tests(args: &Value) -> Result<Value, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating this executable: {e}"))?;
+    let name = if cfg!(windows) { "duckle-runner.exe" } else { "duckle-runner" };
+    let runner = exe
+        .parent()
+        .map(|d| d.join(name))
+        .filter(|p| p.exists())
+        .ok_or_else(|| {
+            format!(
+                "{name} not found next to {}. The MCP server runs the test harness rather than \
+                 carrying its own copy, so the two cannot disagree about what a case means.",
+                exe.display()
+            )
+        })?;
+
+    let mut cmd = std::process::Command::new(&runner);
+    cmd.arg("test").arg("--json");
+    if let Some(paths) = args.get("paths").and_then(Value::as_array) {
+        for p in paths.iter().filter_map(Value::as_str) {
+            cmd.arg(p);
+        }
+    }
+    if let Some(ws) = args.get("workspace").and_then(Value::as_str) {
+        cmd.current_dir(ws);
+    }
+    if let Some(d) = args.get("duckdb").and_then(Value::as_str) {
+        cmd.env("DUCKLE_DUCKDB_BIN", d);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("running {}: {e}", runner.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The harness exits 1 on a failed assertion, which is a RESULT, not an
+    // error - the agent wants the failures, not a tool error that hides them.
+    match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(v) => Ok(v),
+        Err(_) => Err(format!(
+            "the test harness returned nothing readable (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
+/// Turn a loaded pipeline value into the document the engine will run.
+///
+/// The run-time placeholder tiers are resolved here, in the same order every
+/// other execution surface applies them (desktop, scheduler, `serve`, `follow`).
+/// Without this a credential kept in a vault reached the connector as the
+/// literal text `${VAULT:NAME}`, which is the one thing a vault exists to
+/// prevent - and the server's own tool instructions tell an agent to write
+/// `${ENV:KEY}` rather than a literal, so it advertised a mechanism it did not
+/// honour.
+fn prepare_run_doc(v: &Value, workspace: Option<&str>) -> Result<PipelineDoc, String> {
+    let mut doc = to_doc(v)?;
+    duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
+    // Saved connections expand BEFORE the env pass, so a connection field
+    // stored as ${ENV:...} still resolves below. Same order as the scheduler.
+    if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
+        duckle_secrets::resolve_connection_refs(std::path::Path::new(ws), &mut doc.nodes)?;
+    }
+    duckle_duckdb_engine::context::apply_env(&mut doc);
+    duckle_duckdb_engine::context::apply_vault(&mut doc);
+    // Last, exactly as the CLI orders it (`main.rs:494`): `${workspace}` and the
+    // workspace context variables resolve after env and vault, so a context
+    // value spelled `${ENV:...}` has already become a value by the time it is
+    // read.
+    //
+    // Without this an MCP run sent `${workspace}/...` to DuckDB verbatim and
+    // failed with "No files found that match the pattern", while the same
+    // pipeline ran from the desktop app and from `duckle-runner --workspace`.
+    // A file-loaded pipeline does not go through the by-id resolver, so nothing
+    // else in this path would ever substitute it - the same reason the CLI and
+    // the serve endpoints each call this themselves.
+    if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
+        duckle_duckdb_engine::context::apply_workspace_context(
+            &mut doc,
+            std::path::Path::new(ws),
+        );
+    }
+    Ok(doc)
+}
+
 fn t_run_pipeline(args: &Value) -> Result<Value, String> {
     let (v, name) = load_pipeline_value(args)?;
-    let doc = to_doc(&v)?;
     let duckdb = resolve_duckdb(arg_str(args, "duckdb"))
         .ok_or("no DuckDB binary found; set DUCKLE_DUCKDB_BIN or pass 'duckdb'")?;
     std::env::set_var("DUCKLE_DUCKDB_BIN", &duckdb);
@@ -819,13 +1303,59 @@ fn t_run_pipeline(args: &Value) -> Result<Value, String> {
         std::env::remove_var("DUCKLE_LOG_DIR");
     }
 
+    // Prepared after the workspace is set, so every tier sees the same
+    // environment the run itself will see.
+    let doc = prepare_run_doc(&v, arg_str(args, "workspace"))?;
+
+    // The same per-pipeline lock a scheduled run takes, so an agent cannot start
+    // a run beside one already going in this workspace - both would write the
+    // same sink and advance the same saved state. Only when a workspace is
+    // given: without one there is no shared place for a lock, and nothing else
+    // in this workspace can be running either.
+    let _run_lock = match arg_str(args, "workspace") {
+        Some(ws) => {
+            Some(duckle_duckdb_engine::runlock::claim_for_run(std::path::Path::new(ws), &name)?)
+        }
+        None => None,
+    };
+
     let engine = DuckdbEngine::new(duckdb);
+    // #259: a run an agent starts is addressable like any other. Without this,
+    // "which run did the agent just do?" had no answer, and MCP is the surface
+    // where that question is asked most.
+    let receipt = arg_str(args, "workspace").map(|ws| {
+        let hash = duckle_duckdb_engine::retry::pipeline_hash(&doc);
+        let run_id = duckle_duckdb_engine::retry::new_run_id(&name, "mcp");
+        duckle_duckdb_engine::retry::begin(
+            std::path::Path::new(ws),
+            &run_id,
+            "mcp",
+            &name,
+            arg_str(args, "path").unwrap_or("(inline)"),
+            &hash,
+            None,
+        )
+    });
     // Stopping at a node is the point of asking: an agent changing one step should not
     // have to run everything after it, least of all the sinks, to see what it did.
+    // #259: the engine logs under the id the receipt was written with, so a
+    // run's log lines join to its receipt and its history record.
+    let engine = match &receipt {
+        Some(r) => engine.with_run_id(&r.run_id),
+        None => engine,
+    };
     let result = match arg_str(args, "target") {
         Some(t) => engine.execute_pipeline_with_events(&doc, Some(t), Some(&name), |_| {}),
         None => engine.execute_pipeline_named(&doc, &name),
     };
+    if let (Some(r), Some(ws)) = (receipt, arg_str(args, "workspace")) {
+        duckle_duckdb_engine::retry::finish(
+            std::path::Path::new(ws),
+            r,
+            &result.status,
+            duckle_duckdb_engine::retry::nodes_of(&result),
+        );
+    }
 
     let mut out = serde_json::to_value(&result).map_err(|e| e.to_string())?;
     // Cap preview rows so the response stays small.
@@ -920,6 +1450,87 @@ fn t_read_pipeline(args: &Value) -> Result<Value, String> {
     let path = arg_str(args, "path").ok_or("missing 'path'")?;
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// Backfill over MCP, so an agent can inspect and replay without a GUI.
+///
+/// All three go through `duckle_duckdb_engine::watermark`, the same functions
+/// the desktop panel, the CLI and the HTTP API use - including the guard that
+/// refuses a write which would replace a different kind of state. One
+/// implementation, so an agent cannot reach a path the other surfaces block.
+fn t_backfill_list(args: &Value) -> Result<Value, String> {
+    let (ws, name) = backfill_target(args)?;
+    let entries = duckle_duckdb_engine::watermark::list(&ws, &name);
+    Ok(json!({
+        "pipeline": name,
+        "entries": serde_json::to_value(&entries).unwrap_or(json!([])),
+    }))
+}
+
+fn t_backfill_set(args: &Value) -> Result<Value, String> {
+    use duckle_duckdb_engine::watermark as wm;
+    let (ws, name) = backfill_target(args)?;
+    let node = arg_str(args, "nodeId").ok_or("missing 'nodeId'")?;
+    let snapshot = args.get("snapshotId").and_then(|v| v.as_u64());
+    let value = arg_str(args, "value");
+    match (value, snapshot) {
+        (Some(_), Some(_)) => Err("give 'value' or 'snapshotId', not both".into()),
+        (Some(v), None) => wm::set_incremental(&ws, &name, node, v, arg_str(args, "valueType"))
+            .map(|()| json!({ "ok": true, "node": node, "value": v }))
+            .map_err(|e| e.to_string()),
+        (None, Some(id)) => wm::set_snapshot(&ws, &name, node, id)
+            .map(|()| json!({ "ok": true, "node": node, "snapshotId": id }))
+            .map_err(|e| e.to_string()),
+        (None, None) => Err("provide 'value' or 'snapshotId'".into()),
+    }
+}
+
+fn t_backfill_clear(args: &Value) -> Result<Value, String> {
+    let (ws, name) = backfill_target(args)?;
+    let node = arg_str(args, "nodeId").ok_or("missing 'nodeId'")?;
+    duckle_duckdb_engine::watermark::clear(&ws, &name, node)
+        .map(|()| json!({ "ok": true, "cleared": node }))
+        .map_err(|e| e.to_string())
+}
+
+/// #281: operating the anomaly gate over MCP, so an agent that is helping an
+/// operator investigate can also see what "normal" currently means - and, when
+/// the source really did change, re-base it through the same guarded path the
+/// CLI and the panel use rather than a private one.
+fn t_baseline_list(args: &Value) -> Result<Value, String> {
+    let ws = arg_str(args, "workspace").ok_or("missing 'workspace'")?;
+    let rows = duckle_duckdb_engine::baseline::list(std::path::Path::new(ws));
+    Ok(json!({ "baselines": serde_json::to_value(&rows).unwrap_or(json!([])) }))
+}
+
+fn t_baseline_inspect(args: &Value) -> Result<Value, String> {
+    let (ws, name) = backfill_target(args)?;
+    let node = arg_str(args, "nodeId").ok_or("missing 'nodeId'")?;
+    let view = duckle_duckdb_engine::baseline::inspect(&ws, &name, node);
+    serde_json::to_value(&view).map_err(|e| e.to_string())
+}
+
+fn t_baseline_accept(args: &Value) -> Result<Value, String> {
+    let (ws, name) = backfill_target(args)?;
+    let node = arg_str(args, "nodeId").ok_or("missing 'nodeId'")?;
+    let history = args.get("history").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let after = duckle_duckdb_engine::baseline::accept(&ws, &name, node, history)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(&after).map_err(|e| e.to_string())
+}
+
+fn t_baseline_clear(args: &Value) -> Result<Value, String> {
+    let (ws, name) = backfill_target(args)?;
+    let node = arg_str(args, "nodeId").ok_or("missing 'nodeId'")?;
+    duckle_duckdb_engine::baseline::clear(&ws, &name, node)
+        .map(|dropped| json!({ "ok": true, "dropped": dropped }))
+        .map_err(|e| e.to_string())
+}
+
+fn backfill_target(args: &Value) -> Result<(PathBuf, String), String> {
+    let ws = arg_str(args, "workspace").ok_or("missing 'workspace'")?;
+    let name = arg_str(args, "pipelineName").ok_or("missing 'pipelineName'")?;
+    Ok((PathBuf::from(ws), name.to_string()))
 }
 
 fn t_read_run_logs(args: &Value) -> Result<Value, String> {
@@ -1390,6 +2001,139 @@ fn sanitize_segment(name: &str) -> String {
 mod verify_tests {
     use super::*;
 
+    /// A vaulted credential must be FETCHED before the document reaches the
+    /// engine.
+    ///
+    /// Every other execution surface - desktop, scheduler, `serve`, `follow` -
+    /// resolves the run-time placeholder tiers first. The MCP server did not,
+    /// so `${VAULT:NAME}` arrived at the connector as that literal text and the
+    /// connection failed with a password that was never fetched. The server's
+    /// own tool instructions tell an agent to write `${ENV:KEY}` rather than a
+    /// literal, so it was advertising a mechanism it did not honour.
+    #[test]
+    fn an_mcp_run_resolves_vault_and_env_placeholders() {
+        #[cfg(windows)]
+        std::env::set_var("DUCKLE_VAULT_COMMAND", "cmd /c echo {name}");
+        #[cfg(not(windows))]
+        std::env::set_var("DUCKLE_VAULT_COMMAND", "echo {name}");
+        std::env::set_var("DUCKLE_MCP_TEST_TOKEN", "from-env");
+
+        let v = json!({
+            "nodes": [{
+                "id": "n",
+                "position": { "x": 0, "y": 0 },
+                "data": {
+                    "label": "n",
+                    "componentId": "src.inline",
+                    "properties": { "columns": [
+                        { "key": "pw",  "value": "${VAULT:ORDERS}" },
+                        { "key": "tok", "value": "${ENV:DUCKLE_MCP_TEST_TOKEN}" }
+                    ]}
+                }
+            }],
+            "edges": []
+        });
+        let doc = prepare_run_doc(&v, None).expect("prepare");
+        let props = doc.nodes[0].data.properties.clone().expect("properties");
+
+        std::env::remove_var("DUCKLE_VAULT_COMMAND");
+        std::env::remove_var("DUCKLE_MCP_TEST_TOKEN");
+
+        assert_eq!(
+            props["columns"][0]["value"], "ORDERS",
+            "a vaulted credential must be fetched, not handed to the connector \
+             as the placeholder text"
+        );
+        assert_eq!(
+            props["columns"][1]["value"], "from-env",
+            "and the ${{ENV:...}} tier the server's own instructions advertise \
+             must resolve too"
+        );
+    }
+
+    /// A saved connection must be expanded before the run, on this surface too.
+    ///
+    /// The scheduler, `serve` and the desktop app all resolve `connectionRef`
+    /// into the fields the engine reads. The MCP server did not, so a pipeline
+    /// an agent wrote against a saved connection reached the engine with no
+    /// host and no credential at all - the reference was simply left sitting
+    /// there as a property nothing consumes.
+    #[test]
+    fn an_mcp_run_expands_a_saved_connection_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("connections")).unwrap();
+        std::fs::write(
+            ws.join("connections").join("warehouse.json"),
+            r#"{"kind":"postgres","host":"db.internal","port":5432,
+                "database":"sales","username":"reader","password":"pw"}"#,
+        )
+        .unwrap();
+
+        let v = json!({
+            "nodes": [{
+                "id": "n",
+                "position": { "x": 0, "y": 0 },
+                "data": {
+                    "label": "n",
+                    "componentId": "src.postgres",
+                    "properties": { "connectionRef": "warehouse", "tableName": "orders" }
+                }
+            }],
+            "edges": []
+        });
+        let doc = prepare_run_doc(&v, ws.to_str()).expect("prepare");
+        let props = doc.nodes[0].data.properties.clone().expect("properties");
+        assert_eq!(
+            props["host"], "db.internal",
+            "the saved connection has to reach the engine, or the run has no host at all"
+        );
+        assert_eq!(props["database"], "sales");
+    }
+
+    /// A `${workspace}` path has to resolve for an MCP run exactly as it does
+    /// for `duckle-runner --workspace`.
+    ///
+    /// Reported over MCP: `run_pipeline` takes a `workspace` argument, and the
+    /// documented `${workspace}/...` pattern reached DuckDB verbatim -
+    /// `No files found that match the pattern "${workspace}/some/path.parquet"` -
+    /// while the identical pipeline ran from the desktop app and the CLI. The
+    /// CLI resolves it at `main.rs:494`, and `t_schema_drift` / `t_trust_report`
+    /// resolve it in this very file; the tool that actually RUNS a pipeline was
+    /// the one surface that did not.
+    ///
+    /// The cause is the same one the CLI comments on: a file-loaded pipeline
+    /// does not go through the by-id resolver, so nothing else would ever
+    /// substitute it.
+    #[test]
+    fn an_mcp_run_resolves_the_workspace_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let v = json!({
+            "nodes": [{
+                "id": "s",
+                "position": { "x": 0, "y": 0 },
+                "data": {
+                    "label": "s",
+                    "componentId": "src.parquet",
+                    "properties": { "path": "${workspace}/data/orders.parquet" }
+                }
+            }],
+            "edges": []
+        });
+        let doc = prepare_run_doc(&v, ws.to_str()).expect("prepare");
+        let props = doc.nodes[0].data.properties.clone().expect("properties");
+        let path = props["path"].as_str().expect("path is a string");
+        assert!(
+            !path.contains("${workspace}"),
+            "the placeholder reached the engine verbatim, which is the reported IO error: {path}"
+        );
+        assert!(
+            path.ends_with("data/orders.parquet") || path.ends_with("data\\orders.parquet"),
+            "got: {path}"
+        );
+    }
+
     #[test]
     fn structural_risks_clean_pipeline_has_none() {
         let p = json!({
@@ -1702,4 +2446,141 @@ mod verify_tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+}
+
+#[cfg(test)]
+mod capability_tool {
+    use super::*;
+
+    /// #313 criterion 4: CLI *and* MCP can query capabilities. The CLI could;
+    /// an agent could not, and the issue's whole "Agent use" section is about
+    /// not guessing from component names.
+    #[test]
+    fn an_agent_can_ask_which_sources_do_chunked_extraction() {
+        let r = t_component_capabilities(&json!({ "kind": "source", "supports": ["chunking"] }))
+            .expect("the tool answers");
+        let ids: Vec<&str> = r["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .filter_map(|c| c["component"].as_str())
+            .collect();
+        assert!(ids.contains(&"src.postgres"), "{ids:?}");
+        assert!(ids.contains(&"src.oracle"), "{ids:?}");
+        // And it is a filter, not the whole catalog: a CSV source cannot be
+        // chunked and must not be in the answer.
+        assert!(!ids.contains(&"src.csv"), "an unchunkable source was returned: {ids:?}");
+        assert!(r["count"].as_u64().unwrap_or(0) > 0);
+    }
+
+    /// Two capabilities means BOTH, not either - an agent asking for a source
+    /// that does incremental *and* pushdown is narrowing, not widening.
+    #[test]
+    fn several_capabilities_are_required_together() {
+        let one = t_component_capabilities(&json!({ "supports": ["incremental"] })).unwrap();
+        let two = t_component_capabilities(&json!({ "supports": ["incremental", "pushdown"] }))
+            .unwrap();
+        assert!(
+            two["count"].as_u64().unwrap() <= one["count"].as_u64().unwrap(),
+            "asking for more capabilities returned more components"
+        );
+    }
+
+    /// A typo must not read as an answer.
+    #[test]
+    fn an_unknown_capability_matches_nothing() {
+        let r = t_component_capabilities(&json!({ "supports": ["nosuchthing"] })).unwrap();
+        assert_eq!(r["count"].as_u64(), Some(0), "a misspelled capability returned components");
+    }
+
+    #[test]
+    fn one_component_returns_its_whole_record() {
+        let r = t_component_capabilities(&json!({ "component": "src.postgres" })).unwrap();
+        assert_eq!(r["component"].as_str(), Some("src.postgres"));
+        assert_eq!(r["dialect"].as_str(), Some("postgres"));
+        assert!(t_component_capabilities(&json!({ "component": "src.nope" })).is_err());
+    }
+}
+
+#[cfg(test)]
+mod freshness_tool {
+    use super::*;
+
+    fn workspace_with(hours_ago: i64, limit: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("runs")).unwrap();
+        let at = format!("2020-01-01T00:00:0{}Z", hours_ago % 10);
+        std::fs::write(
+            tmp.path().join("runs").join("daily.json"),
+            format!(
+                r#"[{{"at":"{at}","status":"ok","duration_ms":1,"rows":1,"node_count":1,
+                      "trigger":"scheduled",
+                      "assets":[{{"id":"/lake/orders","direction":"write","rows":1}}]}}]"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("owners.json"),
+            format!(r#"{{"assets":[{{"match":"/lake/orders","owner":"data-eng","maximumAge":"{limit}"}}]}}"#),
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// #304's three questions, which are one verdict: which assets are stale,
+    /// why, and when each was last successfully materialized.
+    #[test]
+    fn an_agent_can_ask_which_assets_are_stale_and_why() {
+        // Written in 2020 against a 36h limit, so it is long past.
+        let ws = workspace_with(1, "36h");
+        let r = t_asset_freshness(&json!({ "workspace": ws.path().to_str().unwrap() }))
+            .expect("the tool answers");
+        assert!(r["stale"].as_u64().unwrap_or(0) >= 1, "{r}");
+
+        let a = r["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["asset"] == "/lake/orders")
+            .expect("the asset");
+        // Why, and when - not just that it is stale.
+        assert_eq!(a["state"], "stale");
+        assert_eq!(a["maximumAge"], "36h");
+        assert!(a["lastWrittenAt"].is_string(), "no last-materialized time: {a}");
+        assert!(a["ageSeconds"].as_i64().unwrap_or(0) > 0);
+        assert_eq!(a["owner"], "data-eng", "a stale asset needs someone to tell");
+    }
+
+    /// An asset nobody declared a limit for is `unknown`, never a reassuring
+    /// `fresh` - the distinction the whole module exists to keep.
+    #[test]
+    fn an_undeclared_asset_is_unknown_not_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("runs")).unwrap();
+        std::fs::write(
+            tmp.path().join("runs").join("daily.json"),
+            r#"[{"at":"2020-01-01T00:00:00Z","status":"ok","duration_ms":1,"rows":1,"node_count":1,
+                 "trigger":"manual","assets":[{"id":"/lake/x","direction":"write","rows":1}]}]"#,
+        )
+        .unwrap();
+        let r = t_asset_freshness(&json!({ "workspace": tmp.path().to_str().unwrap() })).unwrap();
+        let a = &r["assets"].as_array().unwrap()[0];
+        assert_eq!(a["state"], "unknown");
+        assert_eq!(r["stale"].as_u64(), Some(0));
+    }
+
+    /// And it does not move the state machine the alerting depends on: asking
+    /// twice must not turn a stale asset into a recovery.
+    #[test]
+    fn asking_does_not_change_anything() {
+        let ws = workspace_with(1, "36h");
+        let first = t_asset_freshness(&json!({ "workspace": ws.path().to_str().unwrap() })).unwrap();
+        let again = t_asset_freshness(&json!({ "workspace": ws.path().to_str().unwrap() })).unwrap();
+        assert_eq!(first["stale"], again["stale"]);
+        assert!(
+            !ws.path().join(".duckle").join("freshness.json").exists(),
+            "reading freshness recorded a verdict, which would make an agent's question \
+             change what the next alert says"
+        );
+    }
 }

@@ -6,7 +6,7 @@
 //! are due, and fires each as a non-blocking spawn that calls into the
 //! shared `DuckdbEngine`.
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use cron::Schedule as CronSchedule;
 use duckle_duckdb_engine::{
     append_run_record, plans, runlock, schedules, DuckdbEngine, RunRecord, RunResult,
@@ -184,7 +184,53 @@ fn run_one_blocking(
     duckle_duckdb_engine::context::apply_env(&mut pipeline);
     duckle_duckdb_engine::context::apply_vault(&mut pipeline);
     // A fresh cancel scope per pipeline, so one step of a plan cannot cancel the next.
-    Ok(engine.for_new_run().execute_pipeline_named(&pipeline, pipeline_id))
+    Ok(run_recorded(
+        engine,
+        workspace,
+        &pipeline,
+        pipeline_id,
+        "plan",
+        &workspace.join("pipelines").join(format!("{pipeline_id}.json")).display().to_string(),
+    ))
+}
+
+/// #259: run a pipeline and record its identity, before and after.
+///
+/// Both scheduler paths go through here, so a scheduled run and a plan step are
+/// addressable the same way as a `duckle-runner` run. Before this, neither
+/// recorded a run id at all - `execute_one` hard-codes `None` - so "which run
+/// was that?" had no answer for anything the scheduler started.
+fn run_recorded(
+    engine: &DuckdbEngine,
+    workspace: &Path,
+    pipeline: &duckle_duckdb_engine::PipelineDoc,
+    pipeline_id: &str,
+    trigger: &str,
+    pipeline_path: &str,
+) -> RunResult {
+    let hash = duckle_duckdb_engine::retry::pipeline_hash(pipeline);
+    let run_id = duckle_duckdb_engine::retry::new_run_id(pipeline_id, trigger);
+    let receipt = duckle_duckdb_engine::retry::begin(
+        workspace,
+        &run_id,
+        trigger,
+        pipeline_id,
+        pipeline_path,
+        &hash,
+        None,
+    );
+    // #259: same id in the log as in the receipt.
+    let result = engine
+        .for_new_run()
+        .with_run_id(&receipt.run_id)
+        .execute_pipeline_named(pipeline, pipeline_id);
+    duckle_duckdb_engine::retry::finish(
+        workspace,
+        receipt,
+        &result.status,
+        duckle_duckdb_engine::retry::nodes_of(&result),
+    );
+    result
 }
 
 /// A run that never started, as a result.
@@ -194,12 +240,18 @@ fn run_one_blocking(
 /// of the gap where a broken schedule reads as a schedule that never fired.
 fn failed_run(started: DateTime<Utc>, error: &str) -> RunResult {
     RunResult {
+        cache_keys: Default::default(),
         status: "error".into(),
         duration_ms: Utc::now().signed_duration_since(started).num_milliseconds().max(0) as u64,
         nodes: Default::default(),
         preview: Vec::new(),
         category: Some(duckle_duckdb_engine::error_category::categorize_error(error).to_string()),
         error: Some(error.to_string()),
+    unchanged: false,
+    incomplete: false,
+    incomplete_reason: None,
+    artifacts: Vec::new(),
+    artifacts_truncated: false,
     }
 }
 
@@ -329,11 +381,9 @@ impl Scheduler {
     }
 
     pub fn upsert(&self, mut schedule: Schedule) -> Result<Schedule, String> {
+        validate_schedule(&schedule)?;
         match &schedule.kind {
-            ScheduleKind::Cron { expr } => {
-                CronSchedule::from_str(expr)
-                    .map_err(|e| format!("Invalid cron expression: {}", e))?;
-            }
+            ScheduleKind::Cron { .. } => {}
             ScheduleKind::Interval { seconds } => {
                 if *seconds < 1 {
                     return Err("Interval must be at least 1 second".into());
@@ -428,7 +478,56 @@ impl Scheduler {
     /// Updates last-run bookkeeping on completion.
     ///
     /// That is one pipeline for most schedules and a whole plan for one that names one.
+    /// Run a schedule now, taking the run lock first.
+    ///
+    /// The public entry point, which is what "Run now" in the desktop app calls.
+    /// It claims because a manual fire is a run of the pipeline like any other:
+    /// pressing the button while this scheduler's own tick, `duckle-runner
+    /// serve`'s scheduler, or a follower is running the same pipeline used to
+    /// start a second one beside it, and two runs of one pipeline write the same
+    /// sink and advance the same `xf.incremental` watermark.
+    ///
+    /// The claim lives HERE rather than inside the body because the scheduled
+    /// paths take it before they call through and hold it for the duration - the
+    /// lock is the operating system's and is not reentrant, so claiming it again
+    /// underneath them would refuse every scheduled run. Which way round it goes
+    /// is therefore load-bearing: the unlocked body is private, so a new caller
+    /// gets the safe one by default.
     pub async fn run_now(&self, id: &str) -> Result<RunResult, String> {
+        let (workspace, key) = {
+            let g = self.inner.lock().expect("scheduler poisoned");
+            let s = g
+                .schedules
+                .iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| "Schedule not found".to_string())?;
+            (g.workspace_path.clone(), lock_key(s).map(str::to_string))
+        };
+        // No key means a plan, which locks each of its pipelines itself as it
+        // reaches them. See `lock_key`.
+        let _claim = match &key {
+            None => None,
+            Some(pipeline_id) => match claim_run(workspace.as_deref(), pipeline_id) {
+                Claim::Ours(lock) => lock,
+                Claim::Taken => {
+                    return Err(format!(
+                        "{pipeline_id} is already running in this workspace, so this run was \
+                         refused rather than started beside it. Two runs of one pipeline write \
+                         the same sink and advance the same saved state. Wait for it to finish, \
+                         or run it somewhere else."
+                    ))
+                }
+                Claim::Unusable(why) => {
+                    return Err(format!("cannot take a run lock for {pipeline_id}: {why}"))
+                }
+            },
+        };
+        self.run_now_claimed(id).await
+    }
+
+    /// The body of [`run_now`](Self::run_now), for a caller that already holds
+    /// the run lock. Private: see the note there on why the order matters.
+    async fn run_now_claimed(&self, id: &str) -> Result<RunResult, String> {
         let (workspace, sched) = {
             let g = self.inner.lock().expect("scheduler poisoned");
             let s = g
@@ -469,7 +568,8 @@ impl Scheduler {
         // Resolve ${ENV:NAME} from the process environment so scheduled runs see
         // OS env vars just like the headless runner does (issue #137).
         duckle_duckdb_engine::context::apply_env(&mut pipeline);
-    duckle_duckdb_engine::context::apply_vault(&mut pipeline);
+        // Fetch anything held in a vault (CyberArk and the like) for this run.
+        duckle_duckdb_engine::context::apply_vault(&mut pipeline);
         // A fresh per-run cancel scope so concurrent scheduled runs (and the
         // interactive run) don't share or reset each other's cancellation.
         let engine = self.engine.for_new_run();
@@ -477,10 +577,33 @@ impl Scheduler {
         // Log scheduled runs under the pipeline id (the scheduler has no
         // friendly name handy) so they still land in the per-pipeline log.
         let log_name = pipeline_id.clone();
+        // #259: identity before work, on the scheduler too. A scheduled run
+        // that dies with the server used to leave nothing addressable at all.
+        let hash = duckle_duckdb_engine::retry::pipeline_hash(&pipeline);
+        let run_id = duckle_duckdb_engine::retry::new_run_id(&pipeline_id, "scheduled");
+        let receipt = duckle_duckdb_engine::retry::begin(
+            &workspace,
+            &run_id,
+            "scheduled",
+            &pipeline_id,
+            &workspace
+                .join("pipelines")
+                .join(format!("{pipeline_id}.json"))
+                .display()
+                .to_string(),
+            &hash,
+            None,
+        );
         let result =
             tokio::task::spawn_blocking(move || engine.execute_pipeline_named(&pipeline, &log_name))
                 .await
                 .map_err(|e| e.to_string())?;
+        duckle_duckdb_engine::retry::finish(
+            &workspace,
+            receipt,
+            &result.status,
+            duckle_duckdb_engine::retry::nodes_of(&result),
+        );
         self.record_run(id, started, &result);
         Ok(result)
     }
@@ -515,7 +638,14 @@ impl Scheduler {
             .collect();
         let elapsed = Utc::now().signed_duration_since(started).num_milliseconds().max(0) as u64;
         Ok(RunResult {
+            cache_keys: Default::default(),
             status: if run.failed() { "error".into() } else { "success".into() },
+            // A plan rollup is not a source poll; it always did work or failed.
+            unchanged: false,
+            incomplete: false,
+            incomplete_reason: None,
+            artifacts: Vec::new(),
+            artifacts_truncated: false,
             duration_ms: elapsed,
             nodes: Default::default(),
             preview: Vec::new(),
@@ -628,7 +758,10 @@ impl Scheduler {
     /// where someone would go looking for the reason.
     async fn fire_and_record(&self, id: &str, why: &str) {
         let started = Utc::now();
-        let Err(e) = self.run_now(id).await else {
+        // The caller already holds the run lock for this pipeline and the
+        // lock is not reentrant, so this takes the body rather than the public
+        // entry point.
+        let Err(e) = self.run_now_claimed(id).await else {
             return;
         };
         warn!("{} run {} failed: {}", why, id, e);
@@ -636,6 +769,7 @@ impl Scheduler {
         // exactly what an operator needs to see against the schedule.
         let elapsed = Utc::now().signed_duration_since(started).num_milliseconds().max(0) as u64;
         let result = RunResult {
+            cache_keys: Default::default(),
             status: "error".into(),
             duration_ms: elapsed,
             nodes: Default::default(),
@@ -644,6 +778,11 @@ impl Scheduler {
                 duckle_duckdb_engine::error_category::categorize_error(&e).to_string(),
             ),
             error: Some(e),
+            unchanged: false,
+            incomplete: false,
+            incomplete_reason: None,
+            artifacts: Vec::new(),
+            artifacts_truncated: false,
         };
         self.record_run(id, started, &result);
     }
@@ -832,13 +971,38 @@ impl Scheduler {
         for (id, pipeline_id) in due {
             let me = self.clone();
             let workspace = workspace.clone();
-            let permit = run_permits().clone();
+            // #289: the pool this pipeline asks for, resolved against what the
+            // workspace (and any server ceiling) actually defines.
+            // A scheduler with no workspace path cannot read a pipeline to
+            // find its pool, so it stays on the default - which is exactly the
+            // behaviour it had before pools existed.
+            // #289: a Plan takes NO workload slot.
+            //
+            // Plan orchestration is a supervisor: it does almost nothing itself
+            // and spends its time waiting for children, each of which acquires
+            // the pool its own pipeline asks for. Holding a slot while waiting
+            // for a child that needs the same pool is a deadlock the size of
+            // the pool - with `heavy: 1`, a Plan whose first step is a heavy
+            // pipeline would wait forever for the permit it is itself holding.
+            //
+            // A scheduler with no workspace path cannot read a pipeline to find
+            // its pool, so it stays on the default - exactly the behaviour it
+            // had before pools existed.
+            let permit = match (workspace.as_deref(), pipeline_id.as_deref()) {
+                (Some(ws), Some(id)) => Some(pool_permits(ws, &pool_of(ws, id))),
+                // No pipeline id means a Plan.
+                (_, None) => None,
+                _ => Some(run_permits().clone()),
+            };
             tokio::spawn(async move {
                 // Hold a permit for the whole run. Every schedule that comes due
                 // in the same tick used to fire at once, so ten due at midnight
                 // meant ten pipelines each sized for the whole machine. The
                 // permit bounds that; the run still happens, it just queues.
-                let _slot = permit.acquire_owned().await;
+                let _slot = match permit {
+                    Some(p) => Some(p.acquire_owned().await),
+                    None => None,
+                };
                 // The semaphore above bounds this process only. Skipping on a
                 // clash rather than queueing is deliberate: the next tick comes
                 // round anyway, and a backlog of identical overdue runs helps
@@ -897,6 +1061,50 @@ fn run_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     })
 }
 
+/// #289: the semaphore for one named pool.
+///
+/// The numbers come from [`duckle_duckdb_engine::pools`], the same definition
+/// the runner's gate reads. Two limiters that each parsed their own config is
+/// how the two schedulers came to disagree about time zones, and a pool that
+/// means 8 here and 1 there is worth less than no pool at all.
+///
+/// The default pool keeps [`run_permits`] - a generous 8 rather than 1 -
+/// because firing due schedules concurrently is long-standing behaviour here
+/// and changing it silently would be a regression dressed as a feature.
+fn pool_permits(workspace: &std::path::Path, pool: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
+    use std::collections::HashMap;
+    if pool == duckle_duckdb_engine::pools::DEFAULT {
+        return run_permits().clone();
+    }
+    static POOLS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    let map = POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(pool.to_string())
+        .or_insert_with(|| {
+            let n = duckle_duckdb_engine::pools::Pools::load(workspace).limit(pool);
+            std::sync::Arc::new(tokio::sync::Semaphore::new(n))
+        })
+        .clone()
+}
+
+/// Which pool a scheduled pipeline belongs to.
+///
+/// Reads the document, because the pool is a property of the pipeline rather
+/// than of the schedule - a pipeline moved between pools should not need every
+/// schedule that fires it edited too.
+fn pool_of(workspace: &std::path::Path, pipeline_id: &str) -> String {
+    let pools = duckle_duckdb_engine::pools::Pools::load(workspace);
+    let path = workspace.join("pipelines").join(format!("{pipeline_id}.json"));
+    let asked = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .map(|v| duckle_duckdb_engine::pools::requested(&v))
+        .unwrap_or_default();
+    pools.resolve(&asked)
+}
+
 /// Advance next_run_at to the next occurrence strictly after `now`.
 /// Used to "claim" a due schedule at dispatch so the 15s ticker can't
 /// re-fire a still-running schedule. Unlike compute_next_run (which for
@@ -905,11 +1113,10 @@ fn run_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 /// future time.
 fn claim_next_run(s: &mut Schedule, now: DateTime<Utc>) {
     s.next_run_at = match &s.kind {
-        // Evaluate in local time (see parse_cron) and store the resulting
-        // absolute instant as UTC.
-        ScheduleKind::Cron { expr } => parse_cron(expr)
-            .and_then(|sched| sched.after(&now.with_timezone(&Local)).next())
-            .map(|dt| dt.with_timezone(&Utc)),
+        // #318: read in the schedule's own zone when it names one, otherwise
+        // the machine's, and store the resulting absolute instant as UTC. Both
+        // schedulers call the same evaluator so they cannot drift apart again.
+        ScheduleKind::Cron { expr } => cron_next(expr, s.timezone.as_deref(), &s.exclude, now),
         ScheduleKind::Interval { seconds } => {
             Some(now + chrono::Duration::seconds(*seconds as i64))
         }
@@ -923,9 +1130,7 @@ fn compute_next_run(s: &mut Schedule) {
         return;
     }
     s.next_run_at = match &s.kind {
-        ScheduleKind::Cron { expr } => parse_cron(expr)
-            .and_then(|sched| sched.upcoming(Local).next())
-            .map(|dt| dt.with_timezone(&Utc)),
+        ScheduleKind::Cron { expr } => cron_next(expr, s.timezone.as_deref(), &s.exclude, Utc::now()),
         ScheduleKind::Interval { seconds } => {
             let base = s.last_run_at.unwrap_or_else(Utc::now);
             Some(base + chrono::Duration::seconds(*seconds as i64))
@@ -935,32 +1140,68 @@ fn compute_next_run(s: &mut Schedule) {
     };
 }
 
-/// The `cron` crate expects a 6- or 7-field expression (seconds first). Accept a
-/// standard 5-field cron ("min hour dom mon dow") by prepending a "0 " seconds
-/// field, and pass 6/7-field expressions through. Without this a hand-edited
-/// 5-field expression parsed to None and the schedule silently never fired.
-/// Mirrors normalize_cron in duckle-runner's serve.rs.
-fn normalize_cron(expr: &str) -> Option<String> {
-    match expr.split_whitespace().count() {
-        5 => Some(format!("0 {}", expr)),
-        6 | 7 => Some(expr.to_string()),
-        _ => None,
+/// What makes a schedule saveable.
+///
+/// Split out so saving and evaluating cannot disagree, which they did: this
+/// validated with a bare `CronSchedule::from_str`, so a five-field expression
+/// was REFUSED on save while `compute_next_run` normalised it and scheduled it
+/// happily. A schedule you cannot save but which would have worked is the same
+/// class of bug as one you can save that never fires.
+fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
+    // #318: an unknown zone is refused here rather than at fire time, so a typo
+    // is a save error in front of the person who made it, not a job that
+    // quietly runs on UTC in a container.
+    duckle_duckdb_engine::cronzone::resolve_zone(schedule.timezone.as_deref())?;
+    schedule.exclude.validate()?;
+    if let ScheduleKind::Cron { expr } = &schedule.kind {
+        let normalized = duckle_duckdb_engine::cronzone::normalize_cron(expr).ok_or_else(|| {
+            format!("Invalid cron expression: {expr:?} does not have 5, 6 or 7 fields")
+        })?;
+        CronSchedule::from_str(&normalized)
+            .map_err(|e| format!("Invalid cron expression: {}", e))?;
+    }
+    Ok(())
+}
+
+/// The next firing of a cron expression, in the schedule's zone (#318).
+///
+/// A bad expression or an unknown zone yields None - the same "this schedule
+/// has no next run" the old code produced for an unparseable expression - but
+/// the reason is said out loud, because a schedule that silently never fires is
+/// the failure mode this area already had once.
+fn cron_next(
+    expr: &str,
+    timezone: Option<&str>,
+    exclude: &duckle_duckdb_engine::cronzone::Exclusions,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let zone = match duckle_duckdb_engine::cronzone::resolve_zone(timezone) {
+        Ok(z) => z,
+        Err(e) => {
+            eprintln!("duckle: schedule has an unusable time zone: {e}");
+            return None;
+        }
+    };
+    match duckle_duckdb_engine::cronzone::next_after_excluding(expr, &zone, exclude, now) {
+        Ok((occ, skipped)) => {
+            for s in skipped {
+                // A civil time that does not exist has not been missed by the
+                // scheduler - the day was short. Said once, where an operator
+                // looking for "why did 02:30 not run" will find it.
+                eprintln!("duckle: schedule skipped an occurrence: {s:?}");
+            }
+            occ.map(|o| o.at)
+        }
+        Err(e) => {
+            eprintln!("duckle: schedule cron is unusable: {e}");
+            None
+        }
     }
 }
 
-/// Parse a cron expression for schedule evaluation (issue #194).
-///
-/// Cron expressions are evaluated in the machine's LOCAL time zone, so
-/// "0 0 3 * * *" means 3am where the user is, not 3am UTC. This matches how
-/// the UI renders next-run times (toLocaleString) and how the web console has
-/// behaved since #132. The computed instant is still stored as UTC.
-fn parse_cron(expr: &str) -> Option<CronSchedule> {
-    normalize_cron(expr).and_then(|e| CronSchedule::from_str(&e).ok())
-}
-
-
 #[cfg(test)]
 mod tests {
+    use chrono::Local;
     use super::*;
 
     #[test]
@@ -974,6 +1215,10 @@ mod tests {
             kind: ScheduleKind::Cron {
                 expr: "0 * * * * *".into(),
             },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             last_run_at: None,
             last_run_status: None,
             last_run_duration_ms: None,
@@ -1000,6 +1245,10 @@ mod tests {
             kind: ScheduleKind::Cron {
                 expr: "0 0 3 * * *".into(),
             },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             last_run_at: None,
             last_run_status: None,
             last_run_duration_ms: None,
@@ -1027,6 +1276,10 @@ mod tests {
             kind: ScheduleKind::Cron {
                 expr: "0 0 3 * * *".into(),
             },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             last_run_at: None,
             last_run_status: None,
             last_run_duration_ms: None,
@@ -1052,6 +1305,10 @@ mod tests {
             kind: ScheduleKind::Cron {
                 expr: "0 3 * * *".into(),
             },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             last_run_at: None,
             last_run_status: None,
             last_run_duration_ms: None,
@@ -1065,7 +1322,87 @@ mod tests {
     }
 
     #[test]
+    fn a_five_field_cron_can_be_saved_as_well_as_scheduled() {
+        // Saving used to validate with a bare CronSchedule::from_str, which
+        // refuses a five-field expression, while compute_next_run normalised it
+        // and scheduled it. So an expression that worked could not be saved.
+        let s = Schedule {
+            id: "t".into(),
+            pipeline_id: "p1".into(),
+            plan_id: None,
+            name: "daily".into(),
+            enabled: true,
+            kind: ScheduleKind::Cron { expr: "0 3 * * *".into() },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_duration_ms: None,
+            last_run_error: None,
+            next_run_at: None,
+        };
+        assert!(validate_schedule(&s).is_ok(), "{:?}", validate_schedule(&s));
+    }
+
+    #[test]
+    fn an_unknown_time_zone_is_refused_on_save() {
+        let mut s = Schedule {
+            id: "t".into(),
+            pipeline_id: "p1".into(),
+            plan_id: None,
+            name: "daily".into(),
+            enabled: true,
+            kind: ScheduleKind::Cron { expr: "0 0 3 * * *".into() },
+            timezone: Some("Europe/Brussel".into()),
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_duration_ms: None,
+            last_run_error: None,
+            next_run_at: None,
+        };
+        let e = validate_schedule(&s).unwrap_err();
+        assert!(e.contains("Europe/Brussel"), "must name the typo: {e}");
+        s.timezone = Some("Europe/Brussels".into());
+        assert!(validate_schedule(&s).is_ok(), "the real zone must be accepted");
+    }
+
+    /// The point of #318: the instant follows the named zone, not the host.
+    #[test]
+    fn a_zoned_cron_fires_on_that_zones_clock() {
+        use chrono::TimeZone;
+        let mut s = Schedule {
+            id: "t".into(),
+            pipeline_id: "p1".into(),
+            plan_id: None,
+            name: "brussels 3am".into(),
+            enabled: true,
+            kind: ScheduleKind::Cron { expr: "0 0 3 * * *".into() },
+            timezone: Some("Europe/Brussels".into()),
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_duration_ms: None,
+            last_run_error: None,
+            next_run_at: None,
+        };
+        claim_next_run(&mut s, chrono::Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap());
+        assert_eq!(
+            s.next_run_at.expect("scheduled"),
+            chrono::Utc.with_ymd_and_hms(2026, 1, 11, 2, 0, 0).unwrap(),
+            "03:00 Brussels in January is 02:00 UTC, wherever this runs"
+        );
+    }
+
+    #[test]
     fn normalize_cron_rejects_bad_field_counts() {
+        use duckle_duckdb_engine::cronzone::normalize_cron;
         assert_eq!(normalize_cron("0 3 * * *").as_deref(), Some("0 0 3 * * *"));
         assert_eq!(normalize_cron("0 0 3 * * *").as_deref(), Some("0 0 3 * * *"));
         assert!(normalize_cron("* * *").is_none());
@@ -1082,6 +1419,10 @@ mod tests {
             name: "every 5".into(),
             enabled: true,
             kind: ScheduleKind::Interval { seconds: 300 },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             last_run_at: None,
             last_run_status: None,
             last_run_duration_ms: None,
@@ -1104,6 +1445,10 @@ mod tests {
             name: "off".into(),
             enabled: false,
             kind: ScheduleKind::Interval { seconds: 60 },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             last_run_at: None,
             last_run_status: None,
             last_run_duration_ms: None,
@@ -1139,6 +1484,10 @@ mod tests {
                 enabled: true,
                 // Six fields, so the leading one is seconds: due almost at once.
                 kind: ScheduleKind::Cron { expr: "* * * * * *".into() },
+                timezone: None,
+                exclude: Default::default(),
+                misfire: Default::default(),
+                catchup: Default::default(),
                 last_run_at: None,
                 last_run_status: None,
                 last_run_duration_ms: None,
@@ -1232,6 +1581,10 @@ mod tests {
                 name: "nightly".into(),
                 enabled: true,
                 kind: ScheduleKind::Interval { seconds: 3600 },
+                timezone: None,
+                exclude: Default::default(),
+                misfire: Default::default(),
+                catchup: Default::default(),
                 last_run_at: None,
                 last_run_status: None,
                 last_run_duration_ms: None,
@@ -1272,6 +1625,10 @@ mod tests {
                 name: "nightly".into(),
                 enabled: true,
                 kind: ScheduleKind::Interval { seconds: 3600 },
+                timezone: None,
+                exclude: Default::default(),
+                misfire: Default::default(),
+                catchup: Default::default(),
                 last_run_at: None,
                 last_run_status: None,
                 last_run_duration_ms: None,
@@ -1329,6 +1686,10 @@ mod tests {
             name: "nightly".into(),
             enabled: true,
             kind: ScheduleKind::Interval { seconds: 3600 },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             last_run_at: None,
             last_run_status: None,
             last_run_duration_ms: None,
@@ -1395,6 +1756,10 @@ mod tests {
                 name: "nightly".into(),
                 enabled: true,
                 kind: ScheduleKind::Interval { seconds: 3600 },
+                timezone: None,
+                exclude: Default::default(),
+                misfire: Default::default(),
+                catchup: Default::default(),
                 last_run_at: None,
                 last_run_status: None,
                 last_run_duration_ms: None,
@@ -1445,6 +1810,10 @@ mod tests {
             name: "nightly".into(),
             enabled: true,
             kind: ScheduleKind::Interval { seconds: 3600 },
+            timezone: None,
+            exclude: Default::default(),
+            misfire: Default::default(),
+            catchup: Default::default(),
             last_run_at: None,
             last_run_status: None,
             last_run_duration_ms: None,

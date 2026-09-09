@@ -5,7 +5,7 @@ import { connectionPlaceholder, useConnectionSupplied } from './useConnectionSup
 type Props<T> = {
     field: Field;
     value: T | undefined;
-    onChange: (v: T) => void;
+    onChange: (v: T | undefined) => void;
 };
 
 // A field holds a secret when explicitly flagged, or by the long-standing
@@ -70,6 +70,11 @@ export function TextareaField({ field, value, onChange }: Props<string>) {
     );
 }
 
+// An emptied box means "not set", not zero. Sending 0 made the field
+// unclearable - `value ?? ''` re-rendered it as "0" the moment it was
+// emptied - and put a 0 in the pipeline that the user never typed. The
+// engine reads these with `.filter(|n| *n > 0)` almost everywhere, which
+// says the same thing: 0 is not a value, it is the absence of one.
 export function NumberField({ field, value, onChange }: Props<number>) {
     const supplied = useConnectionSupplied(field.key);
     const ph = connectionPlaceholder(supplied, field.placeholder, false);
@@ -80,8 +85,9 @@ export function NumberField({ field, value, onChange }: Props<number>) {
             value={value ?? ''}
             placeholder={ph}
             onChange={e => {
-                const n = e.target.value === '' ? NaN : Number(e.target.value);
-                onChange(Number.isFinite(n) ? n : 0);
+                if (e.target.value === '') return onChange(undefined);
+                const n = Number(e.target.value);
+                onChange(Number.isFinite(n) ? n : undefined);
             }}
         />
     );
@@ -98,8 +104,9 @@ export function IntegerField({ field, value, onChange }: Props<number>) {
             value={value ?? ''}
             placeholder={ph}
             onChange={e => {
-                const n = e.target.value === '' ? NaN : parseInt(e.target.value, 10);
-                onChange(Number.isFinite(n) ? n : 0);
+                if (e.target.value === '') return onChange(undefined);
+                const n = parseInt(e.target.value, 10);
+                onChange(Number.isFinite(n) ? n : undefined);
             }}
         />
     );
@@ -119,6 +126,31 @@ export function BoolField({ field, value, onChange }: Props<boolean>) {
 }
 
 export function SelectField({ field, value, onChange }: Props<string>) {
+    // A plain select cannot express "one of these, or something else", and some
+    // of these values are not a closed set: a delimiter can be any character a
+    // system chose to write, and DuckDB accepts over a thousand encoding names.
+    // The options stay - they are what people pick most of the time - and the
+    // field is typable for the file that does not fit any of them.
+    if (field.allowCustom) {
+        const listId = `duckle-opts-${field.key}`;
+        return (
+            <>
+                <input
+                    className="field-input"
+                    list={listId}
+                    value={value ?? ''}
+                    placeholder={field.placeholder}
+                    spellCheck={false}
+                    onChange={e => onChange(e.target.value)}
+                />
+                <datalist id={listId}>
+                    {field.options?.map(o => (
+                        <option key={o.value} value={o.value} label={o.label} />
+                    ))}
+                </datalist>
+            </>
+        );
+    }
     return (
         <select
             className="field-input field-select"

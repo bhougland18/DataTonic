@@ -103,6 +103,9 @@ export const PALETTE: Category[] = [
                     src('tsv', 'TSV', 'available', 'Read tab-separated files'),
                     src('json', 'JSON', 'available', 'Read JSON files'),
                     src('jsonl', 'JSONL / NDJSON', 'available', 'Read newline-delimited JSON'),
+                    src('changed', 'Changed? (remote poll)', 'available', 'Poll a remote source METADATA and emit a row only for what changed - a HEAD or an SFTP stat costs nothing next to the object it decides about. Object mode watches one URI; listing mode watches an s3:// prefix or an sftp:// directory of immutable files and emits the new and changed ones for a ForEach downstream. Emits uri / name / size / modified_at / etag / fingerprint / status. When nothing changed the node reports `unchanged` rather than a bare success, so a working poll and a broken one are told apart. Fingerprints are conservative: a missing or unreadable signal counts as CHANGED, because re-reading costs compute and skipping loses data. Position advances only when the run succeeds.'),
+                    src('ducklake.maintain', 'DuckLake Maintenance', 'available', 'Run one of the maintenance operations DuckLake itself provides and emit what it did as ordinary rows. Compact small files, rewrite files heavy with deletes, expire snapshots, clean up files an expired snapshot released, delete orphaned files, flush inlined data, or read per-table storage statistics. Deliberately thin: each operation is one DuckLake function and its options are the options of that function, so nothing here invents storage semantics. The three destructive operations support DRY RUN, which lists exactly what would go and changes nothing; ticking it on an operation DuckLake cannot dry-run is REFUSED rather than ignored. Snapshot expiry does nothing without an explicit retention boundary. Two maintenance runs against one catalog serialise on a lock rather than racing.'),
+                    src('spool', 'Spool (tail NDJSON)', 'available', 'Tail an append-only NDJSON file from where the last SUCCESSFUL run stopped, by byte offset. Pairs with `duckle-runner listen`, which keeps a webhook listener up and appends here - so nothing is lost between pipeline runs, unlike src.webhook which only collects while a run is executing. A failed run leaves the position alone, so those records are re-read rather than dropped.'),
                     src('model', 'Model Card', 'available', 'Read a registered model card back as one row: name, version, the artifact URI the training script wrote, and whatever metrics and hashes it recorded. Address it as name@version, or name@latest to follow the pointer that moves on every successful retrain, so a scoring pipeline stays unedited. The engine never loads the model - the row carries the URI and your Python stage loads it.'),
                     src('pdf', 'PDF Pages', 'available', 'One row per PAGE of a PDF: document_id, page_number, text, has_text_layer, width, height and the document metadata. Point it at a file or a folder. Reads the text layer a document already carries, so filings, accounts and invoices become a table you can filter, join and hand to a Python or AI stage. No OCR: a scanned page comes back with has_text_layer false, which is exactly what lets you route those pages to whatever OCR you already run. document_id is the same value src.artifact puts in uri, so the two join.'),
                     src('html', 'HTML', 'available', 'Rows out of an HTML page, by CSS selector. Point it at a local file or an http(s) URL, give a row selector, and either name a column per sub-selector (with an optional attribute, so a link href or a data- value is readable) or leave the columns empty and let a table become a table: the th cells name the columns and each tr is a row. Parsed with a tolerant HTML parser, so the unclosed tags and unquoted attributes that real pages carry - and that the strict XML reader rejects outright - are fine.'),
@@ -116,7 +119,7 @@ export const PALETTE: Category[] = [
                     src('fixedwidth', 'Fixed-width', 'available', 'Read positional / fixed-width text files (mainframe / banking exports). Form provides a columns array - {name, start (1-based), width}; engine builds SUBSTR projections. Trailing whitespace stripped by default.'),
                     src('yaml', 'YAML', 'available', 'Read a YAML file as a table. Top-level YAML arrays become one row per element; non-array docs become a single row. Suits config-data ETL (Helm values, GitHub Actions matrices) not bulk logs.'),
                     src('toml', 'TOML', 'available', 'Read a TOML file as a table. Top-level TOML doc becomes one row (TOML disallows a top-level array). Suits Cargo / pyproject / Hugo config audits.'),
-                    src('spatial', 'Geospatial (GeoJSON / Shapefile / GeoPackage)', 'available', 'Read geospatial files via the DuckDB spatial extension (ST_Read)'),
+                    src('spatial', 'Geospatial (GeoParquet / GeoJSON / Shapefile / GeoPackage)', 'available', 'Read geospatial files: GeoParquet natively, and GeoJSON / Shapefile / GeoPackage / KML / GPX / GML via the DuckDB spatial extension (ST_Read)'),
                     src('gdb', 'Esri File Geodatabase (.gdb)', 'available', 'Read a feature class (layer) from an Esri File Geodatabase via the spatial extension (ST_Read with layer=)'),
                     src('huggingface', 'Hugging Face dataset', 'available', 'Read a Hugging Face Hub dataset directly via DuckDB hf:// (httpfs). Give the repo id and a file/glob; CSV / JSON / Parquet auto-detected. Token for private or gated datasets.'),
                 ],
@@ -141,8 +144,9 @@ export const PALETTE: Category[] = [
                     src('mariadb', 'MariaDB', 'available', 'Read from MariaDB via the DuckDB mysql extension'),
                     src('sqlserver', 'SQL Server', 'available', 'Read SQL Server via the native TDS protocol (tiberius, pure Rust). SQL auth (user/password); trust_cert option for self-signed dev servers.'),
                     src('oracle', 'Oracle', 'available', 'Read Oracle via the official `oracle` Rust crate (ODPI-C). Built into the shipped binary - users need Oracle Instant Client (libclntsh.{so,dll,dylib}) on the library path at RUNTIME; the executor surfaces a clear OCI loader error if it\'s missing. SQL auth via user / password; EZ Connect string for host:port/service_name.'),
-                    src('db2', 'IBM DB2', 'planned'),
+                    src('db2', 'IBM DB2', 'available', 'Read IBM DB2 through the IBM Data Server ODBC driver (DB2 ships no DuckDB extension and no native Rust driver). Install the IBM driver, then connect with friendly host / port / database / user / password fields, a DSN, or a full ODBC connection string. Whole-table read or custom SQL; types preserved.'),
                     src('sqlite', 'SQLite', 'available', 'Read SQLite tables'),
+                    src('turso', 'Turso / libSQL', 'available', 'Read a Turso (libSQL) database over the HTTP pipeline API - no driver install. Paste the libsql:// URL the dashboard gives you (it is normalized to https) plus a database auth token. Whole-table read or custom SQL.'),
                     src('duckdb', 'DuckDB', 'available', 'Read a table from a DuckDB file'),
                     src('clickhouse', 'ClickHouse', 'available', 'Read ClickHouse via the HTTP interface (POST SELECT ... FORMAT JSON). User/password auth via X-ClickHouse-User / X-ClickHouse-Key headers.'),
                     src('cockroach', 'CockroachDB', 'available', 'Read from CockroachDB via the DuckDB postgres extension'),
@@ -217,8 +221,10 @@ export const PALETTE: Category[] = [
                     src('scylla', 'ScyllaDB', 'available', 'Read CQL via the scylla driver. Same wire as src.cassandra.'),
                     src('redis', 'Redis', 'available', 'SCAN keys matching a pattern (default *) and GET each value via the sync `redis` Rust client. Emits {key, value} rows. limit caps the walk so a million-key DB doesn\'t spin forever.'),
                     src('dynamodb', 'DynamoDB', 'available', 'Scan a DynamoDB table via direct HTTP + AWS SigV4 signing (no aws-sdk-rust dep). Auto-unwraps the typed-attribute response shape ({S: x}, {N: 5}, {BOOL: t}, {L: [...]}, {M: {...}}) into plain JSON. Pagination follows LastEvaluatedKey. Props: region, accessKeyId, secretAccessKey, sessionToken (optional, for STS), tableName, limitPerPage (default 1000), maxPages (safety net, default 100).'),
+                    src('neo4j', 'Neo4j', 'available', 'Run Cypher against Neo4j over the HTTP Query API (/db/{database}/query/v2) - works with a self-hosted server and with Aura, and needs no Bolt driver. Basic auth; optional Cypher $parameters. Node and relationship values keep their properties as structs.'),
                     src('elastic', 'Elasticsearch', 'available', 'Read docs from an Elasticsearch index via the _search API. from+size pagination (up to 10000 rows by default); ApiKey auth.'),
                     src('opensearch', 'OpenSearch', 'available', 'Read docs from an OpenSearch index via the _search API. Same wire as Elasticsearch; same ApiKey auth.'),
+                    src('manticore', 'Manticore Search', 'available', 'Read rows from a Manticore table via the HTTP JSON /search API (port 9308). Manticore answers in the Elasticsearch response shape but takes its own request: the table is named in the body as `table` (renamed from `index` in 6.0) and paging is limit/offset. A window past the default 1000 best-ranked matches raises max_matches to suit. Optional raw JSON query; optional HTTP Basic auth.'),
                     src('couchdb', 'CouchDB', 'available', 'Read CouchDB documents via the _all_docs endpoint (include_docs=true). Rides src.rest - Basic auth, responsePath /rows, cursor pagination via `next_key` if configured.'),
                 ],
             },
@@ -335,6 +341,9 @@ export const PALETTE: Category[] = [
                     xf('first', 'First Value', 'available'),
                     xf('last', 'Last Value', 'available'),
                     xf('ntile', 'NTile', 'available'),
+                    xf('tumble', 'Tumbling Window', 'available', 'Event-time tumbling windows that survive across runs. Rows are held until their window CLOSES, decided by a watermark (the greatest event time seen so far) rather than the wall clock - so replaying old data produces the windows that data belongs to instead of closing them all at once. Adds window_start / window_end. allowedLateness holds a window open past its end for out-of-order arrivals; anything later than that is dropped and counted, rather than re-emitted as a second partial copy of a window already delivered. Open windows and the watermark ride the deferred flush, so a failed batch keeps them.'),
+                    xf('artifact.copy', 'Copy Artifact', 'available', 'Land the BYTES of the artifacts named upstream somewhere durable, and emit a row per landed copy. Reads a uri column (whatever src.changed, src.artifact or a query produced) and copies from https://, s3://, sftp:// or a local path to an s3:// prefix or a local directory. Streamed and hashed in ONE pass: memory is bounded by the part size, not by the object, so a 40GB file does not become 40GB of RSS, and the sha256 is of the bytes that actually transferred. Naming: keep the source name, preserve its path under the prefix, or content-address it by hash. ifExists skip leaves an immutable raw zone alone rather than re-uploading. Emits uri / source_uri / name / media_type / size_bytes / sha256 / copied.'),
+                    xf('archive.extract', 'Extract Archive', 'available', 'Turn one archive artifact into one artifact per member. Reads a uri column of archives - ZIP, TAR, TAR.GZ or GZIP - and lands each member at an s3:// prefix or a local directory, emitting archive_uri / member_name / member_index / uri / media_type / compressed_size / size_bytes / sha256 so each member flows into whichever parser suits it. Generic on purpose: a ZIP of CSVs, a TAR of JSON and a GZIP of NDJSON all land the same way. TAR and GZIP are streamed straight from the source; a ZIP is spooled one archive at a time because its central directory is at the END of the file. Include and exclude globs pick members. An archive is a compression format, so an expansion limit refuses one that would fill the volume rather than discovering it from a disk-full error, and a member path can never escape the destination.'),
                     xf('sessionize', 'Sessionize', 'available', 'Assign a session id to event rows by inactivity gap (clickstream / analytics prep): a new session starts when the time gap from the previous event in the partition exceeds the threshold. Emits session_id (per-partition running integer) and optionally session_seq (event index within the session).'),
                 ],
             },
@@ -545,7 +554,9 @@ export const PALETTE: Category[] = [
                     snk('sqlserver', 'SQL Server', 'available', 'INSERT to SQL Server via TDS (multi-row VALUES batched at 1000 rows, the SQL Server cap).'),
                     snk('oracle', 'Oracle', 'available', 'INSERT to Oracle via the official `oracle` Rust crate. Built into the shipped binary - users need Oracle Instant Client on the library path at runtime. Multi-row INSERT ALL ... SELECT 1 FROM dual idiom batched at 1000 rows.'),
                     snk('teradata', 'Teradata', 'available', 'Write to Teradata through its free ODBC driver. Install the Teradata ODBC driver, then connect with friendly fields, a DSN, or a full ODBC connection string. Append creates the table if missing then appends; Overwrite clears it first. No upsert.'),
+                    snk('db2', 'IBM DB2', 'available', 'Write to IBM DB2 through the IBM Data Server ODBC driver. Creates the table if missing from the upstream column types; Append adds rows, Overwrite clears it first. Booleans land in SMALLINT as 1/0, which DB2 for z/OS also accepts. No upsert.'),
                     snk('sqlite', 'SQLite', 'available', 'Write a table into a SQLite file'),
+                    snk('turso', 'Turso / libSQL', 'available', 'INSERT rows into a Turso (libSQL) database over the HTTP pipeline API. Creates the table if missing from the upstream column types; Append adds rows, Overwrite clears it first. Values go up as bound parameters, batched (default 500).'),
                     snk('duckdb', 'DuckDB', 'available', 'Write a table into a DuckDB file'),
                     snk('clickhouse', 'ClickHouse', 'available', 'INSERT to ClickHouse via the HTTP interface (FORMAT JSONEachRow). Batched at 10k rows by default.'),
                     snk('execsource', 'Execute in Source', 'available', 'In-database processing: run a CREATE TABLE AS query on the source server itself (Postgres / MySQL) via postgres_execute / mysql_execute. The transform executes in the database and the result lands there, with no round-trip through DuckDB. Self-contained: no input needed.'),
@@ -590,7 +601,7 @@ export const PALETTE: Category[] = [
                 id: 'snk.streaming',
                 label: 'Streaming',
                 components: [
-                    snk('kafka', 'Apache Kafka', 'available', 'Produce one Kafka record per upstream row via the pure-Rust `rskafka` driver. Record key = optional keyColumn value; record value = JSON-stringified row. Records go to a single partition (partitionId, default 0); pipelined batching (default 500 records per produce call).'),
+                    snk('kafka', 'Apache Kafka', 'available', 'Produce one Kafka record per upstream row via the pure-Rust `rskafka` driver. Record key = optional keyColumn value; record value = JSON-stringified row. Records go to a single partition (partitionId, default 0); pipelined batching (default 500 records per produce call). Every write is acknowledged by the full in-sync replica set (acks=all) - the driver does not offer a weaker setting.'),
                     snk('redpanda', 'Redpanda', 'available', 'Same wire protocol as Kafka - rides the rskafka driver. Use snk.kafka semantics.'),
                     snk('pulsar', 'Apache Pulsar', 'planned'),
                     snk('nats', 'NATS JetStream', 'available', 'Publish each upstream row as one NATS message via the pure-Rust `async-nats` driver. Payload = JSON-stringified row. Optional subjectSuffixColumn appends a per-row suffix (subject.value) for routed multi-tenant publishing.'),
@@ -620,8 +631,10 @@ export const PALETTE: Category[] = [
                     snk('cassandra', 'Cassandra', 'available', 'INSERT rows into a Cassandra table via the scylla CQL driver (one INSERT per row; CQL has no multi-row VALUES).'),
                     snk('scylla', 'ScyllaDB', 'available', 'Same wire as snk.cassandra - INSERT via the scylla CQL driver.'),
                     snk('redis', 'Redis', 'available', 'SET each row\'s keyColumn -> valueColumn into Redis via the sync `redis` Rust client. Optional ttlSeconds adds an EXPIRE. If valueColumn is empty, the whole row is JSON-stringified as the value. Pipelined in chunks (default 1000).'),
+                    snk('neo4j', 'Neo4j', 'available', 'Write rows as Neo4j nodes over the HTTP Query API. Rows ride up as one $rows parameter expanded with UNWIND, so a batch is one round trip. Set mergeKeys to MERGE on those properties (re-running updates the matched nodes) instead of CREATE; or supply your own Cypher that consumes $rows.'),
                     snk('elastic', 'Elasticsearch', 'available', 'Bulk-index docs via the _bulk NDJSON API (configurable host, index, ApiKey auth)'),
                     snk('opensearch', 'OpenSearch', 'available', 'Bulk-index docs via the OpenSearch _bulk NDJSON API (same shape as Elasticsearch)'),
+                    snk('manticore', 'Manticore Search', 'available', 'Index rows into a Manticore table via the HTTP JSON /bulk API (port 9308). NDJSON, one line per row, with the document nested inside the action ({"insert":{"table":"t","doc":{...}}}) - not Elasticsearch\'s action/doc pair. Insert or replace (upsert by id), batched at 1000 rows. A batch Manticore rejects comes back as HTTP 200 with errors:true, and fails the run rather than reporting a write that did not happen.'),
                 ],
             },
             {
@@ -677,7 +690,16 @@ export const PALETTE: Category[] = [
                     src('inline', 'Inline Rows', 'available', 'Rows you write here rather than read from anywhere: a control row, an audit stamp, a fixed lookup. Give each column a name and a value; rowCount repeats the row. Every other source names an external system, so this was previously a throwaway file.'),
                     src('artifact', 'Artifacts', 'available', 'One row per FILE described the way a pipeline can reason about it: uri, name, media_type, size_bytes, sha256 and modified_at. For PDFs, images, archives, OCR output and model binaries - an artifact is a reference, not the bytes, so it joins, filters and iterates like any other table. Hashing is off by default because it reads every byte; turn it on when you want reproducibility and can pay for it.'),
                     src('filelist', 'File List', 'available', 'One row per file in a directory - file (full path) and filename - so a pipeline can iterate a folder. Set a glob pattern and optionally recurse. Pair it with ForEach to process every file.'),
-                    ctl('runevents', 'Run Events', 'available', 'Rows describing the stages that have already failed in this run: node_id, kind, status, message, category, duration_ms. Wire it into a mail or table sink to report failures. It reports failures the run SURVIVED, so mark the stages that may fail with Continue on failure.'),
+                    // src(), not ctl(): the engine dispatches `src.runevents`
+                    // and only that. Declared with the control helper - while
+                    // sitting between two src() entries in a source group - it
+                    // shipped as `ctl.runevents`, which no arm matches, so
+                    // dragging Run Events onto the canvas produced a node that
+                    // refused with "isn't executable ... it's a preview
+                    // component" while the palette called it available. Its own
+                    // engine comment says it: a log-catcher is a SOURCE of error
+                    // rows, not a sink for them.
+                    src('runevents', 'Run Events', 'available', 'Rows describing the stages that have already failed in this run: node_id, kind, status, message, category, duration_ms. Wire it into a mail or table sink to report failures. It reports failures the run SURVIVED, so mark the stages that may fail with Continue on failure.'),
                     ctl('file', 'File Operation', 'available', 'One typed filesystem operation: copy, move or delete a file. Staging a file between a landing area and a working area is ordinary batch work; before this the only filesystem-capable component ran a shell command, which cannot serve both platforms from one authored pipeline.'),
                     ctl('anchor', 'Sequence Anchor', 'available', 'Does no work itself. It exists so ordering links have something to attach to: wire a trigger out of it to say what runs after, or into it to say what must finish first. Takes no input and produces no rows, so it never joins the data flow.'),
                     ctl('setvar', 'Set Run Variable', 'available', 'Work out a value while the run is under way and let later steps in the same pipeline ask for it as ${name}: the date on the batch just read, the id just written. Wired to rows the expression is read against them; wired to nothing it stands on its own. The static context cannot carry these, because nothing knows them until the run has started.'),
@@ -714,6 +736,7 @@ export const PALETTE: Category[] = [
                 id: 'qa.validation',
                 label: 'Validation',
                 components: [
+                    qa('baseline', 'Run Baseline', 'available', 'Compare this run against what previous runs looked like. Every row can satisfy the schema and every row-level rule while the dataset is nothing like what normally arrives - 842,114 rows where five million usually come, a null rate that went from 4 percent to 71, a country partition that vanished - and that publishes successfully, which is more dangerous than a crash. Profiles row count, and per column the null count, null rate, distinct count, min, max and mean; compares against the MEDIAN of the last N accepted profiles so one odd day does not move the baseline. Rules take percentage or absolute limits in either direction. groupBy with requireExistingGroups catches a partition disappearing even when the total stays in range. Gate fails the run; report only emits the findings. Deterministic - rolling statistics and explicit thresholds, no model. The new profile is accepted only if the whole run succeeds, so a run that failed downstream never leaves today numbers as the new normal.'),
                     qa('schemavalidate', 'Schema Validate', 'available', 'Reject rows where any expected column is null'),
                     qa('regex', 'Regex Match', 'available', 'Pass rows matching a pattern; rest to reject'),
                     qa('regex.studio', 'Regex Match Studio', 'available', 'Regex match DQ gate with a launched RE2 editor (live tests, explanation, local-AI drafting). Same gate as Regex Match.'),
@@ -792,7 +815,7 @@ export const PALETTE: Category[] = [
                 id: 'code.scripts',
                 label: 'Scripting',
                 components: [
-                    code('python', 'Python UDF', 'available', 'Transform via a real Python 3 interpreter (full language + installed packages). Define `process(row)` to work a row at a time (a dict in, a dict or None out, JSON both ways), or `transform(table)` to be handed the WHOLE table at once as a pyarrow Table - use that for polars/pandas/PyArrow work, OCR, entity resolution or ML, where a row at a time is the wrong shape. transform is also the one that keeps types: through the row path a timestamp arrives as a string. It needs pyarrow in the interpreter; process(row) needs nothing beyond Python. Needs Python 3 on PATH or DUCKLE_PYTHON_BIN. Code in the `code` prop.'),
+                    code('python', 'Python UDF', 'available', 'Transform via a real Python 3 interpreter (full language + installed packages). Define `process(row)` to work a row at a time (a dict in, a dict or None out, JSON both ways), or `transform(table)` to be handed the WHOLE table at once as a pyarrow Table - use that for polars/pandas/PyArrow work, OCR, entity resolution or ML, where a row at a time is the wrong shape. Or `transform_batches(batch)` to be streamed a RecordBatch at a time (65,536 rows), which never holds the whole table in memory - use that when the data is larger than RAM. transform and transform_batches also keep types: through the row path a timestamp arrives as a string. Both need pyarrow in the interpreter; process(row) needs nothing beyond Python. The script can also read INPUT_PATH, the Parquet file the rows arrive in, to scan it with polars, DuckDB or a pyarrow Dataset directly. Needs Python 3 on PATH or DUCKLE_PYTHON_BIN. Code in the `code` prop.'),
                     code('rust', 'Rust UDF', 'planned'),
                     code('javascript', 'JavaScript UDF', 'available', 'Per-row JS transform via the pure-Rust boa interpreter (sandboxed - no fetch / fs / DOM). Define a `transform(row)` function; the engine calls it per row with the row as a JS object and uses the returned object as the output row. Helpers declared at the top of the script are shared across rows within the stage. Script in the `script` prop.'),
                     code('shell', 'Shell Command', 'available', 'Run an arbitrary shell command and emit one row with {stdout, stderr, exit_code, duration_ms}. Defaults to cmd.exe on Windows, /bin/sh on Unix. Optional timeout + workingDir. Cancellation kills the child process.'),
@@ -882,6 +905,62 @@ export const PALETTE: Category[] = [
         ],
     },
 ];
+
+// #307: external components live here rather than in PALETTE, because they are
+// discovered when a workspace opens rather than compiled in. A tiny store
+// instead of prop-threading: Palette takes no props today, and the alternative
+// is passing this through every component between it and the app root.
+let EXTERNAL: ComponentDef[] = [];
+const listeners = new Set<() => void>();
+
+/** Property forms for external components, keyed by id (#307). */
+const EXTERNAL_MANIFESTS: Record<string, unknown> = {};
+
+export function setExternalManifest(id: string, manifest: unknown): void {
+    EXTERNAL_MANIFESTS[id] = manifest;
+}
+
+export function getExternalManifest(id: string): unknown | undefined {
+    return EXTERNAL_MANIFESTS[id];
+}
+
+export function setExternalComponents(defs: ComponentDef[]): void {
+    // Referentially stable when nothing changed, so useSyncExternalStore does
+    // not re-render the palette on every workspace poll.
+    const same =
+        defs.length === EXTERNAL.length &&
+        defs.every((d, i) => d.id === EXTERNAL[i].id && d.label === EXTERNAL[i].label);
+    if (same) return;
+    EXTERNAL = defs;
+    listeners.forEach(l => l());
+}
+
+export function subscribeExternalComponents(l: () => void): () => void {
+    listeners.add(l);
+    return () => {
+        listeners.delete(l);
+    };
+}
+
+export function getExternalComponents(): ComponentDef[] {
+    return EXTERNAL;
+}
+
+/** The palette, plus an "External" category when the workspace has any. */
+export function paletteWith(external: ComponentDef[]): Category[] {
+    if (external.length === 0) return PALETTE;
+    // Its own category rather than mixed into Sources/Transforms: a component
+    // Duckle did not write should be visibly not one Duckle wrote.
+    const groups: Group[] = [
+        { id: 'ext-sources', label: 'Sources', components: external.filter(c => c.kind === 'source') },
+        { id: 'ext-transforms', label: 'Transforms', components: external.filter(c => c.kind === 'transform') },
+        { id: 'ext-sinks', label: 'Sinks', components: external.filter(c => c.kind === 'sink') },
+    ].filter(g => g.components.length > 0);
+    return [
+        ...PALETTE,
+        { id: 'external', label: 'External', icon: 'code', accent: 'slate', groups },
+    ];
+}
 
 export const ALL_COMPONENTS: ComponentDef[] = PALETTE.flatMap(c => c.groups.flatMap(g => g.components));
 

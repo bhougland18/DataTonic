@@ -175,6 +175,11 @@ pub fn is_stale(workspace: &Path, catalog: &Catalog) -> bool {
 /// straight from the object store, so this is safe to run on a dirty worktree
 /// and safe to run while somebody else is editing.
 pub fn build_at_revision(workspace: &Path, rev: &str) -> Result<Catalog, String> {
+    Ok(build_from_documents(&documents_at_revision(workspace, rev)?))
+}
+
+/// The pipeline documents as of a git revision (#302).
+pub fn documents_at_revision(workspace: &Path, rev: &str) -> Result<Vec<(String, Value)>, String> {
     let listed = git(workspace, &["ls-tree", "-r", "--name-only", rev, "--", "."])?;
     let mut docs: Vec<(String, Value)> = Vec::new();
     for rel in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -204,9 +209,10 @@ pub fn build_at_revision(workspace: &Path, rev: &str) -> Result<Catalog, String>
         let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         docs.push((id, doc));
     }
-    // No fingerprint: this graph describes a revision, not the worktree, so
-    // asking whether it is "stale" against the files on disk is meaningless.
-    Ok(build_from_documents(&docs))
+    // No fingerprint is attached by the caller: this describes a revision, not
+    // the worktree, so asking whether it is "stale" against the files on disk
+    // is meaningless.
+    Ok(docs)
 }
 
 fn git(workspace: &Path, args: &[&str]) -> Result<String, String> {
@@ -368,6 +374,18 @@ pub struct AssetView {
     pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<Freshness>,
+    /// #304: where this asset stands against its declared freshness limit.
+    ///
+    /// Beside `freshness`, which is only WHEN it was last written - a timestamp
+    /// answers "when", not "is that acceptable", and only the rule knows the
+    /// difference. Absent when no rule declares a limit, which reads as
+    /// `unknown` rather than as fine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sla_state: Option<crate::sla::State>,
+    /// The declared limit, as authored, so a screen can say what it is measured
+    /// against rather than only that it failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_age: Option<String>,
 }
 
 /// Build the whole view: graph, ownership, annotations and freshness.
@@ -397,6 +415,7 @@ pub fn view(workspace: &Path) -> Result<CatalogView, String> {
 pub fn view_of(workspace: &Path, catalog: &Catalog) -> CatalogView {
     let owners = load_owners(workspace).unwrap_or_default();
     let fresh = freshness(workspace);
+    let now = chrono::Utc::now();
     let assets = catalog
         .assets
         .iter()
@@ -413,6 +432,19 @@ pub fn view_of(workspace: &Path, catalog: &Catalog) -> CatalogView {
                 description: rule.and_then(|r| r.description.clone()),
                 tags: rule.map(|r| r.tags.clone()).unwrap_or_default(),
                 freshness: fresh.get(&a.id).cloned(),
+                // Computed from what is already loaded rather than by calling
+                // the SLA evaluator, which would re-read run history a second
+                // time on every poll of a catalog screen. The RULE is shared,
+                // so the two cannot disagree about what stale means.
+                sla_state: rule.and_then(|r| r.maximum_age.as_deref()).map(|limit| {
+                    let age = fresh.get(&a.id).and_then(|f| {
+                        chrono::DateTime::parse_from_rfc3339(&f.last_written_at)
+                            .ok()
+                            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds())
+                    });
+                    crate::sla::verdict(Some(limit), age)
+                }),
+                maximum_age: rule.and_then(|r| r.maximum_age.clone()),
             }
         })
         .collect();
@@ -474,6 +506,8 @@ pub fn annotate(
         None => rules.insert(
             0,
             OwnerRule {
+                maximum_age: None,
+                expected_after_schedule: None,
                 pattern: name.to_string(),
                 // An annotation with no owner still needs the field; the empty
                 // string reads as "not stated" everywhere it is shown.
@@ -545,7 +579,12 @@ pub fn freshness(workspace: &Path) -> BTreeMap<String, Freshness> {
         let Ok(records) = serde_json::from_str::<Vec<crate::history::RunRecord>>(&text) else {
             continue;
         };
-        for record in records.iter().filter(|r| r.status == "ok") {
+        // #304: a failed run never counted, but an INCOMPLETE one did. An
+        // incomplete run stopped at a ceiling, so its rows are correct and are
+        // not all of them - treating that as a refresh is the quieter half of
+        // "a partial publish must not refresh the asset", because a failure is
+        // visible and a truncated success looks healthy.
+        for record in records.iter().filter(|r| r.status == "ok" && !r.incomplete) {
             for touch in record.assets.iter().filter(|a| a.direction == "write") {
                 let better = match out.get(&touch.id) {
                     // History is appended in order, but two pipelines writing
@@ -563,6 +602,41 @@ pub fn freshness(workspace: &Path) -> BTreeMap<String, Freshness> {
                         },
                     );
                 }
+            }
+        }
+    }
+    // #303/#304: and the durable publication log, which run history is not.
+    //
+    // Run history is a rolling window of the last 50 runs PER PIPELINE, so an
+    // asset written less often than that - a monthly rollup produced by an
+    // hourly pipeline - has the record of its write trimmed away by the runs
+    // that came after it. Freshness then knows of no write at all, and an SLA
+    // reads "no write" as STALE, which is the right reading of a genuinely
+    // unwritten asset and a false alarm here. One that never clears, because
+    // the next window trims it again.
+    //
+    // The materialization log (#325) is the durable record of the same
+    // publications and is not trimmed by volume - only by an explicit retention
+    // horizon an operator sets (#303). Folded in rather than replacing history,
+    // because a workspace that has never built a catalog records runs with no
+    // assets and therefore no events, and its history is all there is.
+    for event in crate::materialize::read(workspace) {
+        for asset in &event.assets {
+            let better = match out.get(asset) {
+                Some(existing) => event.committed_at > existing.last_written_at,
+                None => true,
+            };
+            if better {
+                out.insert(
+                    asset.clone(),
+                    Freshness {
+                        last_written_at: event.committed_at.clone(),
+                        pipeline_id: event.pipeline_id.clone(),
+                        // The event records what was published, not how many
+                        // rows: absent is "not recorded", which is what it is.
+                        rows: None,
+                    },
+                );
             }
         }
     }
@@ -597,6 +671,31 @@ pub struct OwnerRule {
     /// asked for.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// #304: how old this asset is allowed to get before it is stale, written
+    /// the way an operator writes one - "36h", "2d", "90m".
+    ///
+    /// On the same rule as ownership for the same reason description and tags
+    /// are: they are authored together, and a second file would drift from
+    /// this one. A stale asset also needs an owner to tell, which is here.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "maximumAge")]
+    pub maximum_age: Option<String>,
+    /// #304: the grace period after the producing schedule should have fired.
+    ///
+    /// An absolute `maximumAge` has to be picked loose enough for the longest
+    /// gap between runs, which makes it slow to notice a miss on a frequent
+    /// schedule. This says "within 4h of when it was due" instead, so the
+    /// deadline moves with the schedule rather than being guessed from it.
+    ///
+    /// A schedule that is disabled or missing makes the asset STALE rather than
+    /// unknown, because that is one of the failure modes this exists for: a
+    /// deadline derived from a schedule nobody is running would excuse exactly
+    /// the outage it is meant to catch.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "expectedAfterSchedule"
+    )]
+    pub expected_after_schedule: Option<String>,
 }
 
 /// Who owns what, as authored by a human.
@@ -905,8 +1004,28 @@ fn declared_columns(node: &Value) -> Vec<String> {
 }
 
 /// Read every pipeline in the workspace and build the graph.
-pub fn build(workspace: &Path) -> Result<Catalog, String> {
-    let mut docs: Vec<(String, Value)> = Vec::new();
+/// The pipeline documents currently on disk.
+///
+/// Split out (#302) so a caller that needs the DOCUMENTS rather than the graph
+/// - comparing a revision against the worktree, say - uses the same idea of
+/// what a pipeline file is. Two different walks would eventually disagree about
+/// which files count, and a contract check that silently skipped a pipeline
+/// would report "no breaking changes" for the wrong reason.
+pub fn documents(workspace: &Path) -> Vec<(String, Value)> {
+    document_paths(workspace).into_iter().map(|(id, _, doc)| (id, doc)).collect()
+}
+
+/// The same documents, each with the file it came from (#308).
+///
+/// Split out because a caller that needs to ACT on the file - validate it, run
+/// it, rewrite it - was reconstructing the path from the id by guessing at
+/// `<ws>/pipelines/<id>.json` and `<ws>/<id>.json`. The walk is recursive, so
+/// any pipeline in a nested folder resolved to nothing and was silently
+/// dropped; `validate --affected` then reported "nothing affected" and exited
+/// 0 on a changed pipeline. An id cannot be turned back into a path by
+/// guessing, so the path travels with it.
+pub fn document_paths(workspace: &Path) -> Vec<(String, PathBuf, Value)> {
+    let mut docs: Vec<(String, PathBuf, Value)> = Vec::new();
     for path in discover_pipeline_files(workspace) {
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
         let Ok(doc): Result<Value, _> = serde_json::from_str(&text) else { continue };
@@ -914,8 +1033,13 @@ pub fn build(workspace: &Path) -> Result<Catalog, String> {
             continue;
         }
         let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        docs.push((id, doc));
+        docs.push((id, path, doc));
     }
+    docs
+}
+
+pub fn build(workspace: &Path) -> Result<Catalog, String> {
+    let docs = documents(workspace);
     let mut catalog = build_from_documents(&docs);
     catalog.built_from = Some(fingerprint(workspace));
     Ok(catalog)
@@ -1233,13 +1357,13 @@ pub fn asset_of(component_id: &str, props: &Value) -> Result<Asset, String> {
     }
 
     Err(format!(
-        "no target property on {component_id}; expected one of path, bucket+key, topic,          index, collection, tableName, object, url or database"
+        "no target property on {component_id}; expected one of path, bucket+key, topic, index, collection, tableName, object, url or database"
     ))
 }
 
 /// Lower-case the drive letter and use forward slashes, so `C:\data\x.csv` and
 /// `c:/data/x.csv` are recognised as the same file.
-fn normalise_path(path: &str) -> String {
+pub(crate) fn normalise_path(path: &str) -> String {
     let unified = path.replace('\\', "/");
     let mut chars = unified.chars();
     match (chars.next(), chars.next()) {
@@ -1614,8 +1738,11 @@ mod tests {
             trigger: "scheduled".into(),
             error: None,
             category: None,
+            incomplete: false,
+            incomplete_reason: None,
             assets: vec![AssetTouch { id: asset.into(), direction: dir.into(), rows }],
             run_id: None,
+            unchanged: false,
         };
 
         std::fs::write(
@@ -2205,6 +2332,8 @@ mod tests {
         let owners = Owners {
             assets: vec![
                 OwnerRule {
+                    expected_after_schedule: None,
+                    maximum_age: None,
                     pattern: "/lake/raw/pii_*".into(),
                     owner: "Privacy".into(),
                     contact: Some("privacy@acme.test".into()),
@@ -2212,6 +2341,8 @@ mod tests {
                     tags: Vec::new(),
                 },
                 OwnerRule {
+                    expected_after_schedule: None,
+                    maximum_age: None,
                     pattern: "/lake/raw/*".into(),
                     owner: "Data Platform".into(),
                     contact: None,
@@ -2220,6 +2351,8 @@ mod tests {
                 },
             ],
             pipelines: vec![OwnerRule {
+                expected_after_schedule: None,
+                maximum_age: None,
                 pattern: "*-ingest-*".into(),
                 owner: "Ingest".into(),
                 contact: None,
@@ -2241,6 +2374,8 @@ mod tests {
         // ownership were complete.
         let owners = Owners {
             assets: vec![OwnerRule {
+                expected_after_schedule: None,
+                maximum_age: None,
                 pattern: "[unclosed".into(),
                 owner: "Nobody".into(),
                 contact: None,
@@ -2334,5 +2469,174 @@ mod tests {
         let loaded = load(ws).unwrap().expect("saved catalog");
         assert_eq!(loaded.assets, built.assets);
         assert_eq!(loaded.touches, built.touches);
+    }
+}
+
+#[cfg(test)]
+mod sla_on_the_view {
+    use super::*;
+
+    /// #304, the surfacing half: a screen or an agent reading the catalog has
+    /// to be able to SEE that an asset is past its limit.
+    ///
+    /// It carried `freshness` - a timestamp - which answers "when was this
+    /// written" and not "is that acceptable". Only the rule knows the
+    /// difference, so the console could not show staleness and an agent could
+    /// not ask about it, even though the evaluator existed.
+    #[test]
+    fn an_asset_past_its_limit_says_so_on_the_catalog_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("runs")).unwrap();
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(50)).to_rfc3339();
+        std::fs::write(
+            tmp.path().join("runs").join("daily.json"),
+            format!(
+                r#"[{{"at":"{long_ago}","status":"ok","duration_ms":1,"rows":10,"node_count":1,
+                      "trigger":"manual",
+                      "assets":[{{"id":"/lake/orders","direction":"write","rows":10}}]}}]"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("owners.json"),
+            r#"{"assets":[{"match":"/lake/orders","owner":"data-eng","maximumAge":"36h"}]}"#,
+        )
+        .unwrap();
+
+        let catalog = Catalog {
+            assets: vec![Asset {
+                id: "/lake/orders".into(),
+                kind: "file".into(),
+                columns: vec![],
+            }],
+            ..Default::default()
+        };
+        let view = view_of(tmp.path(), &catalog);
+        let a = view.assets.iter().find(|a| a.id == "/lake/orders").expect("the asset");
+        assert_eq!(a.sla_state, Some(crate::sla::State::Stale), "the view does not show staleness");
+        assert_eq!(a.maximum_age.as_deref(), Some("36h"), "and it does not say what the limit was");
+
+        // An asset nobody declared a limit for carries no verdict at all, which
+        // reads as unknown rather than as fine.
+        let catalog = Catalog {
+            assets: vec![Asset { id: "/lake/other".into(), kind: "file".into(), columns: vec![] }],
+            ..Default::default()
+        };
+        let view = view_of(tmp.path(), &catalog);
+        assert_eq!(view.assets[0].sla_state, None, "an undeclared asset was given a verdict");
+    }
+}
+
+/// #303 x #304: freshness is derived from a rolling window of run history.
+#[cfg(test)]
+mod freshness_and_the_history_window {
+    use super::*;
+    use crate::history::{append_run_record, AssetTouch, RunRecord};
+
+    fn wrote(n: usize, asset: &str) -> RunRecord {
+        RunRecord {
+            run_id: Some(format!("run-{n}")),
+            at: format!("2026-09-04T{:02}:00:00Z", n % 24),
+            status: "ok".into(),
+            duration_ms: 1,
+            rows: 1,
+            node_count: 1,
+            trigger: "scheduled".into(),
+            error: None,
+            unchanged: false,
+            incomplete: false,
+            incomplete_reason: None,
+            category: None,
+            assets: vec![AssetTouch { id: asset.into(), direction: "write".into(), rows: Some(1) }],
+        }
+    }
+
+    /// An asset written less often than once per 50 runs of its pipeline loses
+    /// the record that it was ever written.
+    #[test]
+    fn an_infrequently_written_asset_falls_out_of_the_window() {
+        let ws = tempfile::tempdir().unwrap();
+        // The monthly rollup, written once.
+        append_run_record(ws.path(), "hourly", wrote(0, "/data/monthly.parquet")).unwrap();
+        assert!(
+            freshness(ws.path()).contains_key("/data/monthly.parquet"),
+            "it was just written"
+        );
+        // Then the pipeline runs hourly, writing something else each time.
+        for n in 1..=60 {
+            append_run_record(ws.path(), "hourly", wrote(n, "/data/hourly.parquet")).unwrap();
+        }
+        let f = freshness(ws.path());
+        assert!(f.contains_key("/data/hourly.parquet"));
+        // Trimmed out of the 50-run window, and still known - because the
+        // publication log is not trimmed by how often OTHER assets are written.
+        let monthly = f
+            .get("/data/monthly.parquet")
+            .expect("an asset must not be forgotten because other runs came after it");
+        assert_eq!(monthly.last_written_at, "2026-09-04T00:00:00Z");
+        assert_eq!(monthly.pipeline_id, "hourly");
+    }
+
+    /// The history window is genuinely the thing that loses it, so a workspace
+    /// with no publication log to fall back on still shows the gap. This pins
+    /// WHY the fix is needed rather than only that it works.
+    #[test]
+    fn the_history_window_alone_would_have_lost_it() {
+        let ws = tempfile::tempdir().unwrap();
+        append_run_record(ws.path(), "hourly", wrote(0, "/data/monthly.parquet")).unwrap();
+        for n in 1..=60 {
+            append_run_record(ws.path(), "hourly", wrote(n, "/data/hourly.parquet")).unwrap();
+        }
+        // Remove the durable log and re-read: history alone has forgotten it.
+        std::fs::remove_file(crate::materialize::log_path(ws.path())).unwrap();
+        assert!(
+            !freshness(ws.path()).contains_key("/data/monthly.parquet"),
+            "the 50-run window is what loses it"
+        );
+    }
+
+    /// And forgetting it is not harmless: an SLA on that asset reports STALE,
+    /// which is a false alarm that never clears.
+    #[test]
+    fn a_forgotten_asset_with_an_sla_is_falsely_reported_stale() {
+        let ws = tempfile::tempdir().unwrap();
+        save_owners(
+            ws.path(),
+            &Owners {
+                assets: vec![OwnerRule {
+                    pattern: "/data/monthly.parquet".into(),
+                    owner: "data".into(),
+                    contact: None,
+                    description: None,
+                    tags: Vec::new(),
+                    maximum_age: Some("60d".into()),
+                    expected_after_schedule: None,
+                }],
+                pipelines: Vec::new(),
+                terms: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        // Written once, well inside its 60-day allowance.
+        append_run_record(ws.path(), "hourly", wrote(0, "/data/monthly.parquet")).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let before = crate::sla::evaluate(ws.path(), now);
+        let judged = |v: &[crate::sla::AssetFreshness]| {
+            v.iter().find(|a| a.asset == "/data/monthly.parquet").map(|a| a.state.clone())
+        };
+        assert_eq!(judged(&before), Some(crate::sla::State::Fresh), "{before:?}");
+
+        // The pipeline goes on running hourly, writing something else.
+        for n in 1..=60 {
+            append_run_record(ws.path(), "hourly", wrote(n, "/data/hourly.parquet")).unwrap();
+        }
+        let after = crate::sla::evaluate(ws.path(), now);
+        assert_eq!(
+            judged(&after),
+            Some(crate::sla::State::Fresh),
+            "an asset written correctly and inside its allowance must not become stale              because OTHER runs pushed its record out of the history window"
+        );
     }
 }

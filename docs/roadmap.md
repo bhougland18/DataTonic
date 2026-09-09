@@ -130,6 +130,16 @@ Search via DuckDB `vss` / `fts`) ships today.
 |---|---|
 | `ctl.schedule` | Schedules exist - they're configured in the Schedule panel via the orchestration crate, not as a graph node. The graph-node form is on the roadmap for a "this pipeline triggers that pipeline" semantic |
 
+### Enterprise Identity & Access Management (SSO / MFA)
+
+OIDC single sign-on, IdP group-to-role mapping and MFA enforcement all ship
+today. See [Enterprise SSO and MFA](security/reference/sso-okta-architecture-spec.md).
+What remains on this list is SAML alone.
+
+| Capability | Notes |
+|---|---|
+| `auth.saml` | SAML 2.0 Web Browser SSO. Not planned: every provider this would target (Entra ID, Okta, Google Workspace, Ping, Auth0, Keycloak) speaks OIDC natively, and OIDC is the smaller attack surface. A deployment that must use SAML can terminate it in a SAML-to-OIDC gateway. |
+
 ### Other
 
 | Component | Notes |

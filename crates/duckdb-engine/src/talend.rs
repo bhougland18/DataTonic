@@ -91,7 +91,7 @@ impl std::fmt::Display for Warning {
             ),
             Warning::WriteActionApproximated { node, action, used } => write!(
                 f,
-                "{node}: the legacy write action {action} amends rows that match the key and                  drops the rest. The nearest write mode here is '{used}', which also inserts                  the rows that do not match. Check that is what the table should hold"
+                "{node}: the legacy write action {action} amends rows that match the key and drops the rest. The nearest write mode here is '{used}', which also inserts the rows that do not match. Check that is what the table should hold"
             ),
             Warning::MapperOutputUnnamed { node, target, outputs } => write!(
                 f,
@@ -327,6 +327,7 @@ fn declared_schema(raw: &RawNode, component_id: &str) -> Option<duckle_metadata:
         raw.column_types
             .iter()
             .map(|(name, ty)| Column {
+                tags: Vec::new(),
                 name: name.clone(),
                 // The component reads a delimited file, so every field arrives as text
                 // and the expressions that follow do their own conversion. Declaring a
@@ -3183,7 +3184,7 @@ fn extract_loop_bodies(
 ) -> Vec<Import> {
     let mut children = Vec::new();
     for loop_id in loop_nodes(nodes) {
-        let mut body = loop_body_members(&loop_id, edges);
+        let body = loop_body_members(&loop_id, edges);
         if body.is_empty() {
             continue;
         }
@@ -4158,16 +4159,16 @@ fn parse(xml: &str) -> Result<Parsed, String> {
             Event::Eof => break,
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let name = e.local_name();
-                let tag = String::from_utf8_lossy(name.as_ref()).to_string();
+                let tag = name.as_ref().to_string();
                 // Values must be unescaped: Talend stores Java string literals,
                 // so the quotes arrive as `&quot;` and a raw read would leave
                 // `&quot;localhost&quot;` where `localhost` belongs.
                 let attr = |k: &str| -> Option<String> {
                     e.attributes().flatten().find_map(|a| {
-                        (a.key.local_name().as_ref() == k.as_bytes()).then(|| {
+                        (a.key.local_name().as_ref() == k).then(|| {
                             a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .map(|v| v.into_owned())
-                                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).to_string())
+                                .unwrap_or_else(|_| a.value.to_string())
                         })
                     })
                 };
@@ -4389,13 +4390,13 @@ fn parse(xml: &str) -> Result<Parsed, String> {
             }
             Event::End(ref e) => {
                 let name = e.local_name();
-                if name.as_ref() == b"node" || name.as_ref() == b"jobletNodes" {
+                if name.as_ref() == "node" || name.as_ref() == "jobletNodes" {
                     if let Some(done) = cur.take() {
                         nodes.push(done);
                     }
-                } else if name.as_ref() == b"outputTables" {
+                } else if name.as_ref() == "outputTables" {
                     in_output_table = false;
-                } else if name.as_ref() == b"subjob" {
+                } else if name.as_ref() == "subjob" {
                     in_subjob = false;
                 }
             }

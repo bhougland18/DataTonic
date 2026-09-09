@@ -3,8 +3,12 @@
 # engine runs in the container, nothing is sent to any Duckle-hosted service.
 #
 # The entrypoint binds 0.0.0.0. With no credential the console starts UNCLAIMED
-# and anyone who reaches it can claim administrator for 15 minutes, so a token is
-# not optional here. Serve plain HTTP behind a reverse proxy for TLS.
+# for 15 minutes, and claiming it then needs the SETUP CODE the server prints on
+# start - visible with `docker logs`, new every restart, never stored. Reading
+# that output is what proves you own the container rather than merely reaching
+# the port. Setting DUCKLE_CONSOLE_TOKEN skips the window entirely and is still
+# the right thing for anything long-lived. Serve plain HTTP behind a reverse
+# proxy for TLS.
 #
 #   docker build -f Dockerfile.web -t duckle-web .
 #   docker run -p 8080:8080 -v /path/to/workspace:/workspace \

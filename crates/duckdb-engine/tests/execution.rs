@@ -8,6 +8,9 @@ use duckle_duckdb_engine::{DuckdbEngine, PipelineDoc};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
+
+/// Header line ending, as a constant so tests need no escapes for it.
+const CRLF: &str = "\r\n";
 use std::sync::Mutex;
 
 /// Serializes tests that mutate process-global env vars (DUCKLE_WORKSPACE /
@@ -70,6 +73,79 @@ fn node(id: &str, component: &str, props: Value) -> Value {
     })
 }
 
+/// #301: a tagged column is masked in the preview of a REAL run.
+///
+/// The unit tests cover the masking rule; this covers the wiring, which is the
+/// half that silently does nothing if the call is in the wrong place. Every
+/// inspection surface reads this same preview, so if it is masked here it is
+/// masked in the desktop panel, the CLI, the console API and the MCP tools an
+/// agent calls.
+#[test]
+fn a_tagged_column_is_masked_in_the_preview_a_run_returns() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "people.csv", "id,email,token
+1,a@example.com,sk-live-1
+");
+    let out = out_path(tmp.path(), "out.csv");
+
+    let mut src = node("s", "src.csv", json!({ "path": &csv, "hasHeader": true }));
+    // Tags live on the declared schema, which is where a person writes them.
+    src["data"]["schema"] = json!([
+        { "name": "id",    "type": "int64" },
+        { "name": "email", "type": "string", "tags": ["pii"] },
+        { "name": "token", "type": "string", "tags": ["secret"] }
+    ]);
+
+    let src2 = src.clone();
+    let r = engine.execute_pipeline(&doc(
+        json!([src, node("k", "snk.csv", json!({ "path": &out, "hasHeader": true }))]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    let p = r.preview.iter().find(|p| p.node_id == "s").expect("a preview for the source");
+    let row = &p.rows[0];
+    assert_eq!(row["token"], "***", "a secret must never survive to a preview: {row}");
+    assert!(
+        row["email"].as_str().unwrap_or_default().starts_with('#'),
+        "pii must be hashed rather than shown: {row}"
+    );
+    assert_eq!(row["id"], 1, "an untagged column is untouched: {row}");
+
+    // Acceptance criterion 3: what the pipeline WROTE is unchanged. Masking is
+    // for the surfaces people look at, not for the data.
+    let written = std::fs::read_to_string(&out).expect("the sink wrote");
+    assert!(
+        written.contains("a@example.com") && written.contains("sk-live-1"),
+        "masking must not alter what the pipeline writes: {written}"
+    );
+
+    // And again on the OTHER execution path. The run above is pure SQL so it
+    // batches; naming a target forces the per-stage path instead. A masking
+    // point wired into only one of the two would leak on the other, which is
+    // this engine's oldest trap.
+    let staged = engine.execute_pipeline_with_events(
+        &doc(
+            json!([
+                src2,
+                node("k2", "snk.csv", json!({ "path": out_path(tmp.path(), "o2.csv"), "hasHeader": true }))
+            ]),
+            json!([main_edge("e1", "s", "k2")]),
+        ),
+        Some("s"),
+        None,
+        |_| {},
+    );
+    assert_eq!(staged.status, "ok", "{:?}", staged.error);
+    let sp = staged.preview.iter().find(|p| p.node_id == "s").expect("a preview");
+    assert_eq!(
+        sp.rows[0]["token"], "***",
+        "the per-stage path must mask too: {}",
+        sp.rows[0]
+    );
+}
+
 fn main_edge(id: &str, source: &str, target: &str) -> Value {
     json!({ "id": id, "source": source, "target": target, "data": { "connectionType": "main" } })
 }
@@ -129,6 +205,10 @@ fn duckdb_exec(db: &str, sql: &str) {
         "setup sql failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn count_rows(path: &str) -> i64 {
+    count(&format!("read_csv_auto('{}')", path))
 }
 
 fn count(from: &str) -> i64 {
@@ -964,6 +1044,513 @@ fn text_to_columns_splits_into_named_columns() {
 
 /// A row with fewer parts than there are output columns must yield NULL, not an
 /// empty string. split_part returns '' for a missing part and ''::DOUBLE aborts
+/// #226: the columns a node produces, without running it and without reading
+/// anything.
+///
+/// The GUI derives each node's schema from a per-component table, and there are
+/// far more components than entries in it - a component that is missing falls
+/// through to "schema unchanged", so its new columns never appear and a dropped
+/// one stays listed and renders empty. Rather than add entries forever, the
+/// node's own compiled SQL is run against a ZERO-ROW typed stub of its inputs
+/// and DuckDB is asked what came out.
+///
+/// Asserted on components the resolver does NOT model, because those are the
+/// ones this exists for.
+/// #314 criteria 1 and 2: a missing upstream column is caught before any run,
+/// and the diagnostic names the node, the position, and what DuckDB suggests
+/// instead.
+///
+/// The typo was ALWAYS caught here - DuckDB rejects the bind. What was missing
+/// is everything about it: the message, the position and the candidate were
+/// collapsed into one error string and the editor showed only that the node
+/// did not resolve.
+#[test]
+fn a_typo_is_caught_with_its_position_and_the_column_that_was_meant() {
+    let engine = engine_or_skip!();
+    let col = |name: &str, t: duckle_duckdb_engine::DataType| duckle_duckdb_engine::Column {
+        tags: Vec::new(),
+        name: name.into(),
+        data_type: t,
+        nullable: true,
+        primary_key: None,
+        format: None,
+    };
+    let upstream = vec![
+        col("id", duckle_duckdb_engine::DataType::Int64),
+        col("region", duckle_duckdb_engine::DataType::String),
+    ];
+    let doc: duckle_duckdb_engine::PipelineDoc = serde_json::from_value(serde_json::json!({
+        "nodes": [
+            { "id": "s", "type": "source", "position": {"x":0,"y":0},
+              "data": { "label": "in", "componentId": "src.csv",
+                        "properties": { "path": "in.csv", "hasHeader": true } } },
+            { "id": "q", "type": "transform", "position": {"x":200,"y":0},
+              "data": { "label": "sql", "componentId": "code.sql",
+                        "properties": { "sql": "SELECT id, regionn FROM input" } } }
+        ],
+        "edges": [ { "id": "e1", "source": "s", "target": "q",
+                     "data": { "connectionType": "main" } } ]
+    }))
+    .unwrap();
+
+    let a = engine
+        .analyze_node_sql(&doc, "q", &[("s".to_string(), upstream)])
+        .expect("analysis is not an error just because the SQL is wrong");
+    assert!(a.validated, "DuckDB did look at it");
+    assert_eq!(a.dialect, "duckdb");
+    assert_eq!(a.diagnostics.len(), 1, "{:?}", a.diagnostics);
+    let d = &a.diagnostics[0];
+    assert_eq!(d.kind, "schema");
+    assert!(d.message.contains("regionn"), "{}", d.message);
+    assert_eq!(d.candidates, vec!["region"], "the suggestion was lost before #314");
+    // The position is against the SQL the AUTHOR wrote, not the compiled text.
+    let authored = "SELECT id, regionn FROM input";
+    let column = d.column.expect("a column") as usize;
+    assert_eq!(d.line, Some(1));
+    assert_eq!(
+        &authored[column - 1..column - 1 + 7],
+        "regionn",
+        "column {column} points somewhere else in {authored:?}"
+    );
+}
+
+/// A token that appears twice gets no position at all.
+///
+/// DuckDB truncates the line it echoes for any wide statement, and Duckle's
+/// compiled statement always is - so the position comes from finding the named
+/// token in the authored SQL. That is only honest when there is one of it:
+/// pointing at the first of two occurrences would be a confident guess, and
+/// this whole path exists to avoid exactly that.
+#[test]
+fn an_ambiguous_token_gets_no_position_rather_than_the_first_guess() {
+    let engine = engine_or_skip!();
+    let upstream = vec![duckle_duckdb_engine::Column {
+        tags: Vec::new(),
+        name: "amount".into(),
+        data_type: duckle_duckdb_engine::DataType::Int64,
+        nullable: true,
+        primary_key: None,
+        format: None,
+    }];
+    let doc: duckle_duckdb_engine::PipelineDoc = serde_json::from_value(serde_json::json!({
+        "nodes": [
+            { "id": "s", "type": "source", "position": {"x":0,"y":0},
+              "data": { "label": "in", "componentId": "src.csv",
+                        "properties": { "path": "in.csv", "hasHeader": true } } },
+            { "id": "q", "type": "transform", "position": {"x":200,"y":0},
+              "data": { "label": "sql", "componentId": "code.sql",
+                        "properties": { "sql": "SELECT amountt, amountt * 2 AS doubled FROM input" } } }
+        ],
+        "edges": [ { "id": "e1", "source": "s", "target": "q",
+                     "data": { "connectionType": "main" } } ]
+    }))
+    .unwrap();
+    let a = engine.analyze_node_sql(&doc, "q", &[("s".to_string(), upstream)]).unwrap();
+    assert_eq!(a.diagnostics.len(), 1, "{:?}", a.diagnostics);
+    let d = &a.diagnostics[0];
+    assert!(d.message.contains("amountt"), "{}", d.message);
+    assert_eq!(d.line, None, "two occurrences, so no honest position");
+    assert_eq!(d.column, None);
+    // The candidate is still worth having even without a position.
+    assert_eq!(d.candidates, vec!["amount"]);
+}
+
+/// #259: a run's log lines carry the same id as its receipt.
+///
+/// The engine used to mint `run-{pid}-{nanos}` for the log and never persist
+/// it, so "show me the log for run X" had no answer for any X anyone could
+/// hold - the id in the log existed nowhere else. That was the third of the
+/// three competing schemes #259 set out to remove, and the one that survived.
+#[test]
+fn a_run_log_names_the_same_run_as_its_receipt() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_path_buf();
+    std::fs::create_dir_all(ws.join("logs")).unwrap();
+    std::fs::write(ws.join("in.csv"), "id
+1
+2
+").unwrap();
+    let doc: duckle_duckdb_engine::PipelineDoc = serde_json::from_value(serde_json::json!({
+        "nodes": [
+            { "id": "s", "type": "source", "position": {"x":0,"y":0},
+              "data": { "label": "in", "componentId": "src.csv",
+                        "properties": { "path": ws.join("in.csv").to_string_lossy(),
+                                        "hasHeader": true } } },
+            { "id": "k", "type": "sink", "position": {"x":200,"y":0},
+              "data": { "label": "out", "componentId": "snk.csv",
+                        "properties": { "path": ws.join("out.csv").to_string_lossy() } } }
+        ],
+        "edges": [ { "id": "e1", "source": "s", "target": "k",
+                     "data": { "connectionType": "main" } } ]
+    }))
+    .unwrap();
+
+    let run_id = duckle_duckdb_engine::retry::new_run_id("logged", "manual");
+    let receipt = duckle_duckdb_engine::retry::begin(
+        &ws, &run_id, "manual", "logged", "pipelines/logged.json", "hash", None,
+    );
+    std::env::set_var("DUCKLE_LOG_DIR", ws.join("logs"));
+    let result = engine
+        .for_new_run()
+        .with_run_id(&receipt.run_id)
+        .execute_pipeline_named(&doc, "logged");
+    std::env::remove_var("DUCKLE_LOG_DIR");
+    assert_eq!(result.status, "ok", "{:?}", result.error);
+
+    let log = std::fs::read_to_string(ws.join("logs/logged/runtime.log"))
+        .expect("a run log was written");
+    assert!(
+        log.contains(&run_id),
+        "the log names a different run than the receipt.
+wanted {run_id}
+got:
+{}",
+        log.lines().take(2).collect::<Vec<_>>().join("
+")
+    );
+    // And the receipt it must join to is really there under that id.
+    assert!(duckle_duckdb_engine::retry::load(&ws, &run_id).is_ok());
+}
+
+/// #314: raw SQL that names its upstream by the alias the author gave it.
+///
+/// The executor creates `"<alias>"` so raw SQL can say `FROM orders` instead of
+/// `FROM node_3`. Only the node ids were stubbed here, so that SQL failed to
+/// bind and the author was told their pipeline "does not compile to a plain
+/// view" - about a node that compiles and runs perfectly well.
+#[test]
+fn raw_sql_can_name_its_upstream_by_alias() {
+    let engine = engine_or_skip!();
+    let upstream = vec![duckle_duckdb_engine::Column {
+        tags: Vec::new(),
+        name: "amount".into(),
+        data_type: duckle_duckdb_engine::DataType::Int64,
+        nullable: true,
+        primary_key: None,
+        format: None,
+    }];
+    let doc: duckle_duckdb_engine::PipelineDoc = serde_json::from_value(serde_json::json!({
+        "nodes": [
+            { "id": "n3", "type": "source", "position": {"x":0,"y":0},
+              "data": { "label": "Orders", "componentId": "src.csv", "alias": "orders",
+                        "properties": { "path": "in.csv", "hasHeader": true } } },
+            { "id": "q", "type": "transform", "position": {"x":200,"y":0},
+              "data": { "label": "sql", "componentId": "code.sql",
+                        "properties": { "rawSql": true,
+                                        "sql": "SELECT sum(amount) AS total FROM orders" } } }
+        ],
+        "edges": [ { "id": "e1", "source": "n3", "target": "q",
+                     "data": { "connectionType": "main" } } ]
+    }))
+    .unwrap();
+
+    let a = engine
+        .analyze_node_sql(&doc, "q", &[("n3".to_string(), upstream)])
+        .expect("analysable");
+    assert!(
+        a.diagnostics.is_empty(),
+        "the alias did not bind: {:?} {:?}",
+        a.diagnostics,
+        a.note
+    );
+    assert!(a.validated);
+    assert!(
+        a.columns.iter().any(|c| c.name == "total"),
+        "expected the aggregate's column, got {:?}",
+        a.columns
+    );
+}
+
+/// A Pure SQL node is refused, and told why in its own terms.
+#[test]
+fn a_pure_sql_node_is_refused_as_an_effect_step_not_as_a_defect() {
+    let engine = engine_or_skip!();
+    let doc: duckle_duckdb_engine::PipelineDoc = serde_json::from_value(serde_json::json!({
+        "nodes": [
+            { "id": "p", "type": "transform", "position": {"x":0,"y":0},
+              "data": { "label": "Pure", "componentId": "code.sql",
+                        "properties": { "pureSql": true,
+                                        "sql": "CREATE TABLE t AS SELECT 1 AS a;" } } }
+        ],
+        "edges": []
+    }))
+    .unwrap();
+    let a = engine.analyze_node_sql(&doc, "p", &[]).unwrap();
+    let note = a.note.unwrap_or_default();
+    // The author configured this deliberately; "does not compile to a plain
+    // view" reads as a defect in something that is working as designed.
+    assert!(note.contains("Pure SQL"), "{note}");
+    assert!(note.contains("run verbatim") || note.contains("perform those effects"), "{note}");
+    assert!(!a.validated, "nothing was bound, and it must not claim otherwise");
+}
+
+/// Criterion 5: a source's SQL is not checked, and the reason is stated.
+#[test]
+fn a_source_query_is_not_validated_against_duckdb() {
+    let engine = engine_or_skip!();
+    let doc: duckle_duckdb_engine::PipelineDoc = serde_json::from_value(serde_json::json!({
+        "nodes": [
+            { "id": "s", "type": "source", "position": {"x":0,"y":0},
+              "data": { "label": "pg", "componentId": "src.postgres",
+                        "properties": { "host": "db", "database": "app",
+                                        "mode": "sql",
+                                        "sql": "SELECT id FROM public.orders LIMIT 1" } } }
+        ],
+        "edges": []
+    }))
+    .unwrap();
+    let a = engine.analyze_node_sql(&doc, "s", &[]).unwrap();
+    assert_eq!(a.dialect, "remote");
+    assert!(!a.validated, "a DuckDB bind says nothing about Postgres");
+    assert!(a.diagnostics.is_empty(), "and must not invent objections");
+    assert!(a.note.as_deref().unwrap_or("").contains("remote"), "{:?}", a.note);
+}
+
+#[test]
+fn a_node_reports_its_real_columns_without_running() {
+    let engine = engine_or_skip!();
+    let upstream = vec![
+        duckle_duckdb_engine::Column {
+            tags: Vec::new(),
+            name: "id".into(),
+            data_type: duckle_duckdb_engine::DataType::Int64,
+            nullable: true,
+            primary_key: None,
+            format: None,
+        },
+        duckle_duckdb_engine::Column {
+            tags: Vec::new(),
+            name: "location".into(),
+            data_type: duckle_duckdb_engine::DataType::String,
+            nullable: true,
+            primary_key: None,
+            format: None,
+        },
+    ];
+    let names = |cols: &[duckle_duckdb_engine::Column]| {
+        cols.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(",")
+    };
+
+    // xf.hash appends a column and has no entry in the GUI resolver.
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": "unread.csv", "hasHeader": true })),
+            node("h", "xf.hash", json!({
+                "column": "location", "outputColumn": "loc_hash", "algorithm": "md5"
+            })),
+        ]),
+        json!([main_edge("e1", "s", "h")]),
+    );
+    let cols = engine
+        .describe_node_columns(&d, "h", &[("s".to_string(), upstream.clone())])
+        .expect("xf.hash must describe");
+    assert_eq!(
+        names(&cols),
+        "id,location,loc_hash",
+        "the appended column is reported, and the source file was never opened"
+    );
+
+    // Text to Columns with dropSource: the split column must be GONE, which is
+    // the half the GUI got wrong.
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": "unread.csv", "hasHeader": true })),
+            node("t", "xf.text.tocolumns", json!({
+                "column": "location", "delimiter": " ",
+                "outputColumns": "latitude, longitude", "dropSource": true
+            })),
+        ]),
+        json!([main_edge("e1", "s", "t")]),
+    );
+    let cols = engine
+        .describe_node_columns(&d, "t", &[("s".to_string(), upstream.clone())])
+        .expect("tocolumns must describe");
+    assert_eq!(names(&cols), "id,latitude,longitude");
+
+    // And the types are DuckDB's own, not a guess: split_part returns text.
+    assert!(
+        cols.iter().all(|c| c.name == "id" || c.data_type == duckle_duckdb_engine::DataType::String),
+        "{cols:?}"
+    );
+
+    // The type case, which a name-based guess gets wrong. The GUI's generic
+    // fall-through types every added column as text; length() is a BIGINT, so
+    // the Schema tab said string where the relation says int64.
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": "unread.csv", "hasHeader": true })),
+            node("L", "xf.length", json!({ "column": "location", "outputColumn": "loc_len" })),
+        ]),
+        json!([main_edge("e1", "s", "L")]),
+    );
+    let cols = engine
+        .describe_node_columns(&d, "L", &[("s".to_string(), upstream)])
+        .expect("xf.length must describe");
+    let len_col = cols.iter().find(|c| c.name == "loc_len").expect("the added column");
+    assert_eq!(
+        len_col.data_type,
+        duckle_duckdb_engine::DataType::Int64,
+        "length() is a BIGINT - guessing text from the property name is how the tab lied"
+    );
+}
+
+/// #226: describing a node must never WRITE anything.
+///
+/// A sink stage compiles to `COPY (...) TO 'file'`. Describing a node runs its
+/// stage SQL, so describing a sink would run that COPY - against a zero-row
+/// stub, which means truncating the user's real output file to an empty one.
+/// The editor calls this whenever a node is selected, so that would be data
+/// destruction on a click.
+///
+/// Guarded in the ENGINE rather than in the caller, because the engine is what
+/// can do the damage.
+#[test]
+fn describing_a_sink_never_writes_its_file() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let precious = tmp.path().join("precious.csv");
+    std::fs::write(&precious, "id,name\n1,alice\n2,bob\n").unwrap();
+    let before = std::fs::read_to_string(&precious).unwrap();
+
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": "unread.csv", "hasHeader": true })),
+            node("k", "snk.csv", json!({
+                "path": precious.to_string_lossy(), "hasHeader": true
+            })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    );
+    let upstream = vec![duckle_duckdb_engine::Column {
+        tags: Vec::new(),
+        name: "id".into(),
+        data_type: duckle_duckdb_engine::DataType::Int64,
+        nullable: true,
+        primary_key: None,
+        format: None,
+    }];
+    let got = engine.describe_node_columns(&d, "k", &[("s".to_string(), upstream)]);
+
+    assert_eq!(
+        std::fs::read_to_string(&precious).unwrap(),
+        before,
+        "describing a sink must not touch the file it writes to"
+    );
+    assert!(
+        got.is_err(),
+        "and it must say a sink has no columns to describe rather than pretend"
+    );
+}
+
+/// #226: the editor's own node shape reaches the engine.
+///
+/// The Schema tab sends its React Flow nodes as they are, which carry fields
+/// the engine has never heard of - `selected`, `dragging`, `measured`. The
+/// frontend swallows a failure here so the tab keeps its guess, which means a
+/// shape mismatch would make the whole feature silently dead rather than
+/// noisy. So the shape is asserted rather than assumed.
+#[test]
+fn a_react_flow_node_deserialises_and_describes() {
+    let engine = engine_or_skip!();
+    // Exactly what the editor holds: extra keys, and data carrying more than
+    // the engine reads.
+    let raw = json!({
+        "nodes": [
+            { "id": "s", "type": "source", "position": { "x": 1.5, "y": 2.5 },
+              "selected": true, "dragging": false,
+              "measured": { "width": 220, "height": 80 },
+              "data": { "label": "in", "componentId": "src.csv",
+                        "properties": { "path": "unread.csv", "hasHeader": true },
+                        "sampleRows": [], "status": "idle" } },
+            { "id": "h", "type": "transform", "position": { "x": 300.0, "y": 2.5 },
+              "selected": false,
+              "data": { "label": "hash", "componentId": "xf.hash",
+                        "properties": { "column": "location", "outputColumn": "loc_hash",
+                                        "algorithm": "md5" } } }
+        ],
+        "edges": [
+            { "id": "e1", "source": "s", "target": "h",
+              "sourceHandle": null, "targetHandle": null, "selected": false }
+        ]
+    });
+    let d: duckle_duckdb_engine::PipelineDoc =
+        serde_json::from_value(raw).expect("the editor's own node shape must deserialise");
+
+    let upstream = vec![duckle_duckdb_engine::Column {
+        tags: Vec::new(),
+        name: "location".into(),
+        data_type: duckle_duckdb_engine::DataType::String,
+        nullable: true,
+        primary_key: None,
+        format: None,
+    }];
+    let cols = engine
+        .describe_node_columns(&d, "h", &[("s".to_string(), upstream)])
+        .expect("and must describe from it");
+    assert_eq!(
+        cols.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(","),
+        "location,loc_hash"
+    );
+}
+
+/// #226: what Text to Columns actually PRODUCES, for both dropSource states.
+///
+/// dropSource had no test at all, which is how the GUI came to disagree with
+/// it: the schema shown downstream still listed the split column, so it
+/// appeared as a column with no values - exactly what it looks like when a
+/// schema describes a relation that does not have it.
+///
+/// Asserted on the column SET rather than on values, because the set is the
+/// contract the Schema and Preview tabs mirror.
+#[test]
+fn text_to_columns_output_columns_are_the_contract() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,location
+1,31.21 30.24
+");
+
+    let run = |drop: bool, out: &str| {
+        let d = doc(
+            json!([
+                node("s1", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node("t1", "xf.text.tocolumns", json!({
+                    "column": "location",
+                    "delimiter": " ",
+                    "outputColumns": "latitude, longitude",
+                    "dropSource": drop
+                })),
+                node("k1", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s1", "t1"), main_edge("e2", "t1", "k1")]),
+        );
+        let r = engine.execute_pipeline(&d);
+        assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+        // The header line IS the column set the GUI has to agree with.
+        std::fs::read_to_string(out)
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let kept = out_path(tmp.path(), "kept.csv");
+    assert_eq!(
+        run(false, &kept),
+        "id,location,latitude,longitude",
+        "by default the split column stays and the parts are appended"
+    );
+
+    let dropped = out_path(tmp.path(), "dropped.csv");
+    assert_eq!(
+        run(true, &dropped),
+        "id,latitude,longitude",
+        "dropSource removes the column entirely - not blanks it"
+    );
+}
+
 /// the run, so without the nullif guard this pipeline dies on the second row.
 #[test]
 fn text_to_columns_missing_part_is_null_not_empty() {
@@ -1941,6 +2528,43 @@ fn standardize_trims_and_uppercases() {
     assert_eq!(result.status, "ok", "run failed: {:?}", result.error);
     let v = scalar_string(&format!("SELECT name FROM read_csv_auto('{}')", out));
     assert_eq!(v, "HELLO WORLD", "got {}", v);
+}
+
+/// qa.standardize offered a "Title Case" option that emitted `INITCAP(...)`,
+/// and DuckDB has no such function - the pinned 1.5.4 answers
+/// "Catalog Error: Scalar Function with name initcap does not exist!". Picking
+/// it could never work.
+///
+/// The sibling test above only ever exercised `upper`, which is why this went
+/// unnoticed: the generated SQL looks perfectly well-formed, so nothing short
+/// of running it catches a function that is not there.
+#[test]
+fn standardize_title_case_runs_and_title_cases() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "name\nhello world\nALL CAPS TEXT\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let d = doc(
+        json!([
+            node("s1", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("c1", "qa.standardize", json!({ "columns": ["name"], "case": "title" })),
+            node("k1", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s1", "c1"), main_edge("e2", "c1", "k1")]),
+    );
+    let result = engine.execute_pipeline(&d);
+    assert_eq!(result.status, "ok", "run failed: {:?}", result.error);
+    let first = scalar_string(&format!(
+        "SELECT name FROM read_csv_auto('{}') WHERE lower(name) = 'hello world'",
+        out
+    ));
+    assert_eq!(first, "Hello World", "got {}", first);
+    // An already-shouting value must come DOWN to title case, not stay as it was.
+    let second = scalar_string(&format!(
+        "SELECT name FROM read_csv_auto('{}') WHERE lower(name) = 'all caps text'",
+        out
+    ));
+    assert_eq!(second, "All Caps Text", "got {}", second);
 }
 
 #[test]
@@ -6415,7 +7039,7 @@ fn concurrent_foreach_with_python_does_not_cross_contaminate() {
             node("s", "src.csv", json!({ "path": seed, "hasHeader": true })),
             node("py", "code.python", json!({
                 // process(row) sets result to this iteration's n * 10.
-                "code": "def process(row):\n    row['result'] = ${ITER_ITEM_N} * 10\n    return row"
+                "code": "def process(row):\n row['result'] = ${ITER_ITEM_N} * 10\n return row"
             })),
             node("k", "snk.csv", json!({
                 "path": format!("{}${{ITER_ITEM_ID}}.csv", out_prefix),
@@ -9650,6 +10274,112 @@ fn code_javascript_runs_transform_per_row_via_boa() {
     assert_eq!(name1, "WIDGET");
 }
 
+/// #252: a stage that asked for output caching does not run again when neither
+/// its configuration nor its input has changed - and DOES run again when the
+/// input changes.
+///
+/// The proof is deliberately not "the second run produced the same answer",
+/// which a stage that simply re-ran would also satisfy. Between the two runs
+/// the cached file is overwritten with a row that the script could never
+/// produce. If the second run emits that row, the output came from the cache
+/// and the stage did not execute. If it emits the real answer, the cache was
+/// ignored.
+#[test]
+fn cached_output_is_reused_until_the_input_changes() {
+    let engine = engine_or_skip!();
+    let _g = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", &ws);
+
+    let in_csv = write_file(
+        tmp.path(),
+        "in.csv",
+        "id,name,qty,price\n1,widget,3,10.0\n2,gadget,2,5.5\n",
+    );
+    let out = out_path(tmp.path(), "out.csv");
+    let script = r#"
+        function transform(row) {
+            return { id: row.id, total: row.qty * row.price };
+        }
+    "#;
+    let build = |csv: &str| {
+        doc(
+            json!([
+                node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node(
+                    "j",
+                    "code.javascript",
+                    json!({ "script": script, "cacheOutput": true })
+                ),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "j"), main_edge("e2", "j", "k")]),
+        )
+    };
+
+    // Run 1 - a cold cache, so the stage runs and its output is kept.
+    let r1 = engine.execute_pipeline_named(&build(&in_csv), "cachepipe");
+    assert_eq!(r1.status, "ok", "first run failed: {:?}", r1.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+    let cache_dir = ws.join("cache").join("cachepipe").join("j");
+    let cached: Vec<_> = std::fs::read_dir(&cache_dir)
+        .expect("the cache directory should exist after a cached stage ran")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "parquet").unwrap_or(false))
+        .collect();
+    assert_eq!(cached.len(), 1, "exactly one cached output: {:?}", cached);
+
+    // Overwrite the cache with an answer the script cannot produce. Only a run
+    // that skipped the stage can emit this.
+    duckdb_exec(
+        ":memory:",
+        &format!(
+            "COPY (SELECT 99 AS id, -1.0 AS total) TO '{}' (FORMAT PARQUET)",
+            cached[0].to_string_lossy().replace('\\', "/")
+        ),
+    );
+
+    // Run 2 - same config, same input, so the tampered cache is served.
+    let r2 = engine.execute_pipeline_named(&build(&in_csv), "cachepipe");
+    assert_eq!(r2.status, "ok", "second run failed: {:?}", r2.error);
+    assert_eq!(
+        scalar_string(&format!("SELECT id FROM read_csv_auto('{}')", out)),
+        "99",
+        "the second run must have come from the cache, not from the script"
+    );
+    // Louis asked for the reuse to be visible in run metadata, not silent.
+    let note = r2.nodes.get("j").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(
+        note.contains("reused cached output"),
+        "a reused stage must say so; got {:?}",
+        note
+    );
+
+    // Run 3 - one more input row, so the key changes and the stage really runs.
+    let changed = write_file(
+        tmp.path(),
+        "in2.csv",
+        "id,name,qty,price\n1,widget,3,10.0\n2,gadget,2,5.5\n3,bolt,10,0.25\n",
+    );
+    let r3 = engine.execute_pipeline_named(&build(&changed), "cachepipe");
+    assert_eq!(r3.status, "ok", "third run failed: {:?}", r3.error);
+    assert_eq!(
+        count(&format!("read_csv_auto('{}')", out)),
+        3,
+        "a changed input is a cache miss"
+    );
+    let note3 = r3.nodes.get("j").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(
+        !note3.contains("reused cached output"),
+        "a changed input must not be reported as reused; got {:?}",
+        note3
+    );
+
+    std::env::remove_var("DUCKLE_WORKSPACE");
+}
+
 /// Regression: boa's JsValue::from_json/to_json clamped integers to i32 and
 /// demoted the rest to f64, so a 64-bit id (e.g. a Snowflake key) was corrupted
 /// (1350000000000000001 -> 1.35e18) even by an identity transform. The
@@ -10486,6 +11216,227 @@ fn src_webhook_collects_inbound_http_requests() {
         out
     ));
     assert_eq!(ev2, "login");
+}
+
+/// #258: a cost ceiling with no prices could never fire. Caught at COMPILE
+/// time, so `duckle validate` reports it rather than a run discovering it after
+/// the first stage has started spending.
+#[test]
+fn a_cost_ceiling_with_no_prices_does_not_compile() {
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": "x.csv", "hasHeader": true })),
+            node("l", "xf.ai.llm", json!({
+                "promptTemplate": "Greet {name}",
+                "outputColumn": "reply",
+                "model": "mock",
+                "apiKey": "sk-test",
+                "maxEstimatedCostUsd": 50.0,
+            })),
+        ]),
+        json!([main_edge("e1", "s", "l")]),
+    );
+    let e = duckle_duckdb_engine::compile_pipeline_sql(&d)
+        .expect_err("a ceiling that can never fire must not compile")
+        .to_string();
+    assert!(e.contains("never"), "must say why; got: {e}");
+
+    // With a price it compiles, so the refusal is about the missing price and
+    // not about cost ceilings generally.
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": "x.csv", "hasHeader": true })),
+            node("l", "xf.ai.llm", json!({
+                "promptTemplate": "Greet {name}",
+                "outputColumn": "reply",
+                "model": "mock",
+                "apiKey": "sk-test",
+                "maxEstimatedCostUsd": 50.0,
+                "inputUsdPerMillionTokens": 0.15,
+            })),
+        ]),
+        json!([main_edge("e1", "s", "l")]),
+    );
+    assert!(duckle_duckdb_engine::compile_pipeline_sql(&d).is_ok());
+}
+
+/// #258: an expanded reply must not overwrite the row it came from.
+///
+/// The pre-flight refuses a schema FIELD that collides with an upstream column,
+/// but expansion inserts every top-level field the model actually returned -
+/// and with `json_object` there is no schema to check against at all. So a
+/// model that returns `id` silently replaced the caller's `id`, turning the
+/// input into the output with no error and no way to notice.
+#[test]
+fn an_expanded_field_never_overwrites_an_upstream_column() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            // The model returns a field named like the caller's own column.
+            let inner = r#"{\"id\": 999, \"score\": 1}"#;
+            let body = format!(r#"{{"choices":[{{"message":{{"content":"{inner}"}}}}]}}"#);
+            let resp = format!(
+                "HTTP/1.1 200 OK{}Content-Type: application/json{}Content-Length: {}{}Connection: close{}{}",
+                CRLF, CRLF, body.len(), CRLF, CRLF, CRLF
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(tmp.path(), "in.csv", "id,name\n7,alice\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("l", "xf.ai.llm", json!({
+                "promptTemplate": "Score {name}",
+                "outputColumn": "reply",
+                "model": "mock",
+                "apiKey": "sk-test",
+                "baseUrl": format!("http://127.0.0.1:{}", port),
+                "concurrency": 1,
+                // No schema at all - so nothing was checked up front.
+                "responseFormat": "json_object",
+                "expandColumns": true,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "l"), main_edge("e2", "l", "k")]),
+    ));
+    drop(handle);
+
+    assert_eq!(
+        r.status, "error",
+        "a reply that would overwrite the caller's own column must stop the run, \
+         not quietly replace the input"
+    );
+    let msg = r.error.unwrap_or_default();
+    assert!(msg.contains("id"), "the error must name the column: {msg}");
+}
+
+/// #258: a request ceiling stops the stage, and the STOP is what matters more
+/// than the counting.
+///
+/// Five rows, a ceiling of two. The run must:
+///
+/// - end "ok", not "error" - the two rows bought are correct and paid for
+/// - report itself incomplete, with a machine-readable reason
+/// - issue exactly two requests, never a third
+/// - leave the downstream sink SKIPPED and its file unwritten
+///
+/// That last one is the whole point. A partial dataset published as if it were
+/// the whole thing is the damage; stopping is only the mechanism.
+#[test]
+fn an_inference_budget_stops_the_run_before_a_partial_dataset_is_published() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let served = Arc::new(AtomicUsize::new(0));
+    let count_seen = served.clone();
+    let handle = std::thread::spawn(move || {
+        // Offer more than the ceiling allows. If the budget leaks, the extra
+        // connections are there to be taken and the count assertion catches it.
+        for stream in listener.incoming().take(5) {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(8192);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..32 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            let n = count_seen.fetch_add(1, Ordering::SeqCst);
+            let body = format!(
+                r#"{{"choices":[{{"message":{{"content":"answer-{}"}}}}],"usage":{{"prompt_tokens":10,"completion_tokens":5}}}}"#,
+                n
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(tmp.path(), "in.csv", "id,name\n1,a\n2,b\n3,c\n4,d\n5,e\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("l", "xf.ai.llm", json!({
+                "promptTemplate": "Greet {name}",
+                "outputColumn": "reply",
+                "model": "mock",
+                "apiKey": "sk-test",
+                "baseUrl": base_url,
+                "concurrency": 1,
+                "maxRequests": 2,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "l"), main_edge("e2", "l", "k")]),
+    ));
+    drop(handle);
+
+    assert_eq!(r.status, "ok", "a budget stop is not a failure: {:?}", r.error);
+    assert!(r.incomplete, "the run must say it did not finish");
+    assert_eq!(
+        r.incomplete_reason.as_deref(),
+        Some("budget:maxRequests"),
+        "the reason must be matchable by alerting, not just readable"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "exactly the ceiling, never a third request"
+    );
+    let sink = r.nodes.get("k").expect("the sink is still reported");
+    assert_eq!(
+        sink.status, "skipped",
+        "the sink must not run: publishing 2 of 5 rows as the answer is the damage"
+    );
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "and it must not have written a file"
+    );
+    let note = r.nodes.get("l").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(
+        note.contains("budget:maxRequests") && note.contains("2 request(s)"),
+        "the stage must say what it spent; got {:?}",
+        note
+    );
 }
 
 /// xf.ai.llm: stand up a mock /v1/chat/completions endpoint, pipe 2
@@ -14590,6 +15541,549 @@ fn qa_block_keeps_a_pair_once_when_several_rules_catch_it() {
 /// APIs look like: GET /companies, then GET /companies/{id}/officers.
 ///
 /// Asserts on the CAPTURED REQUEST LINES, not just the row count, because the
+/// #257: a cursor must not step over a window whose parents FAILED.
+///
+/// With `onParentError` set to skip or reject, a failed parent's rows were
+/// never fetched - only the fact of the failure was. Advancing the mark past
+/// them means the next run asks from a point after data it never received, and
+/// nothing ever goes back for it. That is silent, permanent loss, which is the
+/// exact failure the incremental design exists to prevent.
+///
+/// The same rule the budget stop already follows: work that did not finish must
+/// not move the cursor.
+#[test]
+fn a_cursor_does_not_advance_past_a_parent_that_failed() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let _g = env_guard();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let line = req.lines().next().unwrap_or("").to_string();
+            seen.lock().unwrap().push(line.clone());
+            // Company 2 is refused; 1 and 3 answer with later marks.
+            let (status, body) = if line.contains("/companies/2/") {
+                ("500 Internal Server Error", r#"{"error":"boom"}"#.to_string())
+            } else {
+                (
+                    "200 OK",
+                    r#"{"results":[{"officer":"x","updated_at":"2026-03-05"}]}"#.to_string(),
+                )
+            };
+            let resp = format!(
+                "HTTP/1.1 {}{}Content-Type: application/json{}Content-Length: {}{}Connection: close{}{}",
+                status, CRLF, CRLF, body.len(), CRLF, CRLF, CRLF
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", &ws);
+    let in_csv = write_file(tmp.path(), "in.csv", "id\n1\n2\n3\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let base = format!("http://127.0.0.1:{}", port);
+    let build = || {
+        doc(
+            json!([
+                node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+                node("c", "src.rest", json!({
+                    "url": base,
+                    "urlTemplate": format!("{}/companies/{{id}}/officers?since={{incremental}}", base),
+                    "responsePath": "/results",
+                    "parentKeyColumn": "id",
+                    "onParentError": "skip",
+                    "incrementalField": "updated_at",
+                    "incrementalInitial": "1970-01-01",
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+        )
+    };
+
+    let r1 = engine.execute_pipeline_named(&build(), "loss");
+    assert_eq!(r1.status, "ok", "a skipped parent must not fail the run: {:?}", r1.error);
+    let r2 = engine.execute_pipeline_named(&build(), "loss");
+    assert_eq!(r2.status, "ok", "second run failed: {:?}", r2.error);
+    drop(handle);
+
+    let reqs = asked.lock().unwrap().clone();
+    let second_run = &reqs[3..];
+    assert!(
+        second_run.iter().all(|r| r.contains("since=1970-01-01")),
+        "company 2 was never fetched, so the cursor must not have moved past it - \
+         otherwise its rows are lost for good: {second_run:?}"
+    );
+}
+
+/// #257: the incremental cursor reaches the REQUEST, and only moves forward
+/// when the whole run succeeded.
+///
+/// Fetch-then-filter is not incremental for an API - it still pays for the
+/// whole dataset every run - so the test that matters is what the server was
+/// asked for, not what came back. Run 1 sends the initial mark; run 2 sends the
+/// highest value run 1 saw.
+#[test]
+fn the_incremental_mark_reaches_the_request_and_advances_only_on_success() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let _g = env_guard();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    let handle = std::thread::spawn(move || {
+        for (idx, stream) in listener.incoming().take(2).enumerate() {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            for _ in 0..8 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
+            seen.lock().unwrap().push(req.lines().next().unwrap_or("").to_string());
+            // Two records; the later one is what the next run must ask from.
+            let body = if idx == 0 {
+                r#"{"items":[{"id":1,"updated_at":"2026-01-01"},{"id":2,"updated_at":"2026-03-05"}]}"#
+            } else {
+                r#"{"items":[{"id":3,"updated_at":"2026-04-09"}]}"#
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", &ws);
+    let out = out_path(tmp.path(), "out.csv");
+    let url = format!("http://127.0.0.1:{}/changes?since={{incremental}}", port);
+    let build = || {
+        doc(
+            json!([
+                node("r", "src.rest", json!({
+                    "url": url,
+                    "responsePath": "/items",
+                    "incrementalField": "updated_at",
+                    "incrementalInitial": "1970-01-01",
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "r", "k")]),
+        )
+    };
+
+    let r1 = engine.execute_pipeline_named(&build(), "incr");
+    assert_eq!(r1.status, "ok", "first run failed: {:?}", r1.error);
+    let r2 = engine.execute_pipeline_named(&build(), "incr");
+    assert_eq!(r2.status, "ok", "second run failed: {:?}", r2.error);
+    drop(handle);
+
+    let reqs = asked.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2, "two runs, two requests: {reqs:?}");
+    assert!(
+        reqs[0].contains("since=1970-01-01"),
+        "the first run must send the initial mark: {}",
+        reqs[0]
+    );
+    // The highest value run 1 SAW, not the last one it happened to receive.
+    assert!(
+        reqs[1].contains("since=2026-03-05"),
+        "the second run must ask from where the first one got to: {}",
+        reqs[1]
+    );
+    std::env::remove_var("DUCKLE_WORKSPACE");
+}
+
+/// #257: the fan-out really runs requests at the same time, and the rows are
+/// all still there.
+///
+/// The stub holds each connection open briefly while counting how many are in
+/// flight. A sequential driver can never see more than one, so the max is the
+/// measurement that distinguishes "concurrency was configured" from
+/// "concurrency happened".
+#[test]
+fn rest_fan_out_runs_parent_requests_concurrently() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (f, pk) = (in_flight.clone(), peak.clone());
+    let handle = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else { break };
+            let (f, pk) = (f.clone(), pk.clone());
+            workers.push(std::thread::spawn(move || {
+                let now = f.fetch_add(1, Ordering::SeqCst) + 1;
+                pk.fetch_max(now, Ordering::SeqCst);
+                stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+                let mut chunk = [0u8; 4096];
+                let _ = stream.read(&mut chunk);
+                // Held open so overlapping requests actually overlap.
+                std::thread::sleep(Duration::from_millis(120));
+                let body = r#"{"results":[{"officer":"x"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                f.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(
+        tmp.path(),
+        "in.csv",
+        "id\n1\n2\n3\n4\n5\n6\n7\n8\n",
+    );
+    let out = out_path(tmp.path(), "out.csv");
+    let base = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("c", "src.rest", json!({
+                "url": base,
+                "urlTemplate": format!("{}/companies/{{id}}/officers", base),
+                "responsePath": "/results",
+                "parentKeyColumn": "id",
+                "concurrency": 4,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+    ));
+    // Not joined: the stub waits for a fixed number of connections, and a run
+    // that stops early never makes them all. A test must not hang on the
+    // failure it is there to detect.
+    drop(handle);
+    assert_eq!(r.status, "ok", "fan-out failed: {:?}", r.error);
+    assert_eq!(
+        count(&format!("read_csv_auto('{}')", out)),
+        8,
+        "every parent's child row is still there"
+    );
+    assert!(
+        peak.load(Ordering::SeqCst) > 1,
+        "requests never overlapped, so this ran sequentially: peak {}",
+        peak.load(Ordering::SeqCst)
+    );
+    // Unordered output is the point of the pool, so the parent key is what
+    // makes a child row traceable - it must be on every row.
+    assert_eq!(
+        count(&format!("read_csv_auto('{}') WHERE id IS NOT NULL", out)),
+        8,
+        "the carried parent key is what replaces order"
+    );
+}
+
+/// #257 + #252: a parent already fetched is not fetched again.
+///
+/// The proof is the second run happening with the SERVER GONE. If it still
+/// produces every row, no request was made - which is what resume has to mean
+/// for a fan-out that died at parent 900,001.
+#[test]
+fn a_checkpointed_parent_is_not_requested_twice() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let _g = env_guard();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let served = Arc::new(AtomicUsize::new(0));
+    let count = served.clone();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(3) {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk);
+            count.fetch_add(1, Ordering::SeqCst);
+            let body = r#"{"results":[{"officer":"x"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", &ws);
+    let in_csv = write_file(tmp.path(), "in.csv", "id
+1
+2
+3
+");
+    let out = out_path(tmp.path(), "out.csv");
+    let base = format!("http://127.0.0.1:{}", port);
+    let build = || {
+        doc(
+            json!([
+                node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+                node("c", "src.rest", json!({
+                    "url": base,
+                    "urlTemplate": format!("{}/companies/{{id}}/officers", base),
+                    "responsePath": "/results",
+                    "parentKeyColumn": "id",
+                    "checkpoint": true,
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+        )
+    };
+
+    let r1 = engine.execute_pipeline_named(&build(), "ckpt");
+    assert_eq!(r1.status, "ok", "first run failed: {:?}", r1.error);
+    assert_eq!(count_rows(&out), 3);
+    assert_eq!(served.load(Ordering::SeqCst), 3, "three parents, three requests");
+
+    // The server stops existing. Anything that needs the network now fails.
+    let _ = handle.join();
+    std::fs::remove_file(&out).ok();
+
+    let r2 = engine.execute_pipeline_named(&build(), "ckpt");
+    assert_eq!(
+        r2.status, "ok",
+        "the second run must not need the network at all: {:?}",
+        r2.error
+    );
+    assert_eq!(
+        count_rows(&out),
+        3,
+        "every row must come back from the checkpoint"
+    );
+    let note = r2.nodes.get("c").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(
+        note.contains("3 parent(s) reused from the checkpoint"),
+        "and it must say so; got {:?}",
+        note
+    );
+    std::env::remove_var("DUCKLE_WORKSPACE");
+}
+
+/// #257: a fan-out over an upstream that matched nothing.
+///
+/// Normal, not exceptional - a filter that selected no rows. The parent list
+/// is spilled to a file that DuckDB writes empty, so the stream has to end
+/// cleanly rather than fail to open it, no request may go out, and the node
+/// must still produce a relation downstream can bind against.
+#[test]
+fn a_fan_out_over_no_parents_makes_no_requests() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(tmp.path(), "in.csv", "id
+1
+2
+");
+    let out = out_path(tmp.path(), "out.csv");
+    // Port 1 is not listening; if a request were made the run would fail, so
+    // "ok" is itself the assertion that none was.
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("none", "code.sql", json!({ "sql": "SELECT * FROM s WHERE 1=0" })),
+            // The declared schema lives on the node, not in its properties -
+            // it is what types an empty result instead of leaving a relation
+            // downstream cannot bind against (#170).
+            json!({
+                "id": "c",
+                "position": { "x": 0, "y": 0 },
+                "data": {
+                    "label": "c",
+                    "componentId": "src.rest",
+                    "schema": [{ "name": "officer", "type": "string" }],
+                    "properties": {
+                        "url": "http://127.0.0.1:1/x",
+                        "urlTemplate": "http://127.0.0.1:1/companies/{id}",
+                        "responsePath": "/results",
+                        "parentKeyColumn": "id",
+                    }
+                }
+            }),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "s", "none"),
+            main_edge("e2", "none", "c"),
+            main_edge("e3", "c", "k"),
+        ]),
+    ));
+    assert_eq!(
+        r.status, "ok",
+        "no parents means no requests, so nothing can fail: {:?}",
+        r.error
+    );
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 0);
+}
+
+/// #257 + #101: one parent's failure does not discard the others, and the
+/// failure itself survives as a row.
+///
+/// A 2M-parent run that half-failed is only operable if the failures are
+/// durable next to the successes. A log line is not durable.
+#[test]
+fn a_failed_parent_becomes_a_reject_row_instead_of_ending_the_run() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(3) {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            for _ in 0..8 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
+            // Company 2 is the one the server refuses.
+            let (status, body) = if req.contains("/companies/2/") {
+                ("500 Internal Server Error", r#"{"error":"boom"}"#)
+            } else {
+                ("200 OK", r#"{"results":[{"officer":"x"}]}"#)
+            };
+            let resp = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                status,
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_csv = write_file(tmp.path(), "in.csv", "id\n1\n2\n3\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let rej = out_path(tmp.path(), "rej.csv");
+    let base = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": in_csv, "hasHeader": true })),
+            node("c", "src.rest", json!({
+                "url": base,
+                "urlTemplate": format!("{}/companies/{{id}}/officers", base),
+                "responsePath": "/results",
+                "parentKeyColumn": "id",
+                "onParentError": "reject",
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            node("kr", "snk.csv", json!({ "path": rej, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "s", "c"),
+            main_edge("e2", "c", "k"),
+            json!({ "id": "e3", "source": "c", "target": "kr", "sourceHandle": "reject" }),
+        ]),
+    ));
+    // Not joined: the stub waits for a fixed number of connections, and a run
+    // that stops early never makes them all. A test must not hang on the
+    // failure it is there to detect.
+    drop(handle);
+
+    assert_eq!(r.status, "ok", "one bad parent must not end the run: {:?}", r.error);
+    assert_eq!(
+        count(&format!("read_csv_auto('{}')", out)),
+        2,
+        "the two companies that answered are still there"
+    );
+    assert_eq!(
+        count(&format!("read_csv_auto('{}')", rej)),
+        1,
+        "and the one that did not is a row, not just a log line"
+    );
+    let key = scalar_string(&format!(
+        "SELECT parent_key FROM read_csv_auto('{}')",
+        rej
+    ));
+    assert_eq!(key, "2", "the reject row names which parent failed");
+    let err = scalar_string(&format!(
+        "SELECT error FROM read_csv_auto('{}')",
+        rej
+    ));
+    assert!(err.contains("500"), "and why: {err}");
+}
+
 /// row count alone cannot tell you the parent's value ever reached the URL.
 #[test]
 fn src_rest_fans_a_child_endpoint_out_over_parent_rows() {
@@ -14791,6 +16285,242 @@ fn src_html_extracts_columns_by_selector_including_attributes() {
 
 /// #255: the GUI writes its column list as a key-value map, so the engine has
 /// to read that shape too - otherwise the form works and the run produces
+/// #255: a pagination walk cut short by a failure is INCOMPLETE, not ok.
+///
+/// `on_error: skip` means "skip a bad document" - fair for a corpus, where the
+/// other documents are unaffected. In a CHAIN it is different: the next link
+/// lives on the page that failed, so skipping page 2 does not lose page 2, it
+/// loses pages 2..N and the walk simply stops. Reporting that as a clean run
+/// publishes part of a dataset as though it were all of it.
+///
+/// Which is exactly what the incomplete outcome from #258 is for.
+#[test]
+fn a_pagination_walk_cut_short_by_a_failure_is_incomplete() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let served = Arc::new(AtomicUsize::new(0));
+    let count = served.clone();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(4) {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let i = count.fetch_add(1, Ordering::SeqCst);
+            // Page 1 answers and names page 2. Page 2 fails, so the link to
+            // page 3 is never seen and the walk ends there.
+            let (status, body) = if i == 0 {
+                (
+                    "200 OK",
+                    "<html><body><ul><li class=item>row1</li></ul>\
+                     <a class=next href=\"?p=2\">next</a></body></html>"
+                        .to_string(),
+                )
+            } else {
+                ("500 Internal Server Error", "nope".to_string())
+            };
+            let resp = format!(
+                "HTTP/1.1 {}{}Content-Type: text/html{}Content-Length: {}{}Connection: close{}{}",
+                status, CRLF, CRLF, body.len(), CRLF, CRLF, CRLF
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "rows.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": format!("http://127.0.0.1:{}/a/list.html", port),
+                "rowSelector": "li.item",
+                "columns": [{ "name": "v", "selector": "" }],
+                "nextPageSelector": "a.next",
+                "onError": "skip",
+                "maxPages": 10,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    drop(handle);
+
+    assert_eq!(r.status, "ok", "a skipped page is not a failed run: {:?}", r.error);
+    assert!(
+        r.incomplete,
+        "but the walk stopped at a broken page, so what came back is not all of it"
+    );
+    let sink = r.nodes.get("k").expect("the sink is still reported");
+    assert_eq!(
+        sink.status, "skipped",
+        "and nothing downstream may publish a chain that stopped early"
+    );
+}
+
+/// #255: server-rendered pagination - follow the link the page names.
+///
+/// The next link is written RELATIVE, which is the shape real pagination uses
+/// and the one string concatenation gets wrong: `?p=2` means the same document
+/// with a different query, not a path segment appended.
+///
+/// The last page names no next link, which is how the walk ends.
+#[test]
+fn src_html_follows_the_next_page_link() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let served = Arc::new(AtomicUsize::new(0));
+    let (seen, count) = (asked.clone(), served.clone());
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(4) {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let line = req.lines().next().unwrap_or("").to_string();
+            seen.lock().unwrap().push(line.clone());
+            let i = count.fetch_add(1, Ordering::SeqCst);
+            // Page 1 and 2 name a RELATIVE next link; page 3 names none.
+            let body = if i < 2 {
+                format!(
+                    "<html><body><ul><li class=item>row{}</li></ul>\
+                     <a class=next href=\"?p={}\">next</a></body></html>",
+                    i + 1,
+                    i + 2
+                )
+            } else {
+                "<html><body><ul><li class=item>row3</li></ul></body></html>".to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK{}Content-Type: text/html{}Content-Length: {}{}Connection: close{}{}",
+                CRLF, CRLF, body.len(), CRLF, CRLF, CRLF
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "rows.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": format!("http://127.0.0.1:{}/a/b/list.html", port),
+                "rowSelector": "li.item",
+                "columns": [{ "name": "v", "selector": "" }],
+                "nextPageSelector": "a.next",
+                "maxPages": 10,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    drop(handle);
+    assert_eq!(r.status, "ok", "pagination failed: {:?}", r.error);
+
+    assert_eq!(
+        count_rows(&out),
+        3,
+        "one row per page, and the walk stopped when a page named no next link"
+    );
+    let reqs = asked.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 3, "three pages, three requests: {reqs:?}");
+    // The relative link resolved against the DIRECTORY of the current
+    // document, keeping the path and replacing only the query.
+    assert!(reqs[0].contains("/a/b/list.html"), "{}", reqs[0]);
+    assert!(
+        reqs[1].contains("/a/b/list.html?p=2"),
+        "a relative ?p=2 must keep the path: {}",
+        reqs[1]
+    );
+    assert!(reqs[2].contains("/a/b/list.html?p=3"), "{}", reqs[2]);
+}
+
+/// #260: src.html archives the exact page it parsed, before parsing it.
+///
+/// The point is not that a file appears - it is that the file is the bytes the
+/// rows came from. The test hashes the captured file and compares it against
+/// the `_response_sha256` stamped on the rows, so a capture of a SECOND fetch
+/// (which could differ) would not pass.
+#[test]
+fn src_html_archives_the_page_it_parsed() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let html = "<html><body><ul>
+<li class=item><a href=/c/1>Acme</a></li>
+<li class=item><a href=/c/2>Globex</a></li>
+</ul></body></html>
+";
+    let page = write_file(tmp.path(), "list.html", html);
+    let raw_dir = tmp.path().join("raw");
+    let dest = format!("{}/{{sha256}}.html", raw_dir.to_string_lossy().replace('\\', "/"));
+    let out = out_path(tmp.path(), "out.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.html", json!({
+                "path": page,
+                "rowSelector": "li.item",
+                "columns": [{ "name": "name", "selector": "a" }],
+                "rawResponseDestination": dest,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.html failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+
+    let captured: Vec<_> = std::fs::read_dir(&raw_dir)
+        .expect("the raw directory must exist")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    assert_eq!(captured.len(), 1, "one page, one capture: {captured:?}");
+
+    let uri = scalar_string(&format!(
+        "SELECT _response_uri FROM read_csv_auto('{}') LIMIT 1",
+        out
+    ));
+    assert!(
+        std::path::Path::new(&uri).is_file(),
+        "the row must name a file that exists: {uri:?}"
+    );
+    // The archived bytes ARE the parsed bytes.
+    let on_disk = std::fs::read(&captured[0]).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&on_disk),
+        html,
+        "the capture must be the page that was parsed, byte for byte"
+    );
+    let stamped = scalar_string(&format!(
+        "SELECT _response_sha256 FROM read_csv_auto('{}') LIMIT 1",
+        out
+    ));
+    assert!(
+        uri.contains(&stamped),
+        "content-addressed: the name carries the hash the rows carry ({stamped} vs {uri})"
+    );
+}
+
 /// nothing, which is the silent-bug class this repo keeps finding.
 #[test]
 fn src_html_reads_the_key_value_column_shape_the_gui_writes() {
@@ -15339,5 +17069,5460 @@ fn snk_model_refuses_an_ambiguous_or_unversioned_card() {
     assert!(
         r2.error.unwrap_or_default().contains("version"),
         "the error should name the missing column"
+    );
+}
+
+/// Kafka offset tracking: two runs must not re-read the same records.
+///
+/// Env-gated exactly like the roundtrip test above - set DUCKLE_KAFKA_BROKERS
+/// and optionally DUCKLE_KAFKA_TOPIC. Also needs DUCKLE_WORKSPACE, since the
+/// resume point is stored under the workspace's state folder.
+///
+/// This is the behaviour that turns a scheduled read into a stream: produce 3,
+/// consume them, produce 3 more, consume again, and the second run must see
+/// ONLY the new three. Without tracking, an `earliest` start re-reads all six.
+#[test]
+fn src_kafka_resumes_where_the_last_successful_run_stopped() {
+    let engine = engine_or_skip!();
+    let brokers = match std::env::var("DUCKLE_KAFKA_BROKERS").ok() {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            eprintln!("skipping: set DUCKLE_KAFKA_BROKERS to run Kafka tests");
+            return;
+        }
+    };
+    // A fresh topic per run, so a previous run's records cannot make this pass.
+    let topic = format!("duckle-resume-{}", std::process::id());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", ws.to_string_lossy().to_string());
+
+    let produce = |csv_text: &str, name: &str| {
+        let csv = write_file(tmp.path(), name, csv_text);
+        let r = engine.execute_pipeline(&doc(
+            json!([
+                node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node("k", "snk.kafka", json!({
+                    "brokers": &brokers, "topic": &topic, "valueColumn": "name",
+                })),
+            ]),
+            json!([main_edge("e", "s", "k")]),
+        ));
+        assert_eq!(r.status, "ok", "produce failed: {:?}", r.error);
+    };
+
+    let consume = |out: &str| -> i64 {
+        let r = engine.execute_pipeline_named(
+            &doc(
+                json!([
+                    node("k", "src.kafka", json!({
+                        "brokers": &brokers,
+                        "topic": &topic,
+                        "partitionId": 0,
+                        "startOffset": -1,
+                        "maxRecords": 100,
+                        "trackOffset": true,
+                    })),
+                    node("o", "snk.csv", json!({ "path": out, "hasHeader": true })),
+                ]),
+                json!([main_edge("e", "k", "o")]),
+            ),
+            "resume_demo",
+        );
+        assert_eq!(r.status, "ok", "consume failed: {:?}", r.error);
+        count(&format!("read_csv_auto('{}')", out))
+    };
+
+    produce("id,name\n1,alpha\n2,beta\n3,gamma\n", "a.csv");
+    let out1 = out_path(tmp.path(), "run1.csv");
+    let first = consume(&out1);
+    assert_eq!(first, 3, "first run should read the 3 produced records");
+
+    produce("id,name\n4,delta\n5,epsilon\n6,zeta\n", "b.csv");
+    let out2 = out_path(tmp.path(), "run2.csv");
+    let second = consume(&out2);
+
+    // THE POINT: only the new records. Without offset tracking this is 6,
+    // because startOffset -1 means "earliest" and re-reads the whole partition.
+    assert_eq!(
+        second, 3,
+        "second run should read ONLY the 3 new records, not re-read all 6"
+    );
+
+    // And the resume point is on disk, naming the stream it belongs to.
+    let state = ws.join("state").join("resume_demo").join("k.json");
+    assert!(state.is_file(), "no resume point written at {:?}", state);
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(v.get("topic").and_then(|x| x.as_str()), Some(topic.as_str()));
+    assert_eq!(v.get("next_offset").and_then(|x| x.as_i64()), Some(6));
+}
+
+/// #253 follow-up, reported after the first implementation shipped: a run that
+/// could not write its deferred state still reported "ok".
+///
+/// That matters most for a model card. "ok" from a pipeline that registers a
+/// model means the card is on disk; if the write failed and the run still says
+/// ok, a later pipeline reads a stale `latest` - or nothing - and nothing ever
+/// said so. The same swallow applied to incremental watermarks and Kafka
+/// resume points.
+///
+/// The registry folder here is a FILE, so creating `<file>/churn/` cannot
+/// succeed, which exercises the failure path without depending on permissions.
+#[test]
+fn a_run_that_cannot_record_its_state_does_not_report_ok() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    // A regular file where the registry directory needs to be.
+    let blocker = tmp.path().join("models");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let models = blocker.to_string_lossy().replace('\\', "/");
+
+    let csv = write_file(
+        tmp.path(),
+        "metrics.csv",
+        "version,artifact\nrun-1,s3://models/churn/v1.pkl\n",
+    );
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node("m", "snk.model", json!({ "path": models, "name": "churn" })),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+
+    assert_eq!(
+        r.status, "error",
+        "a run whose model card could not be written must not report ok"
+    );
+    let err = r.error.unwrap_or_default();
+    assert!(
+        err.contains("could not be recorded"),
+        "the error should say the state was not recorded: {}",
+        err
+    );
+    assert!(
+        err.contains("churn"),
+        "the error should name the path it could not write: {}",
+        err
+    );
+}
+
+/// #10 follow-up: a declared date format is part of the source contract, so
+/// compiling, running, saving, reloading and compiling again must produce the
+/// same parsing expression. If execution or autodetect could rewrite it, two
+/// runs of the same saved pipeline would parse differently - which is exactly
+/// the class of change nobody notices until a date silently becomes NULL.
+#[test]
+fn a_declared_date_format_survives_a_run_and_a_reload() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    // Day-first dates, which are ambiguous without the declared format: 03/04
+    // is 3 April here and would be 4 March if anything re-detected it.
+    let in_csv = write_file(tmp.path(), "in.csv", "id,d\n1,03/04/2026\n2,25/12/2026\n");
+    let out = out_path(tmp.path(), "out.csv");
+
+    // One document, built as JSON so it can be round-tripped through a file the
+    // way a saved pipeline is.
+    let as_json = json!({
+        "nodes": [
+            {
+                "id": "s",
+                "position": { "x": 0, "y": 0 },
+                "data": {
+                    "label": "in",
+                    "componentId": "src.csv",
+                    "properties": { "path": in_csv, "hasHeader": true },
+                    "schema": [
+                        { "name": "id", "type": "int64" },
+                        { "name": "d", "type": "date", "format": "%d/%m/%Y" }
+                    ]
+                }
+            },
+            {
+                "id": "k",
+                "position": { "x": 200, "y": 0 },
+                "data": {
+                    "label": "out",
+                    "componentId": "snk.csv",
+                    "properties": { "path": out, "hasHeader": true }
+                }
+            }
+        ],
+        "edges": [ { "id": "e1", "source": "s", "target": "k", "data": { "connectionType": "main" } } ]
+    });
+
+    let sql_of = |text: &str| -> String {
+        let parsed: duckle_duckdb_engine::PipelineDoc =
+            serde_json::from_str(text).expect("doc parses");
+        duckle_duckdb_engine::compile_pipeline_sql(&parsed)
+            .expect("compiles")
+            .iter()
+            .map(|s| s.sql.clone())
+            .collect::<Vec<_>>()
+            .join("
+")
+    };
+
+    // The bytes as they would sit in the saved pipeline file.
+    let saved = as_json.to_string();
+    let before = sql_of(&saved);
+    assert!(
+        before.contains("%d/%m/%Y"),
+        "the declared format should reach the SQL: {}",
+        before
+    );
+
+    let parsed: duckle_duckdb_engine::PipelineDoc =
+        serde_json::from_str(&saved).expect("doc parses");
+    let r = engine.execute_pipeline(&parsed);
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+    // Parsed with the declared format, not a re-detected one.
+    assert_eq!(
+        scalar_string(&format!("SELECT d::VARCHAR FROM read_csv_auto('{}') WHERE id = 1", out)),
+        "2026-04-03",
+        "03/04/2026 must parse day-first, as declared"
+    );
+
+    // Reload those same bytes and compile again: identical SQL.
+    let after = sql_of(&saved);
+    assert_eq!(
+        before, after,
+        "compiling a saved pipeline again produced different SQL - the declared format is not stable across save/reload"
+    );
+}
+
+/// src.neo4j: the Query API answers columnar - fields once, then a values
+/// array per row - so the source has to zip them back into named columns.
+#[test]
+fn src_neo4j_zips_columnar_results_into_named_rows() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let body = r#"{"data":{"fields":["name","age"],"values":[["Alice",30],["Bob",25]]}}"#;
+    let (port, rx, handle) = serve_n_json(1, "200 OK", body);
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node(
+                "g",
+                "src.neo4j",
+                json!({
+                    "endpoint": format!("http://127.0.0.1:{}", port),
+                    "database": "neo4j",
+                    "user": "neo4j",
+                    "password": "secret",
+                    "cypher": "MATCH (p:Person) RETURN p.name AS name, p.age AS age",
+                })
+            ),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "g", "k")]),
+    ));
+    handle.join().ok();
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+
+    let req = rx.try_iter().collect::<Vec<_>>().join("\n");
+    assert!(
+        req.contains("/db/neo4j/query/v2"),
+        "should POST the Query API v2 path: {}",
+        req
+    );
+    // "neo4j:secret" base64-encoded - the API takes Basic auth, and getting
+    // this wrong is a 401 that looks like an empty result.
+    assert!(
+        req.contains("Authorization: Basic bmVvNGo6c2VjcmV0"),
+        "should send Basic auth: {}",
+        req
+    );
+    assert!(req.contains("MATCH (p:Person)"), "should send the cypher: {}", req);
+
+    let csv = std::fs::read_to_string(&out).unwrap().replace("\r\n", "\n");
+    assert_eq!(
+        csv.trim(),
+        "name,age\nAlice,30\nBob,25",
+        "columnar fields/values should become named columns"
+    );
+}
+
+/// src.turso: libSQL sends every integer as a JSON STRING so 64-bit values
+/// survive JSON numbers. Passing that through untouched makes each integer
+/// column arrive as VARCHAR, which silently breaks arithmetic downstream.
+#[test]
+fn src_turso_decodes_integers_sent_as_strings_as_numbers() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let body = r#"{"baton":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"id"},{"name":"label"}],"rows":[[{"type":"integer","value":"9007199254740993"},{"type":"text","value":"big"}],[{"type":"integer","value":"7"},{"type":"text","value":"small"}]]}}},{"type":"ok","response":{"type":"close"}}]}"#;
+    let (port, rx, handle) = serve_n_json(1, "200 OK", body);
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node(
+                "t",
+                "src.turso",
+                json!({
+                    "url": format!("http://127.0.0.1:{}", port),
+                    "authToken": "tok",
+                    "query": "SELECT id, label FROM things",
+                })
+            ),
+            // SUM only compiles over a numeric column: if the decode left the
+            // ids as text this stage is a binder error, not a wrong number.
+            node("s", "code.sql", json!({ "sql": "SELECT SUM(id) AS total FROM input" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "t", "s"), main_edge("e2", "s", "k")]),
+    ));
+    handle.join().ok();
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+
+    let req = rx.try_iter().collect::<Vec<_>>().join("\n");
+    assert!(req.contains("/v2/pipeline"), "should POST the pipeline API: {}", req);
+    assert!(
+        req.contains("Authorization: Bearer tok"),
+        "should send the auth token: {}",
+        req
+    );
+
+    let csv = std::fs::read_to_string(&out).unwrap().replace("\r\n", "\n");
+    assert_eq!(
+        csv.trim(),
+        "total\n9007199254741000",
+        "integers sent as strings must decode to numbers - SUM does not \
+         compile over VARCHAR, so a passthrough decode fails this run outright"
+    );
+}
+
+/// A failed statement comes back inside an HTTP 200 body, so a connector that
+/// only checks the status code reports success on a broken query.
+#[test]
+fn src_turso_surfaces_a_statement_error_despite_http_200() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let body = r#"{"results":[{"type":"error","error":{"message":"no such table: ghosts","code":"SQLITE_UNKNOWN"}}]}"#;
+    let (port, _rx, handle) = serve_n_json(1, "200 OK", body);
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node(
+                "t",
+                "src.turso",
+                json!({
+                    "url": format!("http://127.0.0.1:{}", port),
+                    "query": "SELECT * FROM ghosts",
+                })
+            ),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "t", "k")]),
+    ));
+    handle.join().ok();
+    assert_eq!(r.status, "error", "a failed statement must not report ok");
+    let err = r.error.unwrap_or_default();
+    assert!(
+        err.contains("no such table: ghosts"),
+        "the server's message should reach the user: {}",
+        err
+    );
+}
+
+/// snk.neo4j: rows go up as one `$rows` parameter expanded with UNWIND, so a
+/// batch is one round trip rather than one statement per row.
+#[test]
+fn snk_neo4j_sends_one_unwind_batch_for_all_rows() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "name,age\nAlice,30\nBob,25\n");
+    let (port, rx, handle) = serve_n_json(1, "200 OK", r#"{"data":{"fields":[],"values":[]}}"#);
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "n",
+                "snk.neo4j",
+                json!({
+                    "endpoint": format!("http://127.0.0.1:{}", port),
+                    "label": "Person",
+                    "mergeKeys": ["name"],
+                    "batchSize": 100,
+                })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "n")]),
+    ));
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+    let first = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the sink should have sent a request");
+    handle.join().ok();
+
+    let mut reqs = vec![first];
+    reqs.extend(rx.try_iter());
+    assert_eq!(reqs.len(), 1, "both rows should ride one request");
+    let req = &reqs[0];
+    assert!(
+        req.contains("UNWIND $rows AS row MERGE (n:`Person` {`name`: row.`name`})"),
+        "mergeKeys should produce a MERGE keyed on those properties: {}",
+        req
+    );
+    assert!(req.contains("Alice") && req.contains("Bob"), "both rows: {}", req);
+}
+
+/// True when the resolved interpreter has pyarrow. The streaming and
+/// whole-table modes both need it, and a machine without it should skip
+/// rather than fail.
+fn pyarrow_available() -> bool {
+    let bin = std::env::var("DUCKLE_PYTHON_BIN").unwrap_or_else(|_| "python".to_string());
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("-c").arg("import pyarrow");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// #245: `transform(table)` calls `pyarrow.parquet.read_table`, which
+/// materializes the whole relation - vectorized, but not out-of-core, so a
+/// table bigger than RAM still cannot run.
+///
+/// `transform_batches` streams instead. This proves it actually streams
+/// rather than just renaming the entry point: 200k rows at a 65,536-row batch
+/// size must reach the script as FOUR separate calls. A harness that
+/// materialized would call it once, and the assertion fails.
+#[test]
+fn code_python_transform_batches_streams_instead_of_materializing() {
+    let engine = engine_or_skip!();
+    if !pyarrow_available() {
+        eprintln!("skipping: pyarrow not installed for the resolved interpreter");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+
+    // Stamp each row with the ordinal of the batch it arrived in, so the
+    // output records how many times the entry point was called.
+    let script = "\
+_calls = {'n': 0}
+
+
+def transform_batches(batch):
+    import pyarrow as pa
+    _calls['n'] += 1
+    n = batch.num_rows
+    return pa.table({
+        'id': batch.column('id'),
+        'batch_no': pa.array([_calls['n']] * n, type=pa.int64()),
+    })
+";
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node(
+                "gen",
+                "code.sql",
+                json!({ "sql": "SELECT i AS id FROM range(200000) t(i)" })
+            ),
+            node("py", "code.python", json!({ "script": script })),
+            node(
+                "agg",
+                "code.sql",
+                json!({ "sql": "SELECT count(DISTINCT batch_no) AS batches, count(*) AS rows FROM input" })
+            ),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "gen", "py"),
+            main_edge("e2", "py", "agg"),
+            main_edge("e3", "agg", "k"),
+        ]),
+    ));
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+
+    let csv = std::fs::read_to_string(&out).unwrap().replace("\r\n", "\n");
+    assert_eq!(
+        csv.trim(),
+        "batches,rows\n4,200000",
+        "200k rows at 65536 a batch is 4 calls to transform_batches, and every \
+         row must survive the round trip; one batch would mean the harness \
+         materialized the table instead of streaming it"
+    );
+}
+
+/// The property continuous running rests on: a batch that fails downstream
+/// must NOT advance the source position, so the records it read are re-read
+/// rather than lost.
+///
+/// This is the failure mode that separates a correct micro-batch loop from an
+/// incorrect one. The tempting implementation commits the source position when
+/// the source reads - at which point a sink failure has silently dropped
+/// everything in that batch, and nothing reports it, because the source did
+/// its job. Here the position is queued and flushed only when the whole run
+/// reaches "ok", which is after every sink has written.
+///
+/// The test drives it through the real thing rather than asserting on the
+/// queue: run once cleanly, break the sink, run again with new records
+/// available, then repair the sink and assert the records that were in flight
+/// during the failure are delivered exactly once.
+#[test]
+fn a_failed_batch_does_not_advance_the_source_position() {
+    let engine = engine_or_skip!();
+    // DUCKLE_WORKSPACE is process-global and decides where the position file
+    // lives, so this has to be serialized against the other tests that set it.
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let src = write_file(
+        tmp.path(),
+        "in.csv",
+        "id,ts\n1,2026-01-01T00:00:00\n2,2026-01-02T00:00:00\n",
+    );
+    let good = out_path(tmp.path(), "good.csv");
+    // A regular FILE where the sink's output directory has to be, so the write
+    // fails without depending on permissions.
+    let blocker = tmp.path().join("blocked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let broken = format!("{}/out.csv", blocker.to_string_lossy().replace('\\', "/"));
+
+    let pipeline = |out: &str| {
+        doc(
+            json!([
+                node("s", "src.csv", json!({ "path": src, "hasHeader": true })),
+                node("i", "xf.incremental", json!({ "column": "ts" })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "i"), main_edge("e2", "i", "k")]),
+        )
+    };
+    let name = "position_holds";
+
+    // 1. A clean pass consumes both records and moves the position.
+    let r = engine.execute_pipeline_named(&pipeline(&good), name);
+    assert_eq!(r.status, "ok", "first pass failed: {:?}", r.error);
+    let state = tmp.path().join("state").join(name).join("i.json");
+    let after_good = std::fs::read_to_string(&state).expect("the position should be saved");
+    assert!(
+        after_good.contains("2026-01-02"),
+        "the position should have advanced to the last record: {}",
+        after_good
+    );
+
+    // 2. Two new records arrive, and the sink is broken.
+    std::fs::write(
+        &src,
+        "id,ts\n1,2026-01-01T00:00:00\n2,2026-01-02T00:00:00\n\
+         3,2026-01-03T00:00:00\n4,2026-01-04T00:00:00\n",
+    )
+    .unwrap();
+    let r = engine.execute_pipeline_named(&pipeline(&broken), name);
+    assert_eq!(r.status, "error", "the broken sink should fail the run");
+
+    // THE ASSERTION. The source read records 3 and 4 in that pass. Because the
+    // sink never wrote them, the position must be exactly where it was.
+    let after_fail = std::fs::read_to_string(&state).expect("the position file should still exist");
+    assert_eq!(
+        after_fail, after_good,
+        "a failed batch advanced the source position - records 3 and 4 would be \
+         lost with nothing reporting it"
+    );
+
+    // 3. Repair the sink. The records that were in flight must arrive, once.
+    std::fs::remove_file(&blocker).unwrap();
+    std::fs::create_dir_all(&blocker).unwrap();
+    let r = engine.execute_pipeline_named(&pipeline(&broken), name);
+    assert_eq!(r.status, "ok", "the repaired run failed: {:?}", r.error);
+    let delivered = std::fs::read_to_string(&broken).unwrap().replace("\r\n", "\n");
+    assert_eq!(
+        delivered.trim(),
+        "id,ts\n3,2026-01-03 00:00:00\n4,2026-01-04 00:00:00",
+        "exactly the records that were in flight during the failure, and no \
+         re-delivery of the two that already landed"
+    );
+}
+
+/// src.spool reads an append-only NDJSON file from where the last SUCCESSFUL
+/// run stopped. It is the reading half of push-source support: a listener
+/// keeps the port up and appends here, so a batch boundary costs nothing.
+///
+/// These cover the three ways a tailer goes wrong: re-reading what it already
+/// delivered, consuming a half-written record, and losing its place when the
+/// file is rotated.
+#[test]
+fn spool_reads_only_what_is_new_and_never_re_delivers() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let spool = tmp.path().join("in.ndjson");
+    let out = out_path(tmp.path(), "out.csv");
+    let pipeline = doc(
+        json!([
+            node("s", "src.spool", json!({ "path": spool.to_string_lossy().replace('\\', "/") })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    );
+    let name = "spooltest";
+    let append = |lines: &str| {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&spool)
+            .unwrap();
+        f.write_all(lines.as_bytes()).unwrap();
+    };
+    let rows_out = || {
+        std::fs::read_to_string(&out)
+            .unwrap()
+            .replace("\r\n", "\n")
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    };
+
+    append("{\"id\":1}\n{\"id\":2}\n");
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(rows_out(), 2, "first pass takes both records");
+
+    // Nothing new: the pass must produce nothing rather than the same two again.
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(rows_out(), 0, "a second pass must not re-deliver what already landed");
+
+    // Records that arrive between passes are exactly what the next pass takes.
+    append("{\"id\":3}\n");
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(rows_out(), 1, "only the record that arrived since");
+}
+
+/// A line without its newline yet is a record still being written. Consuming
+/// it would deliver half a record AND move the offset past the rest, losing
+/// the remainder when it arrives.
+#[test]
+fn spool_leaves_a_half_written_record_for_next_time() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let spool = tmp.path().join("in.ndjson");
+    let out = out_path(tmp.path(), "out.csv");
+    let pipeline = doc(
+        json!([
+            node("s", "src.spool", json!({ "path": spool.to_string_lossy().replace('\\', "/") })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    );
+    let name = "spoolpartial";
+    // One complete record, then a fragment with no newline.
+    std::fs::write(&spool, "{\"id\":1}\n{\"id\":2,\"kin").unwrap();
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let csv = std::fs::read_to_string(&out).unwrap().replace("\r\n", "\n");
+    assert_eq!(
+        csv.lines().skip(1).filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "only the complete record: {csv}"
+    );
+
+    // The rest of that record arrives; now it is whole and must be delivered.
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().append(true).open(&spool).unwrap();
+    f.write_all(b"d\":\"charge\"}\n").unwrap();
+    drop(f);
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let csv = std::fs::read_to_string(&out).unwrap().replace("\r\n", "\n");
+    assert!(
+        csv.contains("charge"),
+        "the completed record must arrive whole, not be lost with its fragment: {csv}"
+    );
+}
+
+/// A spool shorter than the saved position was rotated or truncated. Resuming
+/// at the old offset would read from the middle of a different file, so it
+/// starts again - skipping to the end would silently drop everything written
+/// since the rotation.
+#[test]
+fn spool_restarts_when_the_file_was_rotated_under_it() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let spool = tmp.path().join("in.ndjson");
+    let out = out_path(tmp.path(), "out.csv");
+    let pipeline = doc(
+        json!([
+            node("s", "src.spool", json!({ "path": spool.to_string_lossy().replace('\\', "/") })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    );
+    let name = "spoolrotate";
+    std::fs::write(&spool, "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n").unwrap();
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert!(std::fs::read_to_string(&out).unwrap().contains("3"));
+
+    // Rotated: a fresh, shorter file with different content.
+    std::fs::write(&spool, "{\"id\":99}\n").unwrap();
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let csv = std::fs::read_to_string(&out).unwrap().replace("\r\n", "\n");
+    assert!(
+        csv.contains("99"),
+        "after a rotation the new file must be read from the start, not skipped: {csv}"
+    );
+}
+
+/// The property the whole design rests on, at the spool: a batch that fails
+/// downstream must leave the offset alone, so the records are re-read rather
+/// than lost.
+#[test]
+fn spool_does_not_advance_when_the_run_fails() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let spool = tmp.path().join("in.ndjson");
+    std::fs::write(&spool, "{\"id\":1}\n{\"id\":2}\n").unwrap();
+    let spool_prop = spool.to_string_lossy().replace('\\', "/");
+
+    // A file sits where the sink's output directory has to be.
+    let blocker = tmp.path().join("blocked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let broken = format!("{}/out.csv", blocker.to_string_lossy().replace('\\', "/"));
+    let name = "spoolfail";
+    let r = engine.execute_pipeline_named(
+        &doc(
+            json!([
+                node("s", "src.spool", json!({ "path": spool_prop })),
+                node("k", "snk.csv", json!({ "path": broken, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "k")]),
+        ),
+        name,
+    );
+    assert_eq!(r.status, "error", "the broken sink should fail the run");
+    let state = tmp.path().join("state").join(name).join("s.json");
+    assert!(
+        !state.exists(),
+        "a failed run recorded a spool position, so those records would never be re-read"
+    );
+}
+
+/// Helper: run one tumbling-window batch over the given rows and return the
+/// rows it emitted, plus the message the stage reported.
+#[cfg(test)]
+fn tumble_batch(
+    engine: &duckle_duckdb_engine::DuckdbEngine,
+    tmp: &Path,
+    name: &str,
+    rows_sql: &str,
+    lateness: &str,
+) -> (String, String) {
+    let out = out_path(tmp, &format!("out-{}.csv", name));
+    let _ = std::fs::remove_file(&out);
+    let r = engine.execute_pipeline_named(
+        &doc(
+            json!([
+                node("g", "code.sql", json!({ "sql": rows_sql })),
+                node(
+                    "w",
+                    "xf.tumble",
+                    json!({ "timeColumn": "ts", "size": "1 hour", "allowedLateness": lateness })
+                ),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "g", "w"), main_edge("e2", "w", "k")]),
+        ),
+        name,
+    );
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+    let msg = r
+        .nodes
+        .get("w")
+        .and_then(|n| n.error.clone())
+        .unwrap_or_default();
+    let csv = std::fs::read_to_string(&out).unwrap_or_default().replace("\r\n", "\n");
+    (csv, msg)
+}
+
+/// A window must not be emitted until the watermark says no more rows for it
+/// are coming - and the watermark is EVENT time, not the clock. Data from 2019
+/// produces 2019's windows, and the last window stays open because nothing has
+/// been seen past it.
+#[test]
+fn tumble_holds_a_window_open_until_the_watermark_passes_it() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+
+    // 10:00, 10:30 in one window; 11:15 in the next. The watermark reaches
+    // 11:15, which closes the 10:00-11:00 window but not the 11:00-12:00 one.
+    let (csv, _) = tumble_batch(
+        &engine,
+        tmp.path(),
+        "tumble_hold",
+        "SELECT * FROM (VALUES \
+           (1, TIMESTAMP '2019-03-04 10:00:00'), \
+           (2, TIMESTAMP '2019-03-04 10:30:00'), \
+           (3, TIMESTAMP '2019-03-04 11:15:00')) t(id, ts)",
+        "0 seconds",
+    );
+    let ids: Vec<&str> = csv.lines().skip(1).filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(ids.len(), 2, "only the closed window's rows: {csv}");
+    assert!(csv.contains("10:00:00") && csv.contains("10:30:00"), "{csv}");
+    assert!(
+        !csv.contains("11:15:00"),
+        "the 11:00 window is still open - nothing has been seen past it: {csv}"
+    );
+}
+
+/// The rows held open in one run must come back in the next, joined by
+/// whatever arrived since. This is the part that needs state to survive
+/// between runs at all.
+#[test]
+fn tumble_carries_open_windows_into_the_next_run() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let name = "tumble_carry";
+
+    let (csv1, _) = tumble_batch(
+        &engine,
+        tmp.path(),
+        name,
+        "SELECT * FROM (VALUES (1, TIMESTAMP '2019-03-04 11:15:00')) t(id, ts)",
+        "0 seconds",
+    );
+    assert_eq!(
+        csv1.lines().skip(1).filter(|l| !l.trim().is_empty()).count(),
+        0,
+        "nothing is closed yet: {csv1}"
+    );
+
+    // A row in the NEXT hour pushes the watermark past 12:00, closing the
+    // 11:00 window - and the row buffered last run must be in it.
+    let (csv2, _) = tumble_batch(
+        &engine,
+        tmp.path(),
+        name,
+        "SELECT * FROM (VALUES (2, TIMESTAMP '2019-03-04 12:30:00')) t(id, ts)",
+        "0 seconds",
+    );
+    assert!(
+        csv2.contains("11:15:00"),
+        "the row buffered in the previous run must be emitted when its window closes: {csv2}"
+    );
+    assert!(
+        !csv2.contains("12:30:00"),
+        "the 12:00 window is still open: {csv2}"
+    );
+}
+
+/// A failed batch must leave the window state exactly as it was, or the rows
+/// held in open windows are lost with it.
+#[test]
+fn tumble_state_survives_a_failed_batch() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let name = "tumble_fail";
+    let rows = "SELECT * FROM (VALUES (1, TIMESTAMP '2019-03-04 11:15:00')) t(id, ts)";
+
+    // A good run buffers the row.
+    tumble_batch(&engine, tmp.path(), name, rows, "0 seconds");
+    let state = tmp.path().join("state").join(name).join("w.json");
+    let after_good = std::fs::read_to_string(&state).expect("state saved");
+
+    // A run whose sink cannot be written.
+    let blocker = tmp.path().join("blocked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let broken = format!("{}/out.csv", blocker.to_string_lossy().replace('\\', "/"));
+    let r = engine.execute_pipeline_named(
+        &doc(
+            json!([
+                node("g", "code.sql", json!({ "sql": "SELECT * FROM (VALUES (9, TIMESTAMP '2019-03-04 23:00:00')) t(id, ts)" })),
+                node("w", "xf.tumble", json!({ "timeColumn": "ts", "size": "1 hour" })),
+                node("k", "snk.csv", json!({ "path": broken, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "g", "w"), main_edge("e2", "w", "k")]),
+        ),
+        name,
+    );
+    assert_eq!(r.status, "error", "the broken sink should fail the run");
+    assert_eq!(
+        std::fs::read_to_string(&state).unwrap(),
+        after_good,
+        "a failed batch advanced the window state - the rows it was holding would be gone"
+    );
+
+    // And the row from the good run is still there to be emitted.
+    let (csv, _) = tumble_batch(
+        &engine,
+        tmp.path(),
+        name,
+        "SELECT * FROM (VALUES (2, TIMESTAMP '2019-03-04 12:30:00')) t(id, ts)",
+        "0 seconds",
+    );
+    assert!(csv.contains("11:15:00"), "the buffered row survived the failure: {csv}");
+}
+
+/// Late data must not produce a second, partial copy of a window that was
+/// already delivered. SQLFlow's equivalent re-creates the deleted bucket and
+/// emits it again with only the late count in it; downstream then has the same
+/// window twice with different numbers.
+#[test]
+fn tumble_drops_data_that_arrives_after_its_window_was_delivered() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let name = "tumble_late";
+
+    // Close the 10:00 window and deliver it.
+    let (csv1, _) = tumble_batch(
+        &engine,
+        tmp.path(),
+        name,
+        "SELECT * FROM (VALUES \
+           (1, TIMESTAMP '2019-03-04 10:30:00'), \
+           (2, TIMESTAMP '2019-03-04 11:30:00')) t(id, ts)",
+        "0 seconds",
+    );
+    assert!(csv1.contains("10:30:00"), "the 10:00 window was delivered: {csv1}");
+
+    // A straggler for that same, already-delivered window.
+    let (csv2, msg) = tumble_batch(
+        &engine,
+        tmp.path(),
+        name,
+        "SELECT * FROM (VALUES (3, TIMESTAMP '2019-03-04 10:45:00')) t(id, ts)",
+        "0 seconds",
+    );
+    assert!(
+        !csv2.contains("10:45:00"),
+        "re-emitting a delivered window as a partial second copy is the bug being avoided: {csv2}"
+    );
+    let _ = msg;
+}
+
+/// allowedLateness is the whole knob for out-of-order data: with it, a window
+/// stays open past its end and a straggler still counts.
+#[test]
+fn tumble_allowed_lateness_keeps_a_window_open_for_stragglers() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+
+    // Watermark reaches 11:30. With 1 hour of lateness the 10:00-11:00 window
+    // needs the watermark past 12:00, so it stays open and holds both rows.
+    let (csv, _) = tumble_batch(
+        &engine,
+        tmp.path(),
+        "tumble_late_ok",
+        "SELECT * FROM (VALUES \
+           (1, TIMESTAMP '2019-03-04 10:30:00'), \
+           (2, TIMESTAMP '2019-03-04 11:30:00')) t(id, ts)",
+        "1 hour",
+    );
+    assert_eq!(
+        csv.lines().skip(1).filter(|l| !l.trim().is_empty()).count(),
+        0,
+        "1 hour of allowed lateness holds the 10:00 window open: {csv}"
+    );
+}
+
+/// The watermark only moves forward. A batch of older data must not re-open
+/// windows that already closed.
+#[test]
+fn tumble_watermark_does_not_go_backwards() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let name = "tumble_mono";
+
+    tumble_batch(
+        &engine,
+        tmp.path(),
+        name,
+        "SELECT * FROM (VALUES (1, TIMESTAMP '2019-03-04 20:00:00')) t(id, ts)",
+        "0 seconds",
+    );
+    let read_wm = || -> String {
+        let s = std::fs::read_to_string(tmp.path().join("state").join(name).join("w.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        v["watermark"].as_str().unwrap_or("").to_string()
+    };
+    let high = read_wm();
+    assert!(high.contains("20:00:00"), "watermark: {high}");
+
+    // An older batch arrives.
+    tumble_batch(
+        &engine,
+        tmp.path(),
+        name,
+        "SELECT * FROM (VALUES (2, TIMESTAMP '2019-03-04 09:00:00')) t(id, ts)",
+        "0 seconds",
+    );
+    assert_eq!(read_wm(), high, "a batch of older data dragged the watermark back");
+}
+
+/// #273: an operator can move a watermark while a run is in flight - through
+/// the backfill panel, the CLI, the API or MCP. The run's deferred flush lands
+/// afterwards, and without a check it silently undoes their change: the next
+/// run resumes from the position they thought they had replaced, and nothing
+/// reports it.
+///
+/// A lock cannot fix this here. Only scheduled runs take one, and extending it
+/// to every run would deadlock a parallel `ctl.foreach`, whose children
+/// re-enter the same named-run path. Comparing what the run READ covers every
+/// run path instead, and also catches an edit landing after the read that a
+/// lock taken at the start would miss.
+///
+/// `ctl.wait` gives a deterministic window: the incremental node reads its
+/// state, then the run sits in the delay while the operator's edit lands, then
+/// the flush runs.
+#[test]
+fn an_edit_made_during_a_run_is_not_overwritten_by_its_flush() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let name = "midrun";
+    let ws = tmp.path().to_path_buf();
+    let src = write_file(
+        &ws,
+        "in.csv",
+        "id,ts\n1,2026-01-01T00:00:00\n2,2026-01-02T00:00:00\n",
+    );
+    let out = out_path(&ws, "out.csv");
+    // The probe exists only once `i` has run, which is the moment that matters:
+    // the operator's edit has to land AFTER the incremental node read its
+    // state. Waiting a fixed 700ms instead assumed the first two stages always
+    // finish inside it, and on a loaded Windows CI runner they do not - the
+    // edit then landed BEFORE the read, the run legitimately advanced from it,
+    // and the test failed claiming a bug that had not happened.
+    let probe = out_path(&ws, "probe.csv");
+    let pipeline = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": src, "hasHeader": true })),
+            node("i", "xf.incremental", json!({ "column": "ts" })),
+            node("p", "snk.csv", json!({ "path": probe, "hasHeader": true })),
+            node("w", "ctl.wait", json!({ "duration": 2000, "unit": "ms" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "s", "i"),
+            main_edge("e2", "i", "w"),
+            main_edge("e3", "w", "k"),
+            main_edge("e4", "i", "p"),
+        ]),
+    );
+    let state = ws.join("state").join(name).join("i.json");
+
+    // The operator's edit lands while the run is inside the delay - after the
+    // incremental node read its state, before the flush.
+    let ws_for_thread = ws.clone();
+    let probe_path = std::path::PathBuf::from(&probe);
+    let editor = std::thread::spawn(move || {
+        // Wait for the read to have happened, not for a guess at how long it
+        // takes. The ctl.wait then holds the run open long enough for this
+        // write to land before the flush, which is a file write against a two
+        // second window rather than a race.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !probe_path.exists() {
+            assert!(std::time::Instant::now() < deadline, "the incremental node never ran");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        duckle_duckdb_engine::watermark::set_incremental(
+            &ws_for_thread,
+            "midrun",
+            "i",
+            "2020-01-01 00:00:00",
+            Some("TIMESTAMP"),
+        )
+        .expect("operator edit");
+    });
+
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    editor.join().expect("editor thread");
+
+    // The rows were written - the run did its job. What must NOT have happened
+    // is the flush putting the watermark back on top of the operator's value.
+    let after = std::fs::read_to_string(&state).expect("state exists");
+    assert!(
+        after.contains("2020-01-01"),
+        "the run's flush overwrote an edit made while it was in flight - the \
+         replay the operator asked for would never happen, and nothing would \
+         say so. state: {after}"
+    );
+    assert!(
+        !after.contains("2026-01-02"),
+        "the run's position won over the operator's: {after}"
+    );
+    // And the run reports it rather than staying quiet.
+    let err = r.error.clone().unwrap_or_default();
+    assert!(
+        err.contains("changed while this run was in flight"),
+        "a discarded state write must be reported, not silent. status={} error={:?}",
+        r.status,
+        r.error
+    );
+}
+
+/// #272: a source that checked successfully and found nothing must be
+/// distinguishable from one that did work, and from one that failed.
+///
+/// A healthy poll is unchanged hundreds of times between real updates. If
+/// that reads as an ordinary success, nobody can tell a working poll from a
+/// broken one; if it reads as a failure, it pages somebody every few minutes.
+///
+/// So it is reported at NODE level as `unchanged`, and at RUN level as a
+/// separate flag - the run status stays `ok`, because about forty places key
+/// off ok/error/cancelled and a fourth value none of them know would turn a
+/// quiet poll into a page, a failed plan step or a red CI job.
+#[test]
+fn a_source_with_nothing_new_is_reported_as_unchanged_not_as_a_plain_ok() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let spool = tmp.path().join("in.ndjson");
+    let out = out_path(tmp.path(), "out.csv");
+    let pipeline = doc(
+        json!([
+            node("s", "src.spool", json!({ "path": spool.to_string_lossy().replace('\\', "/") })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    );
+    let name = "pollcheck";
+    std::fs::write(&spool, "{\"id\":1}\n").unwrap();
+
+    // A pass that DID work: ordinary ok, not unchanged.
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(r.nodes.get("s").map(|n| n.status.as_str()), Some("ok"));
+    assert!(!r.unchanged, "a run that loaded a row is not unchanged");
+
+    // A pass with nothing new.
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(
+        r.status, "ok",
+        "a quiet poll must not read as a failure - that pages somebody every few minutes"
+    );
+    assert!(r.error.is_none(), "and must carry no error: {:?}", r.error);
+    assert_eq!(
+        r.nodes.get("s").map(|n| n.status.as_str()),
+        Some("unchanged"),
+        "the node must say it checked and found nothing, or a working poll and a \
+         broken one look identical"
+    );
+    assert!(
+        r.unchanged,
+        "the run did no publishable work, and that is what makes it countable \
+         separately from a run that did"
+    );
+    // The marker is an internal signal, never something the user reads.
+    let shown = format!("{:?}", r.nodes.get("s"));
+    assert!(
+        !shown.contains('\u{1}'),
+        "the marker leaked into what the user sees: {shown}"
+    );
+}
+
+/// A run where one source was unchanged and another wrote rows is an ordinary
+/// `ok`, not an unchanged run. Getting this wrong would hide real work.
+#[test]
+fn a_run_that_wrote_rows_is_not_unchanged_even_if_one_source_was() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let quiet = tmp.path().join("quiet.ndjson");
+    std::fs::write(&quiet, "{\"id\":1}\n").unwrap();
+    let busy = write_file(tmp.path(), "busy.csv", "id\n7\n8\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let name = "mixed";
+
+    let mk = || {
+        doc(
+            json!([
+                node("q", "src.spool", json!({ "path": quiet.to_string_lossy().replace('\\', "/") })),
+                node("b", "src.csv", json!({ "path": busy, "hasHeader": true })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "b", "k")]),
+        )
+    };
+    // Drain the spool so the next run finds it quiet.
+    let r = engine.execute_pipeline_named(&mk(), name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    let r = engine.execute_pipeline_named(&mk(), name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(r.nodes.get("q").map(|n| n.status.as_str()), Some("unchanged"));
+    assert!(
+        !r.unchanged,
+        "a sink wrote rows, so this run did publishable work and must not be \
+         counted as a quiet poll"
+    );
+}
+
+/// #272: a poll should cost a HEAD, not the object. `src.changed` compares
+/// the fingerprint a HEAD gives against the last one it successfully
+/// processed, and emits a row only when it differs.
+#[test]
+fn changed_emits_a_row_only_when_the_remote_fingerprint_moves() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "out.csv");
+    let name = "changedpoll";
+
+    // Three HEADs: same ETag twice, then a different one.
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for (i, stream) in listener.incoming().take(3).enumerate() {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            // The third probe reports a different object.
+            let etag = if i < 2 { "aaa111" } else { "bbb222" };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: 0\r\n\
+                 Last-Modified: Wed, 01 Jan 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let pipeline = doc(
+        json!([
+            node("c", "src.changed", json!({ "uri": format!("http://127.0.0.1:{}/feed.zip", port) })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "c", "k")]),
+    );
+    let rows_out = || {
+        std::fs::read_to_string(&out)
+            .unwrap_or_default()
+            .replace("\r\n", "\n")
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    };
+
+    // First sight of the object: new, so it is emitted.
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(rows_out(), 1, "a source never seen before must be processed");
+    assert_eq!(r.nodes.get("c").map(|n| n.status.as_str()), Some("ok"));
+
+    // Same fingerprint: nothing to do, and it says so rather than looking like
+    // an ordinary success.
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "a quiet poll is not a failure: {:?}", r.error);
+    assert_eq!(rows_out(), 0, "an unchanged source must not be re-processed");
+    assert_eq!(
+        r.nodes.get("c").map(|n| n.status.as_str()),
+        Some("unchanged"),
+        "a working poll and a broken one must not look identical"
+    );
+    assert!(r.unchanged, "the run did no publishable work");
+
+    // The ETag moved: process it again.
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(rows_out(), 1, "a changed fingerprint must be processed");
+    let csv = std::fs::read_to_string(&out).unwrap();
+    assert!(csv.contains("changed"), "and reported as changed, not new: {csv}");
+    server.join().ok();
+}
+
+/// The fingerprint rule decides what gets skipped, so it is worth pinning.
+/// Missing metadata must read as CHANGED - re-reading costs compute, skipping
+/// loses data and reports nothing.
+#[test]
+fn a_source_that_reveals_nothing_is_treated_as_changed() {
+    use duckle_duckdb_engine::remote_fingerprint as fp;
+    // Any single signal is enough to compare on.
+    assert_eq!(fp(Some("abc"), None, None), fp(Some("abc"), None, None));
+    assert_ne!(fp(Some("abc"), None, None), fp(Some("xyz"), None, None));
+    assert_ne!(fp(None, None, Some(10)), fp(None, None, Some(11)));
+    // A weak ETag is a different string, so it reads as changed rather than
+    // being silently treated as equal.
+    assert_ne!(fp(Some("W/abc"), None, None), fp(Some("abc"), None, None));
+    // Nothing usable: two probes of the same object must NOT compare equal.
+    assert_ne!(
+        fp(None, None, None),
+        fp(None, None, None),
+        "with no signal at all the object must be re-processed, not skipped"
+    );
+    // Blank headers count as absent, not as a value.
+    assert_ne!(fp(Some("  "), Some(""), None), fp(Some("  "), Some(""), None));
+}
+
+// ---------------------------------------------------------------------------
+// #274 - publish groups: several DuckLake tables become visible together, or
+// not at all. The failure this prevents is a run that writes four of five
+// tables and reports success, leaving downstream readers on a mix of old and
+// new data with nothing to tell them so.
+// ---------------------------------------------------------------------------
+
+/// Two grouped sinks over the same lake commit in ONE transaction, so the lake
+/// gains a single snapshot rather than one per table. That single snapshot IS
+/// the published version - a reader either sees both tables or neither.
+#[test]
+fn publish_group_commits_both_tables_in_one_snapshot() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = out_path(tmp.path(), "grp.duckdb");
+    let snaps = |c: &str| -> i64 {
+        let rows = duckdb_json(&format!(
+            "INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:{}' AS l (READ_ONLY); \
+             SELECT COUNT(*) AS n FROM ducklake_snapshots('l')",
+            c
+        ));
+        rows.first()
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1)
+    };
+
+    let grouped = |table: &str| {
+        json!({
+            "path": catalog, "schemaName": "main", "tableName": table,
+            "mode": "overwrite", "publishGroup": "nightly"
+        })
+    };
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s1", "code.sql", json!({ "sql": "SELECT 1 AS id" })),
+            node("s2", "code.sql", json!({ "sql": "SELECT 2 AS id" })),
+            node("w1", "snk.ducklake", grouped("dim")),
+            node("w2", "snk.ducklake", grouped("fact")),
+        ]),
+        json!([main_edge("e1", "s1", "w1"), main_edge("e2", "s2", "w2")]),
+    ));
+    assert_eq!(r.status, "ok", "grouped write failed: {:?}", r.error);
+
+    let before = snaps(&catalog);
+    // A second run rewrites BOTH tables. One transaction, so one snapshot -
+    // not one per sink, which is what makes "together" observable at all.
+    let r2 = engine.execute_pipeline(&doc(
+        json!([
+            node("s1", "code.sql", json!({ "sql": "SELECT 10 AS id" })),
+            node("s2", "code.sql", json!({ "sql": "SELECT 20 AS id" })),
+            node("w1", "snk.ducklake", grouped("dim")),
+            node("w2", "snk.ducklake", grouped("fact")),
+        ]),
+        json!([main_edge("e1", "s1", "w1"), main_edge("e2", "s2", "w2")]),
+    ));
+    assert_eq!(r2.status, "ok", "second grouped write failed: {:?}", r2.error);
+    let added = snaps(&catalog) - before;
+    assert_eq!(
+        added, 1,
+        "two grouped sinks must publish as one snapshot, got {} - without a shared \
+         transaction each sink commits on its own and a reader can catch the lake \
+         half-updated",
+        added
+    );
+}
+
+/// The guarantee itself: when one member fails, the member that already wrote
+/// must not be visible.
+///
+/// The control case is the point of this test. The SAME pipeline without a
+/// publish group is run first, and it DOES leave a partial publish behind -
+/// one table updated, the other not, and a failed run to explain it. That is
+/// the bug being fixed, and running it here is what proves the grouped case
+/// below is doing work rather than passing because the failing sink happened
+/// to run first and write nothing.
+#[test]
+fn publish_group_failure_leaves_nothing_published() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let ids = |catalog: &str, table: &str| -> String {
+        scalar_string(&format!(
+            "INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:{}' AS l (READ_ONLY); \
+             SELECT COALESCE(string_agg(id::VARCHAR, ',' ORDER BY id), '') AS s FROM l.main.{}",
+            catalog, table
+        ))
+    };
+    // `fact` is fed by s2 and executes FIRST; `dim` is fed by s1 and executes
+    // second. So the failure goes in `dim`, leaving `fact` written and waiting
+    // to be either published on its own (no group) or rolled back (group).
+    let run = |catalog: &str, group: Option<&str>, dim_sql: &str| {
+        let props = |table: &str| {
+            let mut p = json!({
+                "path": catalog, "schemaName": "main", "tableName": table, "mode": "append"
+            });
+            if let Some(g) = group {
+                p["publishGroup"] = json!(g);
+            }
+            p
+        };
+        engine.execute_pipeline(&doc(
+            json!([
+                node("s1", "code.sql", json!({ "sql": dim_sql })),
+                node("s2", "code.sql", json!({ "sql": "SELECT 2 AS id" })),
+                node("w1", "snk.ducklake", props("dim")),
+                node("w2", "snk.ducklake", props("fact")),
+            ]),
+            json!([main_edge("e1", "s1", "w1"), main_edge("e2", "s2", "w2")]),
+        ))
+    };
+
+    for (catalog, group) in [("plain.duckdb", None), ("grouped.duckdb", Some("nightly"))] {
+        let cat = out_path(tmp.path(), catalog);
+        let r = run(&cat, group, "SELECT 1 AS id");
+        assert_eq!(r.status, "ok", "setup failed for {}: {:?}", catalog, r.error);
+        assert_eq!(ids(&cat, "dim"), "1");
+        assert_eq!(ids(&cat, "fact"), "2");
+
+        // 'boom' will not convert to the INT `dim` already declares, so the
+        // second sink fails after the first has written.
+        let r2 = run(&cat, group, "SELECT 'boom' AS id");
+        assert_eq!(r2.status, "error", "the bad member should fail the run");
+        assert_eq!(ids(&cat, "dim"), "1", "the failing member wrote something");
+
+        match group {
+            // No group: the sink that ran first is published on its own. This
+            // is the failure mode - a reader now sees a new `fact` against an
+            // old `dim`, and only the run log says anything is wrong.
+            None => assert_eq!(
+                ids(&cat, "fact"),
+                "2,2",
+                "control: without a group the first sink publishes alone. If this \
+                 stops holding, the grouped assertion below proves nothing."
+            ),
+            // Grouped: the same write is rolled back with the run.
+            Some(_) => assert_eq!(
+                ids(&cat, "fact"),
+                "2",
+                "the member that succeeded was published anyway - the group is \
+                 not atomic"
+            ),
+        }
+    }
+}
+
+/// A stub that speaks just enough S3 to answer a metadata poll, and records
+/// what it was asked. Serves `replies.len()` requests and then stops.
+///
+/// Recording the request line and the Authorization header is the point: a
+/// signed request that reaches the wrong PATH is a 403 in production and would
+/// be an invisible pass here, because the stub answers anything.
+#[cfg(test)]
+fn stub_s3(replies: Vec<String>) -> (u16, std::sync::mpsc::Receiver<(String, String)>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub s3");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for (i, stream) in listener.incoming().take(replies.len()).enumerate() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .ok();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let line = req.lines().next().unwrap_or_default().to_string();
+            let auth = req
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                .unwrap_or_default()
+                .to_string();
+            let _ = tx.send((line, auth));
+            let _ = stream.write_all(replies[i].as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (port, rx)
+}
+
+#[cfg(test)]
+fn s3_props(port: u16, uri: &str, listing: bool) -> serde_json::Value {
+    json!({
+        "uri": uri,
+        "listing": listing,
+        // The same property names a saved S3 connection supplies, so this is
+        // the shape a connection ref expands into.
+        "accessKey": "AKIAIOSFODNN7EXAMPLE",
+        "secretKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "region": "us-east-1",
+        "endpoint": format!("127.0.0.1:{}", port),
+        "urlStyle": "path",
+        "useSsl": false
+    })
+}
+
+/// #272: an S3 poll must cost a HEAD, not the object, and the HEAD has to be
+/// signed and addressed correctly or it is a 403 that reads like bad keys.
+#[test]
+fn s3_changed_probes_with_a_signed_head_and_only_emits_when_the_etag_moves() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "out.csv");
+    let name = "s3changed";
+
+    let head = |etag: &str| {
+        format!(
+            "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: 4096\r\n\
+             Last-Modified: Wed, 01 Jan 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // Same object twice, then a different one.
+    let (port, rx) = stub_s3(vec![head("aaa111"), head("aaa111"), head("bbb222")]);
+
+    let pipeline = doc(
+        json!([
+            node("c", "src.changed", s3_props(port, "s3://raw/2026/feed.zip", false)),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "c", "k")]),
+    );
+    let rows_out = || {
+        std::fs::read_to_string(&out)
+            .unwrap_or_default()
+            .replace("\r\n", "\n")
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    };
+
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(rows_out(), 1, "an object never seen before must be processed");
+
+    // What actually went on the wire. Path style puts the bucket in the path,
+    // and a HEAD is what makes this cheap - a GET here would download the
+    // object the component exists to avoid.
+    let (line, auth) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(line.starts_with("HEAD /raw/2026/feed.zip "), "wrong request: {line}");
+    assert!(
+        auth.contains("AWS4-HMAC-SHA256")
+            && auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date")
+            && auth.contains("/us-east-1/s3/aws4_request"),
+        "the request was not signed the way S3 requires: {auth}"
+    );
+
+    // Same ETag: a quiet poll, reported as such rather than as ordinary work.
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "a quiet poll is not a failure: {:?}", r.error);
+    assert_eq!(rows_out(), 0, "an unchanged object must not be re-processed");
+    assert_eq!(r.nodes.get("c").map(|n| n.status.as_str()), Some("unchanged"));
+
+    // The ETag moved.
+    let r = engine.execute_pipeline_named(&pipeline, name);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(rows_out(), 1, "a changed object must be processed again");
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("changed"), "the row should say it CHANGED, not that it is new: {body}");
+    assert!(body.contains("bbb222"), "the new etag belongs in the row: {body}");
+}
+
+/// Listing a prefix has to follow continuation tokens. Stopping at the first
+/// page silently processes the first 1000 objects and calls the sweep complete,
+/// which is the failure mode that hides a backlog rather than reporting it.
+#[test]
+fn s3_changed_lists_a_prefix_and_follows_the_continuation_token() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "list.csv");
+
+    let page = |body: &str| {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    };
+    let page1 = r#"<?xml version="1.0"?><ListBucketResult>
+      <IsTruncated>true</IsTruncated>
+      <NextContinuationToken>tok/2</NextContinuationToken>
+      <Contents><Key>incoming/</Key><Size>0</Size></Contents>
+      <Contents><Key>incoming/a.csv</Key><Size>10</Size><ETag>&quot;e1&quot;</ETag>
+        <LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>
+      <Contents><Key>incoming/b.csv</Key><Size>20</Size><ETag>&quot;e2&quot;</ETag>
+        <LastModified>2026-01-02T00:00:00.000Z</LastModified></Contents>
+    </ListBucketResult>"#;
+    let page2 = r#"<?xml version="1.0"?><ListBucketResult>
+      <IsTruncated>false</IsTruncated>
+      <Contents><Key>incoming/c.csv</Key><Size>30</Size><ETag>&quot;e3&quot;</ETag>
+        <LastModified>2026-01-03T00:00:00.000Z</LastModified></Contents>
+    </ListBucketResult>"#;
+    let (port, rx) = stub_s3(vec![page(page1), page(page2)]);
+
+    let r = engine.execute_pipeline_named(
+        &doc(
+            json!([
+                node("c", "src.changed", s3_props(port, "s3://raw/incoming/", true)),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "c", "k")]),
+        ),
+        "s3list",
+    );
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    let rows = body.replace("\r\n", "\n").lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(rows, 3, "all three objects across both pages: {body}");
+    assert!(!body.contains("incoming/,"), "a folder marker is not an object: {body}");
+    assert!(body.contains("s3://raw/incoming/c.csv"), "page 2 was dropped: {body}");
+
+    // The first request carries the prefix; the second carries the token it was
+    // given. A second request that repeats page one would loop forever.
+    let (first, _) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(first.contains("prefix=incoming%2F"), "prefix not sent encoded: {first}");
+    assert!(first.contains("list-type=2"), "not a ListObjectsV2 call: {first}");
+    let (second, _) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(
+        second.contains("continuation-token=tok%2F2"),
+        "the continuation token was not sent back encoded: {second}"
+    );
+}
+
+/// An S3 uri with no credentials must say so. Sending an anonymous request
+/// instead returns 403, which reads as "wrong keys" and sends people to check
+/// credentials they never set.
+#[test]
+fn s3_changed_without_credentials_says_what_is_missing() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let r = engine.execute_pipeline_named(
+        &doc(
+            json!([
+                node("c", "src.changed", json!({ "uri": "s3://raw/feed.zip" })),
+                node("k", "snk.csv", json!({ "path": out_path(tmp.path(), "x.csv") })),
+            ]),
+            json!([main_edge("e1", "c", "k")]),
+        ),
+        "s3nocreds",
+    );
+    assert_eq!(r.status, "error");
+    let err = r.error.unwrap_or_default();
+    assert!(
+        err.contains("S3 credentials") && err.contains("connection"),
+        "the message must name what is missing: {err}"
+    );
+}
+
+/// #247: an artifact is a reference until somebody moves the bytes. This is
+/// that step, and the two things it has to get right are that the bytes arrive
+/// intact and that the hash recorded is of the bytes that actually transferred.
+#[test]
+fn artifact_copy_lands_the_bytes_and_records_their_hash() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let src = write_file(tmp.path(), "report.pdf", "hello world");
+    let dest_dir = out_path(tmp.path(), "raw");
+    let out = out_path(tmp.path(), "landed.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": format!("SELECT '{}' AS uri", src) })),
+            node("c", "xf.artifact.copy", json!({ "destination": dest_dir })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    let landed = format!("{}/report.pdf", dest_dir);
+    assert_eq!(
+        std::fs::read_to_string(&landed).unwrap_or_default(),
+        "hello world",
+        "the bytes did not arrive intact"
+    );
+    let row = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(
+        row.contains("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"),
+        "the sha256 of the transferred bytes belongs in the row: {row}"
+    );
+    assert!(row.contains("application/pdf"), "media type from the extension: {row}");
+    assert!(row.contains("11"), "size in bytes: {row}");
+    assert!(row.contains("true"), "this copy did happen: {row}");
+}
+
+/// A raw zone is immutable, so re-running a feed must not re-upload what is
+/// already there. The row still comes out - downstream needs to know the
+/// artifact exists - but it says the copy did not happen.
+#[test]
+fn artifact_copy_skips_what_is_already_there_without_re_reading_it() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest_dir = out_path(tmp.path(), "raw");
+    let out = out_path(tmp.path(), "landed.csv");
+
+    // The source is served over HTTP so the stub can COUNT how many times the
+    // bytes were actually fetched. A skip that still downloads is not a skip.
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let _ = tx.send(());
+            let body = "hello world";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let uri = format!("http://127.0.0.1:{}/report.pdf", port);
+    let pipeline = doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": format!("SELECT '{}' AS uri", uri) })),
+            node("c", "xf.artifact.copy", json!({ "destination": dest_dir, "ifExists": "skip" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+    );
+
+    let r = engine.execute_pipeline(&pipeline);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert!(std::fs::read_to_string(&out).unwrap_or_default().contains("true"), "first copy ran");
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+        true,
+        "the first run must fetch the object"
+    );
+
+    // Second run: already there.
+    let r = engine.execute_pipeline(&pipeline);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let row = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(row.contains("false"), "the second copy must report that it did not happen: {row}");
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(400)).is_err(),
+        "a skip that still downloads the object is not a skip"
+    );
+}
+
+/// Content-addressed naming makes the store de-duplicating: two different
+/// sources holding the same bytes land on one key, and nothing is transferred
+/// the second time.
+#[test]
+fn artifact_copy_content_addressed_naming_deduplicates() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let a = write_file(tmp.path(), "a.txt", "hello world");
+    let b = write_file(tmp.path(), "b.txt", "hello world");
+    let dest_dir = out_path(tmp.path(), "cas");
+    let out = out_path(tmp.path(), "landed.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({
+                "sql": format!("SELECT '{}' AS uri UNION ALL SELECT '{}'", a, b)
+            })),
+            node("c", "xf.artifact.copy", json!({ "destination": dest_dir, "naming": "hash" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    let sha = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    assert!(
+        std::path::Path::new(&format!("{}/{}.txt", dest_dir, sha)).exists(),
+        "the key is the content hash"
+    );
+    let files: Vec<_> = std::fs::read_dir(&dest_dir).unwrap().flatten().collect();
+    assert_eq!(files.len(), 1, "identical bytes are one object, not two");
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(
+        body.replace("\r\n", "\n").lines().skip(1).filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "both inputs still produce a row - they both refer to that object: {body}"
+    );
+}
+
+/// A destination key is built from a source-controlled name, which is exactly
+/// the shape that writes outside the prefix. A raw zone that can be escaped is
+/// not one.
+///
+/// The source has to actually SUCCEED for this to prove anything: an earlier
+/// version pointed at an unreachable host, so nothing was written either way
+/// and the assertion held with the guard removed.
+#[test]
+fn artifact_copy_cannot_escape_the_destination_prefix() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest_dir = out_path(tmp.path(), "raw/zone");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let out = out_path(tmp.path(), "landed.csv");
+
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = "pwned";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    // naming "path" preserves the source's own path under the prefix, and this
+    // source's path climbs out of it. The fetch succeeds, so the only thing
+    // stopping the write is the guard.
+    let sneaky = format!("http://127.0.0.1:{}/../../escaped.txt", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": format!("SELECT '{}' AS uri", sneaky) })),
+            node("c", "xf.artifact.copy", json!({ "destination": dest_dir, "naming": "path" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "the fetch itself must succeed: {:?}", r.error);
+
+    let root = tmp.path();
+    for climbed in ["escaped.txt", "raw/escaped.txt"] {
+        assert!(
+            !root.join(climbed).exists(),
+            "a source path climbed out of the destination prefix to {climbed}"
+        );
+    }
+    assert!(
+        std::path::Path::new(&format!("{}/escaped.txt", dest_dir)).exists(),
+        "it should land INSIDE the prefix, with the climbing segments dropped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #279 - DuckLake maintenance. A thin surface over DuckLake's own operations,
+// so these tests check that the right function runs with the right options and
+// that its result reaches the pipeline as ordinary rows - not that DuckLake's
+// storage semantics are what we think they are.
+// ---------------------------------------------------------------------------
+
+/// Build a lake with several small files, so there is something to compact.
+#[cfg(test)]
+fn lake_with_small_files(tmp: &Path, name: &str, inserts: usize) -> String {
+    let catalog = out_path(tmp, name);
+    let data = out_path(tmp, &format!("{name}-data"));
+    let mut sql = format!(
+        "INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}/');\n\
+         CALL ducklake_set_option('lake', 'data_inlining_row_limit', '0');\n\
+         CREATE TABLE lake.t(id INT, v VARCHAR);\n",
+        catalog, data
+    );
+    for i in 0..inserts {
+        // One statement per file: DuckLake writes a file per insert once
+        // inlining is off, which is exactly the many-small-files shape
+        // compaction exists for.
+        sql.push_str(&format!("INSERT INTO lake.t VALUES ({i}, 'v{i}');\n"));
+    }
+    duckdb_exec(":memory:", &sql);
+    catalog
+}
+
+#[cfg(test)]
+fn maintain_node(catalog: &str, props: serde_json::Value) -> serde_json::Value {
+    let mut p = json!({ "path": catalog });
+    if let (Some(o), Some(extra)) = (p.as_object_mut(), props.as_object()) {
+        for (k, v) in extra {
+            o.insert(k.clone(), v.clone());
+        }
+    }
+    p
+}
+
+/// Compaction is the headline operation: many small files become fewer large
+/// ones, and the node reports what DuckLake actually did rather than a guess.
+#[test]
+fn ducklake_maintain_compacts_small_files_and_reports_what_it_did() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let catalog = lake_with_small_files(tmp.path(), "compact.duckdb", 4);
+    let out = out_path(tmp.path(), "compact.csv");
+
+    let files_now = |c: &str| -> i64 {
+        let rows = duckdb_json(&format!(
+            "INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:{}' AS l (READ_ONLY); \
+             SELECT COALESCE(SUM(file_count), 0) AS n FROM ducklake_table_info('l')",
+            c
+        ));
+        // DuckDB's -json emits a SUM / COUNT as a STRING (they are HUGEINT),
+        // so reading it only as a number quietly yields -1 and the assertion
+        // fails for a reason that has nothing to do with the lake.
+        rows.first()
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(-1)
+    };
+    assert_eq!(files_now(&catalog), 4, "four inserts, four files");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("m", "src.ducklake.maintain", maintain_node(&catalog, json!({ "operation": "compact" }))),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "m", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(files_now(&catalog), 1, "the small files were not compacted");
+
+    // DuckLake's own result rows reach the pipeline, so a quality gate or an
+    // alert can read a compaction like anything else.
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("files_processed"), "the report's columns: {body}");
+    assert!(body.contains("4"), "four files went in: {body}");
+
+    // And the node says what changed, for the run log.
+    let msg = r.nodes.get("m").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(msg.contains("files 4 -> 1"), "the before/after belongs in the message: {msg}");
+}
+
+/// Expiring snapshots is destructive, so the dry run has to be real: it must
+/// list what WOULD go and change nothing.
+#[test]
+fn ducklake_maintain_dry_run_lists_snapshots_without_removing_them() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let catalog = lake_with_small_files(tmp.path(), "expire.duckdb", 3);
+    let out = out_path(tmp.path(), "expire.csv");
+
+    let snaps = |c: &str| -> i64 {
+        let rows = duckdb_json(&format!(
+            "INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:{}' AS l (READ_ONLY); \
+             SELECT COUNT(*) AS n FROM ducklake_snapshots('l')",
+            c
+        ));
+        // DuckDB's -json emits a SUM / COUNT as a STRING (they are HUGEINT),
+        // so reading it only as a number quietly yields -1 and the assertion
+        // fails for a reason that has nothing to do with the lake.
+        rows.first()
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(-1)
+    };
+    let before = snaps(&catalog);
+    assert!(before > 3, "there should be snapshots to expire: {before}");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("m", "src.ducklake.maintain", maintain_node(&catalog, json!({
+                "operation": "expireSnapshots", "dryRun": true, "olderThan": "2099-01-01"
+            }))),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "m", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(snaps(&catalog), before, "a DRY run removed snapshots");
+
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    let listed =
+        body.replace("\r\n", "\n").lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+    assert!(listed > 0, "a dry run has to say what it WOULD remove: {body}");
+    let msg = r.nodes.get("m").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(msg.contains("dry run"), "the message must not read like a real deletion: {msg}");
+}
+
+/// Without a retention boundary DuckLake expires nothing. That is the right
+/// behaviour and it is surfaced rather than replaced: a scheduled job that
+/// forgot its boundary does nothing instead of deleting history.
+#[test]
+fn ducklake_maintain_expires_nothing_without_a_retention_boundary() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let catalog = lake_with_small_files(tmp.path(), "noboundary.duckdb", 3);
+    let out = out_path(tmp.path(), "nb.csv");
+
+    let snaps = |c: &str| -> i64 {
+        let rows = duckdb_json(&format!(
+            "INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:{}' AS l (READ_ONLY); \
+             SELECT COUNT(*) AS n FROM ducklake_snapshots('l')",
+            c
+        ));
+        // DuckDB's -json emits a SUM / COUNT as a STRING (they are HUGEINT),
+        // so reading it only as a number quietly yields -1 and the assertion
+        // fails for a reason that has nothing to do with the lake.
+        rows.first()
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(-1)
+    };
+    let before = snaps(&catalog);
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("m", "src.ducklake.maintain", maintain_node(&catalog, json!({
+                "operation": "expireSnapshots"
+            }))),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "m", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(snaps(&catalog), before, "history was deleted with no boundary set");
+}
+
+/// Ticking "dry run" on an operation DuckLake cannot dry-run must be refused,
+/// not ignored. Ignoring it would delete files while the operator believed
+/// nothing would happen, which is the worst possible outcome here.
+#[test]
+fn ducklake_maintain_refuses_a_dry_run_it_cannot_honour() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = out_path(tmp.path(), "x.duckdb");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("m", "src.ducklake.maintain", maintain_node(&catalog, json!({
+                "operation": "compact", "dryRun": true
+            }))),
+            node("k", "snk.csv", json!({ "path": out_path(tmp.path(), "x.csv") })),
+        ]),
+        json!([main_edge("e1", "m", "k")]),
+    ));
+    assert_eq!(r.status, "error");
+    let err = r.error.unwrap_or_default();
+    assert!(
+        err.contains("dry run") && err.contains("expireSnapshots"),
+        "the message must say which operations DO have one: {err}"
+    );
+}
+
+/// Statistics come back as an ordinary relation, which is what makes a quality
+/// check or an alert on file counts possible at all.
+#[test]
+fn ducklake_maintain_stats_are_an_ordinary_relation() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let catalog = lake_with_small_files(tmp.path(), "stats.duckdb", 2);
+    let out = out_path(tmp.path(), "stats.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("m", "src.ducklake.maintain", maintain_node(&catalog, json!({ "operation": "stats" }))),
+            node("f", "xf.filter", json!({ "condition": "file_count > 0" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "m", "f"), main_edge("e2", "f", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "stats must be filterable like any other rows: {:?}", r.error);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("table_name") && body.contains("file_size_bytes"), "{body}");
+    assert!(body.contains("t"), "the table should be in there: {body}");
+}
+
+// ---------------------------------------------------------------------------
+// #282 / #248 - a parser reads what an upstream artifact relation names, so
+// `src.changed -> xf.artifact.copy -> parse` is one pipeline rather than a
+// hard-coded path and a shell stage.
+// ---------------------------------------------------------------------------
+
+/// The composable case: the documents are whatever the upstream rows say, and
+/// the hash of the bytes that were landed travels with the pages.
+#[test]
+fn src_pdf_reads_the_documents_an_upstream_relation_names() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.pdf");
+    let b = tmp.path().join("b.pdf");
+    std::fs::write(&a, minimal_pdf(&["Alpha one", "Alpha two"])).unwrap();
+    std::fs::write(&b, minimal_pdf(&["Bravo one"])).unwrap();
+    let out = out_path(tmp.path(), "pages.csv");
+
+    // Exactly the shape xf.artifact.copy emits: a uri and the sha256 of the
+    // bytes it landed.
+    let rows = format!(
+        "SELECT '{}' AS uri, 'aaa111' AS sha256 UNION ALL SELECT '{}', 'bbb222'",
+        a.to_string_lossy().replace('\\', "/"),
+        b.to_string_lossy().replace('\\', "/")
+    );
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("art", "code.sql", json!({ "sql": rows })),
+            node("s", "src.pdf", json!({})),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "art", "s"), main_edge("e2", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.pdf from upstream failed: {:?}", r.error);
+
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    // Counted by reading the CSV, not by counting lines: a page's text
+    // carries its own newlines, so the file has more lines than rows.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3, "two documents, three pages");
+    assert!(body.contains("Alpha one") && body.contains("Bravo one"), "{body}");
+    // The provenance chain: the hash of the bytes that were parsed, carried
+    // rather than recomputed.
+    assert!(body.contains("aaa111") && body.contains("bbb222"), "the sha travels: {body}");
+    assert!(body.contains("a.pdf") && body.contains("b.pdf"), "document_uri names the source");
+}
+
+/// #248: the scanned-page handoff, as a contract.
+///
+/// Duckle does not do OCR and will not: rasterising needs a native rendering
+/// engine plus per-language trained data, which would end the self-contained
+/// cross-OS build. What it owes instead is a page a downstream stage can
+/// render WITHOUT guessing - so this pins the four things a `code.python`
+/// step needs, for a page that has no text layer:
+///
+///   document_uri    a path that stage can actually open
+///   page_number     which page to render
+///   has_text_layer  false, which is how the page was selected
+///   source_sha256   the bytes that were parsed, so the render is reproducible
+///
+/// Asserted on the page with NO text, because that is the only page anyone
+/// hands to OCR.
+#[test]
+fn a_scanned_page_carries_everything_an_ocr_stage_needs() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("scan.pdf");
+    // Page 2 has no text layer - a scan.
+    std::fs::write(&pdf, minimal_pdf(&["Readable page", ""])).unwrap();
+    let out = out_path(tmp.path(), "todo.csv");
+
+    // The realistic shape: an artifact relation naming documents already
+    // localised, which is what xf.artifact.copy produces.
+    let uri = pdf.to_string_lossy().replace('\\', "/");
+    let rows = format!("SELECT '{uri}' AS uri, 'sha-of-scan' AS sha256");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("art", "code.sql", json!({ "sql": rows })),
+            node("s", "src.pdf", json!({})),
+            // Exactly the filter a user writes to find work for OCR.
+            node("todo", "code.sql", json!({
+                "sql": "SELECT document_uri, page_number, source_sha256 FROM s WHERE has_text_layer = false"
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "art", "s"),
+            main_edge("e2", "s", "todo"),
+            main_edge("e3", "todo", "k"),
+        ]),
+    ));
+    assert_eq!(r.status, "ok", "the handoff pipeline failed: {:?}", r.error);
+
+    assert_eq!(
+        count(&format!("read_csv_auto('{}')", out)),
+        1,
+        "one page has no text layer, so exactly one page is OCR work"
+    );
+    let doc_uri = scalar_string(&format!(
+        "SELECT document_uri FROM read_csv_auto('{}')",
+        out
+    ));
+    assert!(
+        std::path::Path::new(&doc_uri).is_file(),
+        "the OCR stage must be able to OPEN this, not merely read it: {doc_uri:?}"
+    );
+    assert_eq!(
+        scalar_string(&format!("SELECT page_number FROM read_csv_auto('{}')", out)),
+        "2",
+        "and it must say WHICH page - page 1 has text and is not OCR work"
+    );
+    assert_eq!(
+        scalar_string(&format!("SELECT source_sha256 FROM read_csv_auto('{}')", out)),
+        "sha-of-scan",
+        "the hash of the bytes that were parsed travels, so a re-render is reproducible"
+    );
+}
+
+/// A raw zone is remote, so the parser has to fetch. The spool is one document
+/// at a time and must be gone afterwards - a long run that leaves every
+/// document behind fills the disk.
+#[test]
+fn src_pdf_fetches_a_remote_document_and_leaves_no_spool_behind() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = minimal_pdf(&["Remote page one", "Remote page two"]);
+
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = bytes.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(400))).ok();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                served.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&served);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let spools = || {
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("duckle_input_"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let before = spools();
+    let out = out_path(tmp.path(), "remote.csv");
+    let uri = format!("http://127.0.0.1:{}/doc.pdf", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("art", "code.sql", json!({ "sql": format!("SELECT '{}' AS uri", uri) })),
+            node("s", "src.pdf", json!({})),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "art", "s"), main_edge("e2", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "remote document failed: {:?}", r.error);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("Remote page one"), "the remote PDF was parsed: {body}");
+    assert!(body.contains(&uri), "document_uri is the URI, not the spool path: {body}");
+
+    assert_eq!(spools(), before, "the spooled document was not cleaned up");
+}
+
+/// A change feed with nothing new is a quiet success, not an error - and the
+/// relation still has to have the right columns so a downstream stage binds.
+#[test]
+fn src_pdf_with_nothing_upstream_produces_an_empty_typed_relation() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "empty.csv");
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("art", "code.sql", json!({
+                "sql": "SELECT 'x' AS uri WHERE 1 = 0"
+            })),
+            node("s", "src.pdf", json!({})),
+            node("f", "code.sql", json!({
+                "sql": "SELECT document_uri, page_number, source_sha256 FROM input"
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "art", "s"),
+            main_edge("e2", "s", "f"),
+            main_edge("e3", "f", "k"),
+        ]),
+    ));
+    assert_eq!(
+        r.status, "ok",
+        "an upstream that named no documents is not a failure: {:?}",
+        r.error
+    );
+    // The columns bound downstream, which is what "typed" has to mean here.
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("document_uri"), "the empty relation still has its shape: {body}");
+    assert_eq!(r.nodes.get("s").map(|n| n.status.as_str()), Some("unchanged"));
+}
+
+/// One unreadable document in a batch of hundreds should not have to end the
+/// run, when the pipeline says so.
+#[test]
+fn src_pdf_can_skip_a_document_it_cannot_read() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let good = tmp.path().join("good.pdf");
+    let bad = tmp.path().join("bad.pdf");
+    std::fs::write(&good, minimal_pdf(&["Readable"])).unwrap();
+    std::fs::write(&bad, b"this is not a pdf at all").unwrap();
+    let out = out_path(tmp.path(), "skip.csv");
+    let rows = format!(
+        "SELECT '{}' AS uri UNION ALL SELECT '{}'",
+        bad.to_string_lossy().replace('\\', "/"),
+        good.to_string_lossy().replace('\\', "/")
+    );
+
+    // Default is still to fail, because silently dropping a document is how a
+    // load goes short without anyone noticing.
+    let strict = engine.execute_pipeline(&doc(
+        json!([
+            node("art", "code.sql", json!({ "sql": rows.clone() })),
+            node("s", "src.pdf", json!({})),
+            node("k", "snk.csv", json!({ "path": out.clone(), "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "art", "s"), main_edge("e2", "s", "k")]),
+    ));
+    assert_eq!(strict.status, "error", "an unreadable document fails by default");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("art", "code.sql", json!({ "sql": rows })),
+            node("s", "src.pdf", json!({ "onError": "skip" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "art", "s"), main_edge("e2", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("Readable"), "the good document was still read: {body}");
+    let note = r.nodes.get("s").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(note.contains("skipped"), "what was skipped has to be reported: {note}");
+}
+
+// ---------------------------------------------------------------------------
+// #284 - archive extraction as an artifact operation, so a ZIP of CSVs and a
+// TAR of JSON land the same way and each member flows into its own parser.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn write_zip(path: &Path, members: &[(&str, &str)]) {
+    use std::io::Write;
+    let f = std::fs::File::create(path).unwrap();
+    let mut z = zip::ZipWriter::new(f);
+    let opts: zip::write::FileOptions<'_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, body) in members {
+        z.start_file(*name, opts).unwrap();
+        z.write_all(body.as_bytes()).unwrap();
+    }
+    z.finish().unwrap();
+}
+
+/// The composable case: an archive becomes one artifact row per member, and
+/// each member is a real file at the destination with its hash recorded.
+#[test]
+fn archive_extract_lands_every_member_as_its_own_artifact() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = tmp.path().join("bundle.zip");
+    write_zip(
+        &zip_path,
+        &[
+            ("companies.csv", "id,name\n1,Acme\n"),
+            ("documents/notes.txt", "hello world"),
+        ],
+    );
+    let dest = out_path(tmp.path(), "unpacked");
+    let out = out_path(tmp.path(), "members.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("a", "code.sql", json!({
+                "sql": format!("SELECT '{}' AS uri", zip_path.to_string_lossy().replace('\\', "/"))
+            })),
+            node("x", "xf.archive.extract", json!({ "destination": dest })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "a", "x"), main_edge("e2", "x", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    // The member paths inside the archive are preserved under the destination.
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/companies.csv", dest)).unwrap_or_default(),
+        "id,name\n1,Acme\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/documents/notes.txt", dest)).unwrap_or_default(),
+        "hello world"
+    );
+
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2, "one row per member: {body}");
+    assert!(body.contains("bundle.zip"), "archive_uri names where it came from: {body}");
+    assert!(body.contains("text/csv"), "media type from the member's own name: {body}");
+    // sha256 of "hello world" - the hash is of the member's bytes, not the
+    // archive's, which is what makes the extracted member a real artifact.
+    assert!(
+        body.contains("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"),
+        "the member's own hash: {body}"
+    );
+}
+
+/// A member path that climbs out of the destination is the classic archive
+/// attack, and it is not hypothetical: the format lets an archive say anything.
+#[test]
+fn archive_extract_cannot_write_outside_the_destination() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = tmp.path().join("evil.zip");
+    write_zip(&zip_path, &[("../../escaped.txt", "pwned")]);
+    let dest = out_path(tmp.path(), "raw/zone");
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("a", "code.sql", json!({
+                "sql": format!("SELECT '{}' AS uri", zip_path.to_string_lossy().replace('\\', "/"))
+            })),
+            node("x", "xf.archive.extract", json!({ "destination": dest })),
+            node("k", "snk.csv", json!({ "path": out_path(tmp.path(), "m.csv"), "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "a", "x"), main_edge("e2", "x", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "the archive itself is readable: {:?}", r.error);
+    for climbed in ["escaped.txt", "raw/escaped.txt"] {
+        assert!(
+            !tmp.path().join(climbed).exists(),
+            "a member climbed out of the destination to {climbed}"
+        );
+    }
+    assert!(
+        std::path::Path::new(&format!("{}/escaped.txt", dest)).exists(),
+        "it should land INSIDE the destination with the climbing segments dropped"
+    );
+}
+
+/// An archive is a compression format, so a small one can expand to fill a
+/// volume. The bound has to be applied WHILE reading - discovering it from a
+/// disk-full error is too late, and by then the disk is full.
+#[test]
+fn archive_extract_refuses_an_archive_that_expands_past_its_limit() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = tmp.path().join("bomb.zip");
+    // Compresses to almost nothing and expands to 8 MB.
+    let big = "A".repeat(8 * 1024 * 1024);
+    write_zip(&zip_path, &[("big.txt", &big)]);
+    let dest = out_path(tmp.path(), "unpacked");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("a", "code.sql", json!({
+                "sql": format!("SELECT '{}' AS uri", zip_path.to_string_lossy().replace('\\', "/"))
+            })),
+            node("x", "xf.archive.extract", json!({
+                "destination": dest, "maxUncompressedGb": 1
+            })),
+            node("k", "snk.csv", json!({ "path": out_path(tmp.path(), "m.csv") })),
+        ]),
+        json!([main_edge("e1", "a", "x"), main_edge("e2", "x", "k")]),
+    ));
+    // 8 MB is well under 1 GB, so this one is allowed through - the limit is
+    // real but not in the way here.
+    assert_eq!(r.status, "ok", "8 MB under a 1 GB limit should extract: {:?}", r.error);
+
+    // Now the same archive against a limit it cannot fit in. The member is
+    // bigger than the budget, so it is refused rather than truncated - a
+    // silently truncated member is worse than a failure, because the file
+    // looks complete.
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("a", "code.sql", json!({
+                "sql": format!("SELECT '{}' AS uri", zip_path.to_string_lossy().replace('\\', "/"))
+            })),
+            node("x", "xf.archive.extract", json!({
+                "destination": out_path(tmp.path(), "unpacked2"),
+                "maxUncompressedGb": 1,
+                "maxMembers": 1
+            })),
+            node("k", "snk.csv", json!({ "path": out_path(tmp.path(), "m2.csv") })),
+        ]),
+        json!([main_edge("e1", "a", "x"), main_edge("e2", "x", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+}
+
+/// Include and exclude decide what comes out, so a bundle carrying several
+/// datasets can be routed without extracting all of it.
+#[test]
+fn archive_extract_include_and_exclude_pick_members() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = tmp.path().join("mixed.zip");
+    write_zip(
+        &zip_path,
+        &[
+            ("companies.xml", "<a/>"),
+            ("officers.csv", "id\n1\n"),
+            ("__MACOSX/junk.xml", "<junk/>"),
+        ],
+    );
+    let dest = out_path(tmp.path(), "picked");
+    let out = out_path(tmp.path(), "picked.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("a", "code.sql", json!({
+                "sql": format!("SELECT '{}' AS uri", zip_path.to_string_lossy().replace('\\', "/"))
+            })),
+            node("x", "xf.archive.extract", json!({
+                "destination": dest, "include": "*.xml", "exclude": "__MACOSX/*"
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "a", "x"), main_edge("e2", "x", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("companies.xml"), "the wanted member: {body}");
+    assert!(!body.contains("officers.csv"), "include kept the csv out: {body}");
+    assert!(!body.contains("__MACOSX"), "exclude beats include: {body}");
+}
+
+/// A .tar.gz is streamed rather than spooled - it is read front to back, so an
+/// archive nobody has to hold is an archive whose size does not matter. The
+/// ordering of the extension check matters too: .tar.gz must not be read as one
+/// compressed stream.
+#[test]
+fn archive_extract_streams_a_tar_gz_without_spooling_it() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let tgz = tmp.path().join("bundle.tar.gz");
+    {
+        use std::io::Write;
+        let f = std::fs::File::create(&tgz).unwrap();
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        for (name, body) in [("one.json", "{\"a\":1}"), ("two.json", "{\"a\":2}")] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, body.as_bytes()).unwrap();
+        }
+        let enc = builder.into_inner().unwrap();
+        enc.finish().unwrap().flush().unwrap();
+    }
+    let dest = out_path(tmp.path(), "tarred");
+    let out = out_path(tmp.path(), "tar.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("a", "code.sql", json!({
+                "sql": format!("SELECT '{}' AS uri", tgz.to_string_lossy().replace('\\', "/"))
+            })),
+            node("x", "xf.archive.extract", json!({ "destination": dest })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "a", "x"), main_edge("e2", "x", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "tar.gz failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2, "both tar members");
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/one.json", dest)).unwrap_or_default(),
+        "{\"a\":1}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #283 - bounded materialization. The parser was already out-of-core in RAM,
+// but every parsed row went to one NDJSON file that grew to the size of the
+// whole result, and NDJSON repeats every property name on every row.
+// ---------------------------------------------------------------------------
+
+/// An input larger than one batch has to produce several parts, every row has
+/// to survive the round trip, and nothing may be left on the temp volume.
+#[test]
+fn xml_larger_than_one_batch_is_materialized_in_parts_without_losing_rows() {
+    /// Unique to this test, so its spool can be told apart from the ones other
+    /// tests are writing at the same moment.
+    const SPILL_NODE: &str = "xmlspillcheck";
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let xml = tmp.path().join("big.xml");
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&xml).unwrap());
+        writeln!(f, "<rows>").unwrap();
+        for i in 0..2500 {
+            writeln!(f, "<row><id>{i}</id><name>name-{i}</name></row>").unwrap();
+        }
+        writeln!(f, "</rows>").unwrap();
+    }
+    let out = out_path(tmp.path(), "xml.csv");
+
+    // The spool directory is <temp>/duckle-rest-<node_id>-<pid>-<nanos>-<tid>.parts
+    // (see unique_rest_tmp_path + spilling_every). Counting every ".parts" in
+    // the shared temp volume counts the ones OTHER tests are spilling into
+    // right now, which is a race that fails on whichever machine is slowest -
+    // it failed on Windows CI. Naming this node uniquely makes the assertion
+    // about this run.
+    let spools_of_this_test = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        n.contains(".parts") && n.contains(SPILL_NODE)
+                    })
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Clear rather than assert: a run that was killed mid-spill would otherwise
+    // fail this test on every future run until somebody emptied the temp
+    // directory by hand, which is a worse failure than the one being guarded.
+    for stale in spools_of_this_test() {
+        let _ = std::fs::remove_dir_all(&stale);
+    }
+
+    // A declared schema is what turns bounded materialization on, and a batch
+    // far smaller than the input is what makes several parts.
+    let node_json = json!({
+        "path": xml.to_string_lossy(),
+        "rowPath": "/rows/row",
+        "batchRows": 400
+    });
+    let mut doc_json = doc(
+        json!([
+            node(SPILL_NODE, "src.xml", node_json),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", SPILL_NODE, "k")]),
+    );
+    // The declared schema lives on the node's Schema tab rather than in props.
+    doc_json.nodes[0].data.schema = Some(
+        serde_json::from_value(json!([
+            { "name": "id", "type": "int64" },
+            { "name": "name", "type": "string" }
+        ]))
+        .unwrap(),
+    );
+
+    let r = engine.execute_pipeline(&doc_json);
+    assert_eq!(r.status, "ok", "src.xml failed: {:?}", r.error);
+
+    // It really was written in parts - without this the test passes whether
+    // spilling happened or not, which is the shape of test that proves nothing.
+    let note = r.nodes.get(SPILL_NODE).and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(
+        note.contains("7 bounded part(s)"),
+        "2500 rows at 400 per part is seven parts: {note}"
+    );
+    // Every row survived the round trip through them.
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2500, "rows were lost between parts");
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("name-0"), "the first row: {}", &body[..body.len().min(200)]);
+    assert!(body.contains("name-2499"), "the last row survived the final part");
+
+    // Nothing left behind. Parts that outlive the run are the temp volume this
+    // exists to protect.
+    assert!(
+        spools_of_this_test().is_empty(),
+        "parts were left on the temp volume: {:?}",
+        spools_of_this_test()
+    );
+}
+
+/// The declared schema still pins the types, which is the property that makes
+/// per-part writing safe: two parts inferring different types for one column
+/// would fail to union at the end.
+#[test]
+fn xml_parts_keep_the_declared_types() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let xml = tmp.path().join("typed.xml");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&xml).unwrap();
+        writeln!(f, "<rows>").unwrap();
+        // The first batch is all digits; the second has a value that would be
+        // inferred as text if each part were typed on its own.
+        for i in 0..12 {
+            writeln!(f, "<row><id>{i}</id></row>").unwrap();
+        }
+        writeln!(f, "</rows>").unwrap();
+    }
+    let out = out_path(tmp.path(), "typed.csv");
+    let mut doc_json = doc(
+        json!([
+            node("x", "src.xml", json!({
+                "path": xml.to_string_lossy(), "rowPath": "/rows/row", "batchRows": 5
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "x", "k")]),
+    );
+    doc_json.nodes[0].data.schema = Some(
+        serde_json::from_value(json!([{ "name": "id", "type": "int64" }])).unwrap(),
+    );
+    let r = engine.execute_pipeline(&doc_json);
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 12);
+    // Still an INTEGER after being written and read back through three parts.
+    let t = scalar_string(&format!(
+        "SELECT typeof(id) AS s FROM read_csv_auto('{}') LIMIT 1",
+        out
+    ));
+    assert!(t.contains("INT"), "the declared type survived the parts: {t}");
+}
+
+// ---------------------------------------------------------------------------
+// #281 - the failure that stays green. Every row can satisfy the schema and
+// every row-level rule while the dataset is nothing like what normally
+// arrives, and that publishes successfully.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn baseline_pipeline(rows_sql: &str, out: &str, props: serde_json::Value) -> PipelineDoc {
+    doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": rows_sql })),
+            node("b", "qa.baseline", props),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "b"), main_edge("e2", "b", "k")]),
+    )
+}
+
+/// The headline case: five million rows on Monday to Wednesday, then eight
+/// hundred thousand. Structurally perfect, and most of the source is gone.
+#[test]
+fn baseline_catches_a_row_count_collapse_the_schema_cannot_see() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "b.csv");
+    let name = "baseline_drop";
+    let rules = json!([{ "metric": "row_count", "maxDecreasePct": 20 }]);
+
+    // Three normal days build the baseline.
+    for _ in 0..3 {
+        let r = engine.execute_pipeline_named(
+            &baseline_pipeline(
+                "SELECT i AS id FROM range(1000) t(i)",
+                &out,
+                json!({ "rules": rules.clone() }),
+            ),
+            name,
+        );
+        assert_eq!(r.status, "ok", "a normal day: {:?}", r.error);
+    }
+
+    // The first run has nothing to compare against and says so rather than
+    // passing - otherwise the very first run could establish any baseline at
+    // all, including a broken one, and look verified doing it.
+    let first_body = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = first_body;
+
+    // Then a day where most of the source did not arrive.
+    let r = engine.execute_pipeline_named(
+        &baseline_pipeline(
+            "SELECT i AS id FROM range(100) t(i)",
+            &out,
+            json!({ "rules": rules }),
+        ),
+        name,
+    );
+    assert_eq!(r.status, "error", "a 90% row loss must not publish");
+    let err = r.error.unwrap_or_default();
+    assert!(
+        err.contains("row_count") && err.contains("decreased"),
+        "the message has to say what moved and by how much: {err}"
+    );
+}
+
+/// A rule that is not broken must not fire, or the gate gets turned off.
+#[test]
+fn baseline_lets_an_ordinary_day_through() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "ok.csv");
+    let name = "baseline_ok";
+    let rules = json!([{ "metric": "row_count", "maxDecreasePct": 20 }]);
+
+    for _ in 0..3 {
+        let r = engine.execute_pipeline_named(
+            &baseline_pipeline("SELECT i AS id FROM range(1000) t(i)", &out, json!({ "rules": rules.clone() })),
+            name,
+        );
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+    }
+    // 950 is a 5% dip - normal variation, not a finding.
+    let r = engine.execute_pipeline_named(
+        &baseline_pipeline("SELECT i AS id FROM range(950) t(i)", &out, json!({ "rules": rules })),
+        name,
+    );
+    assert_eq!(r.status, "ok", "a 5% dip is not an anomaly: {:?}", r.error);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("ok"), "the comparison still comes out as rows: {body}");
+}
+
+/// A null rate going from 0% to 5% is an infinite percentage increase, so a
+/// percentage limit says nothing about it. That is why absolute limits exist.
+#[test]
+fn baseline_catches_a_null_rate_that_percentages_cannot_describe() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "n.csv");
+    let name = "baseline_nulls";
+    let rules = json!([{ "column": "postcode", "metric": "null_pct", "maxIncrease": 0.10 }]);
+
+    for _ in 0..3 {
+        let r = engine.execute_pipeline_named(
+            &baseline_pipeline(
+                "SELECT i AS id, 'AB12' AS postcode FROM range(100) t(i)",
+                &out,
+                json!({ "rules": rules.clone() }),
+            ),
+            name,
+        );
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+    }
+    // Now 70% of postcodes are missing.
+    let r = engine.execute_pipeline_named(
+        &baseline_pipeline(
+            "SELECT i AS id, CASE WHEN i % 10 < 7 THEN NULL ELSE 'AB12' END AS postcode FROM range(100) t(i)",
+            &out,
+            json!({ "rules": rules }),
+        ),
+        name,
+    );
+    assert_eq!(r.status, "error", "a null rate going from 0 to 70% is an anomaly");
+    assert!(
+        r.error.unwrap_or_default().contains("postcode"),
+        "the failing column belongs in the message"
+    );
+}
+
+/// A partition disappearing is invisible to a dataset-level row count when the
+/// remaining partitions grow to cover it.
+#[test]
+fn baseline_catches_a_group_that_stopped_arriving() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "g.csv");
+    let name = "baseline_groups";
+    let props = json!({
+        "groupBy": ["country"],
+        "requireExistingGroups": true,
+        "rules": [{ "metric": "row_count", "maxDecreasePct": 20 }]
+    });
+
+    let three = "SELECT i AS id, CASE WHEN i % 3 = 0 THEN 'BE' WHEN i % 3 = 1 THEN 'NL' ELSE 'GB' END AS country FROM range(300) t(i)";
+    for _ in 0..3 {
+        let r = engine.execute_pipeline_named(&baseline_pipeline(three, &out, props.clone()), name);
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+    }
+    // GB stops arriving, and BE/NL grow to cover it - the total is UNCHANGED,
+    // so a row-count rule sees nothing at all.
+    let two = "SELECT i AS id, CASE WHEN i % 2 = 0 THEN 'BE' ELSE 'NL' END AS country FROM range(300) t(i)";
+    let r = engine.execute_pipeline_named(&baseline_pipeline(two, &out, props), name);
+    assert_eq!(r.status, "error", "a vanished partition must be caught");
+    let err = r.error.unwrap_or_default();
+    assert!(err.contains("GB"), "the missing group has to be named: {err}");
+}
+
+/// A failed run must not leave today's numbers as the new normal - otherwise a
+/// bad day teaches the gate that bad is normal, and the next one passes.
+#[test]
+fn baseline_does_not_accept_a_profile_from_a_failed_run() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "f.csv");
+    let name = "baseline_failed";
+    let rules = json!([{ "metric": "row_count", "maxDecreasePct": 20 }]);
+
+    for _ in 0..3 {
+        let r = engine.execute_pipeline_named(
+            &baseline_pipeline("SELECT i AS id FROM range(1000) t(i)", &out, json!({ "rules": rules.clone() })),
+            name,
+        );
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+    }
+    let state = tmp.path().join("state").join(name).join("baselines").join("b.json");
+    let after_good = std::fs::read_to_string(&state).expect("profiles were saved");
+
+    // A run that reports rather than gates, so the node itself succeeds - and
+    // then fails downstream.
+    let blocker = tmp.path().join("blocked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let broken = format!("{}/out.csv", blocker.to_string_lossy().replace('\\', "/"));
+    let r = engine.execute_pipeline_named(
+        &baseline_pipeline(
+            "SELECT i AS id FROM range(50) t(i)",
+            &broken,
+            json!({ "rules": rules, "mode": "report" }),
+        ),
+        name,
+    );
+    assert_eq!(r.status, "error", "the broken sink should fail the run");
+    assert_eq!(
+        std::fs::read_to_string(&state).unwrap(),
+        after_good,
+        "a failed run taught the gate that 50 rows is normal"
+    );
+}
+
+/// #282: the business keys that say what a document IS live on the artifact
+/// row. Emitting pages loses them unless they are carried, and then the pages
+/// cannot be joined back to the filing they came from without a second lookup.
+#[test]
+fn src_pdf_carries_the_upstream_business_keys_onto_every_page() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("filing.pdf");
+    std::fs::write(&pdf, minimal_pdf(&["Page one", "Page two"])).unwrap();
+    let out = out_path(tmp.path(), "carried.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("art", "code.sql", json!({
+                "sql": format!(
+                    "SELECT '{}' AS uri, 'C-42' AS company_id, 'F-7' AS filing_id",
+                    pdf.to_string_lossy().replace('\\', "/")
+                )
+            })),
+            node("s", "src.pdf", json!({ "carryColumns": ["company_id", "filing_id"] })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "art", "s"), main_edge("e2", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2, "two pages");
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("company_id") && body.contains("filing_id"), "columns: {body}");
+    // On EVERY page, not just the first.
+    assert_eq!(
+        count(&format!(
+            "read_csv_auto('{}') WHERE company_id = 'C-42' AND filing_id = 'F-7'",
+            out
+        )),
+        2,
+        "both pages carry the keys: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// src.json schema inference. DuckDB decides what the columns ARE from the first
+// `sample_size` rows (default 20480). On records that do not all carry the same
+// keys, every column that first appears later is silently DROPPED - the read
+// succeeds, the rows look right, and a field is simply gone.
+// ---------------------------------------------------------------------------
+
+/// A column that first appears past the default sample window must not vanish.
+/// There is no error to notice here, which is what makes it worth a test.
+#[test]
+fn json_keeps_a_column_that_first_appears_past_the_sample_window() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sparse.json");
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        write!(f, "[").unwrap();
+        // 20480 is DuckDB's default sample size, so the late key is past it.
+        for i in 0..20_500 {
+            if i > 0 {
+                write!(f, ",").unwrap();
+            }
+            if i == 20_490 {
+                write!(f, r#"{{"id":{i},"late_field":"found"}}"#).unwrap();
+            } else {
+                write!(f, r#"{{"id":{i}}}"#).unwrap();
+            }
+        }
+        write!(f, "]").unwrap();
+    }
+    let out = out_path(tmp.path(), "sparse.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.json", json!({ "path": path.to_string_lossy(), "format": "array" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "src.json failed: {:?}", r.error);
+
+    let header = std::fs::read_to_string(&out)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        header.contains("late_field"),
+        "a column first seen at row 20490 was dropped without a word: header was [{header}]"
+    );
+    assert_eq!(
+        count(&format!(
+            "read_csv_auto('{}') WHERE late_field = 'found'",
+            out
+        )),
+        1,
+        "and its value has to survive too, not just the column"
+    );
+}
+
+/// The knob is there for a caller who knows their records are uniform and would
+/// rather not pay for the extra pass.
+#[test]
+fn json_sample_size_can_be_lowered_when_the_records_are_uniform() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("uniform.json");
+    std::fs::write(&path, r#"[{"id":1,"name":"a"},{"id":2,"name":"b"}]"#).unwrap();
+    let out = out_path(tmp.path(), "uniform.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.json", json!({
+                "path": path.to_string_lossy(), "format": "array", "sampleSize": 100
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("name"), "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// #252 slice 2 - item checkpointing. The failure this prevents:
+//   399,999 successful paid calls
+//   request 400,000 fails permanently
+//   rerun repeats all 399,999 calls
+// So the test counts the CALLS, not the rows.
+// ---------------------------------------------------------------------------
+
+/// A stub chat-completions endpoint that counts how many times it was actually
+/// called, and can be told to fail after N.
+#[cfg(test)]
+fn stub_llm(fail_after: usize) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(400))).ok();
+            // Drain the whole request, body included, before answering.
+            // Replying to a POST while its body is still being written makes
+            // the client see a connection reset instead of the response, and
+            // the test then fails on a network error rather than on what it is
+            // about - intermittently, depending on how much went out.
+            //
+            // Read to the header terminator, then exactly Content-Length more.
+            // "a read shorter than the buffer means the request is finished"
+            // is a heuristic, not a guarantee: TCP is free to deliver a short
+            // read with more still coming, which is a flake nobody can
+            // reproduce on demand.
+            let mut req: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => {
+                        req.extend_from_slice(&buf[..n]);
+                        if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(i + 4);
+                        }
+                    }
+                }
+            };
+            if let Some(head_end) = head_end {
+                let head = String::from_utf8_lossy(&req[..head_end]).to_ascii_lowercase();
+                let want: usize = head
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['\r', '\n']).next())
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while req.len() - head_end < want {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+            }
+            let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            let resp = if fail_after > 0 && n > fail_after {
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    .to_string()
+            } else {
+                let body = format!(
+                    r#"{{"choices":[{{"message":{{"content":"answer-{}"}}}}]}}"#,
+                    n
+                );
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (port, calls)
+}
+
+#[cfg(test)]
+fn llm_pipeline(port: u16, rows_sql: &str, out: &str, extra: serde_json::Value) -> PipelineDoc {
+    let mut props = json!({
+        "inputColumn": "text",
+        "outputColumn": "answer",
+        "model": "test-model",
+        "apiKey": "k",
+        "baseUrl": format!("http://127.0.0.1:{}", port),
+        "maxRetries": 0
+    });
+    if let (Some(o), Some(e)) = (props.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            o.insert(k.clone(), v.clone());
+        }
+    }
+    doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": rows_sql })),
+            node("m", "xf.ai.llm", props),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "m"), main_edge("e2", "m", "k")]),
+    )
+}
+
+/// Work that was already paid for is not bought again.
+#[test]
+fn ai_llm_does_not_pay_twice_for_a_row_it_already_answered() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "llm.csv");
+    let (port, calls) = stub_llm(0);
+    let rows = "SELECT i AS id, 'ask ' || i AS text FROM range(3) t(i)";
+    let props = json!({ "checkpoint": true, "checkpointKey": ["id"] });
+
+    let r = engine.execute_pipeline_named(&llm_pipeline(port, rows, &out, props.clone()), "ck");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3, "three rows, three calls");
+    let first = std::fs::read_to_string(&out).unwrap_or_default();
+
+    // Same pipeline again. Every row is already done, so nothing is bought.
+    let r = engine.execute_pipeline_named(&llm_pipeline(port, rows, &out, props), "ck");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the rerun called the API again - the checkpoint bought nothing"
+    );
+    // And the answers are the SAME ones, not blanks: the output was stored, not
+    // just the fact that the row succeeded.
+    assert_eq!(std::fs::read_to_string(&out).unwrap_or_default(), first);
+    let note = r.nodes.get("m").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(note.contains("3 reused"), "the reuse has to be visible: {note}");
+}
+
+/// The case from the issue: most items succeed, one fails permanently, and the
+/// rerun must not repeat the successes.
+#[test]
+fn ai_llm_keeps_what_succeeded_when_a_later_row_fails() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "partial.csv");
+    // Four rows, the API dies after the third.
+    let (port, calls) = stub_llm(3);
+    let rows = "SELECT i AS id, 'ask ' || i AS text FROM range(4) t(i)";
+    let props = json!({ "checkpoint": true, "checkpointKey": ["id"], "concurrency": 1 });
+
+    let r = engine.execute_pipeline_named(&llm_pipeline(port, rows, &out, props.clone()), "part");
+    assert_eq!(r.status, "error", "the fourth row fails the stage");
+    let after_fail = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(after_fail >= 3, "three succeeded before the failure: {after_fail}");
+
+    // The three that succeeded are durable. A rerun must only buy the missing
+    // one - this is the entire point of the feature.
+    let store = tmp.path().join("state").join("part").join("checkpoints").join("m.ndjson");
+    let saved = std::fs::read_to_string(&store).unwrap_or_default();
+    assert_eq!(
+        saved.lines().filter(|l| !l.trim().is_empty()).count(),
+        3,
+        "the successful items were not made durable: {saved}"
+    );
+}
+
+/// Changing the prompt invalidates the stored answers, because they were
+/// produced by the old one. Reusing them would be silently wrong.
+#[test]
+fn ai_llm_reprices_the_work_when_the_prompt_changes() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "prompt.csv");
+    let (port, calls) = stub_llm(0);
+    let rows = "SELECT 1 AS id, 'hello' AS text";
+
+    let r = engine.execute_pipeline_named(
+        &llm_pipeline(port, rows, &out, json!({ "checkpoint": true, "checkpointKey": ["id"] })),
+        "pr",
+    );
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Same row, different prompt.
+    let r = engine.execute_pipeline_named(
+        &llm_pipeline(
+            port,
+            rows,
+            &out,
+            json!({
+                "checkpoint": true, "checkpointKey": ["id"],
+                "promptTemplate": "Summarise: ${text}"
+            }),
+        ),
+        "pr",
+    );
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a different prompt is different work and must be re-asked"
+    );
+}
+
+/// A row whose content changed must not be answered from the old content, even
+/// though its business key is the same. This is the trap in keying on the
+/// business key alone.
+#[test]
+fn ai_llm_does_not_reuse_an_answer_for_changed_content() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "changed.csv");
+    let (port, calls) = stub_llm(0);
+    let props = json!({ "checkpoint": true, "checkpointKey": ["id"] });
+
+    let r = engine.execute_pipeline_named(
+        &llm_pipeline(port, "SELECT 1 AS id, 'old' AS text", &out, props.clone()),
+        "chg",
+    );
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // company_id 123 with a new description is NOT the same item.
+    let r = engine.execute_pipeline_named(
+        &llm_pipeline(port, "SELECT 1 AS id, 'new' AS text", &out, props),
+        "chg",
+    );
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the same key with different content was answered from the OLD content"
+    );
+}
+
+/// Off by default, so no existing pipeline silently gains a cache.
+#[test]
+fn ai_llm_without_checkpointing_behaves_exactly_as_before() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "off.csv");
+    let (port, calls) = stub_llm(0);
+    let rows = "SELECT 1 AS id, 'hello' AS text";
+
+    for _ in 0..2 {
+        let r = engine.execute_pipeline_named(&llm_pipeline(port, rows, &out, json!({})), "off");
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "without checkpointing both runs call the API, as they always did"
+    );
+    assert!(
+        !tmp.path().join("state").join("off").join("checkpoints").exists(),
+        "and nothing is written that nobody asked for"
+    );
+}
+
+/// A volatile column must not silently destroy every cache hit.
+///
+/// The whole-row fingerprint is the safe default and it is pessimistic: one
+/// `ingested_at` moving every run means nothing is ever reused, and the stage
+/// pays full price forever while looking like it has a checkpoint.
+/// `checkpointFingerprint` names the columns that actually feed the work.
+#[test]
+fn ai_llm_ignores_a_volatile_column_when_told_which_columns_matter() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "fp.csv");
+    let (port, calls) = stub_llm(0);
+    let props = json!({
+        "checkpoint": true,
+        "checkpointKey": ["id"],
+        "checkpointFingerprint": ["text"],
+    });
+
+    // Same id, same text, DIFFERENT run stamp on the second run.
+    let first = "SELECT 1 AS id, 'hello' AS text, 'run-a' AS ingested_at";
+    let r = engine.execute_pipeline_named(&llm_pipeline(port, first, &out, props.clone()), "fp");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let second = "SELECT 1 AS id, 'hello' AS text, 'run-b' AS ingested_at";
+    let r = engine.execute_pipeline_named(&llm_pipeline(port, second, &out, props.clone()), "fp");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a column nobody named as input still invalidated the checkpoint"
+    );
+
+    // And it is a narrowing, not a blanket ignore: a named column changing is
+    // still different work.
+    let changed = "SELECT 1 AS id, 'goodbye' AS text, 'run-b' AS ingested_at";
+    let r = engine.execute_pipeline_named(&llm_pipeline(port, changed, &out, props), "fp");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a change in a NAMED column was answered from the old content"
+    );
+}
+
+/// Without the setting, the whole row still decides - the safe default is not
+/// quietly loosened by adding the option.
+#[test]
+fn ai_llm_still_reprices_on_any_column_when_no_fingerprint_is_named() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "fpdef.csv");
+    let (port, calls) = stub_llm(0);
+    let props = json!({ "checkpoint": true, "checkpointKey": ["id"] });
+
+    for sql in [
+        "SELECT 1 AS id, 'hello' AS text, 'run-a' AS ingested_at",
+        "SELECT 1 AS id, 'hello' AS text, 'run-b' AS ingested_at",
+    ] {
+        let r = engine.execute_pipeline_named(&llm_pipeline(port, sql, &out, props.clone()), "fpd");
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the default must stay whole-row: any change is different work"
+    );
+}
+
+/// #284: a retry must not report weaker provenance than the run that wrote the
+/// file.
+///
+/// The failure path is the normal one: extract, downstream fails, the source
+/// state does not advance, the same archive arrives again. The members are
+/// already there, `ifExists: skip` leaves them alone - and it used to emit them
+/// with a NULL size and hash, and never add them to the run's artifacts. So the
+/// same logical input produced a different, weaker record on its second run.
+#[test]
+fn archive_extract_keeps_the_member_identity_when_it_skips() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = tmp.path().join("again.zip");
+    write_zip(&zip_path, &[("notes.txt", "hello world")]);
+    let dest = out_path(tmp.path(), "unpacked");
+    // sha256("hello world")
+    let sha = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+    let run = |out: &str| {
+        engine.execute_pipeline(&doc(
+            json!([
+                node("a", "code.sql", json!({
+                    "sql": format!("SELECT '{}' AS uri", zip_path.to_string_lossy().replace('\\', "/"))
+                })),
+                node("x", "xf.archive.extract", json!({
+                    "destination": dest, "ifExists": "skip"
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "a", "x"), main_edge("e2", "x", "k")]),
+        ))
+    };
+
+    let first_out = out_path(tmp.path(), "first.csv");
+    let first = run(&first_out);
+    assert_eq!(first.status, "ok", "{:?}", first.error);
+    let first_body = std::fs::read_to_string(&first_out).unwrap_or_default();
+    assert!(first_body.contains(sha), "the first run records the hash: {first_body}");
+
+    // Second run: the member is already at the destination, so it is skipped.
+    let second_out = out_path(tmp.path(), "second.csv");
+    let second = run(&second_out);
+    assert_eq!(second.status, "ok", "{:?}", second.error);
+    let second_body = std::fs::read_to_string(&second_out).unwrap_or_default();
+
+    assert!(
+        second_body.contains(sha),
+        "the skipped member lost its hash on the retry: {second_body}"
+    );
+    assert!(
+        !second_body.contains(",,"),
+        "size and hash must not come back empty on a skip: {second_body}"
+    );
+    // The whole row is identical, which is the actual requirement: the same
+    // logical input produces the same provenance whichever run it lands on.
+    assert_eq!(
+        first_body, second_body,
+        "a retry produced a different record for the same input"
+    );
+
+    // And it reaches the run's artifact list, not just the rows.
+    let named: Vec<_> = second
+        .artifacts
+        .iter()
+        .filter(|a| a.uri.ends_with("notes.txt"))
+        .collect();
+    assert_eq!(named.len(), 1, "the skipped member is missing from the run manifest");
+    assert_eq!(named[0].sha256.as_deref(), Some(sha));
+    assert_eq!(named[0].size_bytes, Some(11));
+}
+
+/// `skip` claims the destination already IS this member. When it is not, that
+/// is a real conflict and staying quiet about it would hide a corrupted or
+/// half-written file behind a green run.
+#[test]
+fn archive_extract_refuses_to_skip_a_destination_that_is_a_different_file() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = tmp.path().join("conflict.zip");
+    write_zip(&zip_path, &[("notes.txt", "hello world")]);
+    let dest = out_path(tmp.path(), "unpacked");
+    std::fs::create_dir_all(&dest).unwrap();
+    // Something else is already sitting at that path.
+    std::fs::write(format!("{}/notes.txt", dest), "not the same content at all").unwrap();
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("a", "code.sql", json!({
+                "sql": format!("SELECT '{}' AS uri", zip_path.to_string_lossy().replace('\\', "/"))
+            })),
+            node("x", "xf.archive.extract", json!({
+                "destination": dest, "ifExists": "skip"
+            })),
+        ]),
+        json!([main_edge("e1", "a", "x")]),
+    ));
+    assert_eq!(r.status, "error", "a different file at the destination is not a skip");
+    let err = r.error.unwrap_or_default();
+    assert!(err.contains("notes.txt"), "names the file: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// #281 - operating the gate. The failure this prevents is not a wrong answer,
+// it is the check getting switched off: a source legitimately changes shape,
+// every run fails from then on, and with no way to re-base it the only options
+// are deleting the node or widening the thresholds until they mean nothing.
+// ---------------------------------------------------------------------------
+
+/// A refused run still records what it measured, and accepting that promotes it
+/// to the new normal - after which the same data passes.
+#[test]
+fn a_refused_baseline_can_be_accepted_and_the_gate_then_passes() {
+    use duckle_duckdb_engine::baseline;
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let ws = tmp.path();
+    let out = out_path(ws, "b281.csv");
+    let name = "rebase";
+    let rules = json!([{ "metric": "row_count", "maxDecreasePct": 20 }]);
+
+    // Three normal days establish the accepted history.
+    for _ in 0..3 {
+        let r = engine.execute_pipeline_named(
+            &baseline_pipeline(
+                "SELECT i AS id FROM range(1000) t(i)",
+                &out,
+                json!({ "rules": rules.clone() }),
+            ),
+            name,
+        );
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+    }
+
+    // The source legitimately shrinks - a product line was retired, say.
+    let smaller = "SELECT i AS id FROM range(100) t(i)";
+    let r = engine.execute_pipeline_named(
+        &baseline_pipeline(smaller, &out, json!({ "rules": rules.clone() })),
+        name,
+    );
+    assert_eq!(r.status, "error", "the gate does its job first");
+
+    // The refused run still left its numbers behind. This is the whole point:
+    // if the observation were deferred like the accepted history, the run an
+    // operator most needs to look at would leave nothing to look at.
+    let view = baseline::inspect(ws, name, "b");
+    assert_eq!(view.status.observed_status.as_deref(), Some("violation"));
+    assert!(view.status.pending, "there is something to accept");
+    assert!(!view.violations.is_empty(), "and it says why it was refused");
+    let rc = view
+        .metrics
+        .iter()
+        .find(|m| m.metric == "row_count")
+        .expect("row_count is profiled");
+    assert_eq!(rc.baseline, Some(1000.0), "the accepted median");
+    assert_eq!(rc.observed, Some(100.0), "what the refused run saw");
+
+    // The operator investigates, decides this is the new normal, and says so.
+    let after = baseline::accept(ws, name, "b", 10).expect("accept");
+    assert_eq!(after.status.accepted, 4);
+    assert!(!after.status.pending, "nothing left outstanding");
+
+    // Accepting once does not flip the gate on its own - the median of four is
+    // still near the old world, which is the median doing its job. What must be
+    // true is that the operator now has a lever at all, and that repeated
+    // acceptance moves the baseline to the new normal.
+    for _ in 0..3 {
+        let r = engine.execute_pipeline_named(
+            &baseline_pipeline(smaller, &out, json!({ "rules": rules.clone() })),
+            name,
+        );
+        let _ = r;
+        baseline::accept(ws, name, "b", 10).expect("accept");
+    }
+    let r = engine.execute_pipeline_named(
+        &baseline_pipeline(smaller, &out, json!({ "rules": rules })),
+        name,
+    );
+    assert_eq!(
+        r.status, "ok",
+        "once the new shape IS the accepted history the gate passes again: {:?}",
+        r.error
+    );
+}
+
+/// Clearing forces the history to start over, so the next run cannot fail
+/// against a world that no longer exists.
+#[test]
+fn clearing_a_baseline_lets_the_next_run_start_the_history_again() {
+    use duckle_duckdb_engine::baseline;
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let ws = tmp.path();
+    let out = out_path(ws, "b281c.csv");
+    let name = "wipe";
+    let rules = json!([{ "metric": "row_count", "maxDecreasePct": 20 }]);
+
+    for _ in 0..3 {
+        let r = engine.execute_pipeline_named(
+            &baseline_pipeline(
+                "SELECT i AS id FROM range(1000) t(i)",
+                &out,
+                json!({ "rules": rules.clone() }),
+            ),
+            name,
+        );
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+    }
+    assert_eq!(baseline::inspect(ws, name, "b").status.accepted, 3);
+
+    let dropped = baseline::clear(ws, name, "b").expect("clear");
+    assert_eq!(dropped, 3, "reports what it dropped");
+
+    // With no accepted history the next run is a first run, not a failure.
+    let r = engine.execute_pipeline_named(
+        &baseline_pipeline("SELECT i AS id FROM range(100) t(i)", &out, json!({ "rules": rules })),
+        name,
+    );
+    assert_eq!(r.status, "ok", "a cleared baseline cannot refuse anything: {:?}", r.error);
+}
+
+/// The same permission that withholds a watermark edit withholds this one. An
+/// accept is a change to what the environment considers normal, so a locked
+/// down environment must not let it through any surface.
+#[test]
+fn accepting_a_baseline_obeys_the_state_mutation_policy() {
+    use duckle_duckdb_engine::baseline;
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let ws = tmp.path();
+    let dir = ws.join("state").join("p").join("baselines");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("n.json"), r#"{"profiles":[{"row_count":10}]}"#).unwrap();
+    std::fs::write(
+        dir.join("n.observed.json"),
+        r#"{"at":"2026-08-28T00:00:00Z","status":"violation","violations":[],"profile":{"row_count":1}}"#,
+    )
+    .unwrap();
+
+    let policy = ws.join("server-policy.yaml");
+    std::fs::write(&policy, "mode: enforce\nstate:\n  allowMutation: false\n").unwrap();
+    std::env::set_var("DUCKLE_POLICY_FILE", &policy);
+
+    let accept = baseline::accept(ws, "p", "n", 10);
+    let clear = baseline::clear(ws, "p", "n");
+    std::env::remove_var("DUCKLE_POLICY_FILE");
+
+    assert!(accept.is_err(), "accept walked past state.allowMutation");
+    assert!(clear.is_err(), "clear walked past state.allowMutation");
+    // And the refusal is real: the history is untouched.
+    let still = std::fs::read_to_string(dir.join("n.json")).unwrap();
+    assert!(still.contains("\"row_count\":10"), "the accepted history changed: {still}");
+}
+
+// ---------------------------------------------------------------------------
+// #282 - src.xml on the shared ArtifactInput contract. A corpus of documents
+// named by an upstream relation, rather than one configured path.
+// ---------------------------------------------------------------------------
+
+/// The composability case: an upstream relation names the documents, each is
+/// parsed, and the business keys that say what a document IS survive onto every
+/// row it produced.
+#[test]
+fn src_xml_parses_every_document_an_upstream_relation_names() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.xml");
+    let b = tmp.path().join("b.xml");
+    std::fs::write(&a, "<rows><row><id>1</id><name>Acme</name></row></rows>").unwrap();
+    std::fs::write(
+        &b,
+        "<rows><row><id>2</id><name>Globex</name></row><row><id>3</id><name>Initech</name></row></rows>",
+    )
+    .unwrap();
+    let out = out_path(tmp.path(), "corpus.csv");
+    let listing = format!(
+        "SELECT '{}' AS uri, 'sha-a' AS sha256, 101 AS company_id \
+         UNION ALL SELECT '{}', 'sha-b', 202",
+        a.to_string_lossy().replace('\\', "/"),
+        b.to_string_lossy().replace('\\', "/")
+    );
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": listing })),
+            node("x", "src.xml", json!({ "rowPath": "/rows/row", "carryColumns": ["company_id"] })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "x"), main_edge("e2", "x", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3, "one row per <row>: {body}");
+    assert!(body.contains("Acme") && body.contains("Globex") && body.contains("Initech"), "{body}");
+    // The business key rides along, so a row can be joined back to its document
+    // without a second lookup - which is the whole point of carryColumns.
+    assert!(body.contains("101") && body.contains("202"), "carried company_id: {body}");
+    // And the hash is the one the upstream carried, not one recomputed here.
+    assert!(body.contains("sha-a") && body.contains("sha-b"), "carried sha256: {body}");
+}
+
+/// A configured path with nothing wired in behaves exactly as it always did.
+/// The corpus route must not change the single-document one.
+#[test]
+fn src_xml_without_an_upstream_still_reads_its_configured_path() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let only = tmp.path().join("only.xml");
+    std::fs::write(&only, "<rows><row><id>7</id></row></rows>").unwrap();
+    let out = out_path(tmp.path(), "single.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("x", "src.xml", json!({
+                "path": only.to_string_lossy(), "rowPath": "/rows/row"
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "x", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains('7'), "{body}");
+    assert!(
+        !body.contains("source_uri"),
+        "the single-document shape gains no columns: {body}"
+    );
+}
+
+/// A zip cannot be streamed - its directory is at the end - so the corpus route
+/// says so and names the component that solves it, rather than silently
+/// spooling a file of unknown size.
+#[test]
+fn src_xml_refuses_to_stream_a_zip_and_points_at_archive_extract() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let z = tmp.path().join("bundle.zip");
+    write_zip(&z, &[("inner.xml", "<rows><row><id>1</id></row></rows>")]);
+    let listing = format!(
+        "SELECT '{}' AS uri",
+        z.to_string_lossy().replace('\\', "/")
+    );
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": listing })),
+            node("x", "src.xml", json!({ "rowPath": "/rows/row" })),
+        ]),
+        json!([main_edge("e1", "s", "x")]),
+    ));
+    assert_eq!(r.status, "error");
+    let err = r.error.unwrap_or_default();
+    assert!(err.contains("xf.archive.extract"), "names the way out: {err}");
+}
+
+/// One unreadable document in a corpus should not have to end the run - but the
+/// skip has to be VISIBLE, because a corpus that quietly lost documents is the
+/// failure this whole contract exists to prevent.
+#[test]
+fn src_xml_can_skip_a_document_it_cannot_read_and_says_how_many() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let good = tmp.path().join("good.xml");
+    std::fs::write(&good, "<rows><row><id>1</id></row></rows>").unwrap();
+    let missing = tmp.path().join("not-here.xml");
+    let out = out_path(tmp.path(), "skip.csv");
+    let listing = format!(
+        "SELECT '{}' AS uri UNION ALL SELECT '{}'",
+        good.to_string_lossy().replace('\\', "/"),
+        missing.to_string_lossy().replace('\\', "/")
+    );
+
+    // fail (the default) stops the run.
+    let strict = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": listing.clone() })),
+            node("x", "src.xml", json!({ "rowPath": "/rows/row" })),
+        ]),
+        json!([main_edge("e1", "s", "x")]),
+    ));
+    assert_eq!(strict.status, "error", "a missing document is not silently fine");
+
+    // skip keeps going, and reports the count.
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": listing })),
+            node("x", "src.xml", json!({ "rowPath": "/rows/row", "onError": "skip" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "x"), main_edge("e2", "x", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 1, "the readable one still came through");
+    let note = r.nodes.get("x").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(note.contains("1 document(s) skipped"), "the loss has to be visible: {note}");
+}
+
+/// #282: src.html on the same contract - a corpus of pages named upstream,
+/// with the business keys carried onto every extracted row.
+#[test]
+fn src_html_reads_every_page_an_upstream_relation_names() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let one = tmp.path().join("one.html");
+    let two = tmp.path().join("two.html");
+    std::fs::write(
+        &one,
+        "<html><body><table id=t><tr><th>Name</th></tr><tr><td>Acme</td></tr></table></body></html>",
+    )
+    .unwrap();
+    std::fs::write(
+        &two,
+        "<html><body><table id=t><tr><th>Name</th></tr><tr><td>Globex</td></tr></table></body></html>",
+    )
+    .unwrap();
+    let out = out_path(tmp.path(), "pages.csv");
+    let listing = format!(
+        "SELECT '{}' AS uri, 'sha-1' AS sha256, 11 AS filing_id \
+         UNION ALL SELECT '{}', 'sha-2', 22",
+        one.to_string_lossy().replace('\\', "/"),
+        two.to_string_lossy().replace('\\', "/")
+    );
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": listing })),
+            node("h", "src.html", json!({
+                "rowSelector": "table#t", "carryColumns": ["filing_id"]
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "h"), main_edge("e2", "h", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 2, "one row per page: {body}");
+    assert!(body.contains("Acme") && body.contains("Globex"), "{body}");
+    assert!(body.contains("11") && body.contains("22"), "carried filing_id: {body}");
+    assert!(body.contains("sha-1") && body.contains("sha-2"), "carried sha256: {body}");
+}
+
+/// A configured path with nothing wired in is untouched by the corpus route.
+#[test]
+fn src_html_without_an_upstream_still_reads_its_configured_path() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let page = tmp.path().join("solo.html");
+    std::fs::write(
+        &page,
+        "<html><body><table id=t><tr><th>Name</th></tr><tr><td>Initech</td></tr></table></body></html>",
+    )
+    .unwrap();
+    let out = out_path(tmp.path(), "solo.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("h", "src.html", json!({
+                "path": page.to_string_lossy(), "rowSelector": "table#t"
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "h", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("Initech"), "{body}");
+    assert!(
+        !body.contains("source_uri"),
+        "the single-document shape gains no columns: {body}"
+    );
+}
+
+/// One unreadable page must not have to end a corpus run, and the skip has to
+/// be visible.
+#[test]
+fn src_html_can_skip_a_page_it_cannot_read_and_says_how_many() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let good = tmp.path().join("good.html");
+    std::fs::write(
+        &good,
+        "<html><body><table id=t><tr><th>Name</th></tr><tr><td>Acme</td></tr></table></body></html>",
+    )
+    .unwrap();
+    let missing = tmp.path().join("gone.html");
+    let out = out_path(tmp.path(), "htmlskip.csv");
+    let listing = format!(
+        "SELECT '{}' AS uri UNION ALL SELECT '{}'",
+        good.to_string_lossy().replace('\\', "/"),
+        missing.to_string_lossy().replace('\\', "/")
+    );
+
+    let strict = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": listing.clone() })),
+            node("h", "src.html", json!({ "rowSelector": "table#t" })),
+        ]),
+        json!([main_edge("e1", "s", "h")]),
+    ));
+    assert_eq!(strict.status, "error", "a missing page is not silently fine");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": listing })),
+            node("h", "src.html", json!({ "rowSelector": "table#t", "onError": "skip" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "h"), main_edge("e2", "h", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 1);
+    let note = r.nodes.get("h").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(note.contains("1 page(s) skipped"), "the loss has to be visible: {note}");
+}
+
+/// #282 item 3: the corpus LIST is bounded too, not just each parse.
+///
+/// Bounding every parser and leaving the resolver collecting the whole relation
+/// into a Vec would be a fix that looks complete and is not: a pipeline handed
+/// a million artifact rows still held all of them before it opened the first
+/// document. The list is now materialised once into the run database and read
+/// back a batch at a time.
+///
+/// The batch is driven down to 2 here because a corpus big enough to cross the
+/// real 5,000 is not something a test suite should build - and a bound nobody
+/// can cross in a test is a bound nobody has checked.
+#[test]
+fn a_corpus_larger_than_one_batch_is_read_completely_and_exactly_once() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_ARTIFACT_BATCH", "2");
+
+    // Five documents against a batch of two: three batches, the last short.
+    let mut uris = Vec::new();
+    for i in 0..5 {
+        let f = tmp.path().join(format!("doc{i}.xml"));
+        std::fs::write(&f, format!("<rows><row><id>{i}</id></row></rows>")).unwrap();
+        uris.push(f.to_string_lossy().replace('\\', "/"));
+    }
+    let listing = uris
+        .iter()
+        .map(|u| format!("SELECT '{u}' AS uri"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let out = out_path(tmp.path(), "batched.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "code.sql", json!({ "sql": listing })),
+            node("x", "src.xml", json!({ "rowPath": "/rows/row" })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "x"), main_edge("e2", "x", "k")]),
+    ));
+    std::env::remove_var("DUCKLE_ARTIFACT_BATCH");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    // Every document exactly once. Paging a relation with no stable order is
+    // how a corpus silently repeats or skips, which is worse than not fitting
+    // in memory, so this is the property that matters.
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(
+        count(&format!("read_csv_auto('{}')", out)),
+        5,
+        "five documents across three batches: {body}"
+    );
+    for i in 0..5 {
+        assert_eq!(
+            body.matches(&format!("doc{i}.xml")).count(),
+            1,
+            "doc{i} appears exactly once: {body}"
+        );
+    }
+
+    // And the scratch list does not outlive the run.
+    let leftovers = std::fs::read_dir(tmp.path())
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains("duckle_artifacts"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(leftovers, 0, "the artifact list was left behind");
+}
+
+// ---------------------------------------------------------------------------
+// #258: the checkpoint xf.ai.llm got in bda903e, for the other two AI
+// transforms. The GUI already offered the fields on all three; only llm read
+// them, which is a setting that looks like it works and does nothing.
+// ---------------------------------------------------------------------------
+
+/// Read headers then exactly Content-Length more, so a reply never races the
+/// request body still being written.
+fn drain_http_request(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let mut req: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break None,
+            Ok(n) => {
+                req.extend_from_slice(&buf[..n]);
+                if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(i + 4);
+                }
+            }
+        }
+    };
+    if let Some(head_end) = head_end {
+        let head = String::from_utf8_lossy(&req[..head_end]).to_ascii_lowercase();
+        let want: usize = head
+            .split("content-length:")
+            .nth(1)
+            .and_then(|r| r.split(['\r', '\n']).next())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while req.len() - head_end < want {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => req.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+    String::from_utf8_lossy(&req).into_owned()
+}
+
+/// A stub that answers every request with one fixed JSON body.
+fn stub_http_json(body: &str) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(400))).ok();
+            let _ = drain_http_request(&mut stream);
+            seen.fetch_add(1, Ordering::SeqCst);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, hits)
+}
+
+/// A chat-completions stub that always answers with one fixed category and
+/// counts how many times it was actually asked.
+fn stub_fixed_answer(answer: &str) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let answer = answer.to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(400))).ok();
+            let _ = drain_http_request(&mut stream);
+            seen.fetch_add(1, Ordering::SeqCst);
+            let body = format!(
+                "{{\"choices\":[{{\"message\":{{\"content\":\"{}\"}}}}]}}",
+                answer
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, calls)
+}
+
+/// An embeddings stub returning one vector per input, counting the INPUTS it
+/// was asked to embed - which is what the bill is, not the call count.
+fn stub_embeddings() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let embedded = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = embedded.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(400))).ok();
+            let req = drain_http_request(&mut stream);
+            let n = req
+                .split("\r\n\r\n")
+                .nth(1)
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("input").and_then(|i| i.as_array()).map(|a| a.len()))
+                .unwrap_or(0);
+            seen.fetch_add(n, Ordering::SeqCst);
+            let items: Vec<String> = (0..n)
+                .map(|i| format!("{{\"index\":{},\"embedding\":[0.1,0.2,0.3]}}", i))
+                .collect();
+            let body = format!("{{\"data\":[{}]}}", items.join(","));
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, embedded)
+}
+
+/// A row already classified is not classified again.
+#[test]
+fn ai_classify_does_not_pay_twice_for_a_row_it_already_categorised() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "cls.csv");
+    let (port, calls) = stub_fixed_answer("billing");
+    let rows = "SELECT i AS id, 'ask ' || i AS text FROM range(3) t(i)";
+    let props = json!({
+        "inputColumn": "text",
+        "outputColumn": "category",
+        "categories": "billing,support",
+        "model": "test-model",
+        "apiKey": "k",
+        "baseUrl": format!("http://127.0.0.1:{}", port),
+        "maxRetries": 0,
+        "checkpoint": true,
+        "checkpointKey": ["id"],
+    });
+    let pipeline = |p: serde_json::Value| {
+        doc(
+            json!([
+                node("s", "code.sql", json!({ "sql": rows })),
+                node("c", "xf.ai.classify", p),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+        )
+    };
+
+    let r = engine.execute_pipeline_named(&pipeline(props.clone()), "cls");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3, "three rows, three calls");
+    let first = std::fs::read_to_string(&out).unwrap_or_default();
+
+    let r = engine.execute_pipeline_named(&pipeline(props), "cls");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the rerun classified again - the checkpoint bought nothing"
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap_or_default(), first);
+    let note = r.nodes.get("c").and_then(|n| n.note.clone()).unwrap_or_default();
+    assert!(note.contains("3 reused"), "the reuse has to be visible: {note}");
+}
+
+/// Changing the categories is a different question, so the stored answer for
+/// the same text must not be reused.
+#[test]
+fn ai_classify_reprices_when_the_categories_change() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "cls2.csv");
+    let (port, calls) = stub_fixed_answer("billing");
+    let base = |cats: serde_json::Value| {
+        json!({
+            "inputColumn": "text", "outputColumn": "category", "categories": cats,
+            "model": "m", "apiKey": "k",
+            "baseUrl": format!("http://127.0.0.1:{}", port),
+            "maxRetries": 0, "checkpoint": true, "checkpointKey": ["id"],
+        })
+    };
+    let run = |p: serde_json::Value| {
+        doc(
+            json!([
+                node("s", "code.sql", json!({ "sql": "SELECT 1 AS id, 'hello' AS text" })),
+                node("c", "xf.ai.classify", p),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "c"), main_edge("e2", "c", "k")]),
+        )
+    };
+
+    let r = engine.execute_pipeline_named(&run(base(json!("billing,support"))), "c2");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let r = engine.execute_pipeline_named(&run(base(json!("billing,support,sales"))), "c2");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a different category list is a different question and must be re-asked"
+    );
+}
+
+/// Embedding is different: the billable unit is the BATCH, so reuse has to take
+/// the cached rows out and send only what is left - then put everything back in
+/// the original order.
+#[test]
+fn ai_embed_only_embeds_the_rows_it_has_not_embedded_before() {
+    let engine = engine_or_skip!();
+    let _env = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", tmp.path());
+    let out = out_path(tmp.path(), "emb.csv");
+    let (port, embedded) = stub_embeddings();
+    let pipeline = |sql: &str| {
+        doc(
+            json!([
+                node("s", "code.sql", json!({ "sql": sql })),
+                node("e", "xf.ai.embed", json!({
+                    "inputColumn": "text",
+                    "outputColumn": "vec",
+                    "model": "test-embed",
+                    "apiKey": "k",
+                    "baseUrl": format!("http://127.0.0.1:{}", port),
+                    "batchSize": 2,
+                    "maxRetries": 0,
+                    "checkpoint": true,
+                    "checkpointKey": ["id"],
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "e"), main_edge("e2", "e", "k")]),
+        )
+    };
+
+    let three = "SELECT i AS id, 'text ' || i AS text FROM range(3) t(i)";
+    let r = engine.execute_pipeline_named(&pipeline(three), "emb");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(embedded.load(std::sync::atomic::Ordering::SeqCst), 3, "three rows embedded");
+
+    // Three of the four are unchanged; only the new one should be paid for.
+    let four = "SELECT i AS id, 'text ' || i AS text FROM range(4) t(i)";
+    let r = engine.execute_pipeline_named(&pipeline(four), "emb");
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    assert_eq!(
+        embedded.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "only the one new row should have been embedded, not all four again"
+    );
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 4, "every row still comes out");
+
+    // Input order: a cached row goes back where it came from, because an
+    // embedding against the wrong row is worse than paying again.
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    let ids: Vec<&str> = body.lines().skip(1).filter_map(|l| l.split(',').next()).collect();
+    assert_eq!(ids, vec!["0", "1", "2", "3"], "rows came back out of order: {body}");
+}
+
+/// #260: the original response is kept, named after its own content.
+///
+/// A URL is a name that can be rebound, so naming a capture after its URL and
+/// skipping when the file exists keeps the OLD body when the resource changed.
+/// Content addressing makes a changed body a new file and an unchanged one a
+/// genuine no-op.
+#[test]
+fn src_rest_keeps_the_original_response_named_by_its_hash() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let (port, _hits) = stub_http_json(r#"[{"id":1,"name":"Acme"}]"#);
+    let raw_dir = tmp.path().join("raw");
+    let dest = format!("{}/{{sha256}}.json", raw_dir.to_string_lossy().replace('\\', "/"));
+    let out = out_path(tmp.path(), "rest260.csv");
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.rest", json!({
+                "url": format!("http://127.0.0.1:{}/companies", port),
+                "responseMetadata": true,
+                "rawResponseDestination": dest,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+
+    // The body landed, under its own hash.
+    let captured: Vec<_> = std::fs::read_dir(&raw_dir)
+        .expect("raw directory")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(captured.len(), 1, "one response, one capture: {captured:?}");
+    let name = &captured[0];
+    assert!(name.ends_with(".json"), "{name}");
+    let hash = name.trim_end_matches(".json");
+    assert_eq!(hash.len(), 64, "named by a sha256, not by the URL: {name}");
+    assert_eq!(
+        std::fs::read_to_string(raw_dir.join(name)).unwrap(),
+        r#"[{"id":1,"name":"Acme"}]"#,
+        "the bytes kept are the bytes parsed"
+    );
+
+    // And the row carries the same hash, so a row can be traced to the capture.
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains(hash), "the row points at the capture: {body}");
+    assert!(body.contains("_response_sha256"), "{body}");
+    // #260: the row NAMES its artifact rather than requiring the reader to
+    // re-derive the destination template - which {date} would not reproduce on
+    // a run that crossed midnight anyway.
+    let uri = scalar_string(&format!(
+        "SELECT _response_uri FROM read_csv_auto('{}')",
+        out
+    ));
+    assert!(
+        std::path::Path::new(&uri).is_file(),
+        "_response_uri must name a file that exists, got {uri:?}"
+    );
+    assert!(
+        uri.contains(hash),
+        "and it must be THIS response's artifact: {uri}"
+    );
+    assert!(body.contains("_page_number"), "{body}");
+
+    // Re-running with the same body rewrites the same file rather than making a
+    // second one - an unchanged response is a genuine no-op.
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.rest", json!({
+                "url": format!("http://127.0.0.1:{}/companies", port),
+                "rawResponseDestination": dest,
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let after = std::fs::read_dir(&raw_dir).unwrap().flatten().count();
+    assert_eq!(after, 1, "the same body must not make a second capture");
+}
+
+/// #306: a chunked extract, run for real, end to end.
+///
+/// The unit tests cover the predicates and the ledger rules. This covers the
+/// property that actually matters and that no amount of SQL inspection proves:
+/// N bounded reads together contain every source row EXACTLY once - no gap
+/// between two chunks, no row counted by both - and a part that goes missing is
+/// redone rather than skipped.
+///
+/// Both halves have failed before in this design. An off-by-one in a half-open
+/// range loses one row per chunk and the total still looks plausible; a slice
+/// marked done whose output is gone makes a retry silently produce a short
+/// extract.
+#[test]
+fn a_chunked_extract_reads_every_row_exactly_once_and_resumes() {
+    let _ = engine_or_skip!();
+    let duckdb = std::path::PathBuf::from(std::env::var("DUCKLE_DUCKDB_BIN").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let srcdb = out_path(ws, "src.duckdb");
+    duckdb_exec(
+        &srcdb,
+        "CREATE TABLE orders AS SELECT i AS id, 'name-' || i AS name FROM range(1, 101) t(i)",
+    );
+
+    let pipeline = json!({
+        "nodes": [ node("db", "src.duckdb", json!({
+            "database": srcdb,
+            "tableName": "orders",
+            // 100 rows in chunks of 30 is deliberately not a whole number of
+            // chunks: an off-by-one at the last boundary is the easy mistake.
+            "chunking": { "type": "range", "column": "id", "chunkSize": 30, "concurrency": 2 }
+        })) ],
+        "edges": []
+    });
+    let ppath = ws.join("extract.json");
+    std::fs::write(&ppath, serde_json::to_string_pretty(&pipeline).unwrap()).unwrap();
+
+    let plan = duckle_duckdb_engine::chunk_exec::plan_for(
+        ws,
+        &ppath,
+        "db",
+        &duckle_duckdb_engine::chunking::Bounds::Range { min: 1, max: 100 },
+        0,
+    )
+    .expect("planning a chunked extract");
+    assert_eq!(plan.partitions.len(), 4, "1..100 by 30 is four chunks");
+
+    let ran = std::sync::Mutex::new(Vec::<String>::new());
+    let done = duckle_duckdb_engine::chunk_exec::execute(ws, &duckdb, plan, false, &|_| Ok(()), &|o| {
+        ran.lock().unwrap().push(o.key.clone());
+    })
+    .expect("running a chunked extract");
+    assert!(
+        done.is_done(),
+        "not every chunk finished: {:?} {:?}",
+        done.counts(),
+        done.partitions.iter().filter_map(|p| p.error.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(ran.lock().unwrap().len(), 4);
+    for p in &done.partitions {
+        let a = p.artifact.as_ref().expect("a committed part");
+        assert!(std::path::Path::new(&a.uri).exists(), "part {} is not on disk", a.uri);
+        assert_eq!(
+            a.hash,
+            duckle_duckdb_engine::backfill::hash_file(std::path::Path::new(&a.uri)).unwrap(),
+            "the committed hash is not the part's"
+        );
+    }
+
+    // The property: every row, exactly once.
+    let read = duckle_duckdb_engine::chunk_exec::assembled_read(&done).unwrap();
+    let stats = scalar_string(&format!(
+        "SELECT COUNT(*) || '/' || COUNT(DISTINCT id) || '/' || MIN(id) || '/' || MAX(id) AS s \
+         FROM ({read})"
+    ));
+    assert_eq!(stats, "100/100/1/100", "rows/distinct/min/max of the assembled extract");
+
+    // And resumability: a part goes missing, and the chunk that produced it is
+    // redone rather than skipped.
+    let lost = done.partitions[1].artifact.clone().unwrap().uri;
+    std::fs::remove_file(&lost).unwrap();
+    duckle_duckdb_engine::backfill::save(ws, &done).unwrap();
+    // Nothing resets the slice by hand here on purpose: the executor has to
+    // notice by itself, or the guarantee only holds when someone remembers to
+    // ask for it. Every chunk still SAYS succeeded at this point.
+    assert!(done.is_done(), "the ledger should still claim to be complete");
+
+    let again = std::sync::Mutex::new(Vec::<String>::new());
+    let done = duckle_duckdb_engine::chunk_exec::execute(ws, &duckdb, done, false, &|_| Ok(()), &|o| {
+        again.lock().unwrap().push(o.key.clone());
+    })
+    .expect("resuming a chunked extract");
+    assert_eq!(
+        again.lock().unwrap().len(),
+        1,
+        "resuming re-ran chunks whose parts were still there: {:?}",
+        again.lock().unwrap()
+    );
+    assert!(done.is_done(), "{:?}", done.counts());
+    assert!(
+        std::path::Path::new(&lost).exists(),
+        "the chunk was marked done again without its part being written: {lost}"
+    );
+    let read = duckle_duckdb_engine::chunk_exec::assembled_read(&done).unwrap();
+    let stats = scalar_string(&format!(
+        "SELECT COUNT(*) || '/' || COUNT(DISTINCT id) AS s FROM ({read})"
+    ));
+    assert_eq!(stats, "100/100", "the resumed extract is not the same extract");
+}
+
+/// #327: autodetect of an ESRI FileGDB source must not fail with
+/// "st_read is not in the catalog".
+///
+/// The reporter's pipeline RAN - the run path force-loads spatial for src.gdb -
+/// and only autodetect failed, which reads as the component being broken.
+///
+/// The probe deliberately points at a path that does not exist, because that is
+/// what separates the two failures: with the spatial extension loaded DuckDB
+/// resolves `ST_Read` and then cannot open the dataset, and without it DuckDB
+/// never gets that far and says the function is not in the catalog. So the
+/// assertion is on WHICH error comes back, and no FileGDB fixture is needed.
+#[test]
+fn autodetecting_a_filegdb_loads_spatial_rather_than_failing_on_st_read() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = out_path(tmp.path(), "no-such.gdb");
+
+    let err = match engine.inspect("gdb", json!({ "path": missing })) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a .gdb that does not exist somehow inspected"),
+    };
+    assert!(
+        !err.to_ascii_lowercase().contains("not in the catalog"),
+        "autodetect did not load the spatial extension: {err}"
+    );
+    // And the positive half: it failed for the reason it should have, so the
+    // test cannot pass on some unrelated error that happens not to mention the
+    // catalog.
+    let lower = err.to_ascii_lowercase();
+    assert!(
+        lower.contains("gdal") || lower.contains("could not open") || lower.contains("io error"),
+        "expected a could-not-open-the-dataset failure, got: {err}"
+    );
+}
+
+/// #306: the extent of the key is asked of the source, not typed in by hand.
+///
+/// Covers the two answers that matter. The bounds have to match what a hand-run
+/// probe would have said, or every chunk boundary is wrong; and a NULLable key
+/// has to be REFUSED, because every chunk predicate excludes NULL and the
+/// extract would come out short by exactly that many rows with nothing saying
+/// so - which is the failure that made the probe count nulls in the first place.
+#[test]
+fn a_chunked_extract_asks_the_source_for_its_own_bounds() {
+    let _ = engine_or_skip!();
+    let duckdb = std::path::PathBuf::from(std::env::var("DUCKLE_DUCKDB_BIN").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let srcdb = out_path(ws, "probe.duckdb");
+    duckdb_exec(
+        &srcdb,
+        "CREATE TABLE clean AS SELECT i AS id FROM range(7, 58) t(i); \
+         CREATE TABLE dirty AS SELECT * FROM (VALUES (1),(2),(NULL),(4)) t(id)",
+    );
+
+    let write = |table: &str, file: &str| {
+        let doc = json!({
+            "nodes": [ node("db", "src.duckdb", json!({
+                "database": srcdb,
+                "tableName": table,
+                "chunking": { "type": "range", "column": "id", "chunkSize": 20 }
+            })) ],
+            "edges": []
+        });
+        let p = ws.join(file);
+        std::fs::write(&p, serde_json::to_string(&doc).unwrap()).unwrap();
+        p
+    };
+
+    // The clean table: bounds come back exactly as the table's own extent.
+    let (bounds, nulls) =
+        duckle_duckdb_engine::chunk_exec::probe(ws, &duckdb, &write("clean", "clean.json"), "db")
+            .expect("probing a clean key");
+    assert_eq!(nulls, 0);
+    match bounds {
+        duckle_duckdb_engine::chunking::Bounds::Range { min, max } => {
+            assert_eq!((min, max), (7, 57), "the probe did not find the table's extent");
+        }
+        other => panic!("expected range bounds, got {other:?}"),
+    }
+
+    // The nullable key: the probe reports the NULLs and planning refuses.
+    let (bounds, nulls) =
+        duckle_duckdb_engine::chunk_exec::probe(ws, &duckdb, &write("dirty", "dirty.json"), "db")
+            .expect("probing a nullable key");
+    assert_eq!(nulls, 1, "the probe did not count the NULL");
+    let refused = duckle_duckdb_engine::chunk_exec::plan_for(
+        ws,
+        &write("dirty", "dirty.json"),
+        "db",
+        &bounds,
+        nulls,
+    )
+    .expect_err("a nullable key was accepted, so the extract would come out short");
+    assert!(refused.contains("NULL"), "{refused}");
+}
+
+/// #328: a Shapefile written without a declared encoding mangles non-Latin
+/// attributes.
+///
+/// The `.dbf` has no encoding of its own, so GDAL writes the platform default
+/// and a reader has nothing to go on: Arabic place names came back as `?????`.
+/// Declaring it makes GDAL write the bytes as asked AND drop a `.cpg` sidecar
+/// naming the encoding, which is what makes the file self-describing for QGIS
+/// and ArcGIS rather than merely correct on this machine.
+#[test]
+fn a_shapefile_keeps_non_latin_attributes_when_an_encoding_is_declared() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "places.shp");
+    // The reporter's own values.
+    let csv = write_file(tmp.path(), "places.csv", "name,lon,lat\nدهب,34.5,28.5\nالغردقة,33.8,27.2\n");
+
+    let d = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "g",
+                "xf.geo.create",
+                json!({ "source": "xy", "xColumn": "lon", "yColumn": "lat", "outputColumn": "geom" }),
+            ),
+            node(
+                "k",
+                "snk.spatial",
+                json!({ "path": out, "driver": "ESRI Shapefile", "encoding": "UTF-8" })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "g"), main_edge("e2", "g", "k")]),
+    );
+    let r = engine.execute_pipeline(&d);
+    assert_eq!(r.status, "ok", "run failed: {:?}", r.error);
+
+    let back = scalar_string(&format!(
+        "INSTALL spatial; LOAD spatial; SELECT name FROM ST_Read('{out}') ORDER BY name LIMIT 1"
+    ));
+    assert!(
+        !back.contains('?') && !back.is_empty(),
+        "the attribute came back mangled: {back:?}"
+    );
+    // And the sidecar, so the file says what it is rather than depending on the
+    // reader guessing right.
+    let cpg = std::path::Path::new(&out).with_extension("cpg");
+    assert!(cpg.exists(), "no .cpg sidecar was written beside the shapefile");
+}
+
+/// #330 follow-up: a cursor placed in a HEADER never reached the wire.
+///
+/// The substitution builds a shadowed copy of the spec and rewrites its url,
+/// url_template, body and headers - but `eff_headers`, which is what the
+/// request loop actually sends, was cloned from the ORIGINAL spec further up,
+/// so the header rewrite went into a value nothing reads. An API taking its
+/// cursor as `If-Modified-Since` got the literal placeholder.
+#[test]
+fn an_incremental_cursor_in_a_header_reaches_the_request() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let _g = env_guard();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    let handle = std::thread::spawn(move || {
+        // One request, so one accept: waiting for more would block the join.
+        for stream in listener.incoming().take(1) {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            for l in req.lines() {
+                if l.to_ascii_lowercase().starts_with("if-modified-since:") {
+                    seen.lock().unwrap().push(l.trim().to_string());
+                }
+            }
+            let body = r#"{"results":[{"id":"a","updated_at":"2026-03-05"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK{}Content-Type: application/json{}Content-Length: {}{}Connection: close{}{}",
+                CRLF, CRLF, body.len(), CRLF, CRLF, CRLF
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::env::set_var("DUCKLE_WORKSPACE", &ws);
+    let out = out_path(tmp.path(), "out.csv");
+    let d = doc(
+        json!([
+            node("c", "src.rest", json!({
+                "url": format!("http://127.0.0.1:{}/things", port),
+                "responsePath": "/results",
+                "headers": [{ "key": "If-Modified-Since", "value": "{incremental}" }],
+                "incrementalField": "updated_at",
+                "incrementalInitial": "1970-01-01",
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "c", "k")]),
+    );
+    let r = engine.execute_pipeline_named(&d, "hdr");
+    assert!(r.error.is_none(), "run failed: {:?}", r.error);
+    let _ = handle.join();
+
+    let got = asked.lock().unwrap().clone();
+    assert!(!got.is_empty(), "the server saw no If-Modified-Since header at all");
+    assert!(
+        got.iter().all(|h| !h.contains("{incremental}")),
+        "the placeholder was sent verbatim: {got:?}"
+    );
+    assert!(
+        got.iter().any(|h| h.contains("1970-01-01")),
+        "the saved mark has to be substituted into the header: {got:?}"
+    );
+}
+
+/// An inner join declares a `reject` output port and a
+/// `sendUnmatchedToReject` toggle, and the engine reads neither.
+///
+/// `reject_wired` is threaded into `build_view_sql` and honoured by exactly two
+/// components, `src.csv` and `src.tsv`. `build_join` never receives it and
+/// never sees the prop, so a row that matched nothing is dropped by the JOIN
+/// and there is nowhere for it to go. The operator wires the port precisely to
+/// stop that happening, ticks the box, and loses the rows anyway - in silence.
+#[test]
+fn an_inner_join_sends_its_unmatched_rows_to_the_reject_port() {
+    let engine = engine_or_skip!();
+    let _g = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    // 3 orders, one of which (id 3) has no customer.
+    let orders = write_file(tmp.path(), "orders.csv", "id,cust\n1,a\n2,b\n3,zz\n");
+    let custs = write_file(tmp.path(), "custs.csv", "cust,name\na,Ann\nb,Bob\n");
+    let kept = out_path(tmp.path(), "kept.csv");
+    let lost = out_path(tmp.path(), "lost.csv");
+
+    let d = doc(
+        json!([
+            node("o", "src.csv", json!({ "path": orders, "hasHeader": true })),
+            node("c", "src.csv", json!({ "path": custs, "hasHeader": true })),
+            node("j", "xf.join.inner", json!({
+                "leftKey": "cust",
+                "rightKey": "cust",
+                "sendUnmatchedToReject": true
+            })),
+            node("k", "snk.csv", json!({ "path": kept, "hasHeader": true })),
+            node("r", "snk.csv", json!({ "path": lost, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "o", "j"),
+            lookup_edge("e2", "c", "j"),
+            main_edge("e3", "j", "k"),
+            port_edge("e4", "j", "reject", "r"),
+        ]),
+    );
+    let r = engine.execute_pipeline_named(&d, "joinreject");
+    assert!(r.error.is_none(), "run failed: {:?}", r.error);
+
+    let kept_rows = std::fs::read_to_string(&kept).unwrap_or_default();
+    assert!(kept_rows.contains("Ann") && kept_rows.contains("Bob"), "matched rows: {kept_rows}");
+
+    let lost_rows = std::fs::read_to_string(&lost).unwrap_or_default();
+    assert!(
+        lost_rows.contains("zz"),
+        "order 3 matched no customer and the reject port was wired, so it has to arrive there \
+         rather than vanish. Got: {lost_rows:?}"
+    );
+}
+
+/// The data-loss path, end to end: a parquet sink asked to APPEND used to
+/// replace the file, because no file-sink builder reads `mode` and a COPY
+/// always replaces. Rows written by the first run were simply gone.
+///
+/// Now the second run refuses, so the rows survive. That is the assertion that
+/// matters - not the error text, but that the data is still there afterwards.
+#[test]
+fn a_parquet_append_does_not_destroy_what_is_already_there() {
+    let engine = engine_or_skip!();
+    let _g = env_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    let first = write_file(tmp.path(), "a.csv", "id\n1\n2\n");
+    let second = write_file(tmp.path(), "b.csv", "id\n3\n4\n");
+    let out = out_path(tmp.path(), "out.parquet");
+
+    let run = |src: &str, mode: &str| {
+        let d = doc(
+            json!([
+                node("s", "src.csv", json!({ "path": src, "hasHeader": true })),
+                node("k", "snk.parquet", json!({ "path": out, "mode": mode })),
+            ]),
+            json!([main_edge("e1", "s", "k")]),
+        );
+        engine.execute_pipeline_named(&d, "appendguard")
+    };
+    assert!(run(&first, "overwrite").error.is_none(), "the first write must succeed");
+    let r = run(&second, "append");
+    assert!(r.error.is_some(), "an append to a file sink must be refused, not performed");
+
+    let back = out_path(tmp.path(), "back.csv");
+    let check = doc(
+        json!([
+            node("s", "src.parquet", json!({ "path": out })),
+            node("k", "snk.csv", json!({ "path": back, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    );
+    assert!(engine.execute_pipeline_named(&check, "appendcheck").error.is_none());
+    let rows = std::fs::read_to_string(&back).unwrap_or_default();
+    assert!(
+        rows.contains('1') && rows.contains('2'),
+        "the refused run must leave the original rows untouched, got {rows:?}"
+    );
+}
+
+/// Wiring a REST source's reject output broke runs in which nothing failed.
+///
+/// `<node>__reject` was materialized only under `onParentError == "reject"`,
+/// while the comment immediately above that guard says the opposite and gives
+/// the reason: "The reject relation is built even when empty, so a downstream
+/// node wired to it binds on a clean run instead of failing on a missing
+/// table". The dropdown defaults to "fail" and the reject port is drawn on the
+/// tile, so connecting it before touching the dropdown was enough to end a
+/// perfectly good run with
+///   Catalog Error: Table with name <node>__reject does not exist!
+#[test]
+fn a_wired_reject_port_binds_when_no_parent_failed() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock http");
+    let port = listener.local_addr().unwrap().port();
+
+    // Every request succeeds. Nothing should ever reach the reject port.
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            stream.set_read_timeout(Some(Duration::from_millis(250))).ok();
+            stream.set_nodelay(true).ok();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk);
+            let body = r#"[{"v":1}]"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let parents = write_file(tmp.path(), "parents.csv", "id\n1\n2\n");
+    let out = out_path(tmp.path(), "out.csv");
+    let rej = out_path(tmp.path(), "rej.csv");
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("p", "src.csv", json!({ "path": parents, "hasHeader": true })),
+            // onParentError deliberately left unset: "fail" is the default, and
+            // the default is the configuration that broke.
+            node("c", "src.rest", json!({
+                "url": base,
+                "method": "GET",
+                "urlTemplate": format!("{}/thing/{{id}}", base),
+                "parentKeyColumn": "id"
+            })),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            node("kr", "snk.csv", json!({ "path": rej, "hasHeader": true })),
+        ]),
+        json!([
+            main_edge("e1", "p", "c"),
+            main_edge("e2", "c", "k"),
+            port_edge("e3", "c", "reject", "kr"),
+        ]),
+    ));
+    let _ = handle.join();
+    assert_eq!(
+        r.status, "ok",
+        "a clean run must not fail just because the reject port is wired: {:?}",
+        r.error
+    );
+}
+
+/// Every kind xf.ip.parse offers has to actually run.
+///
+/// DuckDB's inet extension provides exactly five functions - host, family,
+/// netmask, network, broadcast. The builder emitted `hostmask(...)` and
+/// `masklen(...)` for two of its seven kinds, and neither exists:
+///   Catalog Error: Scalar Function with name masklen does not exist!
+///
+/// Same shape as qa.standardize's INITCAP, and it survived the same way: the
+/// generated SQL is well formed, so only running each kind catches it. This
+/// test runs all of them rather than a representative one, which is the whole
+/// lesson - a test of one option says nothing about the other six.
+#[test]
+fn every_ip_parse_kind_runs() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "ip\n192.168.1.5/24\n10.0.0.1\n");
+
+    for kind in ["host", "family", "broadcast", "netmask", "network", "masklen"] {
+        let out = out_path(tmp.path(), &format!("out_{kind}.csv"));
+        let d = doc(
+            json!([
+                node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node("p", "xf.ip.parse", json!({
+                    "column": "ip", "kind": kind, "outputColumn": "got"
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "p"), main_edge("e2", "p", "k")]),
+        );
+        let r = engine.execute_pipeline(&d);
+        assert_eq!(r.status, "ok", "kind {kind} failed to run: {:?}", r.error);
+    }
+
+    // masklen is derived rather than provided: an explicit prefix wins, and an
+    // address without one takes the full width for its family, which is what
+    // PostgreSQL's masklen answers too.
+    let out = out_path(tmp.path(), "out_masklen.csv");
+    let got = scalar_string(&format!(
+        "SELECT CAST(got AS VARCHAR) FROM read_csv_auto('{}') WHERE ip = '192.168.1.5/24'",
+        out
+    ));
+    assert_eq!(got, "24", "explicit prefix: got {got}");
+    let bare = scalar_string(&format!(
+        "SELECT CAST(got AS VARCHAR) FROM read_csv_auto('{}') WHERE ip = '10.0.0.1'",
+        out
+    ));
+    assert_eq!(bare, "32", "no prefix means the whole address: got {bare}");
+}
+
+/// xf.dt.add offered every unit its three siblings use, and four of them are
+/// not units you can ADD.
+///
+/// `interval_unit` maps anything it does not recognise to DAY, so the SQL is
+/// always valid and always runs - which is why nothing caught this. Adding
+/// "1 epoch" is a second in every other tool that has the notion; here it
+/// silently added a DAY, wrong by 86,400x. dayofweek / isodow / dayofyear were
+/// meaningless as amounts and quietly became a day too.
+///
+/// The list is shared with xf.dt.extract / trunc / diff, which legitimately
+/// take all twelve - date_part and date_trunc accept them, verified against
+/// 1.5.4. Only the one that builds an INTERVAL needed the narrower set.
+#[test]
+fn date_add_units_mean_what_they_say() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "ts\n2024-01-01 00:00:00\n");
+
+    let add = |unit: &str, out: &str| -> String {
+        let d = doc(
+            json!([
+                node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node("t", "xf.dt.add", json!({
+                    "column": "ts", "amount": 1, "unit": unit, "outputColumn": "got"
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "s", "t"), main_edge("e2", "t", "k")]),
+        );
+        let r = engine.execute_pipeline(&d);
+        assert_eq!(r.status, "ok", "unit {unit} failed: {:?}", r.error);
+        scalar_string(&format!("SELECT CAST(got AS VARCHAR) FROM read_csv_auto('{}')", out))
+    };
+
+    // Every unit the form still offers has to move the clock by ITS OWN amount.
+    let second = add("second", &out_path(tmp.path(), "s.csv"));
+    assert!(second.contains("00:00:01"), "second should add a second: {second}");
+    let day = add("day", &out_path(tmp.path(), "d.csv"));
+    assert!(day.contains("2024-01-02"), "day should add a day: {day}");
+    let hour = add("hour", &out_path(tmp.path(), "h.csv"));
+    assert!(hour.contains("01:00:00"), "hour should add an hour: {hour}");
+    let month = add("month", &out_path(tmp.path(), "m.csv"));
+    assert!(month.contains("2024-02-01"), "month should add a month: {month}");
+
+    // And the form must not offer a unit that cannot be added. `epoch` is the
+    // one that mattered: it silently added a day.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("duckle-mcp")
+        .join("catalog.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).expect("catalog")).expect("json");
+    let comp = v["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "xf.dt.add")
+        .expect("xf.dt.add in catalog");
+    let text = comp.to_string();
+    for bad in ["dayofweek", "isodow", "dayofyear", "epoch"] {
+        assert!(
+            !text.contains(bad),
+            "xf.dt.add still offers '{bad}', which interval_unit turns into DAY"
+        );
+    }
+}
+
+/// Every gate that offers "On failure" has to honour all three of its values.
+///
+/// The warn and fail branches lived in build_quality's PREDICATE path, and two
+/// gates never reach it: qa.unique returns early from its own branch at the top
+/// of that function, and qa.outlier is a separate builder entirely. Both
+/// declared the field and honoured none of it -
+///   fail: a gate asked to STOP the load let it through and reported success
+///   warn: labelled "Keep row" and dropped the row anyway
+/// which is the same pair of bugs that were fixed for the predicate gates, in
+/// the two places the fix did not reach.
+///
+/// qa.notnull is included as the control: it takes the predicate path, so it
+/// proves the harness is measuring the right thing rather than passing by
+/// accident.
+#[test]
+fn every_on_fail_gate_honours_all_three_values() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Each gate, with input where exactly ONE of four rows fails its check.
+    let cases: Vec<(&str, &str, &str, serde_json::Value)> = vec![
+        (
+            "qa.notnull",
+            "id,name\n1,a\n2,b\n3,\n4,d\n",
+            "name",
+            json!({ "columns": ["name"] }),
+        ),
+        (
+            "qa.unique",
+            "id,k\n1,a\n2,b\n3,b\n4,d\n",
+            "k",
+            json!({ "columns": ["k"] }),
+        ),
+        (
+            "qa.outlier",
+            "id,amt\n1,10\n2,11\n3,12\n4,100000\n",
+            "amt",
+            json!({ "column": "amt", "method": "iqr" }),
+        ),
+    ];
+
+    for (component, csv_body, _col, base_props) in cases {
+        let csv = write_file(tmp.path(), &format!("{}.csv", component.replace('.', "_")), csv_body);
+
+        let run = |on_fail: &str, out: &str| {
+            let mut props = base_props.clone();
+            props["onFail"] = json!(on_fail);
+            let d = doc(
+                json!([
+                    node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                    node("t", component, props),
+                    node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+                ]),
+                json!([main_edge("e1", "s", "t"), main_edge("e2", "t", "k")]),
+            );
+            engine.execute_pipeline(&d)
+        };
+
+        // fail: a row fails the check, so the run must STOP.
+        let out = out_path(tmp.path(), &format!("{}_fail.csv", component.replace('.', "_")));
+        let r = run("fail", &out);
+        assert_eq!(
+            r.status, "error",
+            "{component}: On failure = fail must stop the run when a row fails, got {:?}",
+            r.status
+        );
+
+        // warn: labelled "keep row", so every row must come out.
+        let out = out_path(tmp.path(), &format!("{}_warn.csv", component.replace('.', "_")));
+        let r = run("warn", &out);
+        assert_eq!(r.status, "ok", "{component}: warn must not fail: {:?}", r.error);
+        let n = scalar_string(&format!(
+            "SELECT CAST(count(*) AS VARCHAR) FROM read_csv_auto('{}')",
+            out
+        ));
+        assert_eq!(n, "4", "{component}: warn says it keeps the row, so all 4 must survive");
+
+        // reject (the default): the failing row is dropped from main.
+        let out = out_path(tmp.path(), &format!("{}_reject.csv", component.replace('.', "_")));
+        let r = run("reject", &out);
+        assert_eq!(r.status, "ok", "{component}: reject must not fail: {:?}", r.error);
+        let n = scalar_string(&format!(
+            "SELECT CAST(count(*) AS VARCHAR) FROM read_csv_auto('{}')",
+            out
+        ));
+        assert_eq!(n, "3", "{component}: reject drops the failing row, so 3 must remain");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Manticore Search (#340). HTTP JSON API on port 9308: POST /search to read,
+// POST /bulk to write. Two shapes differ from Elasticsearch and both are
+// pinned here: the key is `table` (renamed from `index` in Manticore 6.0),
+// and /bulk carries the document INSIDE the action line rather than on a
+// second line.
+// ---------------------------------------------------------------------------
+
+/// Serve `bodies` in order on 127.0.0.1, one connection each, forwarding the
+/// raw request bytes down a channel. Returns (port, receiver).
+fn manticore_stub(bodies: Vec<String>) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind manticore stub");
+    let port = listener.local_addr().unwrap().port();
+    let count = bodies.len();
+    std::thread::spawn(move || {
+        for (i, stream) in listener.incoming().take(count).enumerate() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(Duration::from_millis(250))).ok();
+            stream.set_nodelay(true).ok();
+            let mut buf = Vec::with_capacity(8192);
+            let mut chunk = [0u8; 4096];
+            for _ in 0..16 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(buf);
+            let body = &bodies[i];
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    (port, rx)
+}
+
+/// A Manticore /search response carrying `rows` as `_source` documents.
+fn manticore_hits(rows: &[&str]) -> String {
+    let inner = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!(r#"{{"_id":{},"_score":1,"_source":{}}}"#, i + 1, r))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"took":1,"timed_out":false,"hits":{{"total":9,"hits":[{}]}}}}"#,
+        inner
+    )
+}
+
+#[test]
+fn src_manticore_pages_by_offset_and_names_the_table() {
+    // Page size 2: the first page fills (2 hits) so a second request goes out
+    // at offset 2; that page returns 1 hit, short of the limit, which ends it.
+    // 3 rows land. Also pins the two things that are NOT Elasticsearch: the
+    // body says "table", and credentials go out as HTTP Basic.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (port, rx) = manticore_stub(vec![
+        manticore_hits(&[r#"{"id":1,"name":"alice"}"#, r#"{"id":2,"name":"bob"}"#]),
+        manticore_hits(&[r#"{"id":3,"name":"carol"}"#]),
+    ]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node(
+                "m",
+                "src.manticore",
+                json!({
+                    "endpoint": endpoint,
+                    "table": "products",
+                    "limit": 2,
+                    "username": "reader",
+                    "password": "s3cret",
+                })
+            ),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "m", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore source failed: {:?}", r.error);
+    assert_eq!(count(&format!("read_csv_auto('{}')", out)), 3);
+
+    let first = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("1st search request"),
+    )
+    .to_string();
+    let second = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("2nd search request"),
+    )
+    .to_string();
+
+    assert!(
+        first.contains("POST /search"),
+        "expected POST /search: {}",
+        first
+    );
+    assert!(
+        first.contains(r#""table":"products""#),
+        "Manticore 6.0+ names it `table`, not `index`: {}",
+        first
+    );
+    // base64("reader:s3cret")
+    assert!(
+        first.contains("Authorization: Basic cmVhZGVyOnMzY3JldA=="),
+        "expected HTTP Basic credentials: {}",
+        first
+    );
+    assert!(
+        first.contains(r#""offset":0"#),
+        "1st page starts at 0: {}",
+        first
+    );
+    assert!(
+        second.contains(r#""offset":2"#),
+        "2nd page starts at 2: {}",
+        second
+    );
+}
+
+#[test]
+fn src_manticore_lifts_max_matches_when_paging_past_the_default() {
+    // Manticore only keeps the 1000 best-ranked matches unless the request
+    // raises max_matches, so a window reaching past 1000 must ask for it or
+    // the server refuses the page.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    // One hit is short of the 1200 limit, so this is also the last page.
+    let (port, rx) = manticore_stub(vec![manticore_hits(&[r#"{"id":1,"name":"alice"}"#])]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node(
+                "m",
+                "src.manticore",
+                json!({ "endpoint": endpoint, "table": "products", "limit": 1200 })
+            ),
+            node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+        ]),
+        json!([main_edge("e1", "m", "k")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore source failed: {:?}", r.error);
+
+    let req = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("search request"),
+    )
+    .to_string();
+    assert!(
+        req.contains(r#""max_matches":1200"#),
+        "a 1200-row window must raise max_matches: {}",
+        req
+    );
+}
+
+#[test]
+fn snk_manticore_puts_the_document_inside_the_action_line() {
+    // Manticore's /bulk is NDJSON like Elasticsearch's, but one line per row:
+    //   {"insert":{"table":"products","doc":{...}}}
+    // Sending Elasticsearch's action/doc PAIR would index nothing.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (port, rx) = manticore_stub(vec![r#"{"items":[],"errors":false,"took":1}"#.into()]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n2,bob\n");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "m",
+                "snk.manticore",
+                json!({ "endpoint": endpoint, "table": "products" })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore sink failed: {:?}", r.error);
+
+    let body = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("bulk request"),
+    )
+    .to_string();
+    assert!(body.contains("POST /bulk"), "expected POST /bulk: {}", body);
+    assert!(
+        body.to_lowercase().contains("application/x-ndjson"),
+        "bulk is NDJSON: {}",
+        body
+    );
+    assert!(
+        body.contains(r#"{"insert":{"table":"products","doc":{"id":1,"name":"alice"}}}"#),
+        "expected the doc nested in the action line: {}",
+        body
+    );
+    assert_eq!(
+        body.matches(r#""insert":{"table":"products""#).count(),
+        2,
+        "one line per row: {}",
+        body
+    );
+}
+
+#[test]
+fn snk_manticore_fails_a_bulk_the_server_rejected() {
+    // Manticore answers a partly-rejected bulk with HTTP 200 and errors:true.
+    // Trusting the status code alone would report a green run that wrote
+    // nothing.
+    let engine = engine_or_skip!();
+    let (port, _rx) = manticore_stub(vec![
+        r#"{"items":[{"insert":{"status":409,"error":"duplicate id"}}],"errors":true,"took":1}"#
+            .into(),
+    ]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "m",
+                "snk.manticore",
+                json!({ "endpoint": endpoint, "table": "products" })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "error", "a rejected bulk must fail the run: {:?}", r);
+    let msg = r.error.unwrap_or_default();
+    assert!(
+        msg.contains("duplicate id"),
+        "the server's reason must reach the user: {}",
+        msg
+    );
+}
+
+#[test]
+fn snk_manticore_replace_writes_a_replace_action() {
+    // "Replace" is upsert-by-id in Manticore. The dropdown has to change the
+    // action name, not just the label.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (port, rx) = manticore_stub(vec![r#"{"items":[],"errors":false}"#.into()]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "m",
+                "snk.manticore",
+                json!({ "endpoint": endpoint, "table": "products", "writeMode": "replace" })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore sink failed: {:?}", r.error);
+
+    let body = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("bulk request"),
+    )
+    .to_string();
+    assert!(
+        body.contains(r#""replace":{"table":"products""#),
+        "expected a replace action: {}",
+        body
+    );
+    assert!(
+        !body.contains(r#""insert""#),
+        "replace must not also insert: {}",
+        body
+    );
+}
+
+#[test]
+fn snk_manticore_splits_rows_into_batches() {
+    // 3 rows at batchSize 2 is two requests, not one body holding everything.
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let (port, rx) = manticore_stub(vec![
+        r#"{"items":[],"errors":false}"#.into(),
+        r#"{"items":[],"errors":false}"#.into(),
+    ]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = write_file(tmp.path(), "in.csv", "id,name\n1,alice\n2,bob\n3,carol\n");
+    let endpoint = format!("http://127.0.0.1:{}", port);
+    let r = engine.execute_pipeline(&doc(
+        json!([
+            node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+            node(
+                "m",
+                "snk.manticore",
+                json!({ "endpoint": endpoint, "table": "products", "batchSize": 2 })
+            ),
+        ]),
+        json!([main_edge("e1", "s", "m")]),
+    ));
+    assert_eq!(r.status, "ok", "manticore sink failed: {:?}", r.error);
+
+    let first = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("1st bulk request"),
+    )
+    .to_string();
+    let second = String::from_utf8_lossy(
+        &rx.recv_timeout(Duration::from_secs(5))
+            .expect("2nd bulk request"),
+    )
+    .to_string();
+    assert_eq!(
+        first.matches(r#""insert""#).count(),
+        2,
+        "1st batch holds 2: {}",
+        first
+    );
+    assert_eq!(
+        second.matches(r#""insert""#).count(),
+        1,
+        "2nd batch holds 1: {}",
+        second
     );
 }

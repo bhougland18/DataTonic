@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Duckle
+GenericName=Data Pipeline Editor
+Comment=Local-first ETL/ELT and streaming platform with a visual editor
+Exec=duckle %U
+Icon=duckle
+Terminal=false
+Categories=Development;Database;
+Keywords=ETL;ELT;data;pipeline;DuckDB;SQL;
+# GTK reports WM_CLASS from the program name, and the package installs the
+# binary as `duckle`, so this should match. It is the one line here that cannot
+# be checked without a running Linux session - confirm with `xprop WM_CLASS`
+# (or `hyprctl clients` under Hyprland) before relying on window grouping.
+StartupWMClass=duckle

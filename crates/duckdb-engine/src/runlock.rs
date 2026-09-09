@@ -140,6 +140,34 @@ pub fn try_acquire(workspace: &Path, key: &str) -> Option<RunLock> {
 /// Every store that two processes share goes through this - schedules.json and
 /// alert-state.json today. A store that reads, modifies and writes without it
 /// loses whichever writer finished first.
+/// Claim a pipeline for a run someone asked for, or say why not.
+///
+/// The same lock and the same key a scheduled run takes, for the surfaces that
+/// start a run on demand: `duckle run`, MCP `run_pipeline`, and the console's
+/// Run. Those took nothing, so a run started from any of them could proceed
+/// beside a scheduled run of the same pipeline - the exact pair this module
+/// exists to prevent, since the hazard it names is two runs writing one sink and
+/// advancing one watermark, not two SCHEDULED runs specifically. Eight
+/// components write durable state on any run (see `policy::advances_saved_state`),
+/// and none of them cares what started it.
+///
+/// NOT for a backfill or a chunk. Those run many slices of one pipeline at once
+/// on purpose, bounded by the ledger's own `max_concurrent`, so a per-pipeline
+/// lock would serialise the feature away. Their concurrency is the ledger's
+/// question, not this one's.
+///
+/// The message is one sentence rather than a code because every caller prints it
+/// straight to a person or an agent.
+pub fn claim_for_run(workspace: &Path, pipeline: &str) -> Result<RunLock, String> {
+    try_acquire(workspace, pipeline).ok_or_else(|| {
+        format!(
+            "{pipeline} is already running in this workspace, so this run was refused rather \
+             than started beside it. Two runs of one pipeline write the same sink and advance \
+             the same saved state. Wait for it to finish, or run it somewhere else."
+        )
+    })
+}
+
 pub fn lock_store(workspace: &Path, name: &str) -> Result<RunLock, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -239,6 +267,41 @@ fn acquire_at_reason(path: PathBuf, key: &str) -> AcquireOutcome {
 mod tests {
     use super::*;
 
+    /// A run someone asks for is refused while the pipeline is already running,
+    /// and told why.
+    ///
+    /// `duckle run`, MCP `run_pipeline` and the console's Run took no lock at
+    /// all, so any of them could proceed beside a scheduled run of the same
+    /// pipeline - the pair this module exists to prevent. The hazard it names is
+    /// two runs writing one sink and advancing one watermark, which does not
+    /// care what started either of them.
+    #[test]
+    fn a_run_someone_asked_for_is_refused_while_the_pipeline_is_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let held = claim_for_run(ws, "orders_etl").expect("a free pipeline is claimable");
+
+        let refused = claim_for_run(ws, "orders_etl")
+            .expect_err("a second run must be refused, not started beside the first");
+        assert!(
+            refused.contains("orders_etl") && refused.contains("already running"),
+            "the refusal has to name the pipeline and say why: {refused}"
+        );
+
+        // A DIFFERENT pipeline is unaffected - the lock is per pipeline, not a
+        // workspace-wide gate.
+        let other = claim_for_run(ws, "customers_etl");
+        assert!(other.is_ok(), "another pipeline was blocked: {:?}", other.err());
+
+        // And releasing frees it, so a finished run does not wedge the next one.
+        drop(held);
+        assert!(
+            claim_for_run(ws, "orders_etl").is_ok(),
+            "the lock was not released when the run ended"
+        );
+    }
+
     #[test]
     fn a_second_acquire_is_refused_while_the_first_is_held() {
         let tmp = tempfile::tempdir().unwrap();
@@ -259,9 +322,42 @@ mod tests {
         // Releasing lets the next caller through, which is what makes the
         // schedule resume on the following tick rather than stalling.
         drop(first);
-        assert!(
-            try_acquire(ws, "nightly-load").is_some(),
-            "lock never became available again"
+        // Asserted on the CLASSIFIED outcome rather than on `is_some()`.
+        //
+        // `try_acquire` collapses "another holder" and "this workspace cannot
+        // be locked at all" into the same `None`, so when this failed on CI it
+        // said only "lock never became available again" - which is the one
+        // thing that could not have been true, since nothing held it. Three
+        // reds and no way to tell contention from an `open` that failed for an
+        // environmental reason, on a runner executing 1160 tests at once.
+        //
+        // HeldByOther is the real regression and still fails loudly. Unusable
+        // is not what this test is about: the property is that RELEASING lets
+        // the next caller through, not that a file can be opened right now.
+        //
+        // An Unusable outcome is retried briefly rather than failed on. It is
+        // not the property under test, and it is transient by definition: a
+        // read-only mount or a filesystem without locks stays broken for the
+        // whole second, while an `open` that lost a race for a file descriptor
+        // on a runner executing 1160 tests at once clears immediately. A
+        // HeldByOther is never retried - that IS the regression, and retrying
+        // it would hide exactly what this test exists to catch.
+        let mut last = None;
+        for _ in 0..50 {
+            match try_acquire_reason(ws, "nightly-load") {
+                AcquireOutcome::Claimed(_) => return,
+                AcquireOutcome::HeldByOther => {
+                    panic!("the lock was still held after its only holder was dropped")
+                }
+                AcquireOutcome::Unusable(e) => {
+                    last = Some(e.to_string());
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        panic!(
+            "the workspace could not be locked at all for a second, so this is the              environment rather than the lock: {}",
+            last.unwrap_or_default()
         );
     }
 
