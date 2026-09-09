@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Network, Save, Wand2, Trash2, Plus, ArrowRight, X } from 'lucide-react';
+import { Network, Save, Wand2, Trash2, Plus, ArrowRight, X, HelpCircle } from 'lucide-react';
 import ErDiagram from './ErDiagram';
+import { maybeStartEditorTour, startEditorTour } from '../GuidedTour';
 import {
     inferRelationships,
     type ErdModel,
@@ -72,6 +73,8 @@ export default function ErdWorkspace({ openRequest, onSave, onClose }: ErdWorksp
         setToTable(openRequest.tables[1]?.name ?? openRequest.tables[0]?.name ?? '');
         setFromCol('');
         setToCol('');
+        // First time this editor is opened, walk the ER Model tour once.
+        maybeStartEditorTour('erd');
     }, [openRequest, lastNonce]);
 
     const colsOf = (name: string) => tables.find(t => t.name === name)?.columns ?? [];
@@ -125,7 +128,21 @@ export default function ErdWorkspace({ openRequest, onSave, onClose }: ErdWorksp
                     <small>{nodeName ? `Working DB · ${nodeName}` : 'Working DB'}</small>
                 </div>
                 <span className="erd-ws-spacer" />
-                <button className="erd-btn" onClick={reinfer} title="Re-infer all relationships">
+                <button
+                    type="button"
+                    className="editor-help-btn"
+                    onClick={() => startEditorTour('erd')}
+                    title="Show the ER Model tour"
+                    aria-label="Show the ER Model tour"
+                >
+                    <HelpCircle size={16} />
+                </button>
+                <button
+                    className="erd-btn"
+                    onClick={reinfer}
+                    title="Re-infer all relationships"
+                    data-tour="erd-infer"
+                >
                     <Wand2 size={14} /> Auto-infer all
                 </button>
                 <button className="erd-btn" onClick={onClose}>
@@ -134,12 +151,13 @@ export default function ErdWorkspace({ openRequest, onSave, onClose }: ErdWorksp
                 <button
                     className="erd-btn erd-btn--primary"
                     onClick={() => onSave(nodeId, { tables, relationships })}
+                    data-tour="erd-save"
                 >
                     <Save size={14} /> Save to node
                 </button>
             </div>
 
-            <div className="erd-ws-body">
+            <div className="erd-ws-body" data-tour="erd-diagram">
                 <ErDiagram
                     tables={tables}
                     relationships={relationships}
@@ -147,7 +165,7 @@ export default function ErdWorkspace({ openRequest, onSave, onClose }: ErdWorksp
                     onRelationshipsChange={setRelationships}
                     onPairSelect={(a, b) => setSelectedPair({ a, b })}
                 />
-                <aside className="erd-ws-side">
+                <aside className="erd-ws-side" data-tour="erd-side">
                     <div className="erd-ws-side-head">
                         Relationships <span>{relationships.length}</span>
                     </div>

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Plug, Search, ChevronDown, Loader2, ArrowUpToLine } from 'lucide-react';
+import { Plug, Search, ChevronDown, Loader2, ArrowUpToLine, HelpCircle } from 'lucide-react';
 import InforProvider from '../InforProvider';
+import { maybeStartEditorTour, startEditorTour } from '../../../GuidedTour';
 import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
 import type { IonApiConfig } from './ionapi';
 import type { IonApiToken } from './inforAuth';
@@ -162,6 +163,9 @@ export default function InforUploadWorkspace({
     // Pre-fill the class search from the node's saved class on (re)open.
     useEffect(() => {
         if (openRequest?.businessClass) setSearch(openRequest.businessClass);
+        // First time this editor is opened, walk the Infor sink tour once (it defers
+        // itself until the signed-in upload config is on screen).
+        maybeStartEditorTour('infor-sink');
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [openRequest?.nonce]);
 
@@ -474,9 +478,19 @@ export default function InforUploadWorkspace({
         <div className="pgi">
             {/* ---- Left: provider + credentials + upload target + fields ---- */}
             <div className="pgi-props" style={{ width: 540 }}>
-                <header className="pg-sidebar-head">
+                <header className="pg-sidebar-head" data-tour="infor-sink-connect">
                     <Plug size={16} strokeWidth={1.75} />
                     <h2>Infor Upload</h2>
+                    <button
+                        type="button"
+                        className="editor-help-btn"
+                        style={{ marginLeft: 'auto' }}
+                        onClick={() => startEditorTour('infor-sink')}
+                        title="Show the Infor upload tour"
+                        aria-label="Show the Infor upload tour"
+                    >
+                        <HelpCircle size={16} />
+                    </button>
                 </header>
                 <InforProvider
                     workspacePath={workspacePath}
@@ -511,7 +525,7 @@ export default function InforUploadWorkspace({
                         </div>
 
                         {/* ---- Business class ---- */}
-                        <div className="pgi-section">
+                        <div className="pgi-section" data-tour="infor-sink-class">
                             <div className="pgi-lbl">Business class</div>
                             {selectedClass && !pickerOpen ? (
                                 <button
@@ -597,7 +611,7 @@ export default function InforUploadWorkspace({
 
                         {/* ---- Action ---- */}
                         {selectedClass && (
-                            <div className="pgi-section">
+                            <div className="pgi-section" data-tour="infor-sink-action">
                                 <div className="pgi-lbl">Action</div>
                                 {busy ? (
                                     <div className="pg-note">
@@ -671,7 +685,7 @@ export default function InforUploadWorkspace({
 
                         {/* ---- Field map: field -> dataset column ---- */}
                         {selectedAction && (
-                            <div className="pgi-section">
+                            <div className="pgi-section" data-tour="infor-sink-map">
                                 <div
                                     className="pgi-lbl"
                                     style={{ display: 'flex', alignItems: 'center', gap: 8 }}

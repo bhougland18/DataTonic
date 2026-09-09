@@ -12,6 +12,7 @@ import {
     PanelLeftClose,
     PanelLeftOpen,
     AlignLeft,
+    HelpCircle,
 } from 'lucide-react';
 import { format as formatSqlText } from 'sql-formatter';
 import './sqleditor.css';
@@ -19,6 +20,7 @@ import type { SqlEditorRequest, SqlEditorResult, SqlRunResult, SqlStudioTable } 
 import type { ErdRelationship } from '../erd/model';
 import QueryPane from './QueryPane';
 import AiPane from './AiPane';
+import { maybeStartEditorTour, startEditorTour } from '../GuidedTour';
 
 interface SqlEditorProps {
     workspacePath?: string | null;
@@ -59,6 +61,8 @@ export default function SqlEditor({
         setRelationships(openRequest.relationships ?? []);
         setMainSql(openRequest.sql ?? '');
         setAiDraft(null);
+        // First time this editor is opened, walk the SQL Studio tour once.
+        maybeStartEditorTour('sql');
     }, [openRequest]);
 
     const runQuery = useCallback(
@@ -112,7 +116,10 @@ export default function SqlEditor({
     return (
         <div className="sqlstudio">
             {/* Catalog sidebar */}
-            <aside className={`sqlstudio-side${showCatalog ? '' : ' sqlstudio-side--hidden'}`}>
+            <aside
+                className={`sqlstudio-side${showCatalog ? '' : ' sqlstudio-side--hidden'}`}
+                data-tour="sqlstudio-catalog"
+            >
                 <div className="sqlstudio-side-head">
                     <Database size={15} strokeWidth={1.8} />
                     <span>Working DB</span>
@@ -168,6 +175,15 @@ export default function SqlEditor({
                     <span className="sqlstudio-spacer" />
                     <button
                         type="button"
+                        className="editor-help-btn"
+                        onClick={() => startEditorTour('sql')}
+                        title="Show the SQL Studio tour"
+                        aria-label="Show the SQL Studio tour"
+                    >
+                        <HelpCircle size={16} />
+                    </button>
+                    <button
+                        type="button"
                         className="sqlstudio-btn"
                         onClick={formatMain}
                         title="Auto-format the query"
@@ -179,6 +195,7 @@ export default function SqlEditor({
                         className={`sqlstudio-btn${showAi ? ' sqlstudio-btn--on' : ''}`}
                         onClick={() => setShowAi(v => !v)}
                         title="Ask AI to write SQL (text-to-SQL)"
+                        data-tour="sqlstudio-askai"
                     >
                         <Sparkles size={14} strokeWidth={2} /> Ask AI
                     </button>
@@ -188,12 +205,13 @@ export default function SqlEditor({
                         onClick={apply}
                         disabled={onApplyToNode == null}
                         title="Write the main query back to the node"
+                        data-tour="sqlstudio-apply"
                     >
                         <ArrowUpToLine size={14} strokeWidth={2} /> Apply to node
                     </button>
                 </div>
 
-                <div className="sqlstudio-panes">
+                <div className="sqlstudio-panes" data-tour="sqlstudio-editor">
                     <QueryPane
                         label="Query"
                         sql={mainSql}

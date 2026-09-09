@@ -17,6 +17,7 @@ import {
     RotateCw,
     Trash2,
     X,
+    HelpCircle,
 } from 'lucide-react';
 import { compile, findMatches, matches as re2matches, extract as re2extract, replace as re2replace } from './re2';
 import type { Re2Match } from './re2';
@@ -37,6 +38,7 @@ import {
 } from './library';
 import { chatSend, type ChatMessage } from '../tauri-bridge';
 import { isTauri } from '../tauri-dialog';
+import { maybeStartEditorTour, startEditorTour } from '../GuidedTour';
 import type { RegexStudioRequest, RegexStudioResult, RegexColumnFetch, RegexMode } from './types';
 import './regexstudio.css';
 
@@ -194,6 +196,8 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
         setTitle('');
         setDescr('');
         setScope('workspace');
+        // First time this editor is opened, walk the Regex Studio tour once.
+        maybeStartEditorTour('regex');
     }, [openRequest]);
 
     // Load the saved-pattern library for this workspace.
@@ -654,7 +658,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
     return (
         <div className="rgx">
             {/* ---- Library (left) ---- */}
-            <aside className="rgx-lib">
+            <aside className="rgx-lib" data-tour="regex-library">
                 <div className="rgx-lib-head">
                     <BookMarked size={15} />
                     <h2>Pattern Library</h2>
@@ -711,12 +715,21 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                             <PanelRightOpen size={15} /> AI
                         </button>
                     )}
-                    <button className="rgx-apply" onClick={apply} disabled={!lint.ok || !column}>
+                    <button className="rgx-apply" onClick={apply} disabled={!lint.ok || !column} data-tour="regex-apply">
                         <Check size={14} /> Apply to node
+                    </button>
+                    <button
+                        type="button"
+                        className="editor-help-btn"
+                        onClick={() => startEditorTour('regex')}
+                        title="Show the Regex Studio tour"
+                        aria-label="Show the Regex Studio tour"
+                    >
+                        <HelpCircle size={16} />
                     </button>
                 </div>
 
-                <div className="rgx-pat">
+                <div className="rgx-pat" data-tour="regex-pattern">
                     <div className="rgx-field">
                         <label>Column</label>
                         <select value={column} onChange={e => setColumn(e.target.value)}>
@@ -832,7 +845,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
 
                 {/* column data | tests */}
                 <div className="rgx-split">
-                    <div className="rgx-col">
+                    <div className="rgx-col" data-tour="regex-column">
                         <div className="rgx-panel-head">
                             <span className="ttl">Column data</span>
                             <span className="cnt">
@@ -865,7 +878,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
                         </div>
                     </div>
 
-                    <div className="rgx-tests">
+                    <div className="rgx-tests" data-tour="regex-expected">
                         <div className="rgx-panel-head">
                             <span className="ttl">Test area — pinned records</span>
                             <span className="cnt">
@@ -1005,7 +1018,7 @@ export default function RegexStudio({ workspacePath, openRequest, onApplyToNode,
 
             {/* ---- Persistent AI chat (right, collapsible) ---- */}
             {chatOpen && (
-                <aside className="rgx-chat">
+                <aside className="rgx-chat" data-tour="regex-chat">
                     <div className="rgx-chat-head">
                         <Sparkles size={14} className="ico" />
                         <span className="ttl">AI chat</span>

@@ -8394,6 +8394,15 @@ select.modal-select:focus {
 }
 
 /* ---- Guided tour (first-run walkthrough) ---- */
+/* Shared "replay this editor's tour" icon button, used in each custom editor's toolbar. */
+.editor-help-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; flex-shrink: 0;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: transparent; color: var(--text-3, var(--text-2, #9aa4bd)); cursor: pointer;
+}
+.editor-help-btn:hover { color: var(--text-1, var(--text)); border-color: var(--border-strong, var(--border)); }
+
 .tour-root { position: fixed; inset: 0; z-index: 99999; pointer-events: none; }
 .tour-dim { position: absolute; inset: 0; background: rgba(7, 9, 15, 0.72); pointer-events: auto; }
 .tour-spotlight {

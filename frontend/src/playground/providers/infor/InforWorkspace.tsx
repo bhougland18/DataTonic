@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Search, ChevronDown, ChevronLeft, ChevronRight, Play, Loader2, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine, Save, Download, Upload, Bookmark } from 'lucide-react';
+import { Search, ChevronDown, ChevronLeft, ChevronRight, Play, Loader2, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine, Save, Download, Upload, Bookmark, HelpCircle } from 'lucide-react';
 import InforProvider from '../InforProvider';
+import { maybeStartEditorTour, startEditorTour } from '../../../GuidedTour';
 import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
 import type { IonApiConfig } from './ionapi';
 import type { IonApiToken } from './inforAuth';
@@ -174,6 +175,9 @@ export default function InforWorkspace({
         setApplyNodeId(openRequest.nodeId);
         setPendingQuery(openRequest.query ?? {});
         setApplied(false);
+        // First time this editor is opened, walk the Infor source tour once (it defers
+        // itself until the signed-in query builder is on screen).
+        maybeStartEditorTour('infor-src');
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [openRequest?.nonce]);
 
@@ -477,9 +481,19 @@ export default function InforWorkspace({
         <div className="pgi">
             {/* ---- Left: provider + credentials + query properties ---- */}
             <div className="pgi-props">
-                <header className="pg-sidebar-head">
+                <header className="pg-sidebar-head" data-tour="infor-src-connect">
                     <Plug size={16} strokeWidth={1.75} />
                     <h2>API Playground</h2>
+                    <button
+                        type="button"
+                        className="editor-help-btn"
+                        style={{ marginLeft: 'auto' }}
+                        onClick={() => startEditorTour('infor-src')}
+                        title="Show the Infor source tour"
+                        aria-label="Show the Infor source tour"
+                    >
+                        <HelpCircle size={16} />
+                    </button>
                 </header>
                 <InforProvider
                     workspacePath={workspacePath}
@@ -507,7 +521,7 @@ export default function InforWorkspace({
                         </div>
 
                         {/* ---- Business class ---- */}
-                        <div className="pgi-section">
+                        <div className="pgi-section" data-tour="infor-src-class">
                             <div className="pgi-lbl">Business class</div>
                             {selected && !pickerOpen ? (
                                 <button
@@ -618,7 +632,7 @@ export default function InforWorkspace({
                         {selected && !pickerOpen && (
                             <>
                                 {/* ---- Fields ---- */}
-                                <div className="pgi-section">
+                                <div className="pgi-section" data-tour="infor-src-fields">
                                     <div className="pgi-section-head">
                                         <div className="pgi-lbl">
                                             Fields <span className="pgi-maps">→ _fields</span>
@@ -695,7 +709,7 @@ export default function InforWorkspace({
                                 </div>
 
                                 {/* ---- Run ---- */}
-                                <div className="pgi-run">
+                                <div className="pgi-run" data-tour="infor-src-run">
                                     <input
                                         type="checkbox"
                                         className="pgi-limitchk"
