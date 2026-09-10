@@ -1,0 +1,57 @@
+/* Reporting (assembly) — own stylesheet, same discipline as blocks.css.
+   The tiles deliberately reuse the Home launcher's `home-group-*` classes from
+   styles.css rather than restyling a lookalike, so the two surfaces cannot
+   drift apart. Only layout around them lives here. */
+
+.rpt {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    background: var(--bg-0);
+    color: var(--text-1);
+    overflow: auto;
+}
+.rpt-inner {
+    margin: auto;
+    padding: 32px 24px;
+    max-width: 1080px;
+    width: 100%;
+}
+.rpt-empty {
+    align-items: center;
+    justify-content: center;
+    color: var(--text-3);
+    font-size: 13px;
+}
+
+.rpt-intro {
+    text-align: center;
+    margin-bottom: 22px;
+}
+.rpt-intro h2 {
+    margin: 0 0 6px;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-1);
+}
+.rpt-intro p {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-3);
+}
+.rpt-link {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+}
+
+/* The launcher grid is already laid out by .home-launcher-groups; this only
+   centres it inside the narrower reporting column. */
+.rpt-groups {
+    margin: 0 auto;
+}

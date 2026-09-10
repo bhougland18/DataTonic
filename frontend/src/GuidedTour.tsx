@@ -552,6 +552,48 @@ const ERD_STEPS: Step[] = [
     },
 ];
 
+const BLOCKS_STEPS: Step[] = [
+    {
+        sel: null,
+        chapter: 'Blocks',
+        title: 'Blocks are the pieces your deliverables are made of',
+        body: 'Three stages, and this is the middle one. The canvas gathers and shapes data into durable files. Blocks turns that data into reusable pieces — today a query and a chart, with written sections to come. Reporting arranges those pieces into a dashboard, a report or a deck. Nothing here asks which of the three you are heading for, on purpose: one block can feed all of them, and choosing up front is what forces you to rebuild the same chart three times.',
+        placement: 'center',
+    },
+    {
+        sel: '[data-tour="blocks-source"]',
+        chapter: 'Blocks',
+        title: 'Every durable dataset, already on the canvas',
+        body: 'These are the files and tables your pipelines actually wrote, read from the workspace catalog. There is no pick-one-source step: a single-table diagram is just a column list, so everything durable goes on the canvas together and the joins between them are the point. A pipeline run’s scratch database is never here — it is deleted when the run ends, so a block pointed at one would be broken by morning. Rescan after a run to pick up anything new.',
+        placement: 'bottom',
+        requireAnchor: true,
+    },
+    {
+        sel: '[data-tour="blocks-steps"]',
+        chapter: 'Blocks',
+        title: 'Schema, SQL, charts',
+        body: 'Schema shows what exists and how it joins. SQL is where the query gets written and run. Charts turns a result into a visual. They are stages of one job rather than separate tools — and a block you save keeps its query, so the numbers in a report are never a stale paste.',
+        placement: 'bottom',
+        requireAnchor: true,
+    },
+    {
+        sel: '[data-tour="blocks-body"]',
+        chapter: 'Blocks',
+        title: 'Schema moves no data',
+        body: 'The diagram is every durable table in the workspace with the joins we can infer between them. Looking at it costs nothing — no query runs and nothing loads. It is here so you can see what is joinable before writing SQL, and so the AI drafting that SQL knows the same thing you do.',
+        placement: 'top',
+        requireAnchor: true,
+    },
+    {
+        sel: '[data-tour="blocks-help"]',
+        chapter: 'Blocks',
+        title: 'Replay this any time',
+        body: 'This button reopens the tour. Reporting has its own, covering how blocks get assembled into something you can send a client.',
+        placement: 'left',
+        requireAnchor: true,
+    },
+];
+
 /** Editor tours by id. The main first-run tour is `forThisSurface`; these are keyed by editor. */
 const EDITOR_TOURS: Record<string, Step[]> = {
     sql: SQL_STUDIO_STEPS,
@@ -559,6 +601,7 @@ const EDITOR_TOURS: Record<string, Step[]> = {
     'infor-src': INFOR_SRC_STEPS,
     'infor-sink': INFOR_SINK_STEPS,
     erd: ERD_STEPS,
+    blocks: BLOCKS_STEPS,
 };
 
 function stepsForTour(tourId: string): Step[] {

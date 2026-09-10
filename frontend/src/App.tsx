@@ -50,6 +50,8 @@ import SetupWizard from './workflow-ui/SetupWizard';
 import ChatPanel from './workflow-ui/ChatPanel';
 import SqlEditor from './sqleditor/SqlEditor';
 import RegexStudio from './regexstudio/RegexStudio';
+import BlocksStudio from './blocks/BlocksStudio';
+import ReportingStudio from './reporting/ReportingStudio';
 import type {
     RegexStudioRequest,
     RegexStudioResult,
@@ -3420,6 +3422,22 @@ export default function App() {
                         openRequest={regexStudioRequest}
                         onApplyToNode={handleApplyRegexStudio}
                         onFetchColumn={handleFetchColumn}
+                    />
+                </div>
+                {/* The two above-the-graph surfaces. Unlike everything above,
+                    neither takes an openRequest nor applies anything back to a
+                    node: they read durable sinks, not the graph. Analysis Blocks
+                    AUTHORS reusable pieces; Reporting ASSEMBLES them. Both kept
+                    mounted so in-progress work survives a trip to Canvas. */}
+                <div style={{ display: mode === 'blocks' ? 'flex' : 'none', flex: 1, minWidth: 0 }}>
+                    <BlocksStudio workspacePath={workspacePathState} active={mode === 'blocks'} />
+                </div>
+                <div
+                    style={{ display: mode === 'reporting' ? 'flex' : 'none', flex: 1, minWidth: 0 }}
+                >
+                    <ReportingStudio
+                        workspacePath={workspacePathState}
+                        onOpenBlocks={() => setMode('blocks')}
                     />
                 </div>
                 {mode === 'canvas' && (
