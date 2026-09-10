@@ -3373,7 +3373,7 @@ Duckle is not a CSV tool with extras. It reads a broad set of formats and source
 
 ### Sources
 
-**121 sources available today.**
+**122 sources available today.**
 
 | Group | Connectors | Status |
 |---|---|---|
@@ -3409,7 +3409,7 @@ For JSON sources, a **Format** selector picks how the file is read (auto / array
 
 ### Transforms
 
-**144 transforms available today.**
+**147 transforms available today.**
 
 | Group | Operations |
 |---|---|
@@ -3487,7 +3487,7 @@ Validators split their input: passing rows continue on the main port, failures r
 
 ### Sinks
 
-**73 sinks available today.**
+**75 sinks available today.**
 
 | Group | Connectors | Status |
 |---|---|---|

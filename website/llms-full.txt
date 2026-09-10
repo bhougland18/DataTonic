@@ -13,10 +13,10 @@ catalog the application itself reads, so the names and counts here are exact.
 - Free and open source, dual-licensed MIT OR Apache-2.0. No per-row, per-connector, or per-seat billing.
 - Local-first desktop app: runs fully offline, no account and no telemetry, suitable for air-gapped and compliance-sensitive work.
 - Engine: pipelines compile to SQL and execute on DuckDB, an in-process analytical database, at native speed.
-- 411 components, 394 available today: sources, transforms, destinations, data-quality checks, control-flow nodes, and code runners.
-- 194 connectors (121 sources / 73 destinations): databases, warehouses, lakehouses, object stores, streaming brokers, NoSQL, vector databases, geospatial formats, and SaaS APIs.
-- Transformation: 144 transforms including joins, window functions, aggregates, CDC/SCD, incremental loads, upsert with delete propagation, and a visual Map (tMap-style) editor.
-- Data quality: 29 checks, plus 21 control-flow nodes for branching, iteration, parallel branches, and calling child pipelines.
+- 420 components, 403 available today: sources, transforms, destinations, data-quality checks, control-flow nodes, and code runners.
+- 197 connectors (122 sources / 75 destinations): databases, warehouses, lakehouses, object stores, streaming brokers, NoSQL, vector databases, geospatial formats, and SaaS APIs.
+- Transformation: 147 transforms including joins, window functions, aggregates, CDC/SCD, incremental loads, upsert with delete propagation, and a visual Map (tMap-style) editor.
+- Data quality: 30 checks, plus 21 control-flow nodes for branching, iteration, parallel branches, and calling child pipelines.
 - Three ways to author the same pipeline: the visual canvas, the Python API (`pip install duckle`), or plain English via the built-in assistant. All three produce the same pipeline JSON and the same SQL.
 - dbt: runs dbt on DuckDB with a GUI, using a fast build engine by default and dbt-core as a fallback.
 - AI: an on-device assistant (Qwen via llama.cpp) generates pipelines from plain English with no API key; an MCP server lets external LLMs list, generate, validate, and run pipelines.
@@ -81,7 +81,7 @@ Every component, by id. `src.*` reads, `snk.*` writes, `xf.*` transforms,
 `qa.*` checks, `ctl.*` controls flow, `code.*` runs your own code. Entries
 marked [planned] or [preview] are not usable yet.
 
-### Sources (read) (130)
+### Sources (read) (131)
 
 - `src.adbc` ADBC (Arrow): Read any database that ships an ADBC (Arrow Database Connectivity) driver. Point at a prebuilt driver shared library (.dll / .so / .dylib) plus a connection URI and SQL; rows stream back as Arrow for fast loads. Friendly wrappers can map their own fields onto driver / options
 - `src.airtable` Airtable: Airtable REST. Bearer Personal Access Token. Cursor pagination on `offset` (cursorNextPath /offset, cursorParam `offset`). responsePath /records
@@ -133,6 +133,7 @@ marked [planned] or [preview] are not usable yet.
 - `src.hubspot` HubSpot: HubSpot REST. Bearer auth via a Private App access token. Cursor pagination on `paging.next.after` (cursorNextPath /paging/next/after, cursorParam `after`). responsePath /results
 - `src.huggingface` Hugging Face dataset: Read a Hugging Face Hub dataset directly via DuckDB hf:// (httpfs). Give the repo id and a file/glob; CSV / JSON / Parquet auto-detected. Token for private or gated datasets
 - `src.iceberg` Apache Iceberg: Read Iceberg tables via DuckDB iceberg_scan
+- `src.infor` Infor: Query an Infor FSM/Landmark business class (the lists/_generic endpoint) via a saved ION API connection. Configure the business class, field list, and filter here, or click "Open in Playground" to build the query interactively. Compiles to a REST source at run time
 - `src.inline` Inline Rows: Rows you write here rather than read from anywhere: a control row, an audit stamp, a fixed lookup. Give each column a name and a value; rowCount repeats the row. Every other source names an external system, so this was previously a throwaway file
 - `src.intercom` Intercom: Intercom REST. Bearer auth. Cursor pagination via `pages.next.starting_after` + `starting_after` param. responsePath /data
 - `src.jdbc` Generic JDBC [planned]: Reads data from Generic JDBC
@@ -214,7 +215,7 @@ marked [planned] or [preview] are not usable yet.
 - `src.yaml` YAML: Read a YAML file as a table. Top-level YAML arrays become one row per element; non-array docs become a single row. Suits config-data ETL (Helm values, GitHub Actions matrices) not bulk logs
 - `src.zendesk` Zendesk: Zendesk Support REST. Basic auth (email/token + API token). Cursor pagination via `meta.after_cursor` + `page[after]` param. responsePath /tickets (or whatever resource)
 
-### Destinations (write) (78)
+### Destinations (write) (80)
 
 - `snk.avro` Avro: Write rows as an Apache Avro container file via the pure-Rust `apache-avro` crate. Schema is inferred from the first row's column types (long / double / string / boolean) - or supply a JSON Avro schema via the schemaJson field to override. recordName names the inferred record (default `Row`)
 - `snk.azureblob` Azure Blob Storage: Write via the azure extension
@@ -240,6 +241,7 @@ marked [planned] or [preview] are not usable yet.
 - `snk.graphql` GraphQL Mutation: POST a GraphQL mutation per upstream row. The mutation body can reference row fields via ${field} substitution
 - `snk.huggingface` Hugging Face dataset: Push the pipeline output to a Hugging Face Hub dataset repo. The engine materializes a Parquet and commits it over the Hub API (create-repo -> preupload -> git-LFS -> commit). Needs a write-scoped token; the repo is created if it does not exist
 - `snk.iceberg` Apache Iceberg: Write a full Iceberg table (data/ + metadata/) via DuckDB v1.5
+- `snk.infor` Infor: Bulk-upload rows to an Infor FSM/Landmark business-class action (Create / Update / ...) via the batch service. Connect a dataset, pick the action, and map columns to the action fields in the rail; per-record results (status + message) flow out the output for logging or retry
 - `snk.jdbc` Generic JDBC [planned]: Writes data to Generic JDBC
 - `snk.json` JSON: Writes data to JSON
 - `snk.jsonl` JSONL / NDJSON: Writes data to JSONL / NDJSON
@@ -292,10 +294,11 @@ marked [planned] or [preview] are not usable yet.
 - `snk.weaviate` Weaviate: Batch upsert objects to a Weaviate cluster via /v1/batch/objects with Bearer auth
 - `snk.webhook` Webhook: HTTP POST one request per row, body = row JSON (configurable method + headers)
 - `snk.websocket` WebSocket: Connect to a ws:// or wss:// URL and send each upstream row as a text frame - the whole row as JSON, or one column when messageColumn is set - then close. For pushing processed results to real-time dashboards or WebSocket APIs
+- `snk.xlsx` Excel — multi-tab (XLSX): Write rows into one named sheet of an .xlsx workbook via the pure-Rust umya-spreadsheet crate, leaving the other tabs intact. Unlike the DuckDB excel sink - whose COPY recreates the whole file on every write - a second run against the same file keeps existing sheets. Pick a Sheet name and a write mode (Replace the tab, or Append rows beneath it)
 - `snk.xml` XML: Write rows as XML via `quick-xml`. Default shape: `<root><row><col>val</col>...</row>...</root>`. rootElement / rowElement override the wrapper names. Complex (object/array) cell values are JSON-encoded inside CDATA so the file round-trips back through src.xml losslessly
 - `snk.yaml` YAML: Write the upstream rows as a top-level YAML array (`- key: value` per row)
 
-### Transforms (144)
+### Transforms (147)
 
 - `xf.addcol` Add Column: Transforms data with Add Column
 - `xf.aggwin` Window Aggregate: Aggregate over a window, keep every row
@@ -407,7 +410,10 @@ marked [planned] or [preview] are not usable yet.
 - `xf.rank.filter` Top N per Group: Keep the top N rows per group, ordered by a column (row_number window + filter)
 - `xf.regex` Regex Replace: Transforms data with Regex Replace
 - `xf.regex.extract` Regex Extract: Extract a capture group from a column via regexp_extract
+- `xf.regex.extract.studio` Regex Extract Studio: Regex extract with the launched RE2 editor. Runs identically to Regex Extract
 - `xf.regex.match` Regex Match: Boolean: does the regex match the column? (regexp_matches)
+- `xf.regex.match.studio` Regex Match Studio: Regex match (boolean) with the launched RE2 editor. Runs identically to Regex Match
+- `xf.regex.studio` Regex Replace Studio: Regex replace with a launched RE2 editor — live tests on pinned rows, capture-group preview, token explanation, and local-AI drafting. Runs identically to Regex Replace
 - `xf.rename` Rename Columns: Transforms data with Rename Columns
 - `xf.reorder` Reorder Columns: Transforms data with Reorder Columns
 - `xf.rollup` Rollup: Transforms data with Rollup
@@ -442,7 +448,7 @@ marked [planned] or [preview] are not usable yet.
 - `xf.uuid` UUID: Add a fresh UUID v4 column per row - the standard surrogate row id
 - `xf.zip` Zip Arrays to Table: Zip a headings list and a list of row-arrays (e.g. {headings:[...], rows:[[...]]}) into one row per record with a real column per heading
 
-### Data quality (30)
+### Data quality (31)
 
 - `qa.addressclean` Address Cleanse [planned]: Validates / profiles data with Address Cleanse
 - `qa.baseline` Run Baseline: Compare this run against what previous runs looked like. Every row can satisfy the schema and every row-level rule while the dataset is nothing like what normally arrives - 842,114 rows where five million usually come, a null rate that went from 4 percent to 71, a country partition that vanished - and that publishes successfully, which is more dangerous than a crash. Profiles row count, and per column the null count, null rate, distinct count, min, max and mean; compares against the MEDIAN of the last N accepted profiles so one odd day does not move the baseline. Rules take percentage or absolute limits in either direction. groupBy with requireExistingGroups catches a partition disappearing even when the total stays in range. Gate fails the run; report only emits the findings. Deterministic - rolling statistics and explicit thresholds, no model. The new profile is accepted only if the whole run succeeds, so a run that failed downstream never leaves today numbers as the new normal
@@ -469,6 +475,7 @@ marked [planned] or [preview] are not usable yet.
 - `qa.reconcile` Reconcile (Source vs Target): Two-source reconciliation report for migrations and CDC QA. Main input is the source; connect the target to the lookup port. Joins on your key column(s) and emits one row per metric: source_rows, target_rows, rows_only_in_source, rows_only_in_target, keys_matched, plus per measure a source_sum / target_sum / difference
 - `qa.refintegrity` Referential Integrity: Check a foreign key against a reference input (connect it to the lookup port): rows whose key exists in the reference pass through, orphan rows (key missing) route to the reject port. Pure semi-join / anti-join, no row fan-out on duplicate reference keys
 - `qa.regex` Regex Match: Pass rows matching a pattern; rest to reject
+- `qa.regex.studio` Regex Match Studio: Regex match DQ gate with a launched RE2 editor (live tests, explanation, local-AI drafting). Same gate as Regex Match
 - `qa.sample.adv` Sample (Reproducible %): Take a percentage sample of rows. Reservoir (even per-row probability) or Bernoulli (independent per row); set a seed to make the draw reproducible so the same rows are picked every run. All columns are preserved
 - `qa.schemavalidate` Schema Validate: Reject rows where any expected column is null
 - `qa.standardize` Standardize: Trim, case-normalize, and collapse whitespace
@@ -500,15 +507,17 @@ marked [planned] or [preview] are not usable yet.
 - `ctl.wait` Wait / Delay: Sleep for a fixed number of milliseconds before passing rows through (smoke tests, rate-limit a downstream API)
 - `ctl.warn` Warn: Emit a warning log line (does not fail the run), then pass rows through. Same {rows} templating and workspace log output as Log Message
 
-### Code and custom (7)
+### Code and custom (9)
 
 - `code.javascript` JavaScript UDF: Per-row JS transform via the pure-Rust boa interpreter (sandboxed - no fetch / fs / DOM). Define a `transform(row)` function; the engine calls it per row with the row as a JS object and uses the returned object as the output row. Helpers declared at the top of the script are shared across rows within the stage. Script in the `script` prop
 - `code.python` Python UDF: Transform via a real Python 3 interpreter (full language + installed packages). Define `process(row)` to work a row at a time (a dict in, a dict or None out, JSON both ways), or `transform(table)` to be handed the WHOLE table at once as a pyarrow Table - use that for polars/pandas/PyArrow work, OCR, entity resolution or ML, where a row at a time is the wrong shape. Or `transform_batches(batch)` to be streamed a RecordBatch at a time (65,536 rows), which never holds the whole table in memory - use that when the data is larger than RAM. transform and transform_batches also keep types: through the row path a timestamp arrives as a string. Both need pyarrow in the interpreter; process(row) needs nothing beyond Python. The script can also read INPUT_PATH, the Parquet file the rows arrive in, to scan it with polars, DuckDB or a pyarrow Dataset directly. Needs Python 3 on PATH or DUCKLE_PYTHON_BIN. Code in the `code` prop
 - `code.rust` Rust UDF [planned]: Runs custom code via Rust UDF
 - `code.shell` Shell Command: Run an arbitrary shell command and emit one row with {stdout, stderr, exit_code, duration_ms}. Defaults to cmd.exe on Windows, /bin/sh on Unix. Optional timeout + workingDir. Cancellation kills the child process
 - `code.sql` Inline SQL: Run a SELECT; upstream is `input`
+- `code.sqlstudio` SQL Studio: Same as Inline SQL, but authored in a full read-only DuckDB studio launched from the node - schema browser of the working DB, syntax highlighting, live preview, visual query builder and AI text-to-SQL. Writes a SELECT back to the node
 - `code.sqltemplate` SQL Template: Parameterized SQL with ${context.var}
 - `code.wasm` WebAssembly UDF: Per-row WASM transform via the pure-Rust wasmi interpreter (sandboxed - no fs / net / env access). Supply the module as `wasmB64` (base64) or `path` to a .wasm file. Module must export `memory` and a function `transform(i32, i32) -> i64` packing (out_ptr << 32) | out_len. Defaults: inputColumn=text, outputColumn=result, function=transform
+- `code.workingdb` Working DB: Collect many sources into the shared DuckDB, then fan out to SQL nodes that query them by name. A multi-input barrier that moves no data (it uses the flow in-memory database). Wire your sources in, then hang Inline SQL nodes off its output and reference each source table by its alias. Set feeding sources to Materialize = Memory so each is read once
 
 ## Documentation
 
