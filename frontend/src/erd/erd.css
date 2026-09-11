@@ -32,6 +32,10 @@
 
 /* Table node */
 .erd-node {
+    /* Row height is pinned rather than left to the font, so "eight rows" is an
+       exact height the column list can be capped at. */
+    --erd-row-h: 22px;
+    --erd-rows-visible: 8;
     min-width: 190px;
     background: var(--bg-1);
     border: 1px solid var(--border-strong, var(--border));
@@ -41,6 +45,9 @@
     font-size: 12px;
 }
 .erd-node-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     padding: 7px 11px;
     font-size: 12.5px;
     font-weight: 600;
@@ -48,15 +55,222 @@
     background: var(--bg-2);
     border-bottom: 1px solid var(--border);
 }
+.erd-node-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* Column count. Earns its place on wide sources — an Infor business class can
+   carry 1000+ columns, and the scrolled list alone gives no sense of depth. */
+.erd-node-count {
+    margin-left: auto;
+    flex-shrink: 0;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-3);
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0 6px;
+}
+/* Column combobox. Replaces <input list> + <datalist>, which always filtered
+   its options by the field's value and so offered only the already-chosen
+   column once one was picked. */
+.erd-combo {
+    position: relative;
+    flex: 1 1 60px;
+    min-width: 0;
+    display: flex;
+}
+.erd-combo input {
+    width: 100%;
+    min-width: 0;
+}
+.erd-combo-list {
+    position: absolute;
+    top: calc(100% + 2px);
+    left: 0;
+    right: 0;
+    z-index: 20;
+    margin: 0;
+    padding: 2px;
+    max-height: 190px;
+    overflow-y: auto;
+    list-style: none;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+}
+.erd-combo-list li {
+    display: block;
+}
+.erd-combo-list button {
+    display: block;
+    width: 100%;
+    padding: 3px 6px;
+    background: none;
+    border: none;
+    border-radius: 3px;
+    text-align: left;
+    font-size: 11.5px;
+    color: var(--text-1);
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.erd-combo-list button:hover {
+    background: var(--bg-2);
+}
+.erd-combo-more {
+    padding: 3px 6px;
+    font-size: 10.5px;
+    color: var(--text-3);
+}
+
+/* Drag handle between the diagram and the relationships panel. Widened by a
+   transparent margin so it is grabbable without being a visible bar. */
+.erd-ws-grip {
+    flex: 0 0 5px;
+    margin: 0 -2px;
+    cursor: col-resize;
+    background: transparent;
+    z-index: 2;
+}
+.erd-ws-grip:hover {
+    background: var(--accent);
+    opacity: 0.35;
+}
+
+/* A qualifier reads as a continuation of the join above it — indented and
+   prefixed AND — because that is exactly what it is in the ON clause. */
+.erd-ws-qual {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 14px;
+    padding: 1px 4px;
+}
+.erd-ws-qual code {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+    color: var(--accent);
+}
+.erd-ws-qual-form {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px;
+    margin: 2px 0 4px 14px;
+    padding: 4px;
+    background: var(--bg-2);
+    border-radius: 4px;
+}
+.erd-ws-qual-form select,
+.erd-ws-qual-form input[type='text'],
+.erd-ws-qual-form input:not([type]) {
+    min-width: 0;
+    flex: 1 1 60px;
+    padding: 2px 4px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-1);
+    font-size: 11px;
+}
+.erd-ws-qual-num {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex: 0 0 auto;
+    font-size: 10px;
+    color: var(--text-3);
+}
+.erd-ws-rel-wrap {
+    margin-bottom: 2px;
+}
+
+/* Save a pair's joins to the library. Sits where the count was, per the
+   relationship list's existing right-aligned controls. */
+.erd-ws-save {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 3px;
+    background: none;
+    border: none;
+    border-radius: 3px;
+    color: var(--text-3);
+    cursor: pointer;
+}
+.erd-ws-save:hover {
+    color: var(--text-1);
+}
+/* Already saved. Shown as state rather than disabled: re-saving updates the
+   entry, which is how you revise a join you have since corrected. */
+.erd-ws-save--on {
+    color: var(--accent);
+}
+
+/* Per-table edge visibility. Sits with the count because both answer "what is
+   this table" rather than "what is in it". */
+.erd-node-eye {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 2px;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    color: var(--text-3);
+    cursor: pointer;
+}
+.erd-node-eye:hover {
+    background: var(--bg-1);
+    color: var(--text-1);
+}
+/* Red while active. Hiding a table's joins suppresses information, and the
+   control that does that should look switched on rather than merely toggled —
+   otherwise a half-empty diagram reads as a diagram with no joins. */
+.erd-node-eye[aria-pressed='true'],
+.erd-node-eye[aria-pressed='true']:hover {
+    color: var(--danger, #d64545);
+}
+/* A table whose edges are hidden reads as set-aside rather than absent — it is
+   still on the canvas and still joinable, just not drawn. */
+.erd-node--muted {
+    opacity: 0.72;
+}
+.erd-node--muted .erd-node-head {
+    border-bottom-style: dashed;
+}
+
+/* Cap at eight rows and scroll the rest. A 1000-column table would otherwise
+   be a node taller than the canvas, which breaks both layout and fitView. */
 .erd-node-cols {
     padding: 4px 0;
+    max-height: calc(var(--erd-row-h) * var(--erd-rows-visible) + 8px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 .erd-node-col {
     display: flex;
     align-items: center;
     gap: 8px;
     padding: 2px 11px;
+    height: var(--erd-row-h);
+    box-sizing: border-box;
     color: var(--text-1);
+    /* Let the browser skip laying out rows scrolled out of view. At 1000+
+       columns that is the difference between a responsive node and a stall. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto var(--erd-row-h);
 }
 .erd-node-col .cn {
     font-weight: 500;
@@ -161,6 +375,13 @@
     background: var(--accent);
     color: #0a0a0a;
     border-color: transparent;
+}
+/* A toggle that is currently on (the library panel), as distinct from a
+   primary action. Marked, not filled: it opens a panel rather than committing
+   anything. */
+.erd-btn--on {
+    border-color: var(--accent);
+    color: var(--accent);
 }
 .erd-modal-x {
     display: inline-flex;
@@ -325,6 +546,7 @@
     flex: 1;
     border-right: 1px solid var(--border);
 }
+/* Width is set inline by the drag handle; this is the pre-mount default. */
 .erd-ws-side {
     width: 320px;
     flex-shrink: 0;

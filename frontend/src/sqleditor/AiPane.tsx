@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import { chatSend } from '../tauri-bridge';
 import type { SqlStudioTable } from './types';
-import type { ErdRelationship } from '../erd/model';
+import { joinSql, type ErdRelationship } from '../erd/model';
 
 interface AiPaneProps {
     tables: SqlStudioTable[];
@@ -41,7 +41,16 @@ function schemaText(tables: SqlStudioTable[], relationships: ErdRelationship[]):
     if (relationships.length) {
         lines.push('Join keys:');
         for (const r of relationships) {
-            lines.push(`  ${r.fromTable}.${r.fromColumn} = ${r.toTable}.${r.toColumn}`);
+            lines.push(`  ${joinSql(r)}`);
+        }
+        // Said explicitly, because the model would otherwise be free to move a
+        // qualifier into a WHERE clause — which is equivalent for an inner join
+        // and quietly wrong for an outer one, discarding the unmatched rows the
+        // outer join exists to keep.
+        if (relationships.some(r => r.qualifiers?.length)) {
+            lines.push(
+                'Some joins carry constant qualifiers. Keep them in the ON clause, not in WHERE.',
+            );
         }
     }
     return lines.join('\n');

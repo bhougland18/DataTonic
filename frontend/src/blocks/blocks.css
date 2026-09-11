@@ -95,6 +95,287 @@
     opacity: 0.5;
     cursor: default;
 }
+/* ---- Join library (secondary panel) ---- */
+.blk-lib {
+    width: 290px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 8px;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+    background: var(--bg-1);
+}
+.blk-lib-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-2);
+}
+.blk-lib-head span {
+    margin-right: auto;
+}
+.blk-lib-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 4px;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    color: var(--text-3);
+    cursor: pointer;
+    font-size: 13px;
+}
+.blk-lib-icon:hover {
+    background: var(--bg-2);
+    color: var(--text-1);
+}
+.blk-lib-section {
+    margin-bottom: 10px;
+}
+.blk-lib-section-head {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-3);
+}
+.blk-lib-section-head small {
+    margin-left: auto;
+    font-weight: 500;
+}
+.blk-lib-hint {
+    margin: 0;
+    padding: 2px 6px 6px;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-3);
+}
+.blk-lib-search {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin: 0 2px 8px;
+    padding: 4px 6px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text-3);
+}
+.blk-lib-search input {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text-1);
+    font-size: 11.5px;
+}
+/* Pair grouping, deliberately the same shape as the relationship list on the
+   right: a saved join and a live one are the same kind of thing. */
+.blk-lib-group {
+    margin-bottom: 4px;
+}
+.blk-lib-group-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    padding: 3px 4px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    color: var(--text-2);
+}
+.blk-lib-group-head:hover {
+    color: var(--text-1);
+}
+.blk-lib-group-head .pair {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    font-weight: 600;
+}
+.blk-lib-group-head .cnt {
+    margin-left: auto;
+    flex-shrink: 0;
+    font-size: 10px;
+    color: var(--accent);
+}
+.blk-lib-group .blk-lib-row {
+    margin-left: 12px;
+}
+.blk-lib-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    border-radius: 4px;
+}
+.blk-lib-row:hover {
+    background: var(--bg-2);
+}
+/* An entry that cannot apply here is dimmed, not hidden: a library that shows
+   fewer rows in some workspaces is one you stop trusting. */
+.blk-lib-row--off {
+    opacity: 0.45;
+}
+.blk-lib-apply {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 4px 6px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+}
+.blk-lib-apply:disabled {
+    cursor: default;
+}
+.blk-lib-apply code {
+    font-size: 10.5px;
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.blk-lib-notes {
+    font-size: 10.5px;
+    color: var(--text-3);
+}
+
+/* ---- Sources panel ---- */
+.blk-sources {
+    width: 260px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+    background: var(--bg-0);
+}
+.blk-sources-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 2px 4px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-3);
+}
+.blk-sources-head span {
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+}
+.blk-src-group {
+    margin-bottom: 10px;
+}
+.blk-src-group-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px;
+    color: var(--text-3);
+}
+.blk-src-db {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-2);
+    cursor: pointer;
+}
+/* The attached database. Marked rather than merely selected: it is the one a
+   query can actually reach, and the others are one click from being that. */
+.blk-src-db--active {
+    color: var(--accent);
+}
+.blk-src-all {
+    margin-left: auto;
+    background: none;
+    border: none;
+    padding: 0 2px;
+    font-size: 11px;
+    color: var(--text-3);
+    cursor: pointer;
+}
+.blk-src-all:hover {
+    color: var(--text-1);
+}
+.blk-src {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.blk-src:hover {
+    background: var(--bg-2);
+}
+/* An excluded source stays listed: it is still in the workspace, and hiding it
+   would make "why is that table missing" unanswerable from this panel. */
+.blk-src--off {
+    opacity: 0.5;
+}
+.blk-src input {
+    margin-top: 2px;
+    flex-shrink: 0;
+}
+.blk-src-body {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.blk-src-name {
+    font-size: 12px;
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.blk-src-meta {
+    font-size: 10.5px;
+    color: var(--text-3);
+}
+.blk-src-by {
+    font-size: 10.5px;
+    color: var(--text-4, var(--text-3));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.blk-src-empty {
+    display: flex;
+    gap: 6px;
+    padding: 8px 4px;
+    font-size: 11.5px;
+    color: var(--text-3);
+}
 .blk-spin {
     animation: blk-spin 1s linear infinite;
 }
@@ -154,18 +435,54 @@
 }
 
 /* ---- Panels ---- */
+/* Everything under the step tabs: the sources panel and the open step, side by
+   side. The tabs themselves span the full surface above this. */
+.blk-lower {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+}
 .blk-body {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+/* Column, not row: the ER step stacks its own toolbar above the shared
+   authoring surface (`erd-ws-body`), which is itself the diagram + side panel
+   row. */
+.blk-erd {
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
 }
-.blk-erd {
-    flex: 1;
-    min-height: 0;
+.blk-erd-bar {
     display: flex;
-    overflow: hidden;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+.blk-erd-title {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-weight: 600;
+    color: var(--text-1);
+}
+.blk-erd-title small {
+    font-weight: 400;
+    font-size: 12px;
+    color: var(--text-3);
+}
+.blk-erd-spacer {
+    flex: 1;
 }
 .blk-query {
     flex: 1;

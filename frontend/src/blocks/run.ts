@@ -18,6 +18,19 @@ import type { SqlRunResult } from '../sqleditor/types';
 /**
  * Run arbitrary read-only SQL against the durable source and return the grid.
  *
+ * `database`, when given, is a DuckDB file the query needs attached. We do not
+ * write the ATTACH ourselves — the engine wraps a node's SQL in `CREATE OR
+ * REPLACE VIEW … AS (…)` and DDL cannot live in a view body. Instead we
+ * synthesize a `src.duckdb` node, whose stage prelude already emits
+ * `ATTACH '<database>' AS duckle_src (READ_ONLY)` and whose `sql` prop is
+ * passed through as the view body. So the same one-node trick still holds; only
+ * the component changes, and read-only is the engine's default rather than
+ * something we have to remember.
+ *
+ * The alias is fixed at `duckle_src` by the engine, so one run reaches one
+ * database. Joining across two `.duckdb` files is therefore not expressible
+ * here — the caller is expected to have resolved which database it is querying.
+ *
  * Errors are returned in the result rather than thrown: `QueryPane` renders
  * `error` inline, and a rejected promise would surface as an unhandled failure
  * in the pane instead of a message the user can act on.
@@ -26,13 +39,16 @@ export async function runBlockSql(
     sql: string,
     workspacePath?: string | null,
     label = 'Block',
+    database?: string | null,
 ): Promise<SqlRunResult> {
     const start = performance.now();
     const node: Node<DuckleNodeData> = {
         id: 'block_sql',
         type: 'duckle',
         position: { x: 0, y: 0 },
-        data: { label, componentId: 'code.sql', properties: { sql } },
+        data: database
+            ? { label, componentId: 'src.duckdb', properties: { database, sql } }
+            : { label, componentId: 'code.sql', properties: { sql } },
     };
     try {
         const result = await runPipeline(

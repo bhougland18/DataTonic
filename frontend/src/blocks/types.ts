@@ -72,6 +72,7 @@ export interface Block {
     sourceId: string;
     /** The block's query. Chart blocks carry one too — a chart is a spec over a query. */
     sql: string;
-    /** vgplot spec for `chart` blocks (DAA.72). */
+    /** Vega-Lite spec for `chart` blocks (DAA.72). Rendered by vega-embed at
+     *  view time on every surface, so there is no baked form to keep in step. */
     spec?: Record<string, unknown>;
 }

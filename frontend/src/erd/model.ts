@@ -18,12 +18,61 @@ export interface ErdTable {
     columns: ErdColumn[];
 }
 
+/**
+ * A constant predicate that qualifies a join, e.g. `MMDIST.source = 'RQ'`.
+ *
+ * Deliberately NOT modelled as "a side of the join may be a literal instead of
+ * a column". That framing permits nonsense (literal = literal) and invites
+ * arbitrary filters to be smuggled into the model. A relationship here is
+ * always column-to-column; a qualifier is an ADDITIONAL predicate scoped to one
+ * of the two tables — the discriminator on a polymorphic association, which is
+ * exactly what an ERP's `source = 'RQ'` is.
+ *
+ * It belongs on the join rather than in a WHERE clause for two reasons. With an
+ * outer join the two are NOT equivalent: in the ON clause unmatched rows
+ * survive with NULLs, in a WHERE they are silently discarded, turning the outer
+ * join into an inner one. And it is knowledge about the source system, worth
+ * recording once next to the join it qualifies rather than remembered by
+ * whoever writes each query.
+ */
+export interface ErdQualifier {
+    /** Which side of the join this constrains. One of the join's two tables. */
+    table: string;
+    column: string;
+    op: '=' | '<>';
+    /** Always stored as text. Quoting is decided at render time by `numeric`. */
+    value: string;
+    /** Emit the value unquoted. Off by default because ERP codes that look
+     *  numeric usually are not — `00123` is a string, and unquoting it would
+     *  silently match `123` instead. */
+    numeric?: boolean;
+}
+
+/** One qualifier as a SQL predicate, with the value safely quoted. */
+export function qualifierSql(q: ErdQualifier): string {
+    const n = Number(q.value);
+    const lit =
+        q.numeric && q.value.trim() !== '' && Number.isFinite(n)
+            ? String(n)
+            : `'${q.value.replace(/'/g, "''")}'`;
+    return `${q.table}.${q.column} ${q.op} ${lit}`;
+}
+
+/** The full ON clause for a relationship: the key, plus any qualifiers. */
+export function joinSql(r: ErdRelationship): string {
+    const parts = [`${r.fromTable}.${r.fromColumn} = ${r.toTable}.${r.toColumn}`];
+    for (const q of r.qualifiers ?? []) parts.push(qualifierSql(q));
+    return parts.join(' AND ');
+}
+
 export interface ErdRelationship {
     id: string;
     fromTable: string;
     fromColumn: string;
     toTable: string;
     toColumn: string;
+    /** Constant predicates that qualify this join. See `ErdQualifier`. */
+    qualifiers?: ErdQualifier[];
     // Coarse cardinality hint for the diagram/AI; refined on the Working DB.
     cardinality?: '1-1' | '1-n' | 'n-1' | 'n-n';
     // True while the relationship is only a name/type guess (not yet confirmed

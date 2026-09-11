@@ -23,6 +23,7 @@ const ROUTINES_DIR = 'routines';
 const DOCS_DIR = 'docs';
 const DIVES_DIR = 'dives';
 const DASHBOARDS_DIR = 'dashboards';
+const BLOCKS_DIR = 'blocks';
 
 const PAYLOAD_DIR_BY_TYPE: Record<string, string> = {
     pipeline: PIPELINES_DIR,
@@ -32,6 +33,7 @@ const PAYLOAD_DIR_BY_TYPE: Record<string, string> = {
     doc: DOCS_DIR,
     dive: DIVES_DIR,
     dashboard: DASHBOARDS_DIR,
+    block: BLOCKS_DIR,
 };
 
 export type WorkspaceState = {
@@ -532,6 +534,31 @@ export async function saveItemPayload(
     } catch (err) {
         console.error('saveItemPayload failed', err);
         return false;
+    }
+}
+
+/**
+ * Read one item's payload back, or null when it has never been written.
+ *
+ * The mirror of `saveItemPayload`. `loadWorkspace` already hydrates payloads,
+ * but only for things that have a REPO ITEM in the tree — so a payload that is
+ * studio state rather than a browsable item has no other way home. Connections
+ * are excluded because their payloads are encrypted and must go through the
+ * decrypting path in `loadWorkspace`, not this one.
+ */
+export async function loadItemPayload<T = unknown>(
+    path: string,
+    itemType: string,
+    itemId: string,
+): Promise<T | null> {
+    if (!hasBackend()) return null;
+    const dir = PAYLOAD_DIR_BY_TYPE[itemType];
+    if (!dir || itemType === 'connection') return null;
+    try {
+        return await readJsonIfExists<T>(joinPath(path, dir, `${itemId}.json`));
+    } catch (err) {
+        console.error('loadItemPayload failed', err);
+        return null;
     }
 }
 

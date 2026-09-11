@@ -3430,7 +3430,14 @@ export default function App() {
                     AUTHORS reusable pieces; Reporting ASSEMBLES them. Both kept
                     mounted so in-progress work survives a trip to Canvas. */}
                 <div style={{ display: mode === 'blocks' ? 'flex' : 'none', flex: 1, minWidth: 0 }}>
-                    <BlocksStudio workspacePath={workspacePathState} active={mode === 'blocks'} />
+                    <BlocksStudio
+                        workspacePath={workspacePathState}
+                        active={mode === 'blocks'}
+                        // The catalog records a pipeline's id as its name, so
+                        // provenance would read `p_mtw3t3op_8wx0m`. The open
+                        // workspace is the only place the real names live.
+                        pipelineNames={Object.fromEntries(jobs.map(j => [j.id, j.name]))}
+                    />
                 </div>
                 <div
                     style={{ display: mode === 'reporting' ? 'flex' : 'none', flex: 1, minWidth: 0 }}

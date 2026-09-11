@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { CatalogAsset } from '../tauri-bridge';
-import { durableSources, fromExpression, inferFormat, starterSql } from './sources';
+import {
+    attachTargetOf,
+    databaseGroups,
+    durableSources,
+    fromExpression,
+    inferFormat,
+    readExpression,
+    starterSql,
+    unresolvedAttachSources,
+} from './sources';
 import type { BlockSource } from './types';
 
 function asset(over: Partial<CatalogAsset> & { id: string; kind: string }): CatalogAsset {
@@ -132,9 +141,163 @@ describe('starterSql', () => {
         expect(starterSql(source({ id: 'a.parquet' }))).toContain("FROM read_parquet('a.parquet')");
     });
 
-    it('explains itself instead of seeding broken SQL for an attach source', () => {
+    it('explains itself instead of seeding broken SQL for an unattached database', () => {
         const sql = starterSql(source({ id: 'wh.duckdb', name: 'wh.duckdb' }));
-        expect(sql).toContain('ATTACH is not wired');
+        expect(sql).toContain('cannot compose a read for');
         expect(sql).not.toContain('read_parquet');
+    });
+
+    // With the database attached the same source IS readable, through the
+    // engine's fixed alias rather than an inline reader.
+    it('seeds a qualified SELECT once the database is attached', () => {
+        const s = source({ id: 'duckdb://C:/w/wh.duckdb.orders', kind: 'table' });
+        const [group] = databaseGroups([s]);
+        expect(starterSql(s, group)).toContain('FROM "duckle_src"."orders"');
+    });
+});
+
+describe('durableSources naming', () => {
+    // An ER diagram entity called `infor.duckdb.Item` reads badly and is not
+    // what the SQL calls it either.
+    it('names a catalogued table after the table', () => {
+        const out = durableSources([
+            asset({ id: 'duckdb://C:/w/infor.duckdb.Item', kind: 'table' }),
+            asset({ id: 'duckdb://C:/w/infor.duckdb.Vendor', kind: 'table' }),
+        ]);
+        expect(out.map(s => s.name)).toEqual(['Item', 'Vendor']);
+    });
+
+    // Two boxes called `Item` would be ONE entity as far as a relationship is
+    // concerned, so the name has to carry the database when it collides.
+    it('qualifies with the database only when the table name collides', () => {
+        const out = durableSources([
+            asset({ id: 'duckdb://C:/w/a.duckdb.Item', kind: 'table' }),
+            asset({ id: 'duckdb://C:/w/b.duckdb.Item', kind: 'table' }),
+            asset({ id: 'duckdb://C:/w/a.duckdb.Vendor', kind: 'table' }),
+        ]);
+        expect(out.map(s => s.name).sort()).toEqual(['Vendor', 'a.duckdb.Item', 'b.duckdb.Item']);
+    });
+
+    it('leaves a plain file name alone', () => {
+        expect(durableSources([asset({ id: 'C:/w/out.parquet', kind: 'file' })])[0].name).toBe(
+            'out.parquet',
+        );
+    });
+});
+
+describe('attachTargetOf', () => {
+    // catalog.rs joins database/schema/table with dots and prefixes the family
+    // scheme, so the only way back to the parts is to split on the db extension.
+    it('splits a catalogued table id into database and table', () => {
+        expect(attachTargetOf(source({ id: 'duckdb://C:/w/data/infor.duckdb.ItemLocation', kind: 'table' }))).toEqual(
+            { dbPath: 'C:/w/data/infor.duckdb', table: 'ItemLocation' },
+        );
+    });
+
+    it('keeps a schema segment when the asset carried one', () => {
+        expect(attachTargetOf(source({ id: 'duckdb://wh.duckdb.main.orders', kind: 'table' }))).toEqual(
+            { dbPath: 'wh.duckdb', schema: 'main', table: 'orders' },
+        );
+    });
+
+    it('treats a bare database file as the whole database', () => {
+        expect(attachTargetOf(source({ id: 'C:/w/wh.duckdb' }))).toEqual({ dbPath: 'C:/w/wh.duckdb' });
+    });
+
+    // Windows paths arrive with backslashes and may contain dots of their own;
+    // the split anchors on the LAST database extension, not the first dot.
+    it('handles backslash paths and dotted folder names', () => {
+        expect(attachTargetOf(source({ id: 'duckdb://C:\\w\\v1.2\\infor.duckdb.Item', kind: 'table' }))).toEqual(
+            { dbPath: 'C:\\w\\v1.2\\infor.duckdb', table: 'Item' },
+        );
+    });
+
+    // A sqlite target has the same shape but needs a different ATTACH, so
+    // claiming it here would emit SQL that fails at Run.
+    it('declines a non-duckdb scheme', () => {
+        expect(attachTargetOf(source({ id: 'sqlite://wh.db.orders', kind: 'table' }))).toBeNull();
+    });
+
+    it('declines a source that is not attach-format', () => {
+        expect(attachTargetOf(source({ id: 'a.parquet' }))).toBeNull();
+    });
+});
+
+describe('databaseGroups', () => {
+    // Several snk.duckdb nodes commonly write several tables into ONE file, and
+    // the file is the unit that gets attached.
+    it('groups tables by the database file they live in', () => {
+        const groups = databaseGroups([
+            source({ id: 'duckdb://C:/w/a.duckdb.orders', kind: 'table' }),
+            source({ id: 'duckdb://C:/w/a.duckdb.items', kind: 'table' }),
+            source({ id: 'duckdb://C:/w/b.duckdb.sales', kind: 'table' }),
+            source({ id: 'plain.parquet' }),
+        ]);
+        expect(groups.map(g => g.name)).toEqual(['a.duckdb', 'b.duckdb']);
+        expect(groups[0].sources).toHaveLength(2);
+        expect(groups[0].fromById['duckdb://C:/w/a.duckdb.orders']).toBe('"duckle_src"."orders"');
+    });
+
+    it('quotes identifiers so a table named like a keyword still reads', () => {
+        const [g] = databaseGroups([source({ id: 'duckdb://a.duckdb.select', kind: 'table' })]);
+        expect(g.fromById['duckdb://a.duckdb.select']).toBe('"duckle_src"."select"');
+    });
+});
+
+describe('readExpression', () => {
+    it('prefers the inline read and ignores the attachment', () => {
+        expect(readExpression(source({ id: 'a.parquet' }), null)).toBe("read_parquet('a.parquet')");
+    });
+
+    // The alias is a constant, so one query reaches one database. A table in
+    // the other file is readable — just not by this run.
+    it('returns null for a table in a database that is not the attached one', () => {
+        const a = source({ id: 'duckdb://C:/w/a.duckdb.orders', kind: 'table' });
+        const b = source({ id: 'duckdb://C:/w/b.duckdb.sales', kind: 'table' });
+        const [groupA] = databaseGroups([a, b]);
+        expect(readExpression(a, groupA)).toBe('"duckle_src"."orders"');
+        expect(readExpression(b, groupA)).toBeNull();
+    });
+});
+
+// Anchored on the asset ids a real workspace produces: four `snk.duckdb` nodes
+// across two pipelines, all writing into one Windows-path database file. This
+// is the shape the whole attach path was built for, so it is worth pinning to
+// actual values rather than only to tidy invented ones.
+describe('a real multi-sink DuckDB workspace', () => {
+    const DB = 'C:\\Users\\b\\Documents\\Duckle_new_workspace\\data\\infor.duckdb';
+    const ids = ['Item', 'VendorItem', 'Vendor', 'ItemLocation'].map(t => `duckdb://${DB}.${t}`);
+
+    it('collapses every table into one attachable database', () => {
+        const groups = databaseGroups(ids.map(id => source({ id, kind: 'table' })));
+        expect(groups).toHaveLength(1);
+        expect(groups[0].dbPath).toBe(DB);
+        expect(groups[0].name).toBe('infor.duckdb');
+        expect(groups[0].sources).toHaveLength(4);
+        expect(Object.values(groups[0].fromById)).toEqual([
+            '"duckle_src"."Item"',
+            '"duckle_src"."VendorItem"',
+            '"duckle_src"."Vendor"',
+            '"duckle_src"."ItemLocation"',
+        ]);
+    });
+
+    // Mixed case survives: DuckDB folds unquoted identifiers, and `ItemLocation`
+    // read back as `itemlocation` would not resolve.
+    it('preserves table-name case through quoting', () => {
+        const s = source({ id: `duckdb://${DB}.ItemLocation`, kind: 'table' });
+        const [g] = databaseGroups([s]);
+        expect(starterSql(s, g)).toContain('FROM "duckle_src"."ItemLocation"');
+    });
+});
+
+describe('unresolvedAttachSources', () => {
+    it('names only the attach sources we could not decompose', () => {
+        const out = unresolvedAttachSources([
+            source({ id: 'duckdb://a.duckdb.orders', kind: 'table' }),
+            source({ id: 'sqlite://wh.db.orders', kind: 'table' }),
+            source({ id: 'a.parquet' }),
+        ]);
+        expect(out.map(s => s.id)).toEqual(['sqlite://wh.db.orders']);
     });
 });
