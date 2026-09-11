@@ -418,6 +418,28 @@ fn run() -> Result<bool, String> {
 /// The run itself, given already-parsed arguments. Split out so `retry` can
 /// drive the same path with arguments it built from a receipt rather than from
 /// the command line (#305).
+/// An engine that prepares sub-pipelines the way this runner prepares a
+/// top-level doc.
+///
+/// The engine reads a child pipeline raw off disk, so none of the server-side
+/// preparation has touched it: saved `connectionRef`s are unresolved, and a
+/// child whose source names one fails with e.g. "src.infor: no Infor
+/// connection resolved (inforApiBase missing)" while the identical pipeline
+/// runs fine standalone. `duckle-secrets` depends on the engine crate, so the
+/// engine cannot resolve them itself; the caller injects it.
+///
+/// Order matches the top-level path exactly - connections first, then
+/// `${ENV:KEY}` - so a connection field stored as an env placeholder still
+/// resolves afterwards.
+pub(crate) fn prepared_engine(duckdb: std::path::PathBuf, workspace: &std::path::Path) -> DuckdbEngine {
+    let ws = workspace.to_path_buf();
+    DuckdbEngine::new(duckdb).with_child_prepare(std::sync::Arc::new(move |doc| {
+        duckle_secrets::resolve_connection_refs(&ws, &mut doc.nodes)?;
+        duckle_duckdb_engine::context::apply_env(doc);
+        Ok(())
+    }))
+}
+
 fn run_with(args: Args) -> Result<bool, String> {
 
     // Backfill flags short-circuit: manage saved watermark/snapshot state and
@@ -520,8 +542,8 @@ fn run_with(args: Args) -> Result<bool, String> {
     // previews: stopping early is only useful if you can see where you stopped.
     let target = args.target.clone();
     let engine = match target.is_some() {
-        true => DuckdbEngine::new(duckdb),
-        false => DuckdbEngine::new(duckdb).without_previews(),
+        true => prepared_engine(duckdb, &workspace),
+        false => prepared_engine(duckdb, &workspace).without_previews(),
     };
     // #259: identity before work. A run killed here still exists to be found,
     // and `reconcile` can later tell it apart from one that finished.

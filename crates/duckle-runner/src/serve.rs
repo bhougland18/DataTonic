@@ -862,7 +862,7 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
             {
                 return respond_err("400 Bad Request", &format!("resolving connection: {e}"));
             }
-            let engine = DuckdbEngine::new(state.duckdb.clone());
+            let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
             match engine.send_one_rest(&props) {
                 Ok(v) => respond_json(&v),
                 Err(e) => respond_err("500 Internal Server Error", &e.to_string()),
@@ -915,7 +915,7 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
             duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
             let name = args.get("pipelineName").and_then(|v| v.as_str()).unwrap_or("web").to_string();
             let (_guard, pool, queued_ms) = state.run_lock.acquire(&doc.resource_pool);
-            let engine = DuckdbEngine::new(state.duckdb.clone());
+            let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
             let receipt =
                 begin_editor_run(&state.workspace, &doc, &name, "web", Some((pool, queued_ms)));
             let result = engine.execute_pipeline_named(&doc, &name);
@@ -1067,7 +1067,7 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
                 Err(e) => return respond_err("400 Bad Request", &format!("bad pipeline: {}", e)),
             };
             duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
-            let engine = DuckdbEngine::new(state.duckdb.clone());
+            let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
             // One node, with the upstream columns the EDITOR resolved - the
             // same call and the same arguments the desktop command makes.
             // Deriving them here instead would answer a subtly different
@@ -1117,7 +1117,7 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
                     .unwrap_or_default();
             let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(12) as usize;
-            let engine = DuckdbEngine::new(state.duckdb.clone());
+            let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
             match engine.complete_node_sql(&doc, &node_id, &inputs, cursor, limit) {
                 Ok(items) => respond_json(&serde_json::to_value(&items).unwrap_or_default()),
                 Err(e) => respond_err("400 Bad Request", &e.to_string()),
@@ -1130,7 +1130,7 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
                 Err(e) => return respond_err("400 Bad Request", &format!("bad pipeline: {}", e)),
             };
             duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
-            let engine = DuckdbEngine::new(state.duckdb.clone());
+            let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
             match engine.pipeline_column_lineage(&doc) {
                 Ok(result) => match serde_json::to_value(&result) {
                     Ok(v) => respond_json(&v),
@@ -1155,7 +1155,7 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
                         Ok(v) => v,
                         Err(e) => return respond_err("500 Internal Server Error", &e.to_string()),
                     };
-                    let engine = DuckdbEngine::new(state.duckdb.clone());
+                    let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
                     let report = duckle_duckdb_engine::trust::trust_report(&resolved, Some(&engine));
                     return respond_json(&report);
                 }
@@ -1285,7 +1285,7 @@ fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(
     // A second handle to the same socket for the event callback (the run is
     // synchronous, so events stream first, the result line follows).
     let mut ev = stream.try_clone().map_err(|e| e.to_string())?;
-    let engine = DuckdbEngine::new(state.duckdb.clone());
+    let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
     // Run-to-here is still a run, and the one an operator is most likely to
     // want to find again.
     let receipt = begin_editor_run(
@@ -1331,7 +1331,7 @@ fn inspect_schema(state: &WebState, body: &[u8]) -> Reply {
         .get("options")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let engine = DuckdbEngine::new(state.duckdb.clone());
+    let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
     match engine.inspect(format, options) {
         Ok(insp) => respond_json(&serde_json::json!({ "columns": insp.schema, "sampleRows": insp.sample_rows }),
         ),
@@ -2660,7 +2660,7 @@ fn dispatch_console(req: &Request, state: &Arc<State>, who: console_auth::Identi
                     Err(e) => return respond_err("409 Conflict", &e),
                 };
             let run_id = new_run_id(&pipeline_id);
-            let engine = DuckdbEngine::new(state.duckdb.clone());
+            let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
             if let Ok(mut runs) = state.runs.lock() {
                 runs.insert(
                     run_id.clone(),
@@ -3990,7 +3990,7 @@ fn execute_one_with(
     // so file-loaded pipelines (manual /api/run + scheduled runs) work too.
     duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
 
-    let engine = engine.unwrap_or_else(|| DuckdbEngine::new(state.duckdb.clone()));
+    let engine = engine.unwrap_or_else(|| crate::prepared_engine(state.duckdb.clone(), &state.workspace));
     // #259: every console execution is addressable, not only the async one.
     // `execute_one` passed None, so a synchronous run, a scheduled step and a
     // plan step each recorded no id at all - which is what made "which run was

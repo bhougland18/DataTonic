@@ -17025,9 +17025,22 @@ impl DuckdbEngine {
             ).collect()
         };
         content = substitute_into_child(&content, &merged);
-        let sub_doc: plan::PipelineDoc = serde_json::from_str(&content).map_err(|e| {
+        let mut sub_doc: plan::PipelineDoc = serde_json::from_str(&content).map_err(|e| {
             EngineError::Config(format!("sub-pipeline: parse '{}': {}", path, e))
         })?;
+        // Give the child the same preparation the caller gives a top-level doc.
+        // Read raw off disk, a child has had NONE of it: saved `connectionRef`s
+        // are unresolved, so a child whose source names one fails with e.g.
+        // "src.infor: no Infor connection resolved (inforApiBase missing)" while
+        // the very same pipeline runs fine standalone. The engine cannot resolve
+        // them itself - `duckle-secrets` depends on this crate - so the caller
+        // injects it (see `DuckdbEngine::with_child_prepare`). Absent, the child
+        // runs unresolved exactly as before.
+        if let Some(prepare) = &self.child_prepare {
+            prepare(&mut sub_doc).map_err(|e| {
+                EngineError::Config(format!("sub-pipeline '{}': {}", path, e))
+            })?;
+        }
         // Run it under the CHILD's own name. Unnamed, every sub-pipeline shared
         // one run-log folder and - far worse - one `xf.incremental` watermark
         // file per node id, so three different children driven by ctl.foreach
@@ -23953,5 +23966,110 @@ mod source_path_of_tests {
         // Only a single-letter prefix is a drive. A key that legitimately
         // contains a colon keeps it.
         assert_eq!(source_path_of("s3://bucket/odd:name/f.txt"), "odd:name/f.txt");
+    }
+}
+
+#[cfg(test)]
+mod child_prepare_tests {
+    use crate::DuckdbEngine;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A child pipeline naming a saved connection, plus an env placeholder in
+    /// the same node - the shape that regressed. `${ENV:...}` has to still
+    /// expand AFTER the connection is resolved, or a connection field stored
+    /// as a placeholder arrives at the source unresolved.
+    fn child_doc() -> String {
+        r#"{"nodes":[{"id":"n1","type":"duckle","position":{"x":0,"y":0},
+             "data":{"label":"Infor","componentId":"src.infor",
+                     "properties":{"connectionRef":"c_test","businessClass":"Item"}}}],
+            "edges":[]}"#
+            .to_string()
+    }
+
+    fn write_child(dir: &std::path::Path) -> String {
+        let path = dir.join("child.json");
+        std::fs::write(&path, child_doc()).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The whole bug: a child read off disk never saw the caller's resolution,
+    /// so a `connectionRef` reached the source unresolved. Assert the engine
+    /// calls whatever preparation it is handed, on the CHILD's doc.
+    #[test]
+    fn a_child_is_prepared_before_it_runs() {
+        let dir = std::env::temp_dir().join(format!("duckle_child_prep_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let child = write_child(&dir);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (c, s) = (Arc::clone(&calls), Arc::clone(&seen));
+
+        // Stands in for `duckle_secrets::resolve_connection_refs`, which this
+        // crate cannot call: duckle-secrets depends on it, so asking for it
+        // directly would close a dependency cycle. Same reasoning as the
+        // resolver injected into `backfill_exec`.
+        let engine = DuckdbEngine::new(std::path::PathBuf::from("duckdb-does-not-exist"))
+            .with_child_prepare(Arc::new(move |doc| {
+                c.fetch_add(1, Ordering::SeqCst);
+                for n in &doc.nodes {
+                    if let Some(p) = n.data.properties.as_ref() {
+                        if let Some(r) = p.get("connectionRef").and_then(|v| v.as_str()) {
+                            s.lock().unwrap().push(r.to_string());
+                        }
+                    }
+                }
+                Ok(())
+            }));
+
+        // The run itself fails (no DuckDB binary here) and that is fine: what
+        // is under test is that preparation happened first, on the child.
+        let _ = engine.run_subpipeline(&child);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the child was not prepared");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["c_test"],
+            "preparation did not see the child's own connectionRef"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal has to stop the child, not be swallowed. Running on unresolved
+    /// credentials is how you get an auth error three layers down instead of
+    /// the real message.
+    #[test]
+    fn a_preparation_failure_stops_the_child() {
+        let dir = std::env::temp_dir().join(format!("duckle_child_fail_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let child = write_child(&dir);
+
+        let engine = DuckdbEngine::new(std::path::PathBuf::from("duckdb-does-not-exist"))
+            .with_child_prepare(Arc::new(|_doc| {
+                Err("this pipeline uses a saved connection; run it from a workspace".into())
+            }));
+
+        let err = engine.run_subpipeline(&child).unwrap_err().to_string();
+        assert!(
+            err.contains("saved connection"),
+            "the preparation error should reach the caller, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Absent preparation is the previous behaviour, so a caller that sets
+    /// none is unaffected by this seam existing.
+    #[test]
+    fn without_preparation_a_child_is_left_exactly_as_before() {
+        let dir = std::env::temp_dir().join(format!("duckle_child_none_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let child = write_child(&dir);
+
+        let engine = DuckdbEngine::new(std::path::PathBuf::from("duckdb-does-not-exist"));
+        // Fails for want of a binary, not for want of preparation.
+        let err = engine.run_subpipeline(&child).unwrap_err().to_string();
+        assert!(!err.contains("saved connection"), "unexpected preparation error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -320,7 +320,23 @@ fn engine() -> Result<DuckdbEngine, String> {
         .cloned()
         .ok_or_else(|| "Engine path not resolved yet".to_string())?;
     Ok(DUCKDB_ENGINE
-        .get_or_init(|| DuckdbEngine::new(bin))
+        .get_or_init(|| {
+            // Sub-pipelines are read raw off disk by the engine, so nothing the
+            // run path does to a top-level doc has happened to them. Hand the
+            // engine the same preparation, in the same order the top-level path
+            // uses: saved connections first, then ${ENV:KEY} - so a connection
+            // field stored as an env placeholder still resolves afterwards.
+            //
+            // The workspace is read from the environment rather than captured,
+            // because this engine is built once and cached while the open
+            // workspace can change under it (see `set_workspace_env`).
+            DuckdbEngine::new(bin).with_child_prepare(std::sync::Arc::new(|doc| {
+                let ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|s| !s.is_empty());
+                resolve_saved_connections(doc, &ws)?;
+                duckle_duckdb_engine::context::apply_env(doc);
+                Ok(())
+            }))
+        })
         .clone())
 }
 

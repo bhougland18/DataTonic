@@ -156,6 +156,13 @@ const PREVIEW_ROW_LIMIT: usize = 100;
 /// than silently grinding.
 const AI_DEDUPE_MAX_ROWS: usize = 25_000;
 
+/// Prepares a child pipeline doc before it runs - see
+/// [`DuckdbEngine::with_child_prepare`].
+///
+/// `Send + Sync` because parallelize branches execute child docs on worker
+/// threads, each with its own clone of the engine.
+pub type ChildPrepare = Arc<dyn Fn(&mut PipelineDoc) -> Result<(), String> + Send + Sync>;
+
 /// Drives the downloaded DuckDB CLI. Cheap to clone; holds only the
 /// binary path and a shared cancel flag.
 #[derive(Clone)]
@@ -200,6 +207,19 @@ pub struct DuckdbEngine {
     /// name one run. Absent for a bare `execute` with no surrounding run, which
     /// falls back to a minted id rather than logging under an empty one.
     run_id: Option<String>,
+    /// Prepare a sub-pipeline's doc the way the caller prepares a top-level one.
+    ///
+    /// Child pipelines are read raw off disk here, so nothing the SERVER does
+    /// to a top-level doc has happened to them: saved `connectionRef`s are
+    /// unresolved, and a child whose source names one fails with e.g.
+    /// "src.infor: no Infor connection resolved". Resolution lives in
+    /// `duckle-secrets`, which DEPENDS on this crate, so the engine cannot
+    /// call it without closing a dependency cycle - the same constraint
+    /// `backfill_exec` hit, solved the same way: the caller injects it.
+    ///
+    /// `None` keeps the previous behaviour (children run unresolved), so a
+    /// caller that does not set one is unaffected.
+    pub(crate) child_prepare: Option<ChildPrepare>,
     /// Whether this engine is a PROBE and must not change anything.
     ///
     /// Autodetect learns a driver source's schema by running it (#148), and
@@ -373,6 +393,7 @@ impl DuckdbEngine {
             skip_nodes: Default::default(),
             run_id: None,
             probing: false,
+            child_prepare: None,
         }
     }
 
@@ -489,6 +510,8 @@ impl DuckdbEngine {
             inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             // A real run is not a probe, whatever this engine was.
             probing: false,
+            // A child still needs the caller's preparation whichever run it is under.
+            child_prepare: self.child_prepare.clone(),
         }
     }
 
@@ -509,7 +532,19 @@ impl DuckdbEngine {
             skip_nodes: Default::default(),
             inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             probing: true,
+            child_prepare: self.child_prepare.clone(),
         }
+    }
+
+    /// Give the engine a way to prepare each sub-pipeline doc before it runs.
+    ///
+    /// The caller should apply exactly what it applies to a TOP-LEVEL doc, in
+    /// the same order the runner uses: `resolve_connection_refs` first, then
+    /// `${ENV:KEY}` expansion - so a connection field stored as an env
+    /// placeholder still resolves afterwards.
+    pub fn with_child_prepare(mut self, prepare: ChildPrepare) -> Self {
+        self.child_prepare = Some(prepare);
+        self
     }
 
     pub fn binary(&self) -> &Path {
