@@ -48,6 +48,23 @@ export interface ErdQualifier {
     numeric?: boolean;
 }
 
+/**
+ * Quote an identifier, but only when it is not already a plain one.
+ *
+ * Table names here are not always SQL-shaped: a file-derived dataset is called
+ * `item_norm.parquet`, and unquoted that parses as schema `item_norm`, table
+ * `parquet` — so `item_norm.parquet.Item` is not a mis-rendering, it is a
+ * three-part name pointing at something that does not exist. Spaces, hyphens
+ * and leading digits fail the same way.
+ *
+ * Quoting only when needed matters: DuckDB folds unquoted identifiers but
+ * treats quoted ones as exact, so blanket-quoting would make every name
+ * case-sensitive and break the ordinary ones.
+ */
+export function quoteIdent(name: string): string {
+    return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
+}
+
 /** One qualifier as a SQL predicate, with the value safely quoted. */
 export function qualifierSql(q: ErdQualifier): string {
     const n = Number(q.value);
@@ -55,12 +72,15 @@ export function qualifierSql(q: ErdQualifier): string {
         q.numeric && q.value.trim() !== '' && Number.isFinite(n)
             ? String(n)
             : `'${q.value.replace(/'/g, "''")}'`;
-    return `${q.table}.${q.column} ${q.op} ${lit}`;
+    return `${quoteIdent(q.table)}.${quoteIdent(q.column)} ${q.op} ${lit}`;
 }
 
 /** The full ON clause for a relationship: the key, plus any qualifiers. */
 export function joinSql(r: ErdRelationship): string {
-    const parts = [`${r.fromTable}.${r.fromColumn} = ${r.toTable}.${r.toColumn}`];
+    const parts = [
+        `${quoteIdent(r.fromTable)}.${quoteIdent(r.fromColumn)} = ` +
+            `${quoteIdent(r.toTable)}.${quoteIdent(r.toColumn)}`,
+    ];
     for (const q of r.qualifiers ?? []) parts.push(qualifierSql(q));
     return parts.join(' AND ');
 }

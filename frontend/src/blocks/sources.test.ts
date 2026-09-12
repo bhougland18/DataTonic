@@ -7,7 +7,6 @@ import {
     fromExpression,
     inferFormat,
     readExpression,
-    starterSql,
     unresolvedAttachSources,
 } from './sources';
 import type { BlockSource } from './types';
@@ -136,23 +135,23 @@ describe('fromExpression', () => {
     });
 });
 
-describe('starterSql', () => {
-    it('seeds a self-contained SELECT for a readable source', () => {
-        expect(starterSql(source({ id: 'a.parquet' }))).toContain("FROM read_parquet('a.parquet')");
+describe('readExpression composition', () => {
+    it('composes an inline read for a file source', () => {
+        expect(readExpression(source({ id: 'a.parquet' }))).toBe("read_parquet('a.parquet')");
     });
 
-    it('explains itself instead of seeding broken SQL for an unattached database', () => {
-        const sql = starterSql(source({ id: 'wh.duckdb', name: 'wh.duckdb' }));
-        expect(sql).toContain('cannot compose a read for');
-        expect(sql).not.toContain('read_parquet');
+    it('returns null for a database file naming no table', () => {
+        // Nothing to read FROM: the file is the unit that gets attached, and a
+        // database is not itself a relation.
+        expect(readExpression(source({ id: 'wh.duckdb', name: 'wh.duckdb' }))).toBeNull();
     });
 
     // With the database attached the same source IS readable, through the
-    // engine's fixed alias rather than an inline reader.
-    it('seeds a qualified SELECT once the database is attached', () => {
+    // engine's alias rather than an inline reader.
+    it('composes a qualified name once the database is attached', () => {
         const s = source({ id: 'duckdb://C:/w/wh.duckdb.orders', kind: 'table' });
         const [group] = databaseGroups([s]);
-        expect(starterSql(s, group)).toContain('FROM "duckle_src"."orders"');
+        expect(readExpression(s, group)).toBe('duckle_src."orders"');
     });
 });
 
@@ -235,12 +234,12 @@ describe('databaseGroups', () => {
         ]);
         expect(groups.map(g => g.name)).toEqual(['a.duckdb', 'b.duckdb']);
         expect(groups[0].sources).toHaveLength(2);
-        expect(groups[0].fromById['duckdb://C:/w/a.duckdb.orders']).toBe('"duckle_src"."orders"');
+        expect(groups[0].fromById['duckdb://C:/w/a.duckdb.orders']).toBe('duckle_src."orders"');
     });
 
     it('quotes identifiers so a table named like a keyword still reads', () => {
         const [g] = databaseGroups([source({ id: 'duckdb://a.duckdb.select', kind: 'table' })]);
-        expect(g.fromById['duckdb://a.duckdb.select']).toBe('"duckle_src"."select"');
+        expect(g.fromById['duckdb://a.duckdb.select']).toBe('duckle_src."select"');
     });
 });
 
@@ -255,7 +254,7 @@ describe('readExpression', () => {
         const a = source({ id: 'duckdb://C:/w/a.duckdb.orders', kind: 'table' });
         const b = source({ id: 'duckdb://C:/w/b.duckdb.sales', kind: 'table' });
         const [groupA] = databaseGroups([a, b]);
-        expect(readExpression(a, groupA)).toBe('"duckle_src"."orders"');
+        expect(readExpression(a, groupA)).toBe('duckle_src."orders"');
         expect(readExpression(b, groupA)).toBeNull();
     });
 });
@@ -275,10 +274,10 @@ describe('a real multi-sink DuckDB workspace', () => {
         expect(groups[0].name).toBe('infor.duckdb');
         expect(groups[0].sources).toHaveLength(4);
         expect(Object.values(groups[0].fromById)).toEqual([
-            '"duckle_src"."Item"',
-            '"duckle_src"."VendorItem"',
-            '"duckle_src"."Vendor"',
-            '"duckle_src"."ItemLocation"',
+            'duckle_src."Item"',
+            'duckle_src."VendorItem"',
+            'duckle_src."Vendor"',
+            'duckle_src."ItemLocation"',
         ]);
     });
 
@@ -287,7 +286,7 @@ describe('a real multi-sink DuckDB workspace', () => {
     it('preserves table-name case through quoting', () => {
         const s = source({ id: `duckdb://${DB}.ItemLocation`, kind: 'table' });
         const [g] = databaseGroups([s]);
-        expect(starterSql(s, g)).toContain('FROM "duckle_src"."ItemLocation"');
+        expect(readExpression(s, g)).toBe('duckle_src."ItemLocation"');
     });
 });
 

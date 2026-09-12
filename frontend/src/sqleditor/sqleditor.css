@@ -662,16 +662,19 @@
     font-size: 12px;
     color: var(--danger, #ff4d6d);
 }
+/* The send button sits INSIDE the box rather than beside it: a taller input
+   next to a small square button reads as two controls, and the room the height
+   buys is room to write a real question. */
 .sqlstudio-ai-foot {
     border-top: 1px solid var(--border);
     padding: 10px 12px;
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
+    position: relative;
 }
 .sqlstudio-ai-input {
-    flex: 1;
-    min-height: 38px;
+    width: 100%;
+    box-sizing: border-box;
+    padding-bottom: 34px;
+    min-height: 84px;
     max-height: 160px;
     resize: none;
     overflow-y: auto;
@@ -689,8 +692,11 @@
     border-color: var(--accent);
 }
 .sqlstudio-ai-send {
-    width: 34px;
-    height: 34px;
+    position: absolute;
+    right: 20px;
+    bottom: 18px;
+    width: 30px;
+    height: 30px;
     flex-shrink: 0;
     display: inline-flex;
     align-items: center;
@@ -837,4 +843,41 @@
 .sqlstudio-icon-btn:hover {
     background: var(--bg-3);
     color: var(--text-1);
+}
+
+/* A checker note between turns — the retry, made visible. Neither side of the
+   conversation said this, so it is not a bubble. */
+.sqlstudio-ai-note {
+    display: flex;
+    gap: 6px;
+    padding: 6px 8px;
+    border-left: 2px solid var(--accent);
+    background: var(--bg-2);
+    border-radius: 0 5px 5px 0;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-3);
+}
+
+/* The disambiguation question. Part of the conversation, not a modal — the
+   draft above it is what makes the choice answerable. */
+.sqlstudio-ai-choice {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--bg-2);
+}
+.sqlstudio-ai-choice b {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-1);
+    line-height: 1.45;
+}
+.sqlstudio-ai-choice-opts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
 }

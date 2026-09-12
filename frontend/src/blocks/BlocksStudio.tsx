@@ -6,13 +6,17 @@ import {
     ChartNoAxesCombined,
     Check,
     Database,
+    FileCode2,
+    FilePlus2,
     HelpCircle,
     LayoutGrid,
     Loader2,
     Network,
     RotateCw,
     Save,
+    Sparkles,
     Wand2,
+    X,
 } from 'lucide-react';
 import { maybeStartEditorTour, startEditorTour } from '../GuidedTour';
 import ErdAuthoring from '../erd/ErdAuthoring';
@@ -20,18 +24,32 @@ import { inferRelationships } from '../erd/model';
 import type { ErdRelationship, ErdTable } from '../erd/model';
 import { loadSchemaModel, mergeRelationships, saveSchemaModel } from './model-io';
 import QueryPane from '../sqleditor/QueryPane';
+import AiPane from '../sqleditor/AiPane';
 import type { SqlStudioColumn, SqlStudioTable } from '../sqleditor/types';
 import { workspaceCatalog, workspaceCatalogRebuild } from '../tauri-bridge';
 import {
     databaseGroups,
     durableSources,
     readExpression,
-    starterSql,
     unresolvedAttachSources,
 } from './sources';
 import { probeAll } from './probe';
 import { runBlockSql } from './run';
 import SourcesPanel from './SourcesPanel';
+import SqlCatalogPanel from './SqlCatalogPanel';
+import SavedQueriesPanel from './SavedQueriesPanel';
+import UnsavedQueryDialog from './UnsavedQueryDialog';
+import {
+    exportQueries,
+    importQueries,
+    loadSavedQueries,
+    queryId,
+    removeQuery,
+    saveSavedQueries,
+    upsertQuery,
+    withQueryHeader,
+    type SavedQuery,
+} from './query-io';
 import JoinLibraryPanel from './JoinLibraryPanel';
 import {
     applicableJoins,
@@ -111,6 +129,35 @@ export default function BlocksStudio({
     const [libraryOpen, setLibraryOpen] = useState(false);
     /** Bumped to re-run auto-arrange on the diagram. */
     const [arrangeNonce, setArrangeNonce] = useState(0);
+    /** Whether the AI pane is showing. The pane itself is always mounted. */
+    const [showAi, setShowAi] = useState(false);
+    // The AI's editable draft; non-null splits the SQL step into two panes.
+    // A draft is NOT written straight into the editor, because the query you
+    // already have is the one thing a suggestion can destroy — and you cannot
+    // judge a generated query without running it. Side by side, both are
+    // runnable, and accepting is a separate deliberate act.
+    const [aiDraft, setAiDraft] = useState<string | null>(null);
+    /** Saved queries, and which one the editor is currently holding. */
+    const [saved, setSaved] = useState<SavedQuery[]>([]);
+    const [savedOpen, setSavedOpen] = useState(false);
+    const [activeQueryId, setActiveQueryId] = useState<string | null>(null);
+    // Title and description are EDITOR fields, not a save-time prompt. A prompt
+    // asks for the name at the one moment the author is least able to give it —
+    // on the way out — and gives back nothing when the query is reopened, so
+    // the description could never be read again. As fields they are filled
+    // while the thinking is happening and restored with the query.
+    const [queryTitle, setQueryTitle] = useState('');
+    const [queryDesc, setQueryDesc] = useState('');
+    /**
+     * A move that is waiting on the unsaved-edits dialog.
+     *
+     * Held as an intention rather than run immediately, because the answer
+     * decides whether it happens at all — Cancel has to leave the editor
+     * exactly as it was, which means the move cannot have started.
+     */
+    const [pending, setPending] = useState<{ kind: 'new' | 'open'; query?: SavedQuery } | null>(
+        null,
+    );
     // "Have we probed yet" is a REF, not state, and deliberately so. As state it
     // was both written inside the probe effect and listed in that effect's
     // dependencies, so setting it re-ran the effect, whose cleanup cancelled the
@@ -155,14 +202,12 @@ export default function BlocksStudio({
                 const keep = groups.find(g => g.dbPath === activeDbRef.current);
                 const group = keep ?? groups[0] ?? null;
                 setActiveDb(group?.dbPath ?? null);
-                // Seed an example query the first time, from whichever source we
-                // can actually read — never clobbering SQL already written.
-                // A database table is preferred over a loose file: it is what a
-                // pipeline most recently chose to publish.
-                const readable =
-                    next.find(s => readExpression(s, group) && s.format === 'attach') ??
-                    next.find(s => readExpression(s, group));
-                if (readable) setSql(prev => (prev.trim() ? prev : starterSql(readable, group)));
+                // No example query is seeded. One used to be, and it was in the
+                // way rather than helpful: a non-empty editor is precisely what
+                // stops the Joins list seeding a whole query, so the example had
+                // to be deleted before the one-click joins could do their job.
+                // An empty editor is also the honest starting state — there is
+                // nothing to run until somebody says what they want.
             } catch (e) {
                 setError(e instanceof Error ? e.message : String(e));
                 setSources([]);
@@ -184,12 +229,17 @@ export default function BlocksStudio({
         if (active) maybeStartEditorTour('blocks');
     }, [active]);
 
-    // Read each dataset's columns the first time the Schema step is opened.
-    // Not on mount: every probe spawns a DuckDB process, so it happens when
-    // somebody actually asks to see the schema, not merely because the surface
-    // is mounted behind another tab.
+    // Read each dataset's columns the first time a step that shows them is
+    // opened. Not on mount: every probe spawns a DuckDB process, so it happens
+    // when somebody actually asks to see the schema, not merely because the
+    // surface is mounted behind another tab.
+    //
+    // The SQL step counts. Its catalog and its autocomplete are both column
+    // lists, so going straight to SQL without passing through Schema used to
+    // give an editor that completed nothing and a panel of empty tables.
     useEffect(() => {
-        if (step !== 'schema' || probedRef.current || sources.length === 0) return;
+        if ((step !== 'schema' && step !== 'sql') || probedRef.current || sources.length === 0)
+            return;
         let cancelled = false;
         probedRef.current = true;
         setProbe({ done: 0, total: 1 });
@@ -403,18 +453,6 @@ export default function BlocksStudio({
         if (!ok) setError('Could not save the ER model.');
     }, [workspacePath, relationships, hiddenRelations]);
 
-    // QueryPane's catalog sidebar — the selected set, since the SQL reads each
-    // address inline rather than through a single bound input.
-    const paneTables: SqlStudioTable[] = useMemo(
-        () =>
-            shown.map(s => ({
-                name: s.name,
-                kind: 'upstream' as const,
-                columns: schema[s.id] ?? s.columns.map(c => ({ name: c })),
-            })),
-        [shown, schema],
-    );
-
     // The database files the catalog knows about, and the one a query attaches.
     const groups = useMemo(() => databaseGroups(sources), [sources]);
     const activeGroup = useMemo(
@@ -438,9 +476,181 @@ export default function BlocksStudio({
         [sources, activeGroup, unresolved],
     );
 
+    /** A source as the SQL surfaces see it: columns, plus its FROM address. */
+    const asTable = useCallback(
+        (s: BlockSource): SqlStudioTable => ({
+            name: s.name,
+            kind: 'upstream' as const,
+            columns: schema[s.id] ?? s.columns.map(c => ({ name: c })),
+            from: readExpression(s, activeGroup) ?? undefined,
+        }),
+        [schema, activeGroup],
+    );
+
+    // The SQL step's catalog and autocomplete, keyed on READABILITY rather than
+    // on the canvas selection — see the note atop `SqlCatalogPanel`. The two
+    // must agree: a name the panel lists and the editor will not complete (or
+    // the reverse) is worse than either alone.
+    const paneTables = useMemo(
+        () => sources.filter(s => readExpression(s, activeGroup)).map(asTable),
+        [sources, activeGroup, asTable],
+    );
+    const unreachableTables = useMemo(
+        () => [
+            ...otherDb.map(s => ({
+                table: asTable(s),
+                reason: 'in another database — switch above to read it',
+            })),
+            ...unresolved.map(s => ({ table: asTable(s), reason: 'no read can be composed' })),
+        ],
+        [otherDb, unresolved, asTable],
+    );
+
     const run = useCallback(
         (text: string) => runBlockSql(text, workspacePath, 'Block', activeGroup?.dbPath ?? null),
         [workspacePath, activeGroup],
+    );
+
+    const acceptAiDraft = useCallback(() => {
+        if (aiDraft != null) setSql(aiDraft);
+        setAiDraft(null);
+    }, [aiDraft]);
+
+    // Saved queries load once per workspace, alongside the catalog.
+    useEffect(() => {
+        if (!workspacePath) return;
+        let cancelled = false;
+        void loadSavedQueries(workspacePath).then(qs => {
+            if (!cancelled) setSaved(qs);
+        });
+        return () => {
+            cancelled = true;
+        };
+    }, [workspacePath]);
+
+    const commitSaved = useCallback(
+        (next: SavedQuery[]) => {
+            setSaved(next);
+            void saveSavedQueries(workspacePath ?? '', next);
+        },
+        [workspacePath],
+    );
+
+    /** Save the editor's SQL under the title and description on the bar. */
+    const saveQuery = useCallback(() => {
+        const title = queryTitle.trim();
+        if (!sql.trim() || !title) return;
+        const current = saved.find(q => q.id === activeQueryId);
+        const id = current?.id ?? queryId(title);
+        // The header goes into the SQL, and the SQL goes back into the editor.
+        // Both halves matter: writing it only to the stored copy would leave
+        // the editor holding different text from the record, which is exactly
+        // the state `dirty` reads as unsaved edits — so saving would leave the
+        // query looking unsaved.
+        const text = withQueryHeader(sql, title, queryDesc);
+        setSql(text);
+        const next = upsertQuery(saved, {
+            id,
+            title,
+            description: queryDesc.trim() || undefined,
+            query: { sql: text },
+            meta: { createdAt: current?.meta?.createdAt ?? new Date().toISOString() },
+        });
+        commitSaved(next);
+        // `upsertQuery` may have merged onto an existing entry of the same
+        // title, so take the id back from the list rather than assuming ours.
+        setActiveQueryId(next[0]?.id ?? id);
+        setSavedOpen(true);
+    }, [sql, queryTitle, queryDesc, saved, activeQueryId, commitSaved]);
+
+    /** Load a saved query — SQL, title and description together. */
+    const openQuery = useCallback((q: SavedQuery) => {
+        setSql(q.query.sql);
+        setQueryTitle(q.title);
+        setQueryDesc(q.description ?? '');
+        setActiveQueryId(q.id);
+    }, []);
+
+    /** Leave whatever is open and start from nothing. */
+    const newQuery = useCallback(() => {
+        setSql('');
+        setQueryTitle('');
+        setQueryDesc('');
+        setActiveQueryId(null);
+        setAiDraft(null);
+    }, []);
+
+    const activeSaved = useMemo(
+        () => saved.find(q => q.id === activeQueryId) ?? null,
+        [saved, activeQueryId],
+    );
+
+    /**
+     * Are there edits that leaving would lose?
+     *
+     * Two cases, and both matter. Against a SAVED query it is a comparison —
+     * opening one and reading it is not an edit, so arriving at a query must
+     * not immediately claim it is dirty. With NO saved query it is simply
+     * whether anything has been typed, because scratch work has nowhere to
+     * have been kept.
+     */
+    const dirty = useMemo(() => {
+        if (activeSaved) {
+            return (
+                sql !== activeSaved.query.sql ||
+                queryTitle !== activeSaved.title ||
+                queryDesc !== (activeSaved.description ?? '')
+            );
+        }
+        return !!(sql.trim() || queryTitle.trim() || queryDesc.trim());
+    }, [activeSaved, sql, queryTitle, queryDesc]);
+
+    /** Ask first when leaving would lose edits; otherwise just go. */
+    const requestNew = useCallback(() => {
+        if (dirty) setPending({ kind: 'new' });
+        else newQuery();
+    }, [dirty, newQuery]);
+
+    const requestOpen = useCallback(
+        (q: SavedQuery) => {
+            if (dirty && q.id !== activeQueryId) setPending({ kind: 'open', query: q });
+            else openQuery(q);
+        },
+        [dirty, activeQueryId, openQuery],
+    );
+
+    const importSavedQueries = useCallback(async () => {
+        try {
+            const incoming = await importQueries();
+            if (!incoming) return;
+            // Merged, not replaced. An import is somebody handing you their
+            // queries, not asking you to throw yours away — and `upsertQuery`
+            // already folds same-title entries together, so re-importing a file
+            // you already have updates rather than duplicates.
+            let next = saved;
+            for (const q of incoming) next = upsertQuery(next, q);
+            commitSaved(next);
+            setSavedOpen(true);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        }
+    }, [saved, commitSaved]);
+
+    const exportSavedQueries = useCallback(async () => {
+        const res = await exportQueries(saved);
+        if (res !== 'ok' && res !== 'cancelled') setError(`Export failed: ${res}`);
+    }, [saved]);
+
+    const resolvePending = useCallback(
+        (action: 'save' | 'discard') => {
+            const p = pending;
+            setPending(null);
+            if (!p) return;
+            if (action === 'save') saveQuery();
+            if (p.kind === 'new') newQuery();
+            else if (p.query) openQuery(p.query);
+        },
+        [pending, saveQuery, newQuery, openQuery],
     );
 
     if (!workspacePath) {
@@ -511,8 +721,8 @@ export default function BlocksStudio({
                         <span>
                             {otherDb.length} dataset{otherDb.length === 1 ? '' : 's'} live in another
                             database: <strong>{otherDb.map(s => s.name).join(', ')}</strong>. A query
-                            attaches one database at a time, so switch to it above to read{' '}
-                            {otherDb.length === 1 ? 'it' : 'them'}.
+                            attaches one database at a time, so switch to it in the panel on the
+                            left to read {otherDb.length === 1 ? 'it' : 'them'}.
                         </span>
                     </div>
                 ) : null}
@@ -543,20 +753,41 @@ export default function BlocksStudio({
                     </div>
                 ) : null}
 
-                {/* Sources sit BELOW the step tabs, not beside them: the tabs
-                    are the studio's top-level navigation and should span the
-                    surface, while the panel scopes what the open step sees. */}
+                {/* The left panel sits BELOW the step tabs, not beside them:
+                    the tabs are the studio's top-level navigation and should
+                    span the surface, while the panel serves the open step.
+
+                    And it is the STEP's panel, not the studio's. Sources —
+                    include/exclude — is a Schema-step control: it chooses what
+                    goes on the ER canvas. The SQL step's question is what a
+                    query can read, so it gets the table/field catalog instead.
+                    Once each step owns its panel, the chart step can bring its
+                    own without either of these two being in the way. */}
                 <div className="blk-lower">
-                    <SourcesPanel
-                        sources={sources}
-                        groups={groups}
-                        selected={selected}
-                        onToggle={toggleSource}
-                        onToggleMany={toggleSources}
-                        activeDb={activeDb}
-                        onSelectDb={setActiveDb}
-                        pipelineNames={pipelineNames}
-                    />
+                    {step === 'sql' ? (
+                        <SqlCatalogPanel
+                            tables={paneTables}
+                            unreachable={unreachableTables}
+                            groups={groups}
+                            activeDb={activeDb}
+                            onSelectDb={setActiveDb}
+                            relationships={relationships}
+                            sql={sql}
+                            onChangeSql={setSql}
+                        />
+                    ) : (
+
+                        <SourcesPanel
+                            sources={sources}
+                            groups={groups}
+                            selected={selected}
+                            onToggle={toggleSource}
+                            onToggleMany={toggleSources}
+                            activeDb={activeDb}
+                            onSelectDb={setActiveDb}
+                            pipelineNames={pipelineNames}
+                        />
+                    )}
                     {libraryOpen ? (
                         <JoinLibraryPanel
                             joins={library}
@@ -569,19 +800,39 @@ export default function BlocksStudio({
                             onClose={() => setLibraryOpen(false)}
                         />
                     ) : null}
+                    {/* Second left panel, beside the catalog — the same slot the
+                        Join Library takes on the Schema step, and only on the
+                        step that can act on it. */}
+                    {step === 'sql' && savedOpen ? (
+                        <SavedQueriesPanel
+                            queries={saved}
+                            activeId={activeQueryId}
+                            onOpen={requestOpen}
+                            onRename={(id, title) =>
+                                commitSaved(saved.map(q => (q.id === id ? { ...q, title } : q)))
+                            }
+                            onDelete={id => {
+                                commitSaved(removeQuery(saved, id));
+                                if (id === activeQueryId) setActiveQueryId(null);
+                            }}
+                            onClose={() => setSavedOpen(false)}
+                            onImport={() => void importSavedQueries()}
+                            onExport={() => void exportSavedQueries()}
+                        />
+                    ) : null}
                 <div className="blk-body" data-tour="blocks-body">
                     {step === 'schema' ? (
                         erdTables.length > 0 ? (
                             <div className="blk-erd">
-                                <div className="blk-erd-bar">
-                                    <span className="blk-erd-title">
+                                <div className="blk-bar">
+                                    <span className="blk-bar-title">
                                         ER Model
                                         <small>
                                             {erdTables.length} durable dataset
                                             {erdTables.length === 1 ? '' : 's'}
                                         </small>
                                     </span>
-                                    <span className="blk-erd-spacer" />
+                                    <span className="blk-bar-spacer" />
                                     <button
                                         className={`erd-btn${libraryOpen ? ' erd-btn--on' : ''}`}
                                         onClick={() => setLibraryOpen(o => !o)}
@@ -644,14 +895,135 @@ export default function BlocksStudio({
                     ) : null}
 
                     {step === 'sql' ? (
-                        <QueryPane
-                            label="SQL"
-                            sql={sql}
-                            onChange={setSql}
-                            run={run}
-                            tables={paneTables}
-                            className="blk-query"
-                        />
+                        <div className="blk-sql">
+                            <div className="blk-bar">
+                                <span className="blk-bar-title">
+                                    SQL
+                                    <small>
+                                        {paneTables.length} readable table
+                                        {paneTables.length === 1 ? '' : 's'}
+                                    </small>
+                                </span>
+                                <span className="blk-bar-spacer" />
+                                <button
+                                    className={`erd-btn${savedOpen ? ' erd-btn--on' : ''}`}
+                                    onClick={() => setSavedOpen(o => !o)}
+                                    title="Queries saved in this workspace"
+                                >
+                                    <FileCode2 size={14} /> Saved
+                                    {saved.length > 0 ? ` (${saved.length})` : ''}
+                                </button>
+                                <button
+                                    className={`erd-btn${showAi ? ' erd-btn--on' : ''}`}
+                                    onClick={() => setShowAi(v => !v)}
+                                    title="Ask AI to write SQL (text-to-SQL)"
+                                >
+                                    <Sparkles size={14} /> Ask AI
+                                </button>
+                                {/* Where Save used to be. Clicking a saved query
+                                    puts the editor INTO that query, and every
+                                    later edit belongs to it — so there has to be
+                                    a way out that is not "delete what is there
+                                    and hope". This is that way out. */}
+                                <button
+                                    className="erd-btn"
+                                    onClick={requestNew}
+                                    title="Start a new query, leaving the one open now"
+                                >
+                                    <FilePlus2 size={14} /> New query
+                                </button>
+                            </div>
+
+                            {/* Below the toolbar rather than in it: a title and
+                                a description are what the query IS, and they
+                                are read far more often than the buttons are
+                                pressed. The description gets the remaining
+                                width because it is the part that has something
+                                to say. */}
+                            <div className="blk-qmeta">
+                                <input
+                                    className="blk-qmeta-title"
+                                    value={queryTitle}
+                                    placeholder="Title"
+                                    aria-label="Query title"
+                                    onChange={e => setQueryTitle(e.target.value)}
+                                />
+                                <input
+                                    className="blk-qmeta-desc"
+                                    value={queryDesc}
+                                    placeholder="What this query answers (optional)"
+                                    aria-label="Query description"
+                                    onChange={e => setQueryDesc(e.target.value)}
+                                />
+                                {/* Save sits with the fields it saves, not with
+                                    the step's navigation. The dot marks edits
+                                    that leaving would lose — the same condition
+                                    the dialog asks about, said quietly first. */}
+                                <button
+                                    className="erd-btn erd-btn--primary blk-qmeta-save"
+                                    onClick={saveQuery}
+                                    disabled={!sql.trim() || !queryTitle.trim()}
+                                    title={
+                                        !sql.trim()
+                                            ? 'Write a query first'
+                                            : !queryTitle.trim()
+                                              ? 'Give the query a title to save it'
+                                              : 'Save this query to the workspace'
+                                    }
+                                >
+                                    <Save size={14} /> Save
+                                    {dirty && activeSaved ? (
+                                        <span className="blk-qmeta-dot" aria-hidden />
+                                    ) : null}
+                                </button>
+                            </div>
+                            {/* The node Studio's own split row, not a copy of it:
+                                `sqlstudio-panes` already lays two panes side by
+                                side and draws the divider between them. */}
+                            <div className="sqlstudio-panes">
+                                <QueryPane
+                                    label="Query"
+                                    sql={sql}
+                                    onChange={setSql}
+                                    run={run}
+                                    tables={paneTables}
+                                    placeholder="Write SQL, or add a join from the panel on the left."
+                                />
+                                {aiDraft != null && (
+                                    <QueryPane
+                                        label={
+                                            <span className="sqlstudio-pane-ai">
+                                                <Sparkles size={13} /> AI draft
+                                            </span>
+                                        }
+                                        sql={aiDraft}
+                                        onChange={v => setAiDraft(v)}
+                                        run={run}
+                                        tables={paneTables}
+                                        actions={
+                                            <>
+                                                <button
+                                                    type="button"
+                                                    className="sqlstudio-btn sqlstudio-btn--primary"
+                                                    onClick={acceptAiDraft}
+                                                    title="Copy this into the main query and close the split"
+                                                >
+                                                    <Check size={14} strokeWidth={2} /> Use this
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    className="sqlstudio-btn"
+                                                    onClick={() => setAiDraft(null)}
+                                                    title="Discard the AI draft"
+                                                >
+                                                    <X size={14} strokeWidth={2} /> Dismiss
+                                                </button>
+                                            </>
+                                        }
+                                    />
+                                )}
+                            </div>
+                        </div>
                     ) : null}
 
                     {step === 'charts' ? (
@@ -665,7 +1037,36 @@ export default function BlocksStudio({
                         </div>
                     ) : null}
                 </div>
+
+                {/* Always mounted, so collapsing the pane — or stepping away to
+                    Schema and back — keeps the conversation. Visibility is
+                    gated on the step as well as the toggle: the pane writes
+                    SQL, and there is no editor to write into anywhere else. */}
+                <AiPane
+                    visible={step === 'sql' && showAi}
+                    onCollapse={() => setShowAi(false)}
+                    tables={paneTables}
+                    relationships={relationships}
+                    currentSql={sql}
+                    workspacePath={workspacePath}
+                    onInsert={setAiDraft}
+                />
                 </div>
+
+                {pending ? (
+                    <UnsavedQueryDialog
+                        title={activeSaved?.title ?? queryTitle}
+                        nextLabel={
+                            pending.kind === 'new'
+                                ? 'Starting a new query will leave them behind.'
+                                : `Opening ${pending.query?.title} will leave them behind.`
+                        }
+                        canSave={!!sql.trim() && !!queryTitle.trim()}
+                        onSave={() => resolvePending('save')}
+                        onDiscard={() => resolvePending('discard')}
+                        onCancel={() => setPending(null)}
+                    />
+                ) : null}
             </div>
         </div>
     );

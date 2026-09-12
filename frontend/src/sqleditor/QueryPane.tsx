@@ -14,6 +14,10 @@ interface QueryPaneProps {
     // Extra header buttons (e.g. Use this / Dismiss on the AI draft), left of Run.
     actions?: ReactNode;
     className?: string;
+    // Empty-editor hint. Overridable because the default names `input`, which
+    // exists inside a node and nowhere else — above the graph it reads as an
+    // example query for a table that is not there.
+    placeholder?: string;
 }
 
 // One editor + its own results grid. Used full-width for the main query and,
@@ -27,6 +31,7 @@ export default function QueryPane({
     tables,
     actions,
     className,
+    placeholder,
 }: QueryPaneProps) {
     const [result, setResult] = useState<SqlRunResult | null>(null);
     const [running, setRunning] = useState(false);
@@ -103,7 +108,7 @@ export default function QueryPane({
                         if (result?.error) setResult(null);
                     }}
                     basicSetup={{ lineNumbers: true, foldGutter: false }}
-                    placeholder="SELECT *, upper(status) AS status FROM input"
+                    placeholder={placeholder ?? 'SELECT *, upper(status) AS status FROM input'}
                 />
             </div>
 

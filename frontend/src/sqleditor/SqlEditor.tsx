@@ -6,9 +6,6 @@ import {
     Sparkles,
     Check,
     X,
-    ChevronRight,
-    ChevronDown,
-    Table2,
     PanelLeftClose,
     PanelLeftOpen,
     AlignLeft,
@@ -19,6 +16,7 @@ import './sqleditor.css';
 import type { SqlEditorRequest, SqlEditorResult, SqlRunResult, SqlStudioTable } from './types';
 import type { ErdRelationship } from '../erd/model';
 import QueryPane from './QueryPane';
+import CatalogTable from './TableCatalog';
 import AiPane from './AiPane';
 import { maybeStartEditorTour, startEditorTour } from '../GuidedTour';
 
@@ -267,35 +265,6 @@ export default function SqlEditor({
                 workspacePath={workspacePath}
                 onInsert={setAiDraft}
             />
-        </div>
-    );
-}
-
-function CatalogTable({ table }: { table: SqlStudioTable }) {
-    const [open, setOpen] = useState(table.kind === 'input');
-    return (
-        <div className="sqlstudio-tnode-wrap">
-            <button className="sqlstudio-tnode" onClick={() => setOpen(o => !o)}>
-                {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                <Table2 size={13} className="sqlstudio-tbl-icon" />
-                <span className="nm">{table.name}</span>
-                {table.kind === 'input' && <span className="tag">input</span>}
-                <span className="ct">{table.columns.length}</span>
-            </button>
-            {open && (
-                <div className="sqlstudio-cols">
-                    {table.columns.map(c => (
-                        <div className="sqlstudio-col" key={c.name}>
-                            <span className="cn">{c.name}</span>
-                            {c.primaryKey && <span className="pk">PK</span>}
-                            {c.type && <span className="ty">{c.type}</span>}
-                        </div>
-                    ))}
-                    {table.columns.length === 0 && (
-                        <div className="sqlstudio-col sqlstudio-col--empty">schema unknown</div>
-                    )}
-                </div>
-            )}
         </div>
     );
 }

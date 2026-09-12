@@ -224,8 +224,21 @@ export function databaseGroups(sources: BlockSource[]): DatabaseGroup[] {
         // A source naming no table IS the whole database: it is what makes the
         // group exist, but there is no single relation to read from it.
         if (!target.table) continue;
-        const parts = [ATTACH_ALIAS, ...(target.schema ? [target.schema] : []), target.table];
-        g.fromById[s.id] = parts.map(ident).join('.');
+        // The ALIAS is written bare, the table and schema quoted — exactly the
+        // form the engine writes for itself (`build_duckdb_source`:
+        // `SELECT * FROM duckle_src.{quoted table}`).
+        //
+        // Not a cosmetic choice on either half. The alias stays bare because
+        // the planner rewrites the token `duckle_src` to a per-node alias
+        // (#76), and matching the engine's spelling keeps one form in
+        // circulation rather than two that both happen to work. The table stays
+        // quoted because a name may be a reserved word — a table called
+        // `select` reads only as `duckle_src."select"` — and because quoting is
+        // what preserves case against DuckDB's folding of bare identifiers.
+        const qualified = (target.schema ? [target.schema, target.table] : [target.table])
+            .map(ident)
+            .join('.');
+        g.fromById[s.id] = `${ATTACH_ALIAS}.${qualified}`;
     }
     return [...byPath.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -248,14 +261,4 @@ export function unresolvedAttachSources(sources: BlockSource[]): BlockSource[] {
  */
 export function readExpression(source: BlockSource, group?: DatabaseGroup | null): string | null {
     return fromExpression(source) ?? group?.fromById[source.id] ?? null;
-}
-
-/** The starter query for a newly picked source. Reads the source inline when it
- *  can; otherwise through `group`, the database the run will attach. */
-export function starterSql(source: BlockSource, group?: DatabaseGroup | null): string {
-    const from = readExpression(source, group);
-    if (!from) {
-        return `-- ${source.name} is a ${source.format === 'attach' ? 'database' : 'source'} the Studio\n-- cannot compose a read for. Write the read yourself below.\nSELECT 1;`;
-    }
-    return `SELECT *\nFROM ${from}\nLIMIT 100;`;
 }

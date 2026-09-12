@@ -13,6 +13,7 @@
 import type { Node } from '@xyflow/react';
 import type { DuckleNodeData } from '../pipeline-types';
 import { runPipeline } from '../tauri-bridge';
+import { stripTerminator } from '../sqleditor/qualify';
 import type { SqlRunResult } from '../sqleditor/types';
 
 /**
@@ -31,6 +32,18 @@ import type { SqlRunResult } from '../sqleditor/types';
  * database. Joining across two `.duckdb` files is therefore not expressible
  * here — the caller is expected to have resolved which database it is querying.
  *
+ * `duckle_src` is what you WRITE, but not what DuckDB ends up seeing. Issue #76
+ * gives every attach-backed source its own alias so several can coexist as live
+ * views in one batched session, so `plan/mod.rs` rewrites the token to
+ * `duckle_src_<node id>` — here, `duckle_src_block_sql` — in both the prelude
+ * and the body. The rewrite is token-boundaried and so reaches inside quotes:
+ * `"duckle_src"."Item"` becomes `"duckle_src_block_sql"."Item"`.
+ *
+ * Which is why a bare `FROM Item` fails with `Did you mean
+ * "duckle_src_block_sql.Item"?` — a name with no `duckle_src` token in it has
+ * nothing to rewrite. Read that error as "you omitted the alias", not as
+ * "the alias we tell you to write is the wrong one".
+ *
  * Errors are returned in the result rather than thrown: `QueryPane` renders
  * `error` inline, and a rejected promise would surface as an unhandled failure
  * in the pane instead of a message the user can act on.
@@ -42,6 +55,7 @@ export async function runBlockSql(
     database?: string | null,
 ): Promise<SqlRunResult> {
     const start = performance.now();
+    sql = stripTerminator(sql);
     const node: Node<DuckleNodeData> = {
         id: 'block_sql',
         type: 'duckle',

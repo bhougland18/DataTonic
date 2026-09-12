@@ -461,7 +461,7 @@
     flex-direction: column;
     overflow: hidden;
 }
-.blk-erd-bar {
+.blk-bar {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -469,19 +469,19 @@
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
 }
-.blk-erd-title {
+.blk-bar-title {
     display: flex;
     align-items: baseline;
     gap: 8px;
     font-weight: 600;
     color: var(--text-1);
 }
-.blk-erd-title small {
+.blk-bar-title small {
     font-weight: 400;
     font-size: 12px;
     color: var(--text-3);
 }
-.blk-erd-spacer {
+.blk-bar-spacer {
     flex: 1;
 }
 .blk-query {
@@ -502,4 +502,368 @@
     font-size: 13px;
     line-height: 1.5;
     color: var(--text-3);
+}
+
+/* ---- SQL catalog panel ---- */
+/* The SQL step's left panel. Same footprint as the Sources panel it replaces —
+   switching steps should move the content, not the layout — and it reuses the
+   node Studio's `sqlstudio-tnode` tree rather than restyling one. */
+.blk-catalog {
+    width: 260px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 8px 0 0;
+    overflow: hidden;
+    border-right: 1px solid var(--border);
+    background: var(--bg-0);
+}
+.blk-catalog .blk-sources-head {
+    padding: 2px 12px 8px;
+    flex-shrink: 0;
+}
+.blk-catalog-db {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    margin: 0 8px 6px;
+    padding: 5px 6px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text-3);
+    font-size: 12px;
+}
+.blk-catalog-db select {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    color: var(--text-1);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+.blk-catalog-db-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-1);
+    font-weight: 600;
+}
+/* `min-height: 0` is what actually makes this scroll: a flex item's default
+   minimum is its content, so without it the list grows past the panel and the
+   joins below are pushed off rather than the tables scrolling. */
+.blk-catalog-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 8px 14px;
+}
+/* The search reuses the join library's input. Wider gutters here to line up
+   with the database selector above it. */
+.blk-catalog .blk-lib-search {
+    flex-shrink: 0;
+    margin: 0 8px 8px;
+}
+/* The FROM address, under the table name. Monospace because it is text to be
+   copied into a query verbatim, quotes and all. */
+.sqlstudio-tfrom {
+    display: block;
+    margin: -2px 0 3px 26px;
+    font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 10.5px;
+    color: var(--text-4);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.sqlstudio-tnode-wrap--muted {
+    opacity: 0.55;
+}
+.blk-catalog-off {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+.blk-catalog-off > header {
+    padding: 0 6px 4px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-4);
+}
+.blk-catalog-why {
+    display: block;
+    margin: -2px 0 6px 26px;
+    font-size: 10.5px;
+    color: var(--text-4);
+}
+
+/* ---- SQL step ---- */
+/* Column: its own toolbar above the pane row, the same shape as the ER step. */
+.blk-sql {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+
+/* ---- Joins list (SQL step panel) ---- */
+/* A sibling of the table list with its own scroll, so a long catalog cannot
+   push the joins out of reach — they matter most when there are many tables.
+   The generous top margin is the separation between the two: they are
+   different questions, and a thin rule alone read as one continuous list. */
+.blk-joins {
+    flex: 0 1 auto;
+    min-height: 0;
+    max-height: 50%;
+    overflow-y: auto;
+    margin-top: 18px;
+    padding: 14px 8px 22px;
+    /* A rule and nothing else. A tinted panel read as a separate surface, which
+       put it in the same visual class as the Saved queries panel alongside —
+       two greys touching, and the boundary between panel and section stopped
+       being the thing the eye found. The divider alone is enough. */
+    border-top: 1px solid var(--border);
+}
+.blk-joins-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 0 4px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-3);
+}
+.blk-joins-head span {
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+}
+.blk-join {
+    display: flex;
+    padding: 3px 4px;
+    border-radius: 5px;
+}
+.blk-join:hover {
+    background: var(--bg-2);
+}
+/* `flex: 1` is what right-aligns the ＋. Without it the row's inner flex sized
+   to its content, so the spacer before the button had no free space to take up
+   and every ＋ sat wherever its table names happened to end — a jagged column. */
+.blk-join-main {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex: 1;
+    min-width: 0;
+}
+/* Both names share the width and truncate together, rather than the second one
+   losing every time. */
+.blk-join-main em {
+    font-style: normal;
+    font-size: 9px;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 0 3px;
+    opacity: 0.8;
+    flex-shrink: 0;
+}
+.blk-join-main b {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text-1);
+}
+.blk-join-gap {
+    flex: 1 0 4px;
+}
+/* Sized for the pointer, not for the glyph. These are the two things actually
+   clicked in this panel — the direction is a three-way toggle and the ＋ writes
+   SQL — and at 20px both were smaller than anything else that does real work. */
+.blk-join-dir,
+.blk-join-add {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--bg-0);
+    color: var(--text-2);
+    cursor: pointer;
+}
+.blk-join-dir:hover,
+.blk-join-add:not(:disabled):hover {
+    background: var(--bg-3);
+    color: var(--accent);
+    border-color: var(--accent);
+}
+.blk-join-add:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+.blk-joins-note {
+    margin: 8px 4px 0;
+    font-size: 10.5px;
+    color: var(--text-4);
+}
+
+/* A section heading for datasets read in place rather than out of the attached
+   database. Same shape as the database row above it, minus the switcher — a
+   parquet file is not something you can switch to, it is always readable. */
+.blk-catalog-db--files {
+    margin-top: 12px;
+}
+
+/* ---- Saved queries panel ---- */
+/* Reuses the join library's panel and row shapes — a saved query and a saved
+   join are the same kind of thing to the eye, and two near-identical panels
+   that looked different would be the surprising part. */
+.blk-sq-title {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* The query the editor is currently holding, so saving again is visibly a
+   revision of THIS entry rather than a new one. */
+.blk-sq-row--active {
+    background: var(--bg-2);
+    box-shadow: inset 2px 0 0 var(--accent);
+}
+.blk-sq-rename {
+    flex: 1;
+    min-width: 0;
+    margin: 2px 4px;
+    padding: 4px 6px;
+    background: var(--bg-0);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 11.5px;
+    outline: none;
+}
+.blk-sq-confirm {
+    font-size: 10.5px;
+    color: var(--accent);
+    padding: 2px 6px;
+}
+
+/* ---- Query title / description ---- */
+/* A row of its own under the SQL toolbar, borrowing the toolbar's own borders
+   so the two read as one header block rather than a bar with something stuck
+   underneath it. */
+.blk-qmeta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+}
+.blk-qmeta input {
+    padding: 4px 8px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text-1);
+    font: inherit;
+    outline: none;
+}
+.blk-qmeta input:focus {
+    border-color: var(--accent);
+}
+.blk-qmeta-title {
+    width: 260px;
+    flex-shrink: 0;
+    font-weight: 600;
+    font-size: 12.5px;
+}
+.blk-qmeta-desc {
+    flex: 1;
+    min-width: 0;
+    font-size: 12.5px;
+}
+.blk-sq-desc {
+    font-size: 10.5px;
+    color: var(--text-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ---- Unsaved-edits dialog ---- */
+/* Same shape as the Infor source's row-limit confirm (`pgi-modal-*`): backdrop,
+   title, body, right-aligned actions. Local classes because Blocks has no other
+   dependency on the playground module and one dialog is a thin reason to add
+   one — see UnsavedQueryDialog.tsx. */
+.blk-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+.blk-modal {
+    width: 420px;
+    max-width: 90vw;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px 20px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md, 10px);
+    box-shadow: 0 12px 44px rgba(0, 0, 0, 0.35);
+}
+.blk-modal-title {
+    font-size: 14px;
+    font-weight: 650;
+    color: var(--text-1);
+}
+.blk-modal-body {
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--text-2);
+}
+.blk-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+/* Save sits with the fields it saves. The dot marks edits that leaving would
+   lose — the dialog's condition, said quietly before it has to be asked. */
+.blk-qmeta-save {
+    flex-shrink: 0;
+    position: relative;
+}
+.blk-qmeta-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    margin-left: 2px;
 }

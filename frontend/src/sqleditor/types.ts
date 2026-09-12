@@ -22,6 +22,11 @@ export interface SqlStudioTable {
     name: string;
     kind: 'input' | 'upstream';
     columns: SqlStudioColumn[];
+    // What to write after FROM, when that differs from `name`. Inside a node it
+    // never does — the working DB holds each upstream under its own name — but
+    // Blocks queries durable sinks, where the address is `"duckle_src"."Item"`
+    // or a parquet path. Optional so the node path is unaffected.
+    from?: string;
 }
 
 // The request bag App.tsx hands the studio when a node opens it. `nonce` forces
