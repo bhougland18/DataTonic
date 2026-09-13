@@ -11,6 +11,7 @@ import {
     HelpCircle,
     LayoutGrid,
     Loader2,
+    MousePointerClick,
     Network,
     RotateCw,
     Save,
@@ -39,6 +40,40 @@ import SourcesPanel from './SourcesPanel';
 import SqlCatalogPanel from './SqlCatalogPanel';
 import SavedQueriesPanel from './SavedQueriesPanel';
 import UnsavedQueryDialog from './UnsavedQueryDialog';
+import { generateSql } from './builder-sql';
+import SelectedColumns from './SelectedColumns';
+import type { ColumnOption } from './ColumnPicker';
+import FiltersPanel from './FiltersPanel';
+import JoinReviewDialog from './JoinReviewDialog';
+import {
+    aggregatesFor,
+    countRules,
+    emptyBuilder,
+    type Aggregate,
+    type BuilderState,
+} from './builder-types';
+import {
+    addFilterNode,
+    addHavingNode,
+    addTable,
+    canReach,
+    moveColumn,
+    removeFilterNode,
+    removeHavingNode,
+    setAggregate,
+    setJoinMode,
+    tableReason,
+    tablesInScope,
+    toggleAllColumns,
+    toggleColumn,
+    updateFilterNode,
+    updateHavingNode,
+    // Aliased: `unreachableTables` is already a local here, meaning datasets
+    // the CURRENT DATABASE cannot read. This one means tables the ER model
+    // cannot connect — a different kind of out of reach.
+    unreachableTables as disconnectedTables,
+} from './builder-ops';
+import type { CatalogSelection } from '../sqleditor/TableCatalog';
 import {
     exportQueries,
     importQueries,
@@ -76,6 +111,9 @@ interface BlocksStudioProps {
      *  this: it records each pipeline's id as its name. */
     pipelineNames?: Record<string, string>;
 }
+
+/** Remembers "do not tell me about join types again", across workspaces. */
+const JOIN_PROMPT_KEY = 'duckle.builder.joinPrompt';
 
 const STEPS: { id: BlockStep; label: string; Icon: typeof Network }[] = [
     { id: 'schema', label: 'Schema', Icon: Network },
@@ -148,6 +186,25 @@ export default function BlocksStudio({
     // while the thinking is happening and restored with the query.
     const [queryTitle, setQueryTitle] = useState('');
     const [queryDesc, setQueryDesc] = useState('');
+    /**
+     * The builder, and whether it owns the query (plan §3).
+     *
+     * Switching off does NOT clear the state — it goes dormant, so coming back
+     * restores what the builder held rather than needing the SQL parsed. The
+     * only thing lost is edits made while it was off, and the switch says so.
+     */
+    const [builder, setBuilder] = useState<BuilderState>(() => emptyBuilder());
+    const [builderMode, setBuilderMode] = useState(true);
+    /**
+     * Shown the first time a query grows a join.
+     *
+     * The default is INNER, which silently drops rows that do not match — the
+     * kind of wrong that looks like a smaller answer rather than an error. It
+     * is worth interrupting for exactly once, and dismissable for good because
+     * somebody who knows that does not need telling again.
+     */
+    const [joinPrompt, setJoinPrompt] = useState(false);
+    const joinPromptShown = useRef(false);
     /**
      * A move that is waiting on the unsaved-edits dialog.
      *
@@ -511,6 +568,139 @@ export default function BlocksStudio({
         [workspacePath, activeGroup],
     );
 
+    // In builder mode the SQL is a projection, regenerated on every change.
+    // Held as derived state rather than pushed into `sql` from a handler: an
+    // effect writing into the editor on every tick is the shape that goes
+    // subtly wrong when the two disagree.
+    const builderSql = useMemo(
+        () =>
+            generateSql(builder, {
+                tables: paneTables,
+                relationships,
+                title: queryTitle,
+                description: queryDesc,
+            }),
+        [builder, paneTables, relationships, queryTitle, queryDesc],
+    );
+    const editorSql = builderMode ? builderSql : sql;
+
+    /** Tables the query needs but the ER model cannot connect. */
+    const stranded = useMemo(
+        () => disconnectedTables(builder, relationships),
+        [builder, relationships],
+    );
+
+    // The first join in a session earns one interruption. A ref, not state, so
+    // asking does not itself re-trigger the effect that asked.
+    useEffect(() => {
+        if (builder.joins.length === 0 || joinPromptShown.current) return;
+        joinPromptShown.current = true;
+        if (localStorage.getItem(JOIN_PROMPT_KEY) === 'off') return;
+        setJoinPrompt(true);
+    }, [builder.joins.length]);
+
+    /**
+     * What the grouping filter may compare: the SUMMARISED columns, aggregate
+     * and all.
+     *
+     * These were offered as bare `Table.Column` before, which read as a filter
+     * on the item rather than on its count — and left no way to ask for "more
+     * than five", since the operators on a plain text column are the text ones.
+     * Carrying the aggregate makes the option `count(Item.Item)`, which is both
+     * what appears in the SELECT list and what HAVING actually compares.
+     */
+    const havingOptions = useMemo(
+        (): ColumnOption[] =>
+            builder.columns
+                .filter(c => (c.aggregate ?? 'none') !== 'none')
+                .map(c => ({ table: c.table, column: c.column, aggregate: c.aggregate })),
+        [builder.columns],
+    );
+
+    /** What a row filter may compare: every column of every reachable table. */
+    const filterOptions = useMemo(
+        (): ColumnOption[] =>
+            paneTables
+                // A filter on a table the model cannot connect is a query that
+                // cannot run.
+                .filter(t => canReach(builder, t.name, relationships))
+                .flatMap(t => t.columns.map(c => ({ table: t.name, column: c.name }))),
+        [paneTables, builder, relationships],
+    );
+
+    /** Which relationships the query uses, and how — for the Joins list. */
+    const activeJoins = useMemo(
+        () => new Map(builder.joins.map(j => [j.relationshipId, j.mode])),
+        [builder.joins],
+    );
+
+    /** Bring a relationship's tables in without selecting from them. */
+    const addJoinTable = useCallback(
+        (rel: ErdRelationship) => {
+            setBuilder(b => {
+                const scope = tablesInScope(b, relationships);
+                // Add whichever end is not there yet; with an empty query, the
+                // `from` side becomes the anchor.
+                const target = scope.has(rel.fromTable.toLowerCase()) ? rel.toTable : rel.fromTable;
+                return addTable(b, target, relationships);
+            });
+        },
+        [relationships],
+    );
+
+    /** Turn the catalog into a picker — only while the builder owns the query. */
+    const selectionFor = useCallback(
+        (table: SqlStudioTable): CatalogSelection => ({
+            isSelected: column =>
+                builder.columns.some(
+                    c =>
+                        c.table.toLowerCase() === table.name.toLowerCase() &&
+                        c.column.toLowerCase() === column.toLowerCase(),
+                ),
+            onToggle: column =>
+                setBuilder(b => toggleColumn(b, table.name, column, relationships)),
+            onToggleAll: () =>
+                setBuilder(b =>
+                    toggleAllColumns(
+                        b,
+                        table.name,
+                        table.columns.map(c => c.name),
+                        relationships,
+                    ),
+                ),
+            aggregateOf: column =>
+                builder.columns.find(
+                    c =>
+                        c.table.toLowerCase() === table.name.toLowerCase() &&
+                        c.column.toLowerCase() === column.toLowerCase(),
+                )?.aggregate ?? 'none',
+            onAggregate: (column, aggregate) =>
+                setBuilder(b => setAggregate(b, table.name, column, aggregate as Aggregate)),
+            aggregatesFor: column =>
+                aggregatesFor(table.columns.find(c => c.name === column)?.type),
+            reachable: canReach(builder, table.name, relationships),
+        }),
+        [builder, relationships],
+    );
+
+    /** Hand the query over, or take it back. */
+    const toggleBuilder = useCallback(() => {
+        if (builderMode) {
+            // Off: the generated SQL becomes the editable text. Nothing is
+            // lost, so nothing to confirm.
+            setSql(builderSql);
+            setBuilderMode(false);
+            return;
+        }
+        // On: the builder's own state comes back, and whatever was typed since
+        // switching off does not. That is worth asking about.
+        const hasEdits = sql.trim() !== builderSql.trim();
+        if (hasEdits && !window.confirm('Go back to the builder? Your SQL edits will be lost.')) {
+            return;
+        }
+        setBuilderMode(true);
+    }, [builderMode, builderSql, sql]);
+
     const acceptAiDraft = useCallback(() => {
         if (aiDraft != null) setSql(aiDraft);
         setAiDraft(null);
@@ -536,10 +726,18 @@ export default function BlocksStudio({
         [workspacePath],
     );
 
-    /** Save the editor's SQL under the title and description on the bar. */
+    /**
+     * Save what the editor is SHOWING, under the title and description.
+     *
+     * `editorSql`, not `sql`: in builder mode the text is generated and `sql`
+     * holds whatever was last hand-written, which is usually nothing. Reading
+     * the wrong one made Save look broken — it was disabled on an empty string
+     * while a perfectly good query was on screen.
+     */
     const saveQuery = useCallback(() => {
         const title = queryTitle.trim();
-        if (!sql.trim() || !title) return;
+        const text = builderMode ? builderSql : sql;
+        if (!text.trim() || !title) return;
         const current = saved.find(q => q.id === activeQueryId);
         const id = current?.id ?? queryId(title);
         // The header goes into the SQL, and the SQL goes back into the editor.
@@ -547,13 +745,17 @@ export default function BlocksStudio({
         // the editor holding different text from the record, which is exactly
         // the state `dirty` reads as unsaved edits — so saving would leave the
         // query looking unsaved.
-        const text = withQueryHeader(sql, title, queryDesc);
-        setSql(text);
+        const stored = withQueryHeader(text, title, queryDesc);
+        // Only the hand-written text is written back. In builder mode the SQL is
+        // regenerated from state on every render, so pushing into `sql` would be
+        // overwritten immediately — the header is already in `builderSql`
+        // because the generator puts it there.
+        if (!builderMode) setSql(stored);
         const next = upsertQuery(saved, {
             id,
             title,
             description: queryDesc.trim() || undefined,
-            query: { sql: text },
+            query: { sql: stored },
             meta: { createdAt: current?.meta?.createdAt ?? new Date().toISOString() },
         });
         commitSaved(next);
@@ -772,8 +974,76 @@ export default function BlocksStudio({
                             activeDb={activeDb}
                             onSelectDb={setActiveDb}
                             relationships={relationships}
-                            sql={sql}
+                            sql={editorSql}
                             onChangeSql={setSql}
+                            selectionFor={builderMode ? selectionFor : undefined}
+                            activeJoins={builderMode ? activeJoins : undefined}
+                            onSetJoinMode={
+                                builderMode
+                                    ? (id, mode) => setBuilder(b => setJoinMode(b, id, mode))
+                                    : undefined
+                            }
+                            onAddJoinTable={builderMode ? addJoinTable : undefined}
+                            reasonFor={
+                                builderMode ? table => tableReason(builder, table) : undefined
+                            }
+                            selectedCount={builder.columns.length}
+                            filterCount={countRules(builder.filters)}
+                            havingCount={countRules(builder.having)}
+                            having={
+                                builderMode && havingOptions.length > 0 ? (
+                                    <FiltersPanel
+                                        root={builder.having}
+                                        // Only the aggregated columns: HAVING
+                                        // filters groups, and a group has no
+                                        // value for a column it grouped BY.
+                                        options={havingOptions}
+                                        onUpdate={node =>
+                                            setBuilder(b => updateHavingNode(b, node))
+                                        }
+                                        onAdd={(groupId, child) =>
+                                            setBuilder(b => addHavingNode(b, groupId, child))
+                                        }
+                                        onRemove={id => setBuilder(b => removeHavingNode(b, id))}
+                                    />
+                                ) : undefined
+                            }
+                            filters={
+                                builderMode ? (
+                                    <FiltersPanel
+                                        root={builder.filters}
+                                        options={filterOptions}
+                                        onUpdate={node =>
+                                            setBuilder(b =>
+                                                updateFilterNode(b, node, relationships),
+                                            )
+                                        }
+                                        onAdd={(groupId, child) =>
+                                            setBuilder(b =>
+                                                addFilterNode(b, groupId, child, relationships),
+                                            )
+                                        }
+                                        onRemove={id =>
+                                            setBuilder(b => removeFilterNode(b, id, relationships))
+                                        }
+                                    />
+                                ) : undefined
+                            }
+                            selected={
+                                builderMode && builder.columns.length > 0 ? (
+                                    <SelectedColumns
+                                        columns={builder.columns}
+                                        onMove={(from, to) =>
+                                            setBuilder(b => moveColumn(b, from, to))
+                                        }
+                                        onRemove={c =>
+                                            setBuilder(b =>
+                                                toggleColumn(b, c.table, c.column, relationships),
+                                            )
+                                        }
+                                    />
+                                ) : undefined
+                            }
                         />
                     ) : (
 
@@ -934,6 +1204,22 @@ export default function BlocksStudio({
                                 </button>
                             </div>
 
+                            {/* A picked table the ER model cannot reach. Said
+                                here rather than silently dropped: its columns
+                                are in the SELECT, so the query is wrong in a
+                                way the SQL alone does not explain. */}
+                            {builderMode && stranded.length > 0 ? (
+                                <div className="blk-note blk-note--warn">
+                                    <AlertTriangle size={14} />
+                                    <span>
+                                        No relationship connects{' '}
+                                        <strong>{stranded.join(', ')}</strong> to the rest of the
+                                        query. Draw the join on the Schema step, or unpick those
+                                        columns.
+                                    </span>
+                                </div>
+                            ) : null}
+
                             {/* Below the toolbar rather than in it: a title and
                                 a description are what the query IS, and they
                                 are read far more often than the buttons are
@@ -962,9 +1248,9 @@ export default function BlocksStudio({
                                 <button
                                     className="erd-btn erd-btn--primary blk-qmeta-save"
                                     onClick={saveQuery}
-                                    disabled={!sql.trim() || !queryTitle.trim()}
+                                    disabled={!editorSql.trim() || !queryTitle.trim()}
                                     title={
-                                        !sql.trim()
+                                        !editorSql.trim()
                                             ? 'Write a query first'
                                             : !queryTitle.trim()
                                               ? 'Give the query a title to save it'
@@ -982,12 +1268,42 @@ export default function BlocksStudio({
                                 side and draws the divider between them. */}
                             <div className="sqlstudio-panes">
                                 <QueryPane
-                                    label="Query"
-                                    sql={sql}
+                                    label={
+                                        // The handover lives with the thing it
+                                        // hands over, not in the step's
+                                        // navigation: it is a statement about
+                                        // THIS editor's contents.
+                                        <span className="blk-mode">
+                                            <button
+                                                type="button"
+                                                className={`blk-mode-toggle${
+                                                    builderMode ? ' blk-mode-toggle--on' : ''
+                                                }`}
+                                                onClick={toggleBuilder}
+                                                role="switch"
+                                                aria-checked={builderMode}
+                                                title={
+                                                    builderMode
+                                                        ? 'Switch the builder off and edit this SQL by hand'
+                                                        : 'Switch the builder back on (discards SQL edits)'
+                                                }
+                                            >
+                                                <span className="blk-mode-knob" />
+                                            </button>
+                                            <MousePointerClick size={13} />
+                                            Query · {builderMode ? 'built' : 'hand-written'}
+                                        </span>
+                                    }
+                                    sql={editorSql}
                                     onChange={setSql}
                                     run={run}
                                     tables={paneTables}
-                                    placeholder="Write SQL, or add a join from the panel on the left."
+                                    readOnly={builderMode}
+                                    placeholder={
+                                        builderMode
+                                            ? 'Tick columns on the left to build a query.'
+                                            : 'Write SQL, or add a join from the panel on the left.'
+                                    }
                                 />
                                 {aiDraft != null && (
                                     <QueryPane
@@ -1052,6 +1368,15 @@ export default function BlocksStudio({
                     onInsert={setAiDraft}
                 />
                 </div>
+
+                {joinPrompt ? (
+                    <JoinReviewDialog
+                        onClose={remember => {
+                            if (remember) localStorage.setItem(JOIN_PROMPT_KEY, 'off');
+                            setJoinPrompt(false);
+                        }}
+                    />
+                ) : null}
 
                 {pending ? (
                     <UnsavedQueryDialog

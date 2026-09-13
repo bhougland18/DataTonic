@@ -15,7 +15,7 @@
 // Useful on BOTH paths. Nothing here needs an address, so a node's SQL Studio
 // gets the same check over its working-DB catalog.
 
-import { joinSql, quoteIdent, type ErdRelationship } from '../erd/model';
+import { joinSql, quoteIdent, relationshipPath, type ErdRelationship } from '../erd/model';
 import { scannable, splitLiterals } from './qualify';
 import type { SqlStudioTable } from './types';
 
@@ -253,47 +253,15 @@ export function joinPath(
     tables: SqlStudioTable[],
     relationships: ErdRelationship[],
 ): string[] | null {
-    const goal = target.toLowerCase();
-    const have = new Set([...present].map(s => s.toLowerCase()));
-    if (have.has(goal)) return [];
-
-    const adj = new Map<string, { other: string; rel: ErdRelationship }[]>();
-    const link = (a: string, b: string, rel: ErdRelationship) => {
-        const k = a.toLowerCase();
-        adj.set(k, [...(adj.get(k) ?? []), { other: b, rel }]);
-    };
-    // Undirected: a relationship is readable from either end.
-    for (const r of relationships) {
-        link(r.fromTable, r.toTable, r);
-        link(r.toTable, r.fromTable, r);
-    }
-
-    const prev = new Map<string, { from: string; rel: ErdRelationship }>();
-    const seen = new Set(have);
-    const queue = [...have];
-    while (queue.length) {
-        const cur = queue.shift() as string;
-        if (cur === goal) break;
-        for (const e of adj.get(cur) ?? []) {
-            const k = e.other.toLowerCase();
-            if (seen.has(k)) continue;
-            seen.add(k);
-            prev.set(k, { from: cur, rel: e.rel });
-            queue.push(k);
-        }
-    }
-    if (!prev.has(goal)) return null;
-
-    const chain: { table: string; rel: ErdRelationship }[] = [];
-    for (let cur = goal; prev.has(cur); ) {
-        const step = prev.get(cur) as { from: string; rel: ErdRelationship };
-        chain.unshift({ table: cur, rel: step.rel });
-        cur = step.from;
-    }
-    return chain.map(step => {
-        const t = tables.find(x => x.name.toLowerCase() === step.table);
-        const name = t?.name ?? step.table;
-        return `JOIN ${t?.from ?? quoteIdent(name)} AS ${quoteIdent(name)} ON ${joinSql(step.rel)}`;
+    // The route itself is a walk over the ER graph with no SQL in it, so it
+    // lives in `erd/model.ts` and is shared with the builder, which wants the
+    // same hops as relationship ids rather than as clauses.
+    const hops = relationshipPath(target, present, relationships);
+    if (hops === null) return null;
+    return hops.map(hop => {
+        const t = tables.find(x => x.name.toLowerCase() === hop.joined.toLowerCase());
+        const name = t?.name ?? hop.joined;
+        return `JOIN ${t?.from ?? quoteIdent(name)} AS ${quoteIdent(name)} ON ${joinSql(hop.rel)}`;
     });
 }
 

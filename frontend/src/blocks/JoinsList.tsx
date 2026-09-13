@@ -22,7 +22,31 @@ export interface JoinsListProps {
     /** The editor's current SQL — decides what a join can anchor to. */
     sql: string;
     onChangeSql: (next: string) => void;
+    /**
+     * Builder mode: which relationships the query is actually using, and how.
+     *
+     * When present the list stops being a set of things you could insert and
+     * becomes a readout of the joins in play — so the direction control is the
+     * live setting rather than a staging choice, and changing it changes the
+     * query.
+     */
+    active?: Map<string, JoinMode>;
+    onSetMode?: (relationshipId: string, mode: JoinMode) => void;
+    /** Builder mode: bring this relationship's tables into the query. */
+    onAddTable?: (relationship: ErdRelationship) => void;
+    /** Why each table is in the query, so a join nobody asked for says so. */
+    reasonFor?: (table: string) => string;
 }
+
+/** Short labels; `column` and `anchor` need none — those are the expected case. */
+const REASON_LABEL: Record<string, { text: string; title: string }> = {
+    filter: { text: 'filter', title: 'Here because a filter names this table' },
+    added: { text: 'added', title: 'Added from this list, without selecting columns' },
+    route: {
+        text: 'route',
+        title: 'Not asked for — it is on the path between two tables that were',
+    },
+};
 
 /**
  * The three directions, in the order clicking cycles them.
@@ -37,7 +61,26 @@ const MODES: { mode: JoinMode; Icon: typeof Equal; hint: (a: string, b: string) 
     { mode: 'keep-to', Icon: ArrowLeft, hint: (_a, b) => `every ${b} row, matched or not` },
 ];
 
-export default function JoinsList({ relationships, tables, sql, onChangeSql }: JoinsListProps) {
+function ReasonTag({ reason }: { reason?: string }) {
+    const spec = reason ? REASON_LABEL[reason] : undefined;
+    if (!spec) return null;
+    return (
+        <em className="blk-join-why" title={spec.title}>
+            {spec.text}
+        </em>
+    );
+}
+
+export default function JoinsList({
+    relationships,
+    tables,
+    sql,
+    onChangeSql,
+    active,
+    onSetMode,
+    onAddTable,
+    reasonFor,
+}: JoinsListProps) {
     // Direction per relationship, defaulting to inner. Held here rather than on
     // the model: it is a choice about the query being written now, not a fact
     // about how the tables relate, and saving it would make one query's shape
@@ -61,40 +104,46 @@ export default function JoinsList({ relationships, tables, sql, onChangeSql }: J
     if (relationships.length === 0) return null;
 
     return (
-        <section className="blk-joins">
-            <header className="blk-joins-head">
-                Joins <span>{usable.length}</span>
-            </header>
-
+        <div className="blk-joins">
             {usable.map(r => {
-                const mode = modes[r.id] ?? 'inner';
+                // In builder mode the query owns the mode; otherwise it is a
+                // staging choice this list keeps for the next insert.
+                const inUse = active?.has(r.id) ?? false;
+                const mode = active?.get(r.id) ?? modes[r.id] ?? 'inner';
                 const spec = MODES.find(m => m.mode === mode) ?? MODES[0];
                 const result = insertJoin(sql, r, mode, tables);
                 const blocked = result.kind === 'blocked' ? result.reason : null;
                 return (
-                    <div className="blk-join" key={r.id} title={`ON ${joinSql(r)}`}>
+                    <div
+                        className={`blk-join${inUse ? ' blk-join--active' : ''}`}
+                        key={r.id}
+                        title={`ON ${joinSql(r)}`}
+                    >
                         {/* The direction sits BETWEEN the two names, where it
                             reads as the relation between them. On the left it
                             read as a control acting on the row — next to a list
                             entry, a dash or an arrow looks like "remove". */}
                         <div className="blk-join-main">
                             <b title={r.fromTable}>{r.fromTable}</b>
+                            <ReasonTag reason={inUse ? reasonFor?.(r.fromTable) : undefined} />
                             <button
                                 type="button"
-                                className="blk-join-dir"
+                                className={`blk-join-dir${inUse ? ' blk-join-dir--active' : ''}`}
                                 title={`Keeps ${spec.hint(r.fromTable, r.toTable)}. Click to change.`}
-                                onClick={() =>
-                                    setModes(m => {
-                                        const i = MODES.findIndex(
-                                            x => x.mode === (m[r.id] ?? 'inner'),
-                                        );
-                                        return { ...m, [r.id]: MODES[(i + 1) % MODES.length].mode };
-                                    })
-                                }
+                                onClick={() => {
+                                    const i = MODES.findIndex(x => x.mode === mode);
+                                    const next = MODES[(i + 1) % MODES.length].mode;
+                                    // A join in the query changes the query; one
+                                    // that is not yet in it just changes what the
+                                    // next insert would do.
+                                    if (inUse && onSetMode) onSetMode(r.id, next);
+                                    else setModes(m => ({ ...m, [r.id]: next }));
+                                }}
                             >
                                 <spec.Icon size={17} strokeWidth={2.75} />
                             </button>
                             <b title={r.toTable}>{r.toTable}</b>
+                            <ReasonTag reason={inUse ? reasonFor?.(r.toTable) : undefined} />
                             {r.qualifiers?.length ? (
                                 <em title="This join carries a qualifier, added to the ON clause">
                                     +{r.qualifiers.length}
@@ -104,12 +153,25 @@ export default function JoinsList({ relationships, tables, sql, onChangeSql }: J
                             <button
                                 type="button"
                                 className="blk-join-add"
-                                disabled={!!blocked}
+                                // In builder mode the join is already implied by
+                                // the columns; ＋ is only for bringing in a table
+                                // to FILTER on without selecting from it, so it
+                                // is offered exactly when the join is not in use.
+                                disabled={onAddTable ? inUse : !!blocked}
                                 // The reason is the whole value when it is
                                 // refused — a greyed button with no explanation
                                 // reads as broken.
-                                title={blocked ?? 'Add this join to the query'}
-                                onClick={() => result.kind !== 'blocked' && onChangeSql(result.sql)}
+                                title={
+                                    onAddTable
+                                        ? inUse
+                                            ? 'Already in the query'
+                                            : 'Bring these tables in so you can filter on them'
+                                        : (blocked ?? 'Add this join to the query')
+                                }
+                                onClick={() => {
+                                    if (onAddTable) return onAddTable(r);
+                                    if (result.kind !== 'blocked') onChangeSql(result.sql);
+                                }}
                             >
                                 <Plus size={17} strokeWidth={2.5} />
                             </button>
@@ -124,6 +186,6 @@ export default function JoinsList({ relationships, tables, sql, onChangeSql }: J
                     read.
                 </p>
             ) : null}
-        </section>
+        </div>
     );
 }

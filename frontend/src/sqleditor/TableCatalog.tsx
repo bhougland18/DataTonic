@@ -10,9 +10,34 @@
 // A shared list would have to model that distinction for a surface that does
 // not have it.
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Table2 } from 'lucide-react';
 import type { SqlStudioTable } from './types';
+
+/**
+ * Turning the catalog into a picker.
+ *
+ * Optional, so the node's SQL Studio — which has no builder — gets exactly the
+ * read-only tree it had before. When present, every row grows a checkbox and a
+ * ticked column grows an aggregate control.
+ */
+export interface CatalogSelection {
+    /** Is this column in the query? */
+    isSelected: (column: string) => boolean;
+    onToggle: (column: string) => void;
+    /** The table-level checkbox: tick or clear every column. */
+    onToggleAll: () => void;
+    /** Current aggregate for a ticked column, and how to change it. */
+    aggregateOf?: (column: string) => string;
+    onAggregate?: (column: string, aggregate: string) => void;
+    /** Which aggregates this column's TYPE allows — `sum` over a VARCHAR does
+     *  not run, so it is not offered. */
+    aggregatesFor?: (column: string) => string[];
+    /** Off when the ER model cannot connect this table to the query. */
+    reachable?: boolean;
+}
+
+const AGGREGATES = ['none', 'count', 'count distinct', 'sum', 'avg', 'min', 'max'];
 
 export interface CatalogTableProps {
     table: SqlStudioTable;
@@ -21,19 +46,58 @@ export interface CatalogTableProps {
     defaultOpen?: boolean;
     /** Dimmed, for a table that exists but cannot be read from here. */
     muted?: boolean;
+    selection?: CatalogSelection;
 }
 
-export default function CatalogTable({ table, defaultOpen, muted }: CatalogTableProps) {
+export default function CatalogTable({
+    table,
+    defaultOpen,
+    muted,
+    selection,
+}: CatalogTableProps) {
     const [open, setOpen] = useState(defaultOpen ?? table.kind === 'input');
+    const unreachable = selection?.reachable === false;
+    const picked = selection ? table.columns.filter(c => selection.isSelected(c.name)).length : 0;
+    const all = picked > 0 && picked === table.columns.length;
+    // Some but not all: the box says "partly", which is the true answer and
+    // stops the table checkbox looking like it lost the individual ticks.
+    const someRef = useRef<HTMLInputElement>(null);
+    useEffect(() => {
+        if (someRef.current) someRef.current.indeterminate = picked > 0 && !all;
+    }, [picked, all]);
     return (
-        <div className={`sqlstudio-tnode-wrap${muted ? ' sqlstudio-tnode-wrap--muted' : ''}`}>
-            <button className="sqlstudio-tnode" onClick={() => setOpen(o => !o)}>
-                {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                <Table2 size={13} className="sqlstudio-tbl-icon" />
-                <span className="nm">{table.name}</span>
-                {table.kind === 'input' && <span className="tag">input</span>}
-                <span className="ct">{table.columns.length}</span>
-            </button>
+        <div
+            className={`sqlstudio-tnode-wrap${muted ? ' sqlstudio-tnode-wrap--muted' : ''}${
+                unreachable ? ' sqlstudio-tnode-wrap--unreachable' : ''
+            }`}
+        >
+            <div className="sqlstudio-tnode-row">
+                {selection ? (
+                    <input
+                        ref={someRef}
+                        type="checkbox"
+                        className="sqlstudio-tick"
+                        checked={all}
+                        disabled={unreachable}
+                        onChange={() => selection.onToggleAll()}
+                        title={
+                            unreachable
+                                ? `No relationship connects ${table.name} to this query`
+                                : all
+                                  ? `Clear all ${table.name} columns`
+                                  : `Select all ${table.name} columns`
+                        }
+                        aria-label={`All columns from ${table.name}`}
+                    />
+                ) : null}
+                <button className="sqlstudio-tnode" onClick={() => setOpen(o => !o)}>
+                    {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                    <Table2 size={13} className="sqlstudio-tbl-icon" />
+                    <span className="nm">{table.name}</span>
+                    {table.kind === 'input' && <span className="tag">input</span>}
+                    <span className="ct">{table.columns.length}</span>
+                </button>
+            </div>
             {/* The address, when it is not simply the name. In a node the table
                 IS what you write after FROM; above the graph it is not — the
                 query reads `"duckle_src"."Item"` or a parquet path — and a
@@ -46,13 +110,49 @@ export default function CatalogTable({ table, defaultOpen, muted }: CatalogTable
             ) : null}
             {open && (
                 <div className="sqlstudio-cols">
-                    {table.columns.map(c => (
-                        <div className="sqlstudio-col" key={c.name}>
-                            <span className="cn">{c.name}</span>
-                            {c.primaryKey && <span className="pk">PK</span>}
-                            {c.type && <span className="ty">{c.type}</span>}
-                        </div>
-                    ))}
+                    {table.columns.map(c => {
+                        const ticked = selection?.isSelected(c.name) ?? false;
+                        return (
+                            <div className="sqlstudio-col" key={c.name}>
+                                {selection ? (
+                                    <input
+                                        type="checkbox"
+                                        className="sqlstudio-tick"
+                                        checked={ticked}
+                                        disabled={unreachable}
+                                        onChange={() => selection.onToggle(c.name)}
+                                        aria-label={`${table.name}.${c.name}`}
+                                    />
+                                ) : null}
+                                <span className="cn">{c.name}</span>
+                                {c.primaryKey && <span className="pk">PK</span>}
+                                {/* The TYPE is dropped once this is a picker
+                                    (plan §4): everything here is VARCHAR, so it
+                                    distinguishes nothing, and the space is
+                                    better spent on the aggregate. */}
+                                {!selection && c.type && <span className="ty">{c.type}</span>}
+                                {ticked && selection?.onAggregate ? (
+                                    <select
+                                        className="sqlstudio-agg"
+                                        value={selection.aggregateOf?.(c.name) ?? 'none'}
+                                        onChange={e =>
+                                            selection.onAggregate?.(c.name, e.target.value)
+                                        }
+                                        title="Summarise this column"
+                                        aria-label={`Aggregate for ${c.name}`}
+                                    >
+                                        {(selection.aggregatesFor?.(c.name) ?? AGGREGATES).map(
+                                            a => (
+                                                <option key={a} value={a}>
+                                                    {a === 'none' ? '—' : a}
+                                                </option>
+                                            ),
+                                        )}
+                                    </select>
+                                ) : null}
+                            </div>
+                        );
+                    })}
                     {table.columns.length === 0 && (
                         <div className="sqlstudio-col sqlstudio-col--empty">schema unknown</div>
                     )}

@@ -16,16 +16,10 @@ import { joinSql, quoteIdent, type ErdRelationship } from '../erd/model';
 import { splitLiterals } from '../sqleditor/qualify';
 import type { SqlStudioTable } from '../sqleditor/types';
 
-/**
- * Which rows survive the join — the arrow in the UI.
- *
- * `inner` keeps only matches. `keep-from` and `keep-to` keep every row of the
- * named side, and the named side is the one that lands in FROM: there is no
- * RIGHT JOIN here, deliberately. A right join is a left join with the tables
- * swapped, and reading one is a well-known way to misjudge which rows survive,
- * so the arrow moves the anchor instead.
- */
-export type JoinMode = 'inner' | 'keep-from' | 'keep-to';
+// One definition, in `builder-types`, so the Joins list can hand the same value
+// to either path — inserting SQL text, or setting a mode on the builder.
+export type { JoinMode } from './builder-types';
+import type { JoinMode } from './builder-types';
 
 export type JoinInsert =
     | { kind: 'seed' | 'append'; sql: string }

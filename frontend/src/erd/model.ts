@@ -105,6 +105,73 @@ export interface ErdModel {
     relationships: ErdRelationship[];
 }
 
+/** One step of a route through the model: a relationship, and the table it adds. */
+export interface JoinHop {
+    rel: ErdRelationship;
+    /** The table this hop brings into scope. */
+    joined: string;
+}
+
+/**
+ * The shortest route from the tables already in hand to `target`.
+ *
+ * Breadth-first, so the answer uses the FEWEST joins. That is not only about
+ * speed: every extra join is another chance to multiply rows, and a row count
+ * nobody expected is the kind of wrong that reaches a client report.
+ *
+ * `[]` means the target is already there. `null` means the model does not
+ * connect it — a real answer, not a failure, because without a relationship
+ * there is no join anyone could honestly propose.
+ *
+ * Lives here rather than beside either caller: it is a walk over the ER graph
+ * with no SQL in it, and both the builder (which wants relationship ids) and
+ * the AI repair path (which wants JOIN clauses) need the same route.
+ */
+export function relationshipPath(
+    target: string,
+    present: Iterable<string>,
+    relationships: ErdRelationship[],
+): JoinHop[] | null {
+    const goal = target.toLowerCase();
+    const have = new Set([...present].map(s => s.toLowerCase()));
+    if (have.has(goal)) return [];
+
+    const adj = new Map<string, { other: string; rel: ErdRelationship }[]>();
+    const link = (a: string, b: string, rel: ErdRelationship) => {
+        const k = a.toLowerCase();
+        adj.set(k, [...(adj.get(k) ?? []), { other: b, rel }]);
+    };
+    // Undirected: a relationship is readable from either end.
+    for (const r of relationships) {
+        link(r.fromTable, r.toTable, r);
+        link(r.toTable, r.fromTable, r);
+    }
+
+    const prev = new Map<string, { from: string; rel: ErdRelationship; name: string }>();
+    const seen = new Set(have);
+    const queue = [...have];
+    while (queue.length) {
+        const cur = queue.shift() as string;
+        if (cur === goal) break;
+        for (const e of adj.get(cur) ?? []) {
+            const k = e.other.toLowerCase();
+            if (seen.has(k)) continue;
+            seen.add(k);
+            prev.set(k, { from: cur, rel: e.rel, name: e.other });
+            queue.push(k);
+        }
+    }
+    if (!prev.has(goal)) return null;
+
+    const hops: JoinHop[] = [];
+    for (let cur = goal; prev.has(cur); ) {
+        const step = prev.get(cur) as { from: string; rel: ErdRelationship; name: string };
+        hops.unshift({ rel: step.rel, joined: step.name });
+        cur = step.from;
+    }
+    return hops;
+}
+
 // A minimal table shape the inference accepts (SqlStudioTable satisfies it too).
 type TableLike = { name: string; columns: { name: string; type?: string }[] };
 

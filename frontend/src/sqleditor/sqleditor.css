@@ -271,9 +271,13 @@
 }
 
 /* ---- Editor ---- */
+/* `min-height: 0` is what lets the editor scroll rather than grow: a flex
+   item's default minimum is its content, so without it a long query pushes the
+   pane taller instead of handing the overflow to `.cm-scroller`. Same trap as
+   the catalog list. */
 .sqlstudio-editor {
     flex: 1 1 45%;
-    min-height: 120px;
+    min-height: 0;
     overflow: hidden;
     background: var(--bg-0);
     border-bottom: 1px solid var(--border);
@@ -788,6 +792,7 @@
 .sqlstudio-pane {
     flex: 1;
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -880,4 +885,69 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+}
+
+/* Visible scrollbars in the editor.
+   The WebView draws overlay scrollbars that only appear mid-scroll, so a query
+   wider or taller than the box gave no sign there was more of it. Styled to be
+   always present rather than merely enabled — "can I scroll here" has to be
+   answerable without trying. */
+.sqlstudio-editor .cm-scroller {
+    overflow: auto;
+    scrollbar-width: thin;
+}
+.sqlstudio-editor .cm-content {
+    white-space: pre;
+}
+.sqlstudio-editor .cm-scroller::-webkit-scrollbar {
+    width: 11px;
+    height: 11px;
+}
+.sqlstudio-editor .cm-scroller::-webkit-scrollbar-track {
+    background: var(--bg-1);
+}
+.sqlstudio-editor .cm-scroller::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border: 2px solid var(--bg-1);
+    border-radius: 6px;
+}
+.sqlstudio-editor .cm-scroller::-webkit-scrollbar-thumb:hover {
+    background: var(--text-4);
+}
+.sqlstudio-editor .cm-scroller::-webkit-scrollbar-corner {
+    background: var(--bg-1);
+}
+
+/* react-codemirror wraps the editor in its own `.cm-theme` div. That wrapper
+   had no height, so `.cm-editor { height: 100% }` measured against an auto-
+   sized parent: the editor grew to fit its content, the pane clipped it with
+   `overflow: hidden`, and `.cm-scroller` never had anything to scroll. Nothing
+   to scroll means no scrollbar, which is why the earlier flex fix did not
+   produce one. */
+.sqlstudio-editor > div,
+.sqlstudio-editor .cm-theme {
+    height: 100%;
+    min-height: 0;
+}
+.sqlstudio-editor .cm-scroller {
+    overflow-y: auto !important;
+}
+
+/* Selection has to win over the current-line highlight.
+   `.cm-activeLine` paints a background on the line element, which sits ABOVE
+   the selection layer — so dragging across the cursor's own line highlighted
+   nothing visible. The active line is now marked in the gutter only, where it
+   cannot cover anything, and the selection colour is strong enough to read
+   against the editor background. */
+.sqlstudio-editor .cm-activeLine {
+    background: transparent;
+}
+.sqlstudio-editor .cm-activeLineGutter {
+    background: var(--bg-2);
+    color: var(--accent);
+}
+.sqlstudio-editor .cm-selectionBackground,
+.sqlstudio-editor .cm-content ::selection,
+.sqlstudio-editor.cm-focused .cm-selectionBackground {
+    background: color-mix(in srgb, var(--accent) 32%, transparent) !important;
 }

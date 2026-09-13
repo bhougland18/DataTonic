@@ -522,6 +522,76 @@
     padding: 2px 12px 8px;
     flex-shrink: 0;
 }
+
+/* ---- Collapsing the panel ---- */
+/* The collapse button gets its own thin row rather than sharing the first
+   section's header: that header is a toggle for Column Selection, and a second
+   button inside it would put "collapse the section" and "collapse the panel"
+   one click apart doing very different things. */
+.blk-catalog-bar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0 6px 4px;
+    flex-shrink: 0;
+}
+
+/* Collapsed: a rail, not nothing. Width is the one thing that changes, so the
+   editor beside it simply gets wider. The whole rail is the button — it keeps
+   `.blk-catalog`'s border and background, and only resets what a <button>
+   brings with it. */
+.blk-catalog--rail {
+    width: 30px;
+    padding: 6px 0;
+    align-items: center;
+    gap: 8px;
+    border-top: none;
+    border-left: none;
+    border-bottom: none;
+    font: inherit;
+    color: var(--text-3);
+    text-align: center;
+    cursor: pointer;
+}
+.blk-catalog--rail:hover {
+    background: var(--bg-1);
+    color: var(--text-1);
+}
+.blk-rail-icon {
+    flex-shrink: 0;
+}
+/* Reads bottom-to-top, the usual direction for a left-hand edge label. */
+.blk-rail-label {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    padding: 2px 0;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    /* min-height 0 so the label yields to the counts rather than pushing them
+       off the bottom of a short panel. */
+    min-height: 0;
+    overflow: hidden;
+}
+.blk-rail-counts {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    margin-top: auto;
+    padding-bottom: 2px;
+    flex-shrink: 0;
+}
+.blk-rail-count {
+    min-width: 18px;
+    padding: 1px 3px;
+    border-radius: 9px;
+    background: var(--bg-2);
+    color: var(--text-2);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+}
 .blk-catalog-db {
     display: flex;
     align-items: center;
@@ -866,4 +936,431 @@
     border-radius: 50%;
     background: currentColor;
     margin-left: 2px;
+}
+
+/* ---- Column picker ---- */
+/* The checkbox sits outside the expand button so clicking one never does the
+   other: ticking a column and opening a table are different intents, and a row
+   that does both depending on where you land is a row you stop trusting. */
+.sqlstudio-tnode-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.sqlstudio-tnode-row .sqlstudio-tnode {
+    flex: 1;
+    min-width: 0;
+}
+.sqlstudio-tick {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    margin: 0 0 0 2px;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+.sqlstudio-tick:disabled {
+    cursor: default;
+    opacity: 0.4;
+}
+/* A table the ER model cannot connect to the query. Dimmed rather than hidden:
+   it is a real dataset, and hiding it would look like the catalog was wrong. */
+.sqlstudio-tnode-wrap--unreachable .sqlstudio-tnode .nm {
+    color: var(--text-3);
+}
+.sqlstudio-agg {
+    margin-left: auto;
+    max-width: 96px;
+    padding: 0 2px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--accent);
+    font: inherit;
+    font-size: 10px;
+    cursor: pointer;
+}
+
+/* ---- Selected columns ---- */
+.blk-selcols {
+    flex-shrink: 0;
+    margin-top: 14px;
+    padding: 12px 8px 4px;
+    border-top: 1px solid var(--border);
+}
+.blk-selcol {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 4px;
+    border-radius: 5px;
+    cursor: grab;
+}
+.blk-selcol:hover {
+    background: var(--bg-2);
+}
+.blk-selcol--dragging {
+    opacity: 0.4;
+}
+/* The line the drop will land on. A top border rather than a highlight: it
+   marks a position between rows, which is what a reorder actually chooses. */
+.blk-selcol--over {
+    box-shadow: inset 0 2px 0 var(--accent);
+}
+.blk-selcol-grip {
+    flex-shrink: 0;
+    color: var(--text-4);
+}
+.blk-selcol-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    color: var(--text-1);
+}
+.blk-selcol-name i {
+    font-style: normal;
+    color: var(--text-4);
+}
+.blk-selcol-agg {
+    font-style: normal;
+    font-size: 9px;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 0 3px;
+    flex-shrink: 0;
+}
+
+/* A join the query is actually using, rather than one on offer. */
+.blk-join--active .blk-join-main b {
+    color: var(--accent);
+}
+.blk-join-dir--active {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+/* ---- Builder toggle, in the pane header ---- */
+.blk-mode {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.blk-mode-toggle {
+    width: 30px;
+    height: 17px;
+    flex-shrink: 0;
+    padding: 2px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--bg-3);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+}
+.blk-mode-toggle--on {
+    background: var(--accent);
+    border-color: var(--accent);
+    justify-content: flex-end;
+}
+.blk-mode-knob {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: var(--bg-0);
+}
+
+.blk-modal-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 10px;
+    background: var(--bg-2);
+    border-radius: 6px;
+}
+.blk-modal-legend span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.blk-modal-remember {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-right: auto;
+    font-size: 11.5px;
+    color: var(--text-3);
+    cursor: pointer;
+}
+
+/* ---- Accordion sections ---- */
+/* Only an OPEN section is a flex container with a scrollable body; a collapsed
+   one is just its header, so three collapsed sections cost three header rows
+   rather than three empty panes. */
+.blk-sec {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-bottom: 1px solid var(--border);
+}
+.blk-sec--grow {
+    flex: 1 1 auto;
+}
+.blk-sec--open {
+    padding-bottom: 6px;
+}
+.blk-sec-head {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    width: 100%;
+    flex-shrink: 0;
+    padding: 8px 10px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    color: var(--text-3);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.blk-sec-head:hover {
+    color: var(--text-1);
+}
+.blk-sec-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.blk-sec-badge {
+    flex-shrink: 0;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--text-4);
+}
+.blk-sec-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+/* The sections own the scrolling now, so the inner lists stop competing for it. */
+.blk-catalog-list,
+.blk-sec .blk-joins {
+    overflow: visible;
+    max-height: none;
+}
+.blk-sec .blk-joins {
+    margin-top: 0;
+    padding: 0 8px 8px;
+    border-top: none;
+}
+.blk-sec .blk-selcols {
+    margin-top: 0;
+    padding: 0 8px 8px;
+    border-top: none;
+}
+
+/* ---- Where clause ---- */
+/* Two lines per row, not three controls across: 260px minus padding gives each
+   about eighty, and a column picker cannot show VendorItemDescription in that.
+   Height is the cheaper thing to spend — the section collapses. */
+.blk-filters {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 8px 8px;
+}
+.blk-filter {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 5px 6px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+.blk-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+}
+.blk-filter select,
+.blk-filter input[type='text'],
+.blk-filter-val {
+    min-width: 0;
+    padding: 3px 5px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 11px;
+    outline: none;
+}
+.blk-filter-col {
+    flex: 1;
+}
+.blk-filter-op {
+    flex: 0 0 92px;
+}
+.blk-filter-val {
+    flex: 1;
+}
+.blk-filter select:focus,
+.blk-filter-val:focus {
+    border-color: var(--accent);
+}
+.blk-filter-add {
+    align-self: flex-start;
+    margin-top: 2px;
+}
+
+/* ---- Filter tree ---- */
+.blk-fgroup {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+/* A nested group is marked by a rule down its left edge rather than a box:
+   nesting can go deep, and boxes inside boxes eat the width the rows need. */
+.blk-fgroup--nested {
+    margin-left: 6px;
+    padding-left: 6px;
+    border-left: 2px solid var(--accent);
+}
+.blk-fgroup-head {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+.blk-conj {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    overflow: hidden;
+}
+.blk-conj button {
+    padding: 2px 8px;
+    background: var(--bg-0);
+    border: none;
+    color: var(--text-3);
+    font: inherit;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+}
+.blk-conj button.on {
+    background: var(--accent);
+    color: #0a0a0a;
+}
+/* A rule that is started but unfinished is skipped in the SQL — marked so that
+   is visible rather than a silent no-op somebody hunts for. */
+.blk-filter--incomplete {
+    border-style: dashed;
+    border-color: var(--accent-warn, #d9880a);
+}
+
+/* ---- Column picker ---- */
+.blk-colpick {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+}
+.blk-colpick input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 3px 5px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 11px;
+    outline: none;
+}
+.blk-colpick input:focus {
+    border-color: var(--accent);
+}
+.blk-colpick-list {
+    position: absolute;
+    z-index: 20;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: 220px;
+    overflow-y: auto;
+    margin: 2px 0 0;
+    padding: 2px;
+    list-style: none;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.blk-colpick-list button {
+    display: block;
+    width: 100%;
+    padding: 4px 6px;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    text-align: left;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.blk-colpick-list button:hover {
+    background: var(--bg-2);
+}
+.blk-colpick-list button i {
+    font-style: normal;
+    color: var(--text-4);
+}
+.blk-colpick-on {
+    color: var(--accent) !important;
+}
+.blk-colpick-none {
+    padding: 5px 6px;
+    font-size: 11px;
+    color: var(--text-4);
+}
+
+/* The list is portalled to the body and positioned in viewport coordinates, so
+   the accordion's scroll container cannot clip it. Fixed, not absolute: the
+   coordinates come from getBoundingClientRect and are recomputed on scroll. */
+.blk-colpick-list {
+    position: fixed;
+    max-height: 220px;
+    overflow-x: hidden;
+}
+
+/* Why a table is in the query, when it is not because you picked a column from
+   it. Small and muted: the answer is usually "column", and a tag on every row
+   would be noise rather than information. */
+.blk-join-why {
+    font-style: normal;
+    font-size: 8.5px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--text-4);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 3px;
+    flex-shrink: 0;
 }

@@ -18,6 +18,9 @@ interface QueryPaneProps {
     // exists inside a node and nowhere else — above the graph it reads as an
     // example query for a table that is not there.
     placeholder?: string;
+    /** Builder mode: the SQL is a projection of the builder state, so editing
+     *  it here would be edits with nowhere to live (plan §3). */
+    readOnly?: boolean;
 }
 
 // One editor + its own results grid. Used full-width for the main query and,
@@ -32,6 +35,7 @@ export default function QueryPane({
     actions,
     className,
     placeholder,
+    readOnly,
 }: QueryPaneProps) {
     const [result, setResult] = useState<SqlRunResult | null>(null);
     const [running, setRunning] = useState(false);
@@ -108,6 +112,7 @@ export default function QueryPane({
                         if (result?.error) setResult(null);
                     }}
                     basicSetup={{ lineNumbers: true, foldGutter: false }}
+                    editable={!readOnly}
                     placeholder={placeholder ?? 'SELECT *, upper(status) AS status FROM input'}
                 />
             </div>
