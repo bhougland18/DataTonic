@@ -2,6 +2,7 @@
 // from the field selection + filter, calls through the backend send path, and
 // parses the `{_fields}` / `_links` response via inforApi.parseGenericResponse.
 
+import type { DataType } from '../../../pipeline-types';
 import { sendRequest } from '../../sendClient';
 import { parseGenericResponse, restBase, type GenericPage, type DataAreaId } from './inforApi';
 import type { IonApiConfig } from './ionapi';
@@ -40,6 +41,13 @@ export interface InforNodeQuery {
     // builder can be re-edited). Absent on legacy nodes.
     filterTree?: FilterGroup;
     limit?: number;
+    // Declared column types for the selected fields, resolved from the Landmark
+    // field specs (see fieldTypes.ts). Absent means "unknown" and the node
+    // falls back to string, which is how every pre-detection node behaved.
+    fieldTypes?: Record<string, DataType>;
+    // strptime formats for date/timestamp columns (Infor dates are YYYYMMDD,
+    // which a plain DATE cast will not parse).
+    fieldFormats?: Record<string, string>;
 }
 
 function genericUrl(

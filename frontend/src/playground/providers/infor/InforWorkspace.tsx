@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Search, ChevronDown, ChevronLeft, ChevronRight, Play, Loader2, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine, Save, Download, Upload, Bookmark, HelpCircle } from 'lucide-react';
+import { Search, ChevronDown, ChevronLeft, ChevronRight, Play, Loader2, Trash2, Boxes, RefreshCw, Plug, Check, ArrowUpToLine, Save, Download, Upload, Bookmark, HelpCircle, Type } from 'lucide-react';
 import InforProvider from '../InforProvider';
 import { maybeStartEditorTour, startEditorTour } from '../../../GuidedTour';
 import type { PlaygroundConnection, credentialsToPayload } from '../../connectionBridge';
@@ -14,6 +14,23 @@ import {
     saveCachedClasses,
 } from './classCache';
 import { runGenericQuery, sampleFields, type InforNodeQuery } from './query';
+import {
+    buildBundle,
+    clearOverride,
+    downloadBundle,
+    importBundle,
+    libraryAvailable,
+    loadLibrary,
+    parseBundle,
+    resolveFieldTypes,
+    setOverride,
+    INFOR_DATE_FORMAT,
+    type FieldTypeEntries,
+    type FieldTypeEntry,
+    type LibraryRow,
+    type ResolvedTypes,
+} from './fieldTypes';
+import { DATA_TYPES, type DataType } from '../../../pipeline-types';
 import FilterBuilder from './FilterBuilder';
 import {
     emptyFilter,
@@ -46,6 +63,16 @@ interface InforWorkspaceProps {
 
 const PAGE_SIZE = 25;
 const DEFAULT_LIMIT = 25;
+
+// Where a column's declared type came from. Worth surfacing: "the field spec
+// says string" and "we could not read the field spec so it defaulted to string"
+// look identical on the node, but only the second is worth investigating.
+function typeProvenance(entry: FieldTypeEntry): string {
+    if (entry.source === 'user') return 'Type you set — saved to this workspace’s library';
+    if (entry.unresolved) return 'Field spec could not be read — defaulted to string';
+    if (entry.source === 'seed') return 'From an imported type library';
+    return 'From the Landmark field spec';
+}
 
 // The full Infor experience in one place: the left panel holds the
 // credentials/connection and the whole query builder (business class → fields
@@ -95,6 +122,20 @@ export default function InforWorkspace({
     const [applied, setApplied] = useState(false);
     // Confirm dialog shown when applying to a node while a limit is active.
     const [limitConfirm, setLimitConfirm] = useState(false);
+    // Resolving field types on Apply is a network round trip the first time a
+    // class's fields are seen, so the button needs a pending state.
+    const [applying, setApplying] = useState(false);
+    // Resolved types for the selected fields, keyed by field name — shown beside
+    // each field so a wrong type is visible at selection, not discovered later
+    // on the node's Schema tab.
+    const [typeEntries, setTypeEntries] = useState<FieldTypeEntries>({});
+    // Which fields have already been asked for, scoped to the current
+    // (tenant, area, class) — keeps the resolve-on-select effect from
+    // re-requesting on every render.
+    const resolvedRef = useRef<{ scope: string; done: Set<string> }>({
+        scope: '',
+        done: new Set(),
+    });
 
     // ---- saved queries (task 1q): per-tenant list, filtered by data area ----
     const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
@@ -102,6 +143,16 @@ export default function InforWorkspace({
     const [savedSearch, setSavedSearch] = useState('');
     const [saveDesc, setSaveDesc] = useState('');
     const importRef = useRef<HTMLInputElement>(null);
+
+    // ---- field-type library (shares the middle panel with saved queries) ----
+    // Tabbed rather than given its own panel: it's the same shape of thing —
+    // a per-tenant library you search — and a third panel would crowd the
+    // results grid for something consulted occasionally.
+    const [savedTab, setSavedTab] = useState<'queries' | 'types'>('queries');
+    const [library, setLibrary] = useState<LibraryRow[]>([]);
+    const [librarySearch, setLibrarySearch] = useState('');
+    const [libraryNote, setLibraryNote] = useState<string | null>(null);
+    const bundleRef = useRef<HTMLInputElement>(null);
 
     const applyFetched = async (config: IonApiConfig, classes: BusinessClass[]) => {
         setAllClasses(classes);
@@ -252,9 +303,93 @@ export default function InforWorkspace({
         setApplied(false);
     }, [checked, filterTree, limit, selected]);
 
-    const performApply = (useLimit: boolean) => {
+    // Types belong to a (tenant, area, class), so a different class starts over.
+    useEffect(() => {
+        setTypeEntries({});
+        resolvedRef.current = { scope: '', done: new Set() };
+    }, [selected, dataArea]);
+
+    // Resolve types as fields are CHECKED, not only on Apply.
+    //
+    // Resolving only at Apply meant the picker showed no types until after the
+    // user had already applied once — so the thing they are meant to be checking
+    // was invisible at the moment of choosing. Resolving on selection also makes
+    // Apply instant, because the library is warm by the time it runs.
+    //
+    // `resolvedRef` tracks what has been asked for so this can't re-request on
+    // every render: typeEntries deliberately stays out of the dep array, since
+    // writing to it is what this effect does.
+    useEffect(() => {
+        if (!session || !selected) return;
+        const scope = `${session.config.tenant}/${dataArea}/${selected.entity}`;
+        if (resolvedRef.current.scope !== scope) {
+            resolvedRef.current = { scope, done: new Set() };
+        }
+        const missing = Array.from(checked).filter((f) => !resolvedRef.current.done.has(f));
+        if (!missing.length) return;
+
+        let cancelled = false;
+        // Debounced: "select all" or fast clicking shouldn't fan out a request
+        // per keystroke, and the batch resolves in one pass anyway.
+        const timer = setTimeout(() => {
+            for (const f of missing) resolvedRef.current.done.add(f);
+            void (async () => {
+                try {
+                    const res = await resolveFieldTypes(
+                        session.config,
+                        session.token.accessToken,
+                        selected.entity,
+                        missing,
+                        workspacePath,
+                        dataArea,
+                    );
+                    if (!cancelled) setTypeEntries((prev) => ({ ...prev, ...res.entries }));
+                } catch {
+                    // Un-mark so a later selection retries rather than leaving
+                    // these fields permanently blank.
+                    for (const f of missing) resolvedRef.current.done.delete(f);
+                }
+            })();
+        }, 250);
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [checked, selected, session, dataArea, workspacePath]);
+
+    const performApply = async (useLimit: boolean) => {
         if (!onApplyToNode || !applyNodeId || !selected) return;
         const activeFields = fields.length ? fields.filter((f) => checked.has(f)) : Array.from(checked);
+
+        // Resolve declared column types before writing the node. Done here
+        // rather than in App.tsx's apply handler because this component already
+        // holds the session and workspace path — threading those into App.tsx
+        // would mean editing a shared upstream file for no gain.
+        //
+        // Only the SELECTED fields are looked up, and the library makes every
+        // later Apply free. A failure degrades to string (the pre-detection
+        // behaviour), so a flaky lookup never blocks applying a query.
+        let resolved: ResolvedTypes | null = null;
+        if (session && activeFields.length) {
+            setApplying(true);
+            try {
+                resolved = await resolveFieldTypes(
+                    session.config,
+                    session.token.accessToken,
+                    selected.entity,
+                    activeFields,
+                    workspacePath,
+                    dataArea,
+                );
+                setTypeEntries(resolved.entries);
+            } catch {
+                resolved = null;
+            } finally {
+                setApplying(false);
+            }
+        }
+
         onApplyToNode(applyNodeId, {
             dataArea,
             businessClass: selected.entity,
@@ -264,9 +399,124 @@ export default function InforWorkspace({
             lplFilter: filterToLpl(filterTree),
             filterTree: isEmptyFilter(filterTree) ? undefined : filterTree,
             limit: useLimit ? limit : undefined,
+            fieldTypes: resolved?.types,
+            fieldFormats: resolved?.formats,
         });
         setApplied(true);
         setLimitConfirm(false);
+    };
+
+    // Correct a detected type. Writes to the durable override file, so it wins
+    // over the API for every node in this workspace from now on — unlike an edit
+    // on the node's Schema tab, which is local to that node and is rebuilt on
+    // the next Apply. Updated optimistically so the select responds instantly.
+    const changeFieldType = async (field: string, type: DataType) => {
+        if (!selected) return;
+        const entry: FieldTypeEntry = { type, source: 'user' };
+        if (type === 'date' || type === 'timestamp') entry.format = INFOR_DATE_FORMAT;
+        setTypeEntries((prev) => ({ ...prev, [field]: entry }));
+        setApplied(false);
+        if (session && workspacePath && libraryAvailable()) {
+            try {
+                await setOverride(
+                    workspacePath,
+                    session.config.tenant,
+                    dataArea,
+                    selected.entity,
+                    field,
+                    type,
+                );
+            } catch {
+                /* the in-memory correction still applies to this Apply */
+            }
+        }
+    };
+
+    // ---- field-type library: load, curate, bulk import/export ----
+
+    const refreshLibrary = async () => {
+        if (!session || !workspacePath || !libraryAvailable()) return;
+        setLibrary(await loadLibrary(workspacePath, session.config.tenant, dataArea));
+    };
+
+    // Load when the tab is opened (and after a data-area switch), not on mount:
+    // the file read is pointless until someone looks.
+    useEffect(() => {
+        if (savedTab !== 'types') return;
+        void refreshLibrary();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [savedTab, session, workspacePath, dataArea]);
+
+    const filteredLibrary = useMemo(() => {
+        const q = librarySearch.trim().toLowerCase();
+        if (!q) return library;
+        // Search across both halves so "item" finds the class and
+        // "uomconversion" finds the field, without needing to know which.
+        return library.filter(
+            (r) =>
+                r.businessClass.toLowerCase().includes(q) || r.field.toLowerCase().includes(q),
+        );
+    }, [library, librarySearch]);
+
+    const curateLibraryType = async (row: LibraryRow, type: DataType) => {
+        if (!session || !workspacePath || !libraryAvailable()) return;
+        await setOverride(
+            workspacePath,
+            session.config.tenant,
+            dataArea,
+            row.businessClass,
+            row.field,
+            type,
+        );
+        // Keep the picker in step when it's showing the same class.
+        if (selected?.entity === row.businessClass) {
+            setTypeEntries((prev) => ({ ...prev, [row.field]: { type, source: 'user' } }));
+        }
+        await refreshLibrary();
+    };
+
+    const revertLibraryType = async (row: LibraryRow) => {
+        if (!session || !workspacePath || !libraryAvailable()) return;
+        await clearOverride(
+            workspacePath,
+            session.config.tenant,
+            dataArea,
+            row.businessClass,
+            row.field,
+        );
+        await refreshLibrary();
+    };
+
+    const handleExportLibrary = async () => {
+        if (!session || !workspacePath || !libraryAvailable()) return;
+        const bundle = await buildBundle(workspacePath, session.config.tenant, dataArea);
+        if (!bundle.count) {
+            setLibraryNote('Nothing to export yet — select some fields first.');
+            return;
+        }
+        downloadBundle(bundle);
+        setLibraryNote(`Exported ${bundle.count} field type(s).`);
+    };
+
+    const handleImportLibrary = async (file: File | null) => {
+        if (!file || !session || !workspacePath || !libraryAvailable()) return;
+        const bundle = parseBundle(await file.text());
+        if (!bundle) {
+            setLibraryNote('Not a field-type library file.');
+            return;
+        }
+        const r = await importBundle(workspacePath, session.config.tenant, dataArea, bundle);
+        if (r.areaMismatch) {
+            setLibraryNote(
+                `That library is for ${r.areaMismatch.bundle}, not ${r.areaMismatch.local}. Nothing imported.`,
+            );
+            return;
+        }
+        const bits = [`${r.added} added`, `${r.skipped} already known`];
+        if (r.conflicts) bits.push(`${r.conflicts} kept your own`);
+        if (r.tenantMismatch) bits.push(`from tenant ${r.tenantMismatch.bundle}`);
+        setLibraryNote(bits.join(' · '));
+        await refreshLibrary();
     };
 
     // A limit is handy for previewing here, but a pipeline node usually wants
@@ -274,7 +524,7 @@ export default function InforWorkspace({
     const requestApply = () => {
         if (!onApplyToNode || !applyNodeId || !selected) return;
         if (limitEnabled) setLimitConfirm(true);
-        else performApply(false);
+        else void performApply(false);
     };
 
     // Load this tenant's saved queries once signed in.
@@ -659,16 +909,53 @@ export default function InforWorkspace({
                                                 </div>
                                             )}
                                             <div className="pgi-fieldbox">
-                                                {visibleFields.map((f) => (
-                                                    <label key={f} className="pgi-fl">
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={checked.has(f)}
-                                                            onChange={() => toggleField(f)}
-                                                        />
-                                                        <span>{f}</span>
-                                                    </label>
-                                                ))}
+                                                {visibleFields.map((f) => {
+                                                    const isChecked = checked.has(f);
+                                                    const entry = typeEntries[f];
+                                                    return (
+                                                        <div key={f} className="pgi-fl">
+                                                            <label className="pgi-fl-pick">
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={isChecked}
+                                                                    onChange={() => toggleField(f)}
+                                                                />
+                                                                <span>{f}</span>
+                                                            </label>
+                                                            {/* The resolved type, correctable in place. Shown
+                                                                here rather than on the node's Schema tab so a
+                                                                wrong type is caught at selection — and a change
+                                                                saves to the library, applying everywhere. */}
+                                                            {isChecked && entry && (
+                                                                <select
+                                                                    className={`pgi-fl-type${
+                                                                        entry.source === 'user'
+                                                                            ? ' pgi-fl-type--user'
+                                                                            : ''
+                                                                    }${
+                                                                        entry.unresolved
+                                                                            ? ' pgi-fl-type--unresolved'
+                                                                            : ''
+                                                                    }`}
+                                                                    value={entry.type}
+                                                                    title={typeProvenance(entry)}
+                                                                    onChange={(e) =>
+                                                                        void changeFieldType(
+                                                                            f,
+                                                                            e.target.value as DataType,
+                                                                        )
+                                                                    }
+                                                                >
+                                                                    {DATA_TYPES.map((t) => (
+                                                                        <option key={t} value={t}>
+                                                                            {t}
+                                                                        </option>
+                                                                    ))}
+                                                                </select>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
                                                 {fields.length === 0 && (
                                                     <div className="pg-note">
                                                         No sample fields — the class may have no rows.
@@ -746,10 +1033,15 @@ export default function InforWorkspace({
                                             type="button"
                                             className={`pg-btn${applied ? '' : ' pg-btn--primary'}`}
                                             onClick={requestApply}
-                                            disabled={!selected || checked.size === 0}
+                                            disabled={!selected || checked.size === 0 || applying}
                                             title="Write this query back to the Infor node on the canvas"
                                         >
-                                            {applied ? (
+                                            {applying ? (
+                                                <>
+                                                    <Loader2 size={14} strokeWidth={2} className="pg-spin" />{' '}
+                                                    Resolving types…
+                                                </>
+                                            ) : applied ? (
                                                 <>
                                                     <Check size={14} strokeWidth={2} /> Applied to node
                                                 </>
@@ -791,9 +1083,26 @@ export default function InforWorkspace({
                 (savedOpen ? (
                     <div className="pgi-saved">
                         <div className="pgi-saved-head">
-                            <span className="pgi-saved-title">
-                                <Bookmark size={13} strokeWidth={2} /> Saved queries
+                            <span className="pgi-ptabs">
+                                <button
+                                    type="button"
+                                    className={`pgi-ptab${savedTab === 'queries' ? ' pgi-ptab--on' : ''}`}
+                                    onClick={() => setSavedTab('queries')}
+                                >
+                                    <Bookmark size={13} strokeWidth={2} /> Queries
+                                </button>
+                                <button
+                                    type="button"
+                                    className={`pgi-ptab${savedTab === 'types' ? ' pgi-ptab--on' : ''}`}
+                                    onClick={() => setSavedTab('types')}
+                                    title="Field types learned from the Landmark field specs"
+                                >
+                                    <Type size={13} strokeWidth={2} /> Field types
+                                </button>
                             </span>
+                            {/* Collapse only. Import/export sit at the bottom: three
+                                icons up here squeezed the tab row until "Field types"
+                                truncated. */}
                             <button
                                 type="button"
                                 className="pg-icon-btn"
@@ -803,6 +1112,106 @@ export default function InforWorkspace({
                                 <ChevronLeft size={14} />
                             </button>
                         </div>
+                        {savedTab === 'types' ? (
+                            <>
+                                <div className="pgi-search">
+                                    <Search size={13} strokeWidth={2} />
+                                    <input
+                                        placeholder="Search by business class or field…"
+                                        value={librarySearch}
+                                        onChange={(e) => setLibrarySearch(e.target.value)}
+                                    />
+                                </div>
+                                <div className="pgi-saved-list">
+                                    {library.length === 0 ? (
+                                        <div className="pg-note">
+                                            Nothing learned yet. Types resolve as you select fields —
+                                            they land here so no field is looked up twice.
+                                        </div>
+                                    ) : filteredLibrary.length === 0 ? (
+                                        <div className="pg-note">
+                                            No field matches “{librarySearch}”.
+                                        </div>
+                                    ) : (
+                                        filteredLibrary.map((row) => (
+                                            <div key={row.key} className="pgi-ftl">
+                                                <span className="pgi-ftl-name">
+                                                    <span className="pgi-ftl-bc">
+                                                        {row.businessClass}
+                                                    </span>
+                                                    <span className="pgi-ftl-f">{row.field}</span>
+                                                </span>
+                                                <select
+                                                    className={`pgi-fl-type${
+                                                        row.entry.source === 'user'
+                                                            ? ' pgi-fl-type--user'
+                                                            : ''
+                                                    }`}
+                                                    value={row.entry.type}
+                                                    title={typeProvenance(row.entry)}
+                                                    onChange={(e) =>
+                                                        void curateLibraryType(
+                                                            row,
+                                                            e.target.value as DataType,
+                                                        )
+                                                    }
+                                                >
+                                                    {DATA_TYPES.map((t) => (
+                                                        <option key={t} value={t}>
+                                                            {t}
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                                {row.entry.source === 'user' ? (
+                                                    <button
+                                                        type="button"
+                                                        className="pg-icon-btn"
+                                                        onClick={() => void revertLibraryType(row)}
+                                                        title="Forget your override and use the detected type again"
+                                                    >
+                                                        <Trash2 size={12} />
+                                                    </button>
+                                                ) : (
+                                                    <span className="pgi-ftl-spacer" />
+                                                )}
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                                {libraryNote && <div className="pg-note">{libraryNote}</div>}
+                                {/* Whole-library only — a single field's type isn't
+                                    worth moving around, and the value here is the bulk. */}
+                                <div className="pgi-ftl-actions">
+                                    <button
+                                        type="button"
+                                        className="pg-btn"
+                                        onClick={() => void handleExportLibrary()}
+                                        title="Export every field type known for this tenant and data area"
+                                    >
+                                        <Download size={13} strokeWidth={1.75} /> Export all
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="pg-btn"
+                                        onClick={() => bundleRef.current?.click()}
+                                        title="Import a field-type library — fills gaps, never overwrites your own corrections"
+                                    >
+                                        <Upload size={13} strokeWidth={1.75} /> Import all…
+                                    </button>
+                                </div>
+                                <input
+                                    ref={bundleRef}
+                                    type="file"
+                                    accept="application/json,.json"
+                                    hidden
+                                    onChange={(e) => {
+                                        void handleImportLibrary(e.target.files?.[0] ?? null);
+                                        e.target.value = '';
+                                    }}
+                                />
+                            </>
+                        ) : (
+                        <>
                         <div className="pgi-search">
                             <Search size={13} strokeWidth={2} />
                             <input
@@ -874,6 +1283,8 @@ export default function InforWorkspace({
                                 e.target.value = '';
                             }}
                         />
+                        </>
+                        )}
                     </div>
                 ) : (
                     <button
@@ -972,14 +1383,14 @@ export default function InforWorkspace({
                                 <button
                                     type="button"
                                     className="pg-btn"
-                                    onClick={() => performApply(false)}
+                                    onClick={() => void performApply(false)}
                                 >
                                     Apply without limit
                                 </button>
                                 <button
                                     type="button"
                                     className="pg-btn pg-btn--primary"
-                                    onClick={() => performApply(true)}
+                                    onClick={() => void performApply(true)}
                                 >
                                     Keep limit ({limit})
                                 </button>

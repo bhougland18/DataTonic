@@ -1407,16 +1407,22 @@ export default function App() {
                     else delete nextProps.inforFilter;
                     const patch: Partial<DuckleNodeData> = { properties: nextProps };
                     // Declare the schema from the selected fields so the node has
-                    // one without a live probe (types default to string; editable
-                    // on the node's Schema tab).
+                    // one without a live probe. Types come from the Landmark field
+                    // specs resolved in the Playground (fieldTypes.ts); `string` is
+                    // the fallback when a spec could not be read, which is how every
+                    // pre-detection node behaved. Still editable on the Schema tab.
                     const cols = (q.fields ?? '')
                         .split(',')
                         .map(s => s.trim())
                         .filter(Boolean);
                     if (cols.length) {
-                        patch.schema = cols.map(
-                            (name): Column => ({ name, type: 'string', nullable: true }),
-                        );
+                        patch.schema = cols.map((name): Column => {
+                            const type = q.fieldTypes?.[name] ?? 'string';
+                            const format = q.fieldFormats?.[name];
+                            return format
+                                ? { name, type, nullable: true, format }
+                                : { name, type, nullable: true };
+                        });
                     }
                     // Default the SQL name to the business class when the user
                     // hasn't set their own alias.

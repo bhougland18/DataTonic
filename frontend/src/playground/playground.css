@@ -974,6 +974,15 @@
 .pgi-fl { display:flex; align-items:center; gap:7px; padding:4px 6px; border-radius:4px; font-size:12px; color:var(--text-2); font-family:var(--font-mono, ui-monospace, monospace); }
 .pgi-fl:hover { background:var(--bg-2); }
 .pgi-fl input { accent-color:var(--accent); }
+/* Field row: the checkbox+name take the space, the detected type sits right. */
+.pgi-fl-pick { display:flex; align-items:center; gap:7px; flex:1; min-width:0; cursor:pointer; }
+.pgi-fl-pick span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pgi-fl-type { flex:none; max-width:96px; font-family:inherit; font-size:11px; color:var(--text-3); background:var(--bg-1); border:1px solid var(--border); border-radius:3px; padding:1px 3px; cursor:pointer; }
+.pgi-fl-type:hover { color:var(--text-1); border-color:var(--accent-soft); }
+/* A type the user set, not one the API reported — worth telling apart. */
+.pgi-fl-type--user { color:var(--accent); border-color:var(--accent-soft); }
+/* Defaulted to string because the field spec couldn't be read. */
+.pgi-fl-type--unresolved { opacity:.55; font-style:italic; }
 .pgi-foot { font-size:11.5px; color:var(--text-3); }
 
 .pgi-filters { display:flex; flex-direction:column; gap:7px; }
@@ -1042,6 +1051,36 @@
 .pgi-saved-cols { font-size:10px; text-transform:uppercase; letter-spacing:.03em; color:var(--text-3); }
 .pgi-saved-actions { display:flex; flex-direction:column; justify-content:center; gap:2px; padding-right:4px; }
 .pgi-saved-import { justify-content:center; }
+
+/* Middle panel tabs: saved queries / field-type library.
+   Flat underline rather than filled pills — the pill version read as two
+   buttons competing with the real buttons below it. Sentence case, not the
+   panel's old uppercase + letter-spacing, which wrapped "Field types" onto two
+   lines in the available width. Matches the Saved-queries panel header. */
+/* NOTE the `pgi-ptab` prefix: `pgi-tabs`/`pgi-tab` are already taken by
+   InforUploadWorkspace's tablist further down this file. Reusing those names
+   silently lost the active state — at equal specificity the later `.pgi-tab`
+   rule won, and its `border:0; color:var(--text-2)` erased both the underline
+   and the accent. Distinct names, not !important. */
+.pgi-ptabs { display:flex; align-items:center; gap:16px; min-width:0; }
+.pgi-ptab { display:flex; align-items:center; gap:5px; padding:3px 0; border:none; background:none; cursor:pointer; font-size:12px; font-weight:500; color:var(--text-3); white-space:nowrap; }
+.pgi-ptab:hover { color:var(--text-1); }
+/* Active: accent text + heavier weight + an underline drawn as an INSET SHADOW
+   rather than a border. A border adds height to only the tab box, which pushed
+   the tab text up relative to the centred collapse button; a shadow costs no
+   layout, so the header stays aligned. */
+.pgi-ptab--on { color:var(--accent); font-weight:650; box-shadow:inset 0 -2px 0 var(--accent); }
+
+/* Field-type library rows: class + field on the left, the type select right. */
+.pgi-ftl { display:flex; align-items:center; gap:6px; padding:3px 4px 3px 6px; border-radius:4px; }
+.pgi-ftl:hover { background:var(--bg-2); }
+.pgi-ftl-name { display:flex; flex-direction:column; flex:1; min-width:0; line-height:1.25; }
+.pgi-ftl-bc { font-size:10.5px; color:var(--text-3); text-transform:uppercase; letter-spacing:.03em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pgi-ftl-f { font-size:12px; color:var(--text-1); font-family:var(--font-mono, ui-monospace, monospace); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* Keeps the select column aligned on rows with no revert button. */
+.pgi-ftl-spacer { display:inline-block; width:22px; flex:none; }
+.pgi-ftl-actions { display:flex; gap:6px; }
+.pgi-ftl-actions .pg-btn { flex:1; justify-content:center; }
 .pgi-saved-rail { flex-shrink:0; width:30px; display:flex; flex-direction:column; align-items:center; gap:8px; padding-top:14px; border-right:1px solid var(--border); background:var(--bg-1); color:var(--text-3); cursor:pointer; }
 .pgi-saved-rail:hover { color:var(--text-1); background:var(--bg-2); }
 

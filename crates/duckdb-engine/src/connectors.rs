@@ -16745,7 +16745,22 @@ impl DuckdbEngine {
             }
         }
 
-        writer.finalize_into_table(&self.bin, db, &spec.node_id)?;
+        // Infor only: honor the node's declared column types. Landmark's
+        // `_generic` list returns every cell as a JSON string, so the default
+        // read_json_auto path types the whole table VARCHAR no matter what the
+        // node declares - numbers can't be summed and dates can't be sorted.
+        //
+        // Gated on `infor_generic` rather than "any REST source with a declared
+        // schema": this is the generic `run_rest_source`, so switching every
+        // REST source to a typed finalize would change behaviour for Salesforce,
+        // DHIS2 and the rest, where a declared schema is currently advisory.
+        match &spec.declared_schema {
+            Some(schema) if spec.infor_generic && !schema.is_empty() => {
+                let (columns_spec, select_list) = infor_declared_columns(schema);
+                writer.finalize_typed(&self.bin, db, &spec.node_id, &columns_spec, &select_list)?;
+            }
+            _ => writer.finalize_into_table(&self.bin, db, &spec.node_id)?,
+        }
         // The reject relation is built even when empty, so a downstream node
         // wired to it binds on a clean run instead of failing on a missing
         // table - the same reason the main output is typed when empty.
@@ -20058,6 +20073,79 @@ mod ftp_tests {
 }
 
 #[cfg(test)]
+mod infor_declared_columns_tests {
+    use super::infor_declared_columns;
+    use duckle_metadata::{Column, DataType};
+
+    fn col(name: &str, data_type: DataType, format: Option<&str>) -> Column {
+        Column {
+            name: name.into(),
+            data_type,
+            nullable: true,
+            primary_key: None,
+            format: format.map(str::to_string),
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reads_every_column_as_varchar_then_casts_to_the_declared_type() {
+        let (columns_spec, select_list) = infor_declared_columns(&[
+            col("Item", DataType::String, None),
+            col("UOMConversion", DataType::Float64, None),
+        ]);
+        // Landmark hands back JSON strings, so the READ is always VARCHAR ...
+        assert_eq!(columns_spec, "'Item': 'VARCHAR', 'UOMConversion': 'VARCHAR'");
+        // ... and the declared type is applied in the projection.
+        assert!(select_list.contains(r#"TRY_CAST(NULLIF("Item", '') AS VARCHAR) AS "Item""#));
+        assert!(select_list.contains(
+            r#"TRY_CAST(NULLIF("UOMConversion", '') AS DOUBLE) AS "UOMConversion""#
+        ));
+    }
+
+    #[test]
+    fn a_format_parses_with_strptime_instead_of_a_bare_cast() {
+        // The whole point of the format: TRY_CAST('20260826' AS DATE) is NULL,
+        // so without strptime every Infor date column would silently empty.
+        let (_, select_list) = infor_declared_columns(&[col(
+            "ExpirationDate",
+            DataType::Date,
+            Some("%Y%m%d"),
+        )]);
+        assert!(
+            select_list.contains(
+                r#"TRY_CAST(try_strptime(NULLIF("ExpirationDate", ''), '%Y%m%d') AS DATE) AS "ExpirationDate""#
+            ),
+            "got: {select_list}"
+        );
+    }
+
+    #[test]
+    fn a_date_without_a_format_still_gets_a_plain_cast() {
+        // Not every date source is YYYYMMDD; an ISO value casts natively.
+        let (_, select_list) = infor_declared_columns(&[col("AddedDate", DataType::Date, None)]);
+        assert!(select_list.contains(r#"TRY_CAST(NULLIF("AddedDate", '') AS DATE) AS "AddedDate""#));
+        assert!(!select_list.contains("strptime"));
+    }
+
+    #[test]
+    fn an_empty_format_is_treated_as_absent() {
+        let (_, select_list) = infor_declared_columns(&[col("AddedDate", DataType::Date, Some(""))]);
+        assert!(!select_list.contains("strptime"), "got: {select_list}");
+    }
+
+    #[test]
+    fn column_names_are_quoted_and_escaped() {
+        // Landmark group fields carry dots (ContextManufacturer.ManufacturerCode),
+        // which must be quoted or the projection parses as a struct access.
+        let (columns_spec, select_list) =
+            infor_declared_columns(&[col("Manufacturer.Code", DataType::String, None)]);
+        assert!(columns_spec.contains("'Manufacturer.Code': 'VARCHAR'"));
+        assert!(select_list.contains(r#"AS "Manufacturer.Code""#));
+    }
+}
+
+#[cfg(test)]
 mod infor_generic_tests {
     use super::infor_unwrap_generic;
     use serde_json::json;
@@ -21110,6 +21198,41 @@ fn xml_declared_columns(schema: &[duckle_metadata::Column]) -> (String, String) 
         columns_spec_parts.push(format!("'{}': 'VARCHAR'", col.name.replace('\'', "''")));
         let ty = plan::data_type_to_duckdb_sql(&col.data_type);
         select_parts.push(format!("TRY_CAST(NULLIF({i}, '') AS {ty}) AS {i}", i = ident, ty = ty));
+    }
+    (columns_spec_parts.join(", "), select_parts.join(", "))
+}
+
+/// Build the `columns={...}` body and typed SELECT list for src.infor's declared
+/// schema. Landmark's `_generic` list returns EVERY cell as a JSON string - even
+/// numbers and dates - so read_json_auto types the whole table VARCHAR and
+/// downstream nodes can't do arithmetic, date math or typed joins. Read every
+/// column as VARCHAR and cast it to the type the node declares (resolved from the
+/// Landmark field specs; see frontend fieldTypes.ts).
+///
+/// Same shape as `xml_declared_columns` with one addition: a column carrying an
+/// explicit `format` (Column.format, #10) is parsed with `try_strptime` rather
+/// than a bare cast. Infor dates are `YYYYMMDD` with no separators, which
+/// `TRY_CAST(... AS DATE)` cannot parse - it would silently NULL every date.
+///
+/// TRY_CAST / try_strptime throughout, deliberately: one malformed cell in a
+/// 2M-row extract yields NULL for that cell instead of aborting the run.
+fn infor_declared_columns(schema: &[duckle_metadata::Column]) -> (String, String) {
+    let mut columns_spec_parts: Vec<String> = Vec::with_capacity(schema.len());
+    let mut select_parts: Vec<String> = Vec::with_capacity(schema.len());
+    for col in schema {
+        let ident = plan::quote_ident(&col.name);
+        columns_spec_parts.push(format!("'{}': 'VARCHAR'", col.name.replace('\'', "''")));
+        let ty = plan::data_type_to_duckdb_sql(&col.data_type);
+        let expr = match col.format.as_deref().filter(|f| !f.is_empty()) {
+            Some(fmt) => format!(
+                "TRY_CAST(try_strptime(NULLIF({i}, ''), '{f}') AS {ty}) AS {i}",
+                i = ident,
+                f = sql_escape(fmt),
+                ty = ty
+            ),
+            None => format!("TRY_CAST(NULLIF({i}, '') AS {ty}) AS {i}", i = ident, ty = ty),
+        };
+        select_parts.push(expr);
     }
     (columns_spec_parts.join(", "), select_parts.join(", "))
 }

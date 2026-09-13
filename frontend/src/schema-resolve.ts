@@ -176,6 +176,30 @@ function computeNodeSchema(
 
     const upstream = () => mergedUpstream(node.id, nodes, edges, visiting);
 
+    // SQL nodes: prefer DuckDB's own answer over the persisted snapshot.
+    //
+    // Arbitrary SQL can rename, cast or aggregate anything, so a SQL node's
+    // output cannot be derived by propagation - hence `schemaSource: 'declared'`
+    // and a stored schema. But `deriveSchemaFromEngine` DOES analyse authored
+    // SQL, and PropertiesPanel asks it for every selected node (#226). That
+    // answer was being computed and then thrown away here, because the only
+    // read of the `derived` cache sits in the `xf.*` branch below. The result:
+    // the Schema tab kept showing a snapshot taken BEFORE upstream types
+    // changed - e.g. an Infor column that is now float64 still reading `string`
+    // long after the run materialized a DOUBLE.
+    //
+    // `derivedKey` includes the upstream columns, so when an upstream type
+    // changes the key changes and the engine is re-asked: the tab tracks
+    // reality instead of freezing at first authoring. The stored schema stays
+    // as the fallback for a node that has never been analysed (no engine yet,
+    // or an unfinished configuration).
+    if (id === 'code.sql' || id === 'code.sqltemplate' || id === 'code.sqlstudio') {
+        const up = upstream();
+        const known = derived.get(derivedKey(node.id, id, props, up));
+        if (known && known.length > 0) return known;
+        return node.data.schema ?? up;
+    }
+
     // Declared / autodetect - node owns its schema explicitly.
     if (manifest?.schemaSource === 'declared') {
         return node.data.schema ?? upstream();
