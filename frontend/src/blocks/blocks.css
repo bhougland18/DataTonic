@@ -1107,8 +1107,14 @@
     min-height: 0;
     border-bottom: 1px solid var(--border);
 }
-.blk-sec--grow {
-    flex: 1 1 auto;
+/* `0 1 auto`, NOT `1 1 auto`. Growing to fill the panel pushed Joins and Where
+   to the very bottom, so a five-table catalog left a screen of blank between
+   the last table and the next step — which reads as the end of the panel
+   rather than as space. Sections now sit at their content height, one under
+   the next, and this one is the one that shrinks (and scrolls, via
+   `.blk-sec-body`) once they stop fitting. */
+.blk-sec--shrink {
+    flex: 0 1 auto;
 }
 .blk-sec--open {
     padding-bottom: 6px;

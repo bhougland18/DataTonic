@@ -1246,7 +1246,7 @@ export default function BlocksStudio({
                                     that leaving would lose — the same condition
                                     the dialog asks about, said quietly first. */}
                                 <button
-                                    className="erd-btn erd-btn--primary blk-qmeta-save"
+                                    className="erd-btn erd-btn--accent blk-qmeta-save"
                                     onClick={saveQuery}
                                     disabled={!editorSql.trim() || !queryTitle.trim()}
                                     title={

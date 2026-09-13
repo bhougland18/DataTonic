@@ -222,13 +222,19 @@
     border-color: color-mix(in srgb, var(--accent) 40%, transparent);
     background: var(--accent-soft);
 }
+/* The app's primary button, not a local approximation of one. `--btn-primary-bg`
+   is the same colour as `--accent` in both themes, but the FOREGROUND differed:
+   this hardcoded `#0a0a0a`, while light mode deepens the fill specifically so a
+   WHITE label stays readable (see the token comment in styles.css). Black text
+   on light-mode orange was the outlier, and the reason Run did not match the
+   pipeline toolbar's Run. */
 .sqlstudio-btn--primary {
-    background: var(--accent);
-    color: #0a0a0a;
+    background: var(--btn-primary-bg);
+    color: var(--btn-primary-fg);
     border-color: transparent;
 }
 .sqlstudio-btn--primary:hover:not(:disabled) {
-    background: var(--accent-strong, var(--accent));
+    background: var(--btn-primary-bg-strong);
 }
 .sqlstudio-spin {
     animation: sqlstudio-rot 0.8s linear infinite;

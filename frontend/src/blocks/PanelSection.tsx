@@ -18,8 +18,16 @@ export interface PanelSectionProps {
     badge?: ReactNode;
     /** Where the collapsed state is remembered. */
     storageKey: string;
-    /** Take the leftover height, rather than only what the content needs. */
-    grow?: boolean;
+    /**
+     * The section that gives up height when the panel runs out of it.
+     *
+     * Not "take the leftover space" — that is what this used to do, and with a
+     * short table list it left a screen of nothing between the last table and
+     * the next section's header, which read as the end of the panel. The
+     * sections now stack from the top at their natural height; this one is
+     * simply the one that shrinks and scrolls when they no longer fit.
+     */
+    shrink?: boolean;
     defaultOpen?: boolean;
     children: ReactNode;
 }
@@ -53,7 +61,7 @@ export default function PanelSection({
     title,
     badge,
     storageKey,
-    grow,
+    shrink,
     defaultOpen = true,
     children,
 }: PanelSectionProps) {
@@ -69,7 +77,7 @@ export default function PanelSection({
     return (
         <section
             className={`blk-sec${open ? ' blk-sec--open' : ''}${
-                open && grow ? ' blk-sec--grow' : ''
+                open && shrink ? ' blk-sec--shrink' : ''
             }`}
         >
             <button

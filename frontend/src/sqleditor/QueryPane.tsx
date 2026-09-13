@@ -85,9 +85,14 @@ export default function QueryPane({
                 <span className="sqlstudio-pane-label">{label}</span>
                 <span className="sqlstudio-spacer" />
                 {actions}
+                {/* Primary, like the pipeline toolbar's Run. It is the action
+                    this pane exists for, and it was reading as one more grey
+                    button among the pane's controls. Solid triangle for the
+                    same reason the toolbar uses one — an outlined play glyph
+                    goes muddy at 14px on a filled background. */}
                 <button
                     type="button"
-                    className="sqlstudio-btn"
+                    className="sqlstudio-btn sqlstudio-btn--primary"
                     onClick={doRun}
                     disabled={running}
                     title="Run this query (⌘/Ctrl+Enter)"
@@ -95,7 +100,7 @@ export default function QueryPane({
                     {running ? (
                         <Loader2 size={14} className="sqlstudio-spin" strokeWidth={2} />
                     ) : (
-                        <Play size={14} strokeWidth={2} />
+                        <Play size={13} fill="currentColor" strokeWidth={2} />
                     )}
                     Run
                 </button>

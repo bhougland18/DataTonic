@@ -371,10 +371,29 @@
 .erd-btn:hover {
     background: var(--bg-4);
 }
+/* Same correction as `.sqlstudio-btn--primary`: the app's primary tokens, whose
+   foreground is white in light mode where a hardcoded near-black was not
+   readable on the deepened orange fill. */
 .erd-btn--primary {
-    background: var(--accent);
-    color: #0a0a0a;
+    background: var(--btn-primary-bg);
+    color: var(--btn-primary-fg);
     border-color: transparent;
+}
+.erd-btn--primary:hover {
+    background: var(--btn-primary-bg-strong);
+}
+/* Grey fill, accent label — an action that matters without competing with the
+   primary one beside it. Save is deliberately quieter than Run: running a query
+   is the loop you are in, saving is the thing you do once at the end of it. */
+.erd-btn--accent {
+    color: var(--accent);
+}
+.erd-btn--accent:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+.erd-btn--accent:disabled:hover {
+    background: var(--bg-3);
 }
 /* A toggle that is currently on (the library panel), as distinct from a
    primary action. Marked, not filled: it opens a panel rather than committing

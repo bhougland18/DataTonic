@@ -215,7 +215,7 @@ export default function SqlCatalogPanel({
                 badge={`${tables.length} readable${
                     unreachable.length > 0 ? ` Â· ${unreachable.length} not` : ''
                 }`}
-                grow
+                shrink
             >
             {/* Above the database, because it searches everything below it â€”
                 both the database's tables and the loose files. Sitting under
