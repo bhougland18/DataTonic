@@ -21,6 +21,18 @@ const NUMERIC_TYPES =
     /\b(tinyint|smallint|integer|bigint|hugeint|int\d*|decimal|numeric|double|float|real)\b/i;
 
 /**
+ * Does this DuckDB type hold a number?
+ *
+ * Exported so the chart-shape matcher asks the same question this file already
+ * answers for aggregates. Two copies of this list would drift, and they would
+ * drift silently — the failure is a column that can be summed but cannot be
+ * plotted, or the reverse, with nothing to say which list was wrong.
+ */
+export function isNumericType(type?: string): boolean {
+    return !!type && NUMERIC_TYPES.test(type);
+}
+
+/**
  * The aggregates that make sense for a column's type.
  *
  * `sum` over a VARCHAR is not a query that returns something odd — it does not
@@ -260,6 +272,26 @@ export interface BuilderState {
     extraTables?: string[];
     columns: SelectedColumn[];
     joins: BuilderJoin[];
+    /**
+     * Relationships the router may NOT route through.
+     *
+     * Recorded because a tie between two equal-length routes is not something
+     * the model can settle. `Item` reaches `Vendor` through `VendorItem` or
+     * through `item_norm.parquet`; both are two hops, and the second inflates
+     * the join from 370 rows to 518 because the derived extract carries
+     * duplicate pairs. Picking one by a rule ("prefer database tables") is right
+     * there and wrong wherever somebody's real bridge table is a parquet.
+     *
+     * So the person decides, once, and it is kept — an exclusion is a statement
+     * about THIS query's shape, not about the schema, which is why it lives here
+     * and not on the ER model.
+     *
+     * An INPUT to `rebuildJoins`, never a patch applied after it. The joins list
+     * is recomputed from scratch on every edit (see `rebuildJoins`), so an
+     * exclusion that were merely subtracted afterwards would reappear the next
+     * time anything was ticked.
+     */
+    excludedJoins?: string[];
     /** The root group. Always present, usually `and` with a flat child list. */
     filters: FilterGroup;
     /**

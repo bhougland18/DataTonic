@@ -71,7 +71,7 @@ export function rebuildJoins(state: BuilderState, relationships: ErdRelationship
 
     for (const table of required.slice(1)) {
         if (scope.has(table.toLowerCase())) continue;
-        const hops = relationshipPath(table, scope, relationships);
+        const hops = relationshipPath(table, scope, relationships, state.excludedJoins);
         // Unreachable: leave it out of the FROM chain rather than inventing a
         // join. `unreachableTables` reports it so the UI can say so.
         if (!hops) continue;
@@ -122,6 +122,66 @@ export function unreachableTables(
     return requiredTables(state).filter(t => !scope.has(t.toLowerCase()));
 }
 
+/**
+ * Rule a relationship out of routing, and re-route around it.
+ *
+ * The answer to a tie the model cannot settle (see `BuilderState.excludedJoins`).
+ * Removing the join the router happened to pick sends it down the other route,
+ * which is the whole point: `Item → item_norm.parquet → Vendor` becomes
+ * `Item → VendorItem → Vendor`, and the row count stops being inflated by the
+ * extract's duplicate pairs.
+ */
+export function excludeJoin(
+    state: BuilderState,
+    relationshipId: string,
+    relationships: ErdRelationship[],
+): BuilderState {
+    const excluded = state.excludedJoins ?? [];
+    if (excluded.includes(relationshipId)) return state;
+    return rebuildJoins(
+        { ...state, excludedJoins: [...excluded, relationshipId] },
+        relationships,
+    );
+}
+
+/** Put a ruled-out relationship back in play. */
+export function restoreJoin(
+    state: BuilderState,
+    relationshipId: string,
+    relationships: ErdRelationship[],
+): BuilderState {
+    const excluded = (state.excludedJoins ?? []).filter(id => id !== relationshipId);
+    return rebuildJoins(
+        { ...state, excludedJoins: excluded.length > 0 ? excluded : undefined },
+        relationships,
+    );
+}
+
+/**
+ * Would removing this join leave the query able to reach everything it needs?
+ *
+ * Asked by simulating it rather than reasoning about it. Whether another route
+ * exists is exactly the question `rebuildJoins` answers, so excluding and
+ * counting what became unreachable cannot disagree with what excluding would
+ * actually do — which a separate "is there an alternative path" check could.
+ *
+ * False means the join is load-bearing: it is the only way in, and offering to
+ * delete it would be offering to break the query.
+ */
+export function canExcludeJoin(
+    state: BuilderState,
+    relationshipId: string,
+    relationships: ErdRelationship[],
+): boolean {
+    if ((state.excludedJoins ?? []).includes(relationshipId)) return false;
+    const before = unreachableTables(state, relationships).length;
+    const after = unreachableTables(
+        { ...state, excludedJoins: [...(state.excludedJoins ?? []), relationshipId] },
+        relationships,
+    ).length;
+    return after <= before;
+}
+
 /** Can this table be added to the query at all? */
 export function canReach(
     state: BuilderState,
@@ -130,7 +190,13 @@ export function canReach(
 ): boolean {
     const scope = tablesInScope(state, relationships);
     // An empty query can start anywhere — the first pick chooses the anchor.
-    return scope.size === 0 || relationshipPath(table, scope, relationships) !== null;
+    // Exclusions count here too: a table only reachable through a route the
+    // person ruled out is not reachable, and offering it would produce a
+    // column that silently fails to join.
+    return (
+        scope.size === 0 ||
+        relationshipPath(table, scope, relationships, state.excludedJoins) !== null
+    );
 }
 
 /** The tables the FROM chain actually reaches, lowercased. */

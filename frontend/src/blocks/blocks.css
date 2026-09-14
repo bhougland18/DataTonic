@@ -788,6 +788,30 @@
     opacity: 0.35;
     cursor: default;
 }
+/* Removing a join is destructive-ish but recoverable — the route comes back
+   with one click — so it is warned, not alarmed. Red only on hover, where the
+   intent is already formed. */
+.blk-join-add--remove:not(:disabled):hover {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+/* A ruled-out join stays listed rather than disappearing: a list that silently
+   drops rows is one you stop trusting, and the whole point is that the choice
+   stays visible and reversible. */
+.blk-join--excluded {
+    opacity: 0.5;
+}
+.blk-join--excluded .blk-join-main b {
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+}
+.blk-join-add--restore {
+    border-style: dashed;
+}
+.blk-join-add--restore:not(:disabled):hover {
+    opacity: 1;
+}
 .blk-joins-note {
     margin: 8px 4px 0;
     font-size: 10.5px;
@@ -1369,4 +1393,79 @@
     border-radius: 3px;
     padding: 0 3px;
     flex-shrink: 0;
+}
+
+/* ---- Chart shape strip ---- */
+/* One line between the results header and the grid: what this result could be
+   charted as. Sits with the data it judges (plan §6) rather than in the pane,
+   because somebody staring at a grid of numbers should not have to remember
+   that a tab exists to be told a bar chart would work.
+
+   Matches `.sqlstudio-res-head` so the two read as one block of chrome above
+   the grid rather than as a banner that arrived. */
+.blk-shape {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 8px;
+    padding: 6px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-1);
+    font-size: 12px;
+    flex-shrink: 0;
+}
+.blk-shape-lbl {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-3);
+    flex-shrink: 0;
+}
+/* A chip is a <span> until a picker exists to click it (DAA.100); the button
+   rules only bite once `onPick` is passed, so nothing here looks interactive
+   before it is. */
+.blk-shape-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-radius: 11px;
+    background: var(--accent-soft);
+    color: var(--text-1);
+    font: inherit;
+    font-size: 12px;
+    white-space: nowrap;
+}
+button.blk-shape-chip {
+    cursor: pointer;
+}
+button.blk-shape-chip:hover {
+    border-color: var(--accent);
+}
+/* Near misses are quieter than fits on purpose: they are advice, not an error.
+   "Line chart needs a date" should read as a next step, not as a complaint. */
+.blk-shape-near,
+.blk-shape-none {
+    color: var(--text-3);
+    white-space: nowrap;
+}
+.blk-shape-ok,
+.blk-shape-bad {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+}
+.blk-shape-ok {
+    color: var(--text-1);
+    font-weight: 600;
+}
+.blk-shape-bad {
+    color: var(--text-3);
+}
+.blk-shape-enc {
+    color: var(--text-3);
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 11.5px;
 }

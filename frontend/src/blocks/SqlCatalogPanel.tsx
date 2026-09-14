@@ -67,6 +67,11 @@ export interface SqlCatalogPanelProps {
     onAddJoinTable?: (relationship: ErdRelationship) => void;
     /** Why each table is in the query — shown as a tag on the join. */
     reasonFor?: (table: string) => string;
+    /** Routes the person ruled out, and how to rule one out or put it back. */
+    excludedJoins?: Set<string>;
+    onExcludeJoin?: (relationshipId: string) => void;
+    onRestoreJoin?: (relationshipId: string) => void;
+    canExcludeJoin?: (relationshipId: string) => boolean;
 }
 
 export default function SqlCatalogPanel({
@@ -89,6 +94,10 @@ export default function SqlCatalogPanel({
     onSetJoinMode,
     onAddJoinTable,
     reasonFor,
+    excludedJoins,
+    onExcludeJoin,
+    onRestoreJoin,
+    canExcludeJoin,
 }: SqlCatalogPanelProps) {
     const activeName = groups.find(g => g.dbPath === activeDb)?.name ?? null;
     const [query, setQuery] = useState('');
@@ -331,6 +340,10 @@ export default function SqlCatalogPanel({
                         onSetMode={onSetJoinMode}
                         onAddTable={onAddJoinTable}
                         reasonFor={reasonFor}
+                        excluded={excludedJoins}
+                        onExclude={onExcludeJoin}
+                        onRestore={onRestoreJoin}
+                        canExclude={canExcludeJoin}
                     />
                 </PanelSection>
             ) : null}

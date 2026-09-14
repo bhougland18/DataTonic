@@ -10,7 +10,7 @@
 // look at is still a join you may want to write.
 
 import { useMemo, useState } from 'react';
-import { ArrowLeft, ArrowRight, Equal, Plus } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Equal, Plus, RotateCcw, Trash2 } from 'lucide-react';
 import { joinSql, type ErdRelationship } from '../erd/model';
 import type { SqlStudioTable } from '../sqleditor/types';
 import { insertJoin, type JoinMode } from './join-insert';
@@ -36,6 +36,20 @@ export interface JoinsListProps {
     onAddTable?: (relationship: ErdRelationship) => void;
     /** Why each table is in the query, so a join nobody asked for says so. */
     reasonFor?: (table: string) => string;
+    /**
+     * Relationships ruled out of routing, and how to rule one out or put it
+     * back.
+     *
+     * Where two routes tie on length the router picks one arbitrarily, and the
+     * two can give different row counts. Rather than guess a rule, the list
+     * shows which join was chosen and lets it be deleted — the router then takes
+     * the other way round.
+     */
+    excluded?: Set<string>;
+    onExclude?: (relationshipId: string) => void;
+    onRestore?: (relationshipId: string) => void;
+    /** False when this join is the only way in, so deleting it would strand a table. */
+    canExclude?: (relationshipId: string) => boolean;
 }
 
 /** Short labels; `column` and `anchor` need none — those are the expected case. */
@@ -71,6 +85,92 @@ function ReasonTag({ reason }: { reason?: string }) {
     );
 }
 
+/**
+ * The one button at the end of a join row, in whichever of its three jobs applies.
+ *
+ * ＋ to bring the tables in, a bin to rule the join out, an undo to put it back.
+ * One button rather than three, because they are mutually exclusive states of
+ * the same row and a row of greyed-out icons is harder to read than a single
+ * one that says what is currently possible.
+ *
+ * The bin only appears on a join the query is USING and could do without — that
+ * is exactly the ambiguous-route case, so the affordance is its own explanation:
+ * a join you can delete is one the router chose rather than one it had to take.
+ */
+function RowAction({
+    inUse,
+    isExcluded,
+    removable,
+    builderMode,
+    blocked,
+    onAdd,
+    onExclude,
+    onRestore,
+}: {
+    inUse: boolean;
+    isExcluded: boolean;
+    removable: boolean;
+    builderMode: boolean;
+    blocked: string | null;
+    onAdd: () => void;
+    onExclude?: () => void;
+    onRestore?: () => void;
+}) {
+    if (isExcluded && onRestore) {
+        return (
+            <button
+                type="button"
+                className="blk-join-add blk-join-add--restore"
+                title="You ruled this join out. Put it back in play."
+                aria-label="Restore this join"
+                onClick={onRestore}
+            >
+                <RotateCcw size={15} strokeWidth={2.5} />
+            </button>
+        );
+    }
+
+    if (removable && onExclude) {
+        return (
+            <button
+                type="button"
+                className="blk-join-add blk-join-add--remove"
+                title={
+                    'Remove this join — the query can reach the same tables another way. ' +
+                    'Use this when the route it picked is not the one you meant.'
+                }
+                aria-label="Remove this join"
+                onClick={onExclude}
+            >
+                <Trash2 size={15} strokeWidth={2.25} />
+            </button>
+        );
+    }
+
+    return (
+        <button
+            type="button"
+            className="blk-join-add"
+            // In builder mode the join is already implied by the columns; ＋ is
+            // only for bringing in a table to FILTER on without selecting from
+            // it, so it is offered exactly when the join is not in use.
+            disabled={builderMode ? inUse : !!blocked}
+            // The reason is the whole value when it is refused — a greyed button
+            // with no explanation reads as broken.
+            title={
+                builderMode
+                    ? inUse
+                        ? 'In the query, and the only route to it — it cannot be removed'
+                        : 'Bring these tables in so you can filter on them'
+                    : (blocked ?? 'Add this join to the query')
+            }
+            onClick={onAdd}
+        >
+            <Plus size={17} strokeWidth={2.5} />
+        </button>
+    );
+}
+
 export default function JoinsList({
     relationships,
     tables,
@@ -80,6 +180,10 @@ export default function JoinsList({
     onSetMode,
     onAddTable,
     reasonFor,
+    excluded,
+    onExclude,
+    onRestore,
+    canExclude,
 }: JoinsListProps) {
     // Direction per relationship, defaulting to inner. Held here rather than on
     // the model: it is a choice about the query being written now, not a fact
@@ -109,13 +213,20 @@ export default function JoinsList({
                 // In builder mode the query owns the mode; otherwise it is a
                 // staging choice this list keeps for the next insert.
                 const inUse = active?.has(r.id) ?? false;
+                const isExcluded = excluded?.has(r.id) ?? false;
+                // Only offered when another route exists. A join that is the
+                // only way in is load-bearing, and a delete button on it would
+                // be offering to break the query.
+                const removable = inUse && !!onExclude && (canExclude?.(r.id) ?? false);
                 const mode = active?.get(r.id) ?? modes[r.id] ?? 'inner';
                 const spec = MODES.find(m => m.mode === mode) ?? MODES[0];
                 const result = insertJoin(sql, r, mode, tables);
                 const blocked = result.kind === 'blocked' ? result.reason : null;
                 return (
                     <div
-                        className={`blk-join${inUse ? ' blk-join--active' : ''}`}
+                        className={`blk-join${inUse ? ' blk-join--active' : ''}${
+                            isExcluded ? ' blk-join--excluded' : ''
+                        }`}
                         key={r.id}
                         title={`ON ${joinSql(r)}`}
                     >
@@ -150,31 +261,19 @@ export default function JoinsList({
                                 </em>
                             ) : null}
                             <span className="blk-join-gap" />
-                            <button
-                                type="button"
-                                className="blk-join-add"
-                                // In builder mode the join is already implied by
-                                // the columns; ＋ is only for bringing in a table
-                                // to FILTER on without selecting from it, so it
-                                // is offered exactly when the join is not in use.
-                                disabled={onAddTable ? inUse : !!blocked}
-                                // The reason is the whole value when it is
-                                // refused — a greyed button with no explanation
-                                // reads as broken.
-                                title={
-                                    onAddTable
-                                        ? inUse
-                                            ? 'Already in the query'
-                                            : 'Bring these tables in so you can filter on them'
-                                        : (blocked ?? 'Add this join to the query')
-                                }
-                                onClick={() => {
+                            <RowAction
+                                inUse={inUse}
+                                isExcluded={isExcluded}
+                                removable={removable}
+                                builderMode={!!onAddTable}
+                                blocked={blocked}
+                                onAdd={() => {
                                     if (onAddTable) return onAddTable(r);
                                     if (result.kind !== 'blocked') onChangeSql(result.sql);
                                 }}
-                            >
-                                <Plus size={17} strokeWidth={2.5} />
-                            </button>
+                                onExclude={onExclude ? () => onExclude(r.id) : undefined}
+                                onRestore={onRestore ? () => onRestore(r.id) : undefined}
+                            />
                         </div>
                     </div>
                 );

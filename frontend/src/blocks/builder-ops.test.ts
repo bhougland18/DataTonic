@@ -1,8 +1,11 @@
 ﻿import { describe, expect, it } from 'vitest';
 import {
     addTable,
+    canExcludeJoin,
     canReach,
     cycleSort,
+    excludeJoin,
+    restoreJoin,
     rebuildJoins,
     removeFilterNode,
     removeTable,
@@ -302,3 +305,111 @@ describe('end to end, ticking columns', () => {
     });
 });
 
+
+// Ben's real model in miniature (2026-09-13). `Item` reaches `Vendor` two ways
+// — through `VendorItem`, or through a derived parquet extract — and both are
+// two hops. The extract's relationship is declared FIRST, which is the only
+// reason plain BFS takes it. In the real workspace that route returned 518 rows
+// against VendorItem's 370, because the extract carries duplicate pairs.
+const ROUTE_RELS: ErdRelationship[] = [
+    { id: 'n1', fromTable: 'Item', fromColumn: 'Item', toTable: 'norm.parquet', toColumn: 'Item' },
+    { id: 'b', fromTable: 'Item', fromColumn: 'Item', toTable: 'VendorItem', toColumn: 'Item' },
+    {
+        id: 'c',
+        fromTable: 'Vendor',
+        fromColumn: 'Vendor',
+        toTable: 'VendorItem',
+        toColumn: 'Vendor',
+    },
+    {
+        id: 'n2',
+        fromTable: 'Vendor',
+        fromColumn: 'Vendor',
+        toTable: 'norm.parquet',
+        toColumn: 'Vendor',
+    },
+];
+
+/** Item.Item + Vendor.VendorName — the selection that forces a route. */
+const twoTableQuery = (rels: ErdRelationship[]) =>
+    toggleColumn(toggleColumn(emptyBuilder(), 'Item', 'Item', rels), 'Vendor', 'VendorName', rels);
+
+const joinIds = (s: BuilderState) => s.joins.map(j => j.relationshipId);
+
+describe('excluding a route', () => {
+    it('reproduces the arbitrary choice: declaration order decides the route', () => {
+        expect(joinIds(twoTableQuery(ROUTE_RELS))).toEqual(['n1', 'n2']);
+    });
+
+    it('re-routes through the other way round when the chosen join is removed', () => {
+        const s = excludeJoin(twoTableQuery(ROUTE_RELS), 'n1', ROUTE_RELS);
+        expect(joinIds(s)).toEqual(['b', 'c']);
+        expect(s.excludedJoins).toEqual(['n1']);
+    });
+
+    it('keeps the exclusion when anything else is edited', () => {
+        // `rebuildJoins` recomputes the whole join list on every edit, so an
+        // exclusion that were subtracted afterwards would silently come back.
+        let s = excludeJoin(twoTableQuery(ROUTE_RELS), 'n1', ROUTE_RELS);
+        s = toggleColumn(s, 'Item', 'ItemGroup', ROUTE_RELS);
+        expect(joinIds(s)).toEqual(['b', 'c']);
+    });
+
+    it('puts the route back on restore', () => {
+        let s = excludeJoin(twoTableQuery(ROUTE_RELS), 'n1', ROUTE_RELS);
+        s = restoreJoin(s, 'n1', ROUTE_RELS);
+        expect(joinIds(s)).toEqual(['n1', 'n2']);
+        expect(s.excludedJoins).toBeUndefined();
+    });
+
+    it('excludes only once, however many times it is asked', () => {
+        let s = excludeJoin(twoTableQuery(ROUTE_RELS), 'n1', ROUTE_RELS);
+        s = excludeJoin(s, 'n1', ROUTE_RELS);
+        expect(s.excludedJoins).toEqual(['n1']);
+    });
+});
+
+describe('canExcludeJoin', () => {
+    it('allows removing a join that has an alternative', () => {
+        expect(canExcludeJoin(twoTableQuery(ROUTE_RELS), 'n1', ROUTE_RELS)).toBe(true);
+    });
+
+    // The guard that stops the button offering to break the query: with only
+    // one route, VendorItem is the only way to reach Vendor at all.
+    it('refuses to remove the only way in', () => {
+        const s = twoTableQuery(RELS);
+        expect(joinIds(s)).toEqual(['b', 'c']);
+        expect(canExcludeJoin(s, 'b', RELS)).toBe(false);
+        expect(canExcludeJoin(s, 'c', RELS)).toBe(false);
+    });
+
+    it('refuses a join already excluded', () => {
+        const s = excludeJoin(twoTableQuery(ROUTE_RELS), 'n1', ROUTE_RELS);
+        expect(canExcludeJoin(s, 'n1', ROUTE_RELS)).toBe(false);
+    });
+
+    it('still allows the second hop of a route that has an alternative', () => {
+        // Removing either end of the parquet route forces the other way round.
+        const s = excludeJoin(twoTableQuery(ROUTE_RELS), 'n2', ROUTE_RELS);
+        expect(joinIds(s)).toEqual(['b', 'c']);
+    });
+});
+
+describe('exclusions and reachability', () => {
+    it('reports a table unreachable once its only route is ruled out', () => {
+        const s = excludeJoin(twoTableQuery(RELS), 'b', RELS);
+        expect(unreachableTables(s, RELS)).toContain('Vendor');
+    });
+
+    it('stops offering a table only reachable through a ruled-out route', () => {
+        const base = toggleColumn(emptyBuilder(), 'Item', 'Item', RELS);
+        expect(canReach(base, 'Vendor', RELS)).toBe(true);
+        const s = { ...base, excludedJoins: ['b'] };
+        expect(canReach(s, 'Vendor', RELS)).toBe(false);
+    });
+
+    it('leaves an unrelated query alone', () => {
+        const s = excludeJoin(twoTableQuery(ROUTE_RELS), 'n1', ROUTE_RELS);
+        expect(unreachableTables(s, ROUTE_RELS)).toEqual([]);
+    });
+});

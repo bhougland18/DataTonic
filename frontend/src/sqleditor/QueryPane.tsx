@@ -21,6 +21,23 @@ interface QueryPaneProps {
     /** Builder mode: the SQL is a projection of the builder state, so editing
      *  it here would be edits with nowhere to live (plan §3). */
     readOnly?: boolean;
+    /**
+     * Rendered between the results header and the grid, for a successful run.
+     *
+     * A slot rather than the chart strip itself, because this pane is shared
+     * with the SQL Editor NODE, where chart guidance means nothing — a node
+     * writes a table, not a picture. Blocks passes something; the node passes
+     * nothing and is unchanged.
+     */
+    resultInfo?: (result: SqlRunResult) => ReactNode;
+    /**
+     * The result of each run, for callers that need it outside the pane.
+     *
+     * The pane keeps owning its own result — two panes run independently and
+     * lifting the state would entangle them. This is a copy for context, not
+     * the source of truth.
+     */
+    onResult?: (result: SqlRunResult) => void;
 }
 
 // One editor + its own results grid. Used full-width for the main query and,
@@ -36,6 +53,8 @@ export default function QueryPane({
     className,
     placeholder,
     readOnly,
+    resultInfo,
+    onResult,
 }: QueryPaneProps) {
     const [result, setResult] = useState<SqlRunResult | null>(null);
     const [running, setRunning] = useState(false);
@@ -48,13 +67,22 @@ export default function QueryPane({
         try {
             const r = await run(sql);
             setResult(r);
+            onResult?.(r);
             setSort(null);
         } catch (e) {
-            setResult({ columns: [], rows: [], error: e instanceof Error ? e.message : String(e) });
+            const failed = {
+                columns: [],
+                rows: [],
+                error: e instanceof Error ? e.message : String(e),
+            };
+            setResult(failed);
+            // Reported too: a caller holding the last result should learn that
+            // it is stale, not go on describing the one before it.
+            onResult?.(failed);
         } finally {
             setRunning(false);
         }
-    }, [run, sql, running]);
+    }, [run, sql, running, onResult]);
     runRef.current = doRun;
 
     const extensions = useMemo(() => sqlExtensions(tables, runRef), [tables]);
@@ -143,6 +171,10 @@ export default function QueryPane({
                     <span className="sqlstudio-res-m">Run to preview results.</span>
                 )}
             </div>
+
+            {resultInfo && result && !result.error && result.columns.length > 0
+                ? resultInfo(result)
+                : null}
 
             <div className="sqlstudio-grid-wrap">
                 {result && !result.error && result.columns.length > 0 ? (

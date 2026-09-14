@@ -26,7 +26,7 @@ import type { ErdRelationship, ErdTable } from '../erd/model';
 import { loadSchemaModel, mergeRelationships, saveSchemaModel } from './model-io';
 import QueryPane from '../sqleditor/QueryPane';
 import AiPane from '../sqleditor/AiPane';
-import type { SqlStudioColumn, SqlStudioTable } from '../sqleditor/types';
+import type { SqlRunResult, SqlStudioColumn, SqlStudioTable } from '../sqleditor/types';
 import { workspaceCatalog, workspaceCatalogRebuild } from '../tauri-bridge';
 import {
     databaseGroups,
@@ -42,6 +42,8 @@ import SavedQueriesPanel from './SavedQueriesPanel';
 import UnsavedQueryDialog from './UnsavedQueryDialog';
 import { generateSql } from './builder-sql';
 import SelectedColumns from './SelectedColumns';
+import { chartContext } from './chart-context';
+import ChartShapeStrip from './ChartShapeStrip';
 import type { ColumnOption } from './ColumnPicker';
 import FiltersPanel from './FiltersPanel';
 import JoinReviewDialog from './JoinReviewDialog';
@@ -56,8 +58,11 @@ import {
     addFilterNode,
     addHavingNode,
     addTable,
+    canExcludeJoin,
     canReach,
+    excludeJoin,
     moveColumn,
+    restoreJoin,
     removeFilterNode,
     removeHavingNode,
     setAggregate,
@@ -634,6 +639,23 @@ export default function BlocksStudio({
         [builder.joins],
     );
 
+    /** Routes ruled out, so the list can offer to put them back. */
+    const excludedJoinIds = useMemo(
+        () => new Set(builder.excludedJoins ?? []),
+        [builder.excludedJoins],
+    );
+
+    /**
+     * The last run, kept so the AI pane can be told what is on screen.
+     *
+     * The pane owns its own result for rendering; this is a copy for context.
+     * Without it the pane answers charting questions from general knowledge,
+     * which is how "what do I need for a line chart" came back recommending
+     * matplotlib.
+     */
+    const [lastResult, setLastResult] = useState<SqlRunResult | null>(null);
+    const aiContext = useMemo(() => chartContext(lastResult), [lastResult]);
+
     /** Bring a relationship's tables in without selecting from them. */
     const addJoinTable = useCallback(
         (rel: ErdRelationship) => {
@@ -765,21 +787,46 @@ export default function BlocksStudio({
         setSavedOpen(true);
     }, [sql, queryTitle, queryDesc, saved, activeQueryId, commitSaved]);
 
-    /** Load a saved query — SQL, title and description together. */
+    /**
+     * Load a saved query — SQL, title and description together.
+     *
+     * Always lands in HAND-WRITTEN mode, and empties the builder on the way.
+     * A `SavedQuery` stores SQL and nothing else (builder persistence is still
+     * unbuilt, plan §12 phase 5), so there is no builder state to restore and
+     * reconstructing one from arbitrary SQL is the text-to-SQL problem the
+     * builder exists to avoid.
+     *
+     * Clearing the builder matters as much as switching off it. Left behind, it
+     * would still be generating the PREVIOUS query, so toggling the builder back
+     * on would silently replace the query just opened with the one before it.
+     */
     const openQuery = useCallback((q: SavedQuery) => {
         setSql(q.query.sql);
         setQueryTitle(q.title);
         setQueryDesc(q.description ?? '');
         setActiveQueryId(q.id);
+        setAiDraft(null);
+        setBuilderMode(false);
+        setBuilder(emptyBuilder());
     }, []);
 
-    /** Leave whatever is open and start from nothing. */
+    /**
+     * Leave whatever is open and start from nothing.
+     *
+     * The builder is reset too. Without that, New query cleared `sql` — which
+     * in builder mode is not what is on screen — so the button appeared to do
+     * nothing at all while every ticked column stayed exactly where it was.
+     */
     const newQuery = useCallback(() => {
         setSql('');
         setQueryTitle('');
         setQueryDesc('');
         setActiveQueryId(null);
         setAiDraft(null);
+        setBuilder(emptyBuilder());
+        // Back to the default the studio opens in, not to whatever mode the
+        // last query happened to leave behind.
+        setBuilderMode(true);
     }, []);
 
     const activeSaved = useMemo(
@@ -795,17 +842,27 @@ export default function BlocksStudio({
      * not immediately claim it is dirty. With NO saved query it is simply
      * whether anything has been typed, because scratch work has nowhere to
      * have been kept.
+     *
+     * Reads `editorSql`, NOT `sql`. In builder mode `sql` holds whatever was
+     * last hand-written — usually nothing — so a builder query full of ticked
+     * columns read as a clean slate, and the "you will lose your changes"
+     * prompt never appeared for the one kind of work most at risk of being
+     * thrown away. Same bug Save had, and the same fix.
+     *
+     * Compared in its STORED form rather than raw, because saving rewrites the
+     * `-- name:` header; comparing raw text would call a freshly saved query
+     * dirty the moment its title was in the header twice over.
      */
     const dirty = useMemo(() => {
         if (activeSaved) {
             return (
-                sql !== activeSaved.query.sql ||
+                withQueryHeader(editorSql, queryTitle, queryDesc) !== activeSaved.query.sql ||
                 queryTitle !== activeSaved.title ||
                 queryDesc !== (activeSaved.description ?? '')
             );
         }
-        return !!(sql.trim() || queryTitle.trim() || queryDesc.trim());
-    }, [activeSaved, sql, queryTitle, queryDesc]);
+        return !!(editorSql.trim() || queryTitle.trim() || queryDesc.trim());
+    }, [activeSaved, editorSql, queryTitle, queryDesc]);
 
     /** Ask first when leaving would lose edits; otherwise just go. */
     const requestNew = useCallback(() => {
@@ -986,6 +1043,22 @@ export default function BlocksStudio({
                             onAddJoinTable={builderMode ? addJoinTable : undefined}
                             reasonFor={
                                 builderMode ? table => tableReason(builder, table) : undefined
+                            }
+                            excludedJoins={excludedJoinIds}
+                            onExcludeJoin={
+                                builderMode
+                                    ? id => setBuilder(b => excludeJoin(b, id, relationships))
+                                    : undefined
+                            }
+                            onRestoreJoin={
+                                builderMode
+                                    ? id => setBuilder(b => restoreJoin(b, id, relationships))
+                                    : undefined
+                            }
+                            canExcludeJoin={
+                                builderMode
+                                    ? id => canExcludeJoin(builder, id, relationships)
+                                    : undefined
                             }
                             selectedCount={builder.columns.length}
                             filterCount={countRules(builder.filters)}
@@ -1304,6 +1377,19 @@ export default function BlocksStudio({
                                             ? 'Tick columns on the left to build a query.'
                                             : 'Write SQL, or add a join from the panel on the left.'
                                     }
+                                    // What this result could be charted as. On
+                                    // the main query only: the AI draft is a
+                                    // proposal, and telling somebody which
+                                    // charts fit a query they have not accepted
+                                    // yet is an answer to a question they are
+                                    // not asking.
+                                    resultInfo={r => (
+                                        <ChartShapeStrip
+                                            columns={r.columns}
+                                            rowCount={r.rows.length}
+                                        />
+                                    )}
+                                    onResult={setLastResult}
                                 />
                                 {aiDraft != null && (
                                     <QueryPane
@@ -1366,6 +1452,7 @@ export default function BlocksStudio({
                     currentSql={sql}
                     workspacePath={workspacePath}
                     onInsert={setAiDraft}
+                    extraContext={aiContext}
                 />
                 </div>
 

@@ -36,6 +36,15 @@ interface AiPaneProps {
     onCollapse: () => void;
     // Put generated SQL into the editor.
     onInsert: (sql: string) => void;
+    /**
+     * Extra context to append to the system prompt, opaque to this pane.
+     *
+     * Blocks passes the result on screen and the charts it fits. A slot rather
+     * than the chart knowledge itself, because this pane is shared with the SQL
+     * Editor node, where a chart is not a thing that exists — the same seam as
+     * `QueryPane`'s `resultInfo`.
+     */
+    extraContext?: string;
 }
 
 interface Msg {
@@ -136,10 +145,39 @@ export function schemaText(tables: SqlStudioTable[], relationships: ErdRelations
     return lines.join('\n');
 }
 
+/**
+ * What to say when the question is about charts rather than about SQL.
+ *
+ * Added because the pane got "what do I need to add to use a line chart" and
+ * answered with matplotlib and Python's datetime module — a real library, sound
+ * advice, and about a tool that is not in this product. A model with no frame
+ * reaches for the most common one in its training data, and for charting that
+ * is Python.
+ *
+ * Naming the encoding channels and the four types matters as much as naming
+ * Vega-Lite: it is what turns "you need a date column" into "x needs a temporal
+ * field, and none of your columns are temporal".
+ */
+const CHART_RULES =
+    '\n\nCHARTING. Every chart in this product is VEGA-LITE, and nothing else. ' +
+    'Never mention matplotlib, seaborn, plotly, ggplot, Python, Excel, or any other ' +
+    'charting tool — they are not available here and naming one is a wrong answer.\n' +
+    '- Talk in Vega-Lite terms: marks (bar, line, area, point, arc, rect, boxplot) and ' +
+    'encoding channels (x, y, color, theta, size), each taking a field with a type of ' +
+    'nominal, ordinal, quantitative or temporal.\n' +
+    '- A chart is possible when every required channel has a column of a type it accepts. ' +
+    'When one is missing, say WHICH channel and what type it needs.\n' +
+    '- The user fixes a missing chart by changing the SQL — adding a column, an aggregate, ' +
+    'or a date — so answer with the column to add, not with a different library.\n' +
+    '- When the question is about charts, answer in prose. The SQL-only rule above applies ' +
+    'to requests for a query.';
+
 function systemPrompt(
     tables: SqlStudioTable[],
     relationships: ErdRelationship[],
     currentSql?: string,
+    /** Opaque context from the caller — in Blocks, the result and its charts. */
+    extraContext?: string,
 ): string {
     const current = currentSql?.trim()
         ? `\n\nThe user's current query in the editor is:\n\`\`\`sql\n${currentSql.trim()}\n\`\`\``
@@ -190,10 +228,14 @@ function systemPrompt(
         // error rather than a harmless habit. Repaired on the way out too — this
         // just saves the round trip.
         '- ONE statement, and do NOT end it with a semicolon.\n' +
-        '- Return ONLY the SQL inside a ```sql fenced block, no prose.\n\n' +
+        // Scoped to "asked for a query", because the pane is also asked about
+        // charts now and a flat no-prose rule makes that unanswerable.
+        '- When asked FOR A QUERY, return ONLY the SQL inside a ```sql fenced block, no prose.\n\n' +
         schemaText(tables, relationships) +
         example +
-        current
+        current +
+        (extraContext?.trim() ? `\n\n${extraContext.trim()}` : '') +
+        CHART_RULES
     );
 }
 
@@ -225,6 +267,7 @@ export default function AiPane({
     visible,
     onCollapse,
     onInsert,
+    extraContext,
 }: AiPaneProps) {
     const [input, setInput] = useState('');
     const [messages, setMessages] = useState<Msg[]>([]);
@@ -305,7 +348,7 @@ export default function AiPane({
                 }
             },
             workspacePath,
-            systemPrompt(tables, relationships, currentSql),
+            systemPrompt(tables, relationships, currentSql, extraContext),
         );
         return acc;
     };

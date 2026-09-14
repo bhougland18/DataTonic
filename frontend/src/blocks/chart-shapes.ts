@@ -1,0 +1,583 @@
+// Does this result fit that chart — and if not, what is missing?
+//
+// The whole correctness surface of chart guidance (plan `chart-shape-guidance.md`
+// §2), and pure on purpose: no framework, no network, no model call. A chart
+// type's data requirement is small, closed and knowable — a set of encoding
+// channels, each accepting certain Vega-Lite types — so whether a result suits
+// it is DETERMINED by the column types, not a matter of opinion.
+//
+// Same move `builder-sql.ts` made for SQL. Asking a model "does this data suit a
+// bar chart" invites an answer that sounds right and is not checkable; asking
+// the types gives an answer that is instant, testable without a browser, and
+// cannot invent a requirement that does not exist.
+
+import { isNumericType } from './builder-types';
+import type { SqlStudioColumn } from '../sqleditor/types';
+
+/** Vega-Lite's four measurement types. */
+export type VlType = 'nominal' | 'ordinal' | 'quantitative' | 'temporal';
+
+/** The encoding channels the first eight marks need between them. */
+export type Channel = 'x' | 'y' | 'color' | 'theta' | 'size';
+
+export type ChartType =
+    | 'bar'
+    | 'line'
+    | 'area'
+    | 'point'
+    | 'arc'
+    | 'rect'
+    | 'boxplot'
+    | 'histogram';
+
+export interface ChannelNeed {
+    channel: Channel;
+    accepts: VlType[];
+    required: boolean;
+    /**
+     * What to call it when asking for it — "a category", "a number".
+     *
+     * The message has to name the fix, not the failure. "Wrong shape" tells
+     * somebody they are stuck; "needs a number — add a count or a sum" tells
+     * them what to click.
+     */
+    label: string;
+}
+
+export interface ShapeVariant {
+    id: string;
+    /** Shown when this is the variant that matched: "Grouped bars". */
+    label: string;
+    needs: ChannelNeed[];
+}
+
+export interface ChartShape {
+    type: ChartType;
+    label: string;
+    variants: ShapeVariant[];
+    /**
+     * Summarises the DISTRIBUTION of one measure, discarding everything else.
+     *
+     * Box plots and histograms answer the same question in different ink, and
+     * both need a crowd: quartiles or bins computed from a handful of points
+     * describe the handful, not a distribution.
+     */
+    distribution?: boolean;
+}
+
+/**
+ * What the matcher knows beyond the column types.
+ *
+ * Optional throughout: the builder can answer these before a run, a result
+ * answers them after one, and hand-written SQL may answer neither. An unknown
+ * stays unknown rather than being guessed — the same rule `vlTypeOf` follows
+ * for a failed probe.
+ */
+export interface ShapeContext {
+    /** Rows in the result. */
+    rowCount?: number;
+}
+
+/**
+ * How many rows a distribution chart needs before it says anything.
+ *
+ * Calibrated against two real queries rather than chosen in the abstract, which
+ * is what plan §12 asked for: a count over 36 manufacturers was a fair box plot,
+ * a count over 7 vendors was not. Twenty puts the line between them with room
+ * either side, and leaves every quartile more than a couple of points.
+ *
+ * Applied only when the row count is KNOWN. Before a run there is nothing to
+ * count, and suppressing the chart then would make it flicker into existence on
+ * Run for reasons nobody could see.
+ */
+export const MIN_DISTRIBUTION_ROWS = 20;
+
+/** A result column, already reduced to what the matcher cares about. */
+export interface Field {
+    name: string;
+    vlType: VlType;
+}
+
+/** Channel → field, ready to become a Vega-Lite `encoding` block. */
+export type Encoding = Partial<Record<Channel, { field: string; type: VlType }>>;
+
+/**
+ * Whether a result fits, nearly fits, or does not fit a chart.
+ *
+ * `close` is a DISTINCT verdict rather than a flavour of `wrong`, because "you
+ * have the category, now add a count" is the single most useful thing this can
+ * say and it is not the same message as "this cannot be a bar chart". One
+ * missing required channel is close; more than one is wrong.
+ */
+export type Verdict =
+    | {
+          kind: 'fits';
+          chart: ChartType;
+          variant: ShapeVariant;
+          encoding: Encoding;
+          /** Columns the chart will not show. Not a problem, but worth saying. */
+          unused: string[];
+      }
+    | { kind: 'close'; chart: ChartType; variant: ShapeVariant; missing: ChannelNeed[] }
+    | { kind: 'wrong'; chart: ChartType; nearest: ShapeVariant; missing: ChannelNeed[] }
+    /**
+     * The columns fit, but the chart would not mean anything.
+     *
+     * A separate verdict from `wrong` because it is a different statement: not
+     * "your data cannot make this chart" but "it can, and the result would be
+     * misleading". A box plot of seven numbers renders perfectly and reports
+     * quartiles computed from two points each.
+     */
+    | { kind: 'unsuitable'; chart: ChartType; variant: ShapeVariant; reason: string };
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** Composite types have no single value to put on an axis. */
+const COMPOSITE = /^\s*(struct|map|union)\s*\(/i;
+const TEMPORAL = /\b(date|time|timestamp|timestamptz|datetime)\b/i;
+const BOOLEAN = /^\s*bool(ean)?\s*$/i;
+
+/**
+ * A DuckDB type as Vega-Lite sees it, or `null` when it cannot be plotted.
+ *
+ * Two judgement calls, both recorded in plan §4:
+ *
+ * **An unknown type is `nominal`, not `quantitative`.** Same reasoning as
+ * `aggregatesFor`: a probe that failed must not manufacture a capability. A
+ * wrong `nominal` draws an ugly chart; a wrong `quantitative` draws a chart
+ * that silently means nothing.
+ *
+ * **`BOOLEAN` is `nominal`.** Two categories, not a measure — averaging it is
+ * a thing somebody might want, but plotting it as a magnitude is not what a
+ * true/false column means.
+ */
+export function vlTypeOf(duckdbType?: string): VlType | null {
+    if (!duckdbType) return 'nominal';
+    const t = duckdbType.trim();
+    if (!t) return 'nominal';
+    // Lists (`INTEGER[]`) and structs before anything else: `INTEGER[]` would
+    // otherwise read as numeric, and a list of numbers is not a number.
+    if (t.endsWith('[]') || COMPOSITE.test(t)) return null;
+    if (TEMPORAL.test(t)) return 'temporal';
+    if (BOOLEAN.test(t)) return 'nominal';
+    if (isNumericType(t)) return 'quantitative';
+    return 'nominal';
+}
+
+/**
+ * Result columns as matcher fields, dropping what cannot be plotted.
+ *
+ * Column ORDER is preserved and load-bearing: where several columns share a
+ * type, the matcher takes the first, which is the order the person put them in.
+ */
+export function fieldsFromColumns(columns: SqlStudioColumn[]): Field[] {
+    const out: Field[] = [];
+    for (const c of columns) {
+        const vlType = vlTypeOf(c.type);
+        if (vlType) out.push({ name: c.name, vlType });
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// The contracts
+// ---------------------------------------------------------------------------
+
+const category = (channel: Channel, required = true, label = 'a category'): ChannelNeed => ({
+    channel,
+    accepts: ['nominal', 'ordinal'],
+    required,
+    label,
+});
+
+const measure = (channel: Channel, required = true, label = 'a number'): ChannelNeed => ({
+    channel,
+    accepts: ['quantitative'],
+    required,
+    label,
+});
+
+/**
+ * The eight shapes, and why each accepts what it does.
+ *
+ * Variants, not one shape per chart (plan §3) — the biggest correctness risk in
+ * the whole feature. A contract naming only the simple case tells somebody
+ * holding a perfectly good grouped-bar result that their data is wrong, and a
+ * validator that is wrong even occasionally gets ignored permanently.
+ *
+ * Grouped and stacked bars are the OPTIONAL `color` on `bars`, not a second
+ * variant. Two variants that both match the same data would make "which one did
+ * it pick" a question nobody asked.
+ */
+export const CHART_SHAPES: ChartShape[] = [
+    {
+        type: 'bar',
+        label: 'Bar chart',
+        variants: [
+            {
+                id: 'bars',
+                label: 'Bars per category',
+                needs: [
+                    category('x'),
+                    measure('y'),
+                    category('color', false, 'a second category to split by'),
+                ],
+            },
+        ],
+    },
+    {
+        type: 'histogram',
+        label: 'Histogram',
+        distribution: true,
+        variants: [
+            {
+                id: 'histogram',
+                label: 'Binned counts',
+                // The one deliberate exception to "shaping happens in SQL"
+                // (plan §9): binning in SQL to draw a histogram is worse than
+                // letting the spec bin, and it throws away the raw column.
+                needs: [measure('x', true, 'a number to bin')],
+            },
+        ],
+    },
+    {
+        type: 'line',
+        label: 'Line chart',
+        variants: [
+            {
+                id: 'line',
+                label: 'A line over time',
+                needs: [
+                    // Deliberately NOT nominal. A line implies the x axis has
+                    // an order, and accepting categories would make `line` fit
+                    // every result a bar chart fits — which makes the
+                    // suggestion list noise instead of a recommendation.
+                    {
+                        channel: 'x',
+                        accepts: ['temporal', 'quantitative'],
+                        required: true,
+                        label: 'a date or a number for the axis',
+                    },
+                    measure('y'),
+                    category('color', false, 'a category to draw one line each'),
+                ],
+            },
+        ],
+    },
+    {
+        type: 'area',
+        label: 'Area chart',
+        variants: [
+            {
+                id: 'area',
+                label: 'Filled area over time',
+                needs: [
+                    {
+                        channel: 'x',
+                        accepts: ['temporal', 'quantitative'],
+                        required: true,
+                        label: 'a date or a number for the axis',
+                    },
+                    measure('y'),
+                    category('color', false, 'a category to stack by'),
+                ],
+            },
+        ],
+    },
+    {
+        type: 'point',
+        label: 'Scatter plot',
+        variants: [
+            {
+                id: 'scatter',
+                label: 'One point per row',
+                needs: [
+                    {
+                        channel: 'x',
+                        accepts: ['quantitative', 'temporal'],
+                        required: true,
+                        label: 'a number for the x axis',
+                    },
+                    measure('y', true, 'a number for the y axis'),
+                    category('color', false, 'a category to colour by'),
+                    measure('size', false, 'a number to size the points by'),
+                ],
+            },
+        ],
+    },
+    {
+        type: 'arc',
+        label: 'Pie chart',
+        variants: [
+            {
+                id: 'pie',
+                label: 'Slices of a whole',
+                needs: [
+                    measure('theta', true, 'a number to size the slices'),
+                    category('color'),
+                ],
+            },
+        ],
+    },
+    {
+        type: 'rect',
+        label: 'Heatmap',
+        variants: [
+            {
+                id: 'heatmap',
+                label: 'A grid coloured by value',
+                needs: [
+                    {
+                        channel: 'x',
+                        accepts: ['nominal', 'ordinal', 'temporal'],
+                        required: true,
+                        label: 'a category or date across',
+                    },
+                    category('y', true, 'a category down'),
+                    measure('color', true, 'a number to colour by'),
+                ],
+            },
+        ],
+    },
+    {
+        type: 'boxplot',
+        label: 'Box plot',
+        distribution: true,
+        variants: [
+            {
+                id: 'spread',
+                label: 'Spread of one measure',
+                // NO category channel, and that is the whole point.
+                //
+                // A box plot summarises the y values WITHIN each x group, so
+                // splitting by a category needs many rows per category. Against
+                // an aggregated result — `GROUP BY Manufacturer`, one row each —
+                // every box is built from a single number and comes out as a
+                // flat tick. It renders, it means nothing, and it looked like a
+                // fit.
+                //
+                // GRAIN is what the contract cannot see: row multiplicity is not
+                // visible in a column's type, which is all the matcher gets.
+                // Until it is (from builder state, or from distinct counts in
+                // the result), the honest offer is the ungrouped form — one box
+                // over the measure, which is a real answer to "how are these
+                // counts distributed".
+                needs: [measure('y', true, 'a number to summarise')],
+            },
+        ],
+    },
+];
+
+export const shapeFor = (type: ChartType): ChartShape | undefined =>
+    CHART_SHAPES.find(s => s.type === type);
+
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
+
+type Counts = Record<VlType, number>;
+
+const emptyCounts = (): Counts => ({
+    nominal: 0,
+    ordinal: 0,
+    quantitative: 0,
+    temporal: 0,
+});
+
+function countByType(fields: Field[]): Counts {
+    const counts = emptyCounts();
+    for (const f of fields) counts[f.vlType] += 1;
+    return counts;
+}
+
+/** Which need took which TYPE. Concrete columns are chosen afterwards. */
+type Plan = (VlType | null)[];
+
+/**
+ * The best way to satisfy a variant's needs from the types available.
+ *
+ * Searches over TYPE COUNTS rather than over individual columns, which is what
+ * keeps this exact and still cheap. A greedy left-to-right assignment is
+ * subtly wrong — needs `x: nominal|quantitative` then `y: nominal` against one
+ * of each would hand the nominal to `x` and then report `y` unfillable, when
+ * swapping them satisfies both. Backtracking over concrete columns would fix
+ * that but costs O(columns^needs); backtracking over the four types costs at
+ * most 4^needs, because two columns of the same type are interchangeable here.
+ *
+ * Ranked by required-needs-filled first, then optional — a variant that seats
+ * every required channel always beats one that trades a required for two
+ * optionals.
+ */
+function bestPlan(needs: ChannelNeed[], fields: Field[]): Plan {
+    let best: Plan | null = null;
+    let bestScore = [-1, -1];
+
+    const score = (plan: Plan): [number, number] => {
+        let req = 0;
+        let opt = 0;
+        plan.forEach((t, i) => {
+            if (!t) return;
+            if (needs[i].required) req += 1;
+            else opt += 1;
+        });
+        return [req, opt];
+    };
+
+    const walk = (i: number, left: Counts, acc: Plan) => {
+        if (i === needs.length) {
+            const s = score(acc);
+            if (s[0] > bestScore[0] || (s[0] === bestScore[0] && s[1] > bestScore[1])) {
+                bestScore = s;
+                best = [...acc];
+            }
+            return;
+        }
+        for (const t of needs[i].accepts) {
+            if (left[t] > 0) {
+                left[t] -= 1;
+                acc.push(t);
+                walk(i + 1, left, acc);
+                acc.pop();
+                left[t] += 1;
+            }
+        }
+        // Leaving a need unfilled is always a branch: an optional channel is
+        // often better left empty, and a required one has to be reportable as
+        // missing rather than making the whole variant unmatchable.
+        acc.push(null);
+        walk(i + 1, left, acc);
+        acc.pop();
+    };
+
+    walk(0, countByType(fields), []);
+    return best ?? needs.map(() => null);
+}
+
+/** Turn a type plan into real columns, first unused of each type, in order. */
+function materialise(needs: ChannelNeed[], fields: Field[], plan: Plan): Encoding {
+    const used = new Set<number>();
+    const encoding: Encoding = {};
+    plan.forEach((t, i) => {
+        if (!t) return;
+        const idx = fields.findIndex((f, j) => !used.has(j) && f.vlType === t);
+        if (idx < 0) return;
+        used.add(idx);
+        encoding[needs[i].channel] = { field: fields[idx].name, type: t };
+    });
+    return encoding;
+}
+
+function checkVariant(chart: ChartType, variant: ShapeVariant, fields: Field[]): Verdict {
+    const plan = bestPlan(variant.needs, fields);
+    const missing = variant.needs.filter((n, i) => n.required && !plan[i]);
+
+    if (missing.length === 0) {
+        const encoding = materialise(variant.needs, fields, plan);
+        const taken = new Set(Object.values(encoding).map(e => e.field));
+        return {
+            kind: 'fits',
+            chart,
+            variant,
+            encoding,
+            unused: fields.filter(f => !taken.has(f.name)).map(f => f.name),
+        };
+    }
+    if (missing.length === 1) return { kind: 'close', chart, variant, missing };
+    return { kind: 'wrong', chart, nearest: variant, missing };
+}
+
+const RANK = { fits: 0, close: 1, unsuitable: 2, wrong: 3 } as const;
+
+/** Fewer unused columns is a tighter fit; fewer missing needs is a nearer miss. */
+function verdictScore(v: Verdict): [number, number] {
+    if (v.kind === 'fits') return [RANK.fits, v.unused.length];
+    if (v.kind === 'close') return [RANK.close, v.missing.length];
+    if (v.kind === 'unsuitable') return [RANK.unsuitable, 0];
+    return [RANK.wrong, v.missing.length];
+}
+
+const better = (a: Verdict, b: Verdict): Verdict => {
+    const [ar, au] = verdictScore(a);
+    const [br, bu] = verdictScore(b);
+    if (ar !== br) return ar < br ? a : b;
+    return au <= bu ? a : b;
+};
+
+/**
+ * Does this result fit this chart?
+ *
+ * Returns the best of the chart's variants, so a grouped bar result is judged
+ * as grouped bars rather than measured against the simple case and failed.
+ */
+export function checkShape(fields: Field[], chart: ChartType, ctx?: ShapeContext): Verdict {
+    const shape = shapeFor(chart);
+    if (!shape || shape.variants.length === 0) {
+        return { kind: 'wrong', chart, nearest: { id: 'none', label: '', needs: [] }, missing: [] };
+    }
+    const best = shape.variants.map(v => checkVariant(chart, v, fields)).reduce(better);
+
+    // The columns can be right and the chart still meaningless. Checked AFTER
+    // matching so the verdict can name the variant it would have been, and only
+    // against a fit — telling somebody their box plot needs more rows when it
+    // also has no number to plot buries the thing they can act on.
+    if (
+        best.kind === 'fits' &&
+        shape.distribution &&
+        ctx?.rowCount != null &&
+        ctx.rowCount < MIN_DISTRIBUTION_ROWS
+    ) {
+        return {
+            kind: 'unsuitable',
+            chart,
+            variant: best.variant,
+            reason: `needs more rows — ${ctx.rowCount} is too few to show a distribution`,
+        };
+    }
+    return best;
+}
+
+/**
+ * What could I chart with this? — every chart type, best first.
+ *
+ * The reverse of `checkShape` and the more useful direction for somebody who
+ * cannot yet say what shape they need. Nearly free: the matcher already answers
+ * it per chart type, so this is a map and a sort. Plan §8 filed this under
+ * "where a model earns its place" — it does not, the matcher settles it, and a
+ * model would only ever add the phrasing.
+ *
+ * `close` results are kept on purpose. "A bar chart, if you add a count" is a
+ * suggestion; dropping it would leave somebody one click from a chart with
+ * nothing on screen telling them so.
+ */
+export function suggestCharts(
+    fields: Field[],
+    includeClose = true,
+    ctx?: ShapeContext,
+): Verdict[] {
+    return CHART_SHAPES.map(s => checkShape(fields, s.type, ctx))
+        // `unsuitable` is dropped alongside `wrong`. It is a real answer to
+        // "can I chart this", but this list is a recommendation, and a chart
+        // that would mislead does not belong in one.
+        .filter(v =>
+            includeClose ? v.kind === 'fits' || v.kind === 'close' : v.kind === 'fits',
+        )
+        .sort((a, b) => {
+            const [ar, au] = verdictScore(a);
+            const [br, bu] = verdictScore(b);
+            return ar - br || au - bu;
+        });
+}
+
+/** The encoding a fitting verdict implies, or null when it does not fit. */
+export function proposeEncoding(verdict: Verdict): Encoding | null {
+    return verdict.kind === 'fits' ? verdict.encoding : null;
+}
+
+/** "needs a number to bin" — the phrase a verdict puts in front of somebody. */
+export function missingSummary(verdict: Verdict): string | null {
+    if (verdict.kind === 'fits') return null;
+    if (verdict.kind === 'unsuitable') return verdict.reason;
+    return `needs ${verdict.missing.map(m => m.label).join(', and ')}`;
+}

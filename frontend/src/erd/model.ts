@@ -126,16 +126,31 @@ export interface JoinHop {
  * Lives here rather than beside either caller: it is a walk over the ER graph
  * with no SQL in it, and both the builder (which wants relationship ids) and
  * the AI repair path (which wants JOIN clauses) need the same route.
+ *
+ * **Where two routes tie on length, this picks whichever the relationship list
+ * reaches first, and that is not a judgement about the data.** Ben hit the case
+ * live: `Item` to `Vendor` is two hops through `VendorItem` or through
+ * `item_norm.parquet`, and the parquet won only because its relationship was
+ * declared earlier — inflating a join from 370 rows to 518, because the derived
+ * extract carries duplicate pairs.
+ *
+ * No tiebreak rule is applied here, deliberately. "Prefer database tables over
+ * file extracts" is right in that case and wrong the moment somebody's
+ * authoritative bridge IS a parquet. Instead `exclude` lets the CALLER rule a
+ * route out, and the builder surfaces the choice rather than guessing it.
  */
 export function relationshipPath(
     target: string,
     present: Iterable<string>,
     relationships: ErdRelationship[],
+    /** Relationship ids the route may not pass through. */
+    exclude?: Iterable<string>,
 ): JoinHop[] | null {
     const goal = target.toLowerCase();
     const have = new Set([...present].map(s => s.toLowerCase()));
     if (have.has(goal)) return [];
 
+    const barred = new Set(exclude ?? []);
     const adj = new Map<string, { other: string; rel: ErdRelationship }[]>();
     const link = (a: string, b: string, rel: ErdRelationship) => {
         const k = a.toLowerCase();
@@ -143,6 +158,7 @@ export function relationshipPath(
     };
     // Undirected: a relationship is readable from either end.
     for (const r of relationships) {
+        if (barred.has(r.id)) continue;
         link(r.fromTable, r.toTable, r);
         link(r.toTable, r.fromTable, r);
     }
