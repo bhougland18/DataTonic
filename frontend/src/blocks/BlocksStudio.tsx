@@ -36,46 +36,19 @@ import SourcesPanel from './SourcesPanel';
 import SqlCatalogPanel from './SqlCatalogPanel';
 import SavedQueriesPanel from './SavedQueriesPanel';
 import UnsavedQueryDialog from './UnsavedQueryDialog';
-import { generateSql } from './builder-sql';
 import SelectedColumns from './SelectedColumns';
 import { chartContext } from './chart-context';
+import { addressOf } from './join-insert';
+import { useQueryBuilder } from './useQueryBuilder';
 import { clearDistinctCache, distinctValues } from './distinct-values';
 import ChartShapeStrip from './ChartShapeStrip';
-import type { ColumnOption } from './ColumnPicker';
 import FiltersPanel from './FiltersPanel';
 import JoinReviewDialog from './JoinReviewDialog';
-import {
-    aggregatesFor,
-    countRules,
-    emptyBuilder,
-    type Aggregate,
-    type BuilderState,
-} from './builder-types';
-import {
-    addFilterNode,
-    addHavingNode,
-    addTable,
-    canExcludeJoin,
-    canReach,
-    excludeJoin,
-    moveColumn,
-    restoreJoin,
-    removeFilterNode,
-    removeHavingNode,
-    setAggregate,
-    setJoinMode,
-    tableReason,
-    tablesInScope,
-    toggleAllColumns,
-    toggleColumn,
-    updateFilterNode,
-    updateHavingNode,
-    // Aliased: `unreachableTables` is already a local here, meaning datasets
-    // the CURRENT DATABASE cannot read. This one means tables the ER model
-    // cannot connect — a different kind of out of reach.
-    unreachableTables as disconnectedTables,
-} from './builder-ops';
-import type { CatalogSelection } from '../sqleditor/TableCatalog';
+import { countRules } from './builder-types';
+// Only what the HOST still decides for itself. Every other builder operation
+// moved into `useQueryBuilder`, which is what makes the builder mountable by
+// the SQL Studio node rather than by this component alone.
+import { tableReason } from './builder-ops';
 import {
     exportQueries,
     importQueries,
@@ -171,13 +144,17 @@ export default function BlocksStudio({
     const [queryTitle, setQueryTitle] = useState('');
     const [queryDesc, setQueryDesc] = useState('');
     /**
-     * The builder, and whether it owns the query (plan §3).
+     * Whether the builder owns the query (plan §3).
      *
-     * Switching off does NOT clear the state — it goes dormant, so coming back
-     * restores what the builder held rather than needing the SQL parsed. The
-     * only thing lost is edits made while it was off, and the switch says so.
+     * Switching off does NOT clear the builder — it goes dormant, so coming
+     * back restores what it held rather than needing the SQL parsed. The only
+     * thing lost is edits made while it was off, and the switch says so.
+     *
+     * The builder ITSELF lives in `useQueryBuilder`, mounted below once the
+     * catalog is known, because it needs the tables. This flag stays here: which
+     * of two documents is on screen is a question about this surface, and the
+     * SQL Studio node will answer it differently.
      */
-    const [builder, setBuilder] = useState<BuilderState>(() => emptyBuilder());
     const [builderMode, setBuilderMode] = useState(true);
     /**
      * Shown the first time a query grows a join.
@@ -455,23 +432,18 @@ export default function BlocksStudio({
     // Held as derived state rather than pushed into `sql` from a handler: an
     // effect writing into the editor on every tick is the shape that goes
     // subtly wrong when the two disagree.
-    const builderSql = useMemo(
-        () =>
-            generateSql(builder, {
-                tables: paneTables,
-                relationships,
-                title: queryTitle,
-                description: queryDesc,
-            }),
-        [builder, paneTables, relationships, queryTitle, queryDesc],
-    );
+    const qb = useQueryBuilder({
+        tables: paneTables,
+        relationships,
+        title: queryTitle,
+        description: queryDesc,
+    });
+    // Read-only aliases. The builder's state and every edit to it now live in
+    // the hook, so the SQL Studio node can mount the same thing.
+    const builder = qb.state;
+    const builderSql = qb.sql;
+    const stranded = qb.stranded;
     const editorSql = builderMode ? builderSql : sql;
-
-    /** Tables the query needs but the ER model cannot connect. */
-    const stranded = useMemo(
-        () => disconnectedTables(builder, relationships),
-        [builder, relationships],
-    );
 
     // The first join in a session earns one interruption. A ref, not state, so
     // asking does not itself re-trigger the effect that asked.
@@ -483,24 +455,6 @@ export default function BlocksStudio({
     }, [builder.joins.length]);
 
     /**
-     * What the grouping filter may compare: the SUMMARISED columns, aggregate
-     * and all.
-     *
-     * These were offered as bare `Table.Column` before, which read as a filter
-     * on the item rather than on its count — and left no way to ask for "more
-     * than five", since the operators on a plain text column are the text ones.
-     * Carrying the aggregate makes the option `count(Item.Item)`, which is both
-     * what appears in the SELECT list and what HAVING actually compares.
-     */
-    const havingOptions = useMemo(
-        (): ColumnOption[] =>
-            builder.columns
-                .filter(c => (c.aggregate ?? 'none') !== 'none')
-                .map(c => ({ table: c.table, column: c.column, aggregate: c.aggregate })),
-        [builder.columns],
-    );
-
-    /**
      * The values in one column, for a filter's dropdown.
      *
      * Needs the table's ADDRESS, not its name — `duckle_src."Item"` or a
@@ -508,41 +462,19 @@ export default function BlocksStudio({
      * and handed down rather than looked up in the panel.
      */
     const fetchFilterValues = useCallback(
-        (table: string, column: string) => {
-            const t = paneTables.find(x => x.name.toLowerCase() === table.toLowerCase());
-            if (!t?.from) return Promise.resolve([]);
-            return distinctValues({
-                from: t.from,
+        (table: string, column: string) =>
+            distinctValues({
+                // `addressOf`, not `table.from` — a table whose address IS its
+                // name is the normal case inside a node, and reading `from`
+                // directly returned no values at all there.
+                from: addressOf(table, paneTables),
                 column,
                 workspacePath,
                 database: activeGroup?.dbPath ?? null,
-            });
-        },
+            }),
         [paneTables, workspacePath, activeGroup],
     );
 
-    /** What a row filter may compare: every column of every reachable table. */
-    const filterOptions = useMemo(
-        (): ColumnOption[] =>
-            paneTables
-                // A filter on a table the model cannot connect is a query that
-                // cannot run.
-                .filter(t => canReach(builder, t.name, relationships))
-                .flatMap(t => t.columns.map(c => ({ table: t.name, column: c.name }))),
-        [paneTables, builder, relationships],
-    );
-
-    /** Which relationships the query uses, and how — for the Joins list. */
-    const activeJoins = useMemo(
-        () => new Map(builder.joins.map(j => [j.relationshipId, j.mode])),
-        [builder.joins],
-    );
-
-    /** Routes ruled out, so the list can offer to put them back. */
-    const excludedJoinIds = useMemo(
-        () => new Set(builder.excludedJoins ?? []),
-        [builder.excludedJoins],
-    );
 
     /**
      * The last run, kept so the AI pane can be told what is on screen.
@@ -571,7 +503,7 @@ export default function BlocksStudio({
             setLastRun({
                 result,
                 aggregated: builderMode
-                    ? builder.columns.some(c => (c.aggregate ?? 'none') !== 'none')
+                    ? qb.aggregated
                     : undefined,
             });
         },
@@ -598,54 +530,6 @@ export default function BlocksStudio({
         setLastRun(null);
     }, []);
 
-    /** Bring a relationship's tables in without selecting from them. */
-    const addJoinTable = useCallback(
-        (rel: ErdRelationship) => {
-            setBuilder(b => {
-                const scope = tablesInScope(b, relationships);
-                // Add whichever end is not there yet; with an empty query, the
-                // `from` side becomes the anchor.
-                const target = scope.has(rel.fromTable.toLowerCase()) ? rel.toTable : rel.fromTable;
-                return addTable(b, target, relationships);
-            });
-        },
-        [relationships],
-    );
-
-    /** Turn the catalog into a picker — only while the builder owns the query. */
-    const selectionFor = useCallback(
-        (table: SqlStudioTable): CatalogSelection => ({
-            isSelected: column =>
-                builder.columns.some(
-                    c =>
-                        c.table.toLowerCase() === table.name.toLowerCase() &&
-                        c.column.toLowerCase() === column.toLowerCase(),
-                ),
-            onToggle: column =>
-                setBuilder(b => toggleColumn(b, table.name, column, relationships)),
-            onToggleAll: () =>
-                setBuilder(b =>
-                    toggleAllColumns(
-                        b,
-                        table.name,
-                        table.columns.map(c => c.name),
-                        relationships,
-                    ),
-                ),
-            aggregateOf: column =>
-                builder.columns.find(
-                    c =>
-                        c.table.toLowerCase() === table.name.toLowerCase() &&
-                        c.column.toLowerCase() === column.toLowerCase(),
-                )?.aggregate ?? 'none',
-            onAggregate: (column, aggregate) =>
-                setBuilder(b => setAggregate(b, table.name, column, aggregate as Aggregate)),
-            aggregatesFor: column =>
-                aggregatesFor(table.columns.find(c => c.name === column)?.type),
-            reachable: canReach(builder, table.name, relationships),
-        }),
-        [builder, relationships],
-    );
 
     /** Hand the query over, or take it back. */
     const toggleBuilder = useCallback(() => {
@@ -749,7 +633,7 @@ export default function BlocksStudio({
         setActiveQueryId(q.id);
         setAiDraft(null);
         setBuilderMode(false);
-        setBuilder(emptyBuilder());
+        qb.reset();
         clearResults();
     }, []);
 
@@ -766,7 +650,7 @@ export default function BlocksStudio({
         setQueryDesc('');
         setActiveQueryId(null);
         setAiDraft(null);
-        setBuilder(emptyBuilder());
+        qb.reset();
         // Back to the default the studio opens in, not to whatever mode the
         // last query happened to leave behind.
         setBuilderMode(true);
@@ -977,51 +861,31 @@ export default function BlocksStudio({
                             relationships={relationships}
                             sql={editorSql}
                             onChangeSql={setSql}
-                            selectionFor={builderMode ? selectionFor : undefined}
-                            activeJoins={builderMode ? activeJoins : undefined}
-                            onSetJoinMode={
-                                builderMode
-                                    ? (id, mode) => setBuilder(b => setJoinMode(b, id, mode))
-                                    : undefined
-                            }
-                            onAddJoinTable={builderMode ? addJoinTable : undefined}
+                            selectionFor={builderMode ? qb.selectionFor : undefined}
+                            activeJoins={builderMode ? qb.activeJoins : undefined}
+                            onSetJoinMode={builderMode ? qb.setJoinMode : undefined}
+                            onAddJoinTable={builderMode ? qb.addJoinTable : undefined}
                             reasonFor={
                                 builderMode ? table => tableReason(builder, table) : undefined
                             }
-                            excludedJoins={excludedJoinIds}
-                            onExcludeJoin={
-                                builderMode
-                                    ? id => setBuilder(b => excludeJoin(b, id, relationships))
-                                    : undefined
-                            }
-                            onRestoreJoin={
-                                builderMode
-                                    ? id => setBuilder(b => restoreJoin(b, id, relationships))
-                                    : undefined
-                            }
-                            canExcludeJoin={
-                                builderMode
-                                    ? id => canExcludeJoin(builder, id, relationships)
-                                    : undefined
-                            }
+                            excludedJoins={qb.excludedJoinIds}
+                            onExcludeJoin={builderMode ? qb.excludeJoin : undefined}
+                            onRestoreJoin={builderMode ? qb.restoreJoin : undefined}
+                            canExcludeJoin={builderMode ? qb.canExcludeJoin : undefined}
                             selectedCount={builder.columns.length}
                             filterCount={countRules(builder.filters)}
                             havingCount={countRules(builder.having)}
                             having={
-                                builderMode && havingOptions.length > 0 ? (
+                                builderMode && qb.havingOptions.length > 0 ? (
                                     <FiltersPanel
                                         root={builder.having}
                                         // Only the aggregated columns: HAVING
                                         // filters groups, and a group has no
                                         // value for a column it grouped BY.
-                                        options={havingOptions}
-                                        onUpdate={node =>
-                                            setBuilder(b => updateHavingNode(b, node))
-                                        }
-                                        onAdd={(groupId, child) =>
-                                            setBuilder(b => addHavingNode(b, groupId, child))
-                                        }
-                                        onRemove={id => setBuilder(b => removeHavingNode(b, id))}
+                                        options={qb.havingOptions}
+                                        onUpdate={qb.updateHaving}
+                                        onAdd={qb.addHaving}
+                                        onRemove={qb.removeHaving}
                                     />
                                 ) : undefined
                             }
@@ -1029,20 +893,10 @@ export default function BlocksStudio({
                                 builderMode ? (
                                     <FiltersPanel
                                         root={builder.filters}
-                                        options={filterOptions}
-                                        onUpdate={node =>
-                                            setBuilder(b =>
-                                                updateFilterNode(b, node, relationships),
-                                            )
-                                        }
-                                        onAdd={(groupId, child) =>
-                                            setBuilder(b =>
-                                                addFilterNode(b, groupId, child, relationships),
-                                            )
-                                        }
-                                        onRemove={id =>
-                                            setBuilder(b => removeFilterNode(b, id, relationships))
-                                        }
+                                        options={qb.filterOptions}
+                                        onUpdate={qb.updateFilter}
+                                        onAdd={qb.addFilter}
+                                        onRemove={qb.removeFilter}
                                         fetchValues={fetchFilterValues}
                                     />
                                 ) : undefined
@@ -1051,14 +905,8 @@ export default function BlocksStudio({
                                 builderMode && builder.columns.length > 0 ? (
                                     <SelectedColumns
                                         columns={builder.columns}
-                                        onMove={(from, to) =>
-                                            setBuilder(b => moveColumn(b, from, to))
-                                        }
-                                        onRemove={c =>
-                                            setBuilder(b =>
-                                                toggleColumn(b, c.table, c.column, relationships),
-                                            )
-                                        }
+                                        onMove={qb.moveColumn}
+                                        onRemove={qb.removeColumn}
                                     />
                                 ) : undefined
                             }

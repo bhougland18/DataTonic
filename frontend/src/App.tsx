@@ -1498,6 +1498,9 @@ export default function App() {
                 tables,
                 relationships,
                 fromWorkingDb: upstreamIsWorkingDb,
+                // Present only if the node was authored with the builder; its
+                // absence is what opens the editor in SQL mode.
+                builder: p.builder,
             }));
             setMode('sql');
         },
@@ -1514,6 +1517,17 @@ export default function App() {
                         ...(n.data.properties ?? {}),
                         sql: result.sql,
                     };
+                    // Builder state rides alongside the SQL so reopening the
+                    // node returns to the builder rather than to text. The
+                    // engine reads `sql`/`rawSql`/`pureSql` by name and ignores
+                    // the rest, so this needs no schema or migration.
+                    //
+                    // `undefined` means "leave whatever is there"; `null` means
+                    // the query was taken over by hand, and the stale builder
+                    // must GO — otherwise switching it back on would replace
+                    // the node's SQL with an older query.
+                    if (result.builder === null) delete nextProps.builder;
+                    else if (result.builder !== undefined) nextProps.builder = result.builder;
                     return { ...n, data: { ...n.data, properties: nextProps } };
                 }),
             );

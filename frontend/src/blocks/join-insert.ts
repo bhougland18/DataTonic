@@ -29,7 +29,20 @@ export type JoinInsert =
 const TAIL =
     /\b(where|group\s+by|order\s+by|having|limit|offset|qualify|window|union|except|intersect)\b/i;
 
-const addressOf = (name: string, tables: SqlStudioTable[]): string => {
+/**
+ * What to write after FROM or JOIN for a table, however it is addressed.
+ *
+ * `from` when the catalog gave one — `duckle_src."Item"`, a `read_parquet(…)` —
+ * and the quoted NAME when it did not. Both are real cases and neither is a
+ * fallback for an error: inside a SQL Studio node the working DB holds each
+ * upstream under its own name, so `from` is legitimately absent.
+ *
+ * Exported because that second case is the one Blocks code forgets. The filter
+ * value picker read `table.from` directly and returned nothing when it was
+ * undefined, which would have meant no value lists at all on the node — a
+ * feature silently missing rather than visibly broken.
+ */
+export const addressOf = (name: string, tables: SqlStudioTable[]): string => {
     const t = tables.find(x => x.name.toLowerCase() === name.toLowerCase());
     return t?.from ?? quoteIdent(name);
 };

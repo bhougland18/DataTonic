@@ -957,3 +957,12 @@
 .sqlstudio-editor.cm-focused .cm-selectionBackground {
     background: color-mix(in srgb, var(--accent) 32%, transparent) !important;
 }
+
+/* The builder panel's wrapper exists only to carry `data-tour`; `display:
+   contents` keeps it out of the layout so `.blk-catalog` is a direct flex child
+   of `.sqlstudio`, exactly as it is of `.blk-lower` in Blocks. Without this the
+   panel's own width and the collapse rail would both be fighting a div that
+   defaults to stretching. */
+.sqlstudio-builder-side {
+    display: contents;
+}

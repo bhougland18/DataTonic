@@ -11,6 +11,7 @@
 // person wrote: leading commas, one clause per line, table names as aliases.
 
 import { joinSql, quoteIdent, type ErdRelationship } from '../erd/model';
+import { addressOf } from './join-insert';
 import type { SqlStudioTable } from '../sqleditor/types';
 import {
     filterIsComplete,
@@ -181,8 +182,7 @@ function joinClause(
     keyword: string,
     tables: SqlStudioTable[],
 ): string {
-    const t = tables.find(x => x.name.toLowerCase() === joined.toLowerCase());
-    const addr = t?.from ?? quoteIdent(joined);
+    const addr = addressOf(joined, tables);
     return `${keyword} ${addr} AS ${quoteIdent(joined)}\n  ON ${joinSql(rel)}`;
 }
 
@@ -225,9 +225,8 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
     // dependable: a join is only ever added onto a table that is present, so
     // nothing can reference a table introduced later (the failure
     // `join-order.ts` exists to repair in AI drafts cannot arise here).
-    const anchorTable = tables.find(t => t.name.toLowerCase() === state.anchor?.toLowerCase());
     lines.push(
-        `FROM ${anchorTable?.from ?? quoteIdent(state.anchor)} AS ${quoteIdent(state.anchor)}`,
+        `FROM ${addressOf(state.anchor, tables)} AS ${quoteIdent(state.anchor)}`,
     );
 
     const inScope = new Set([state.anchor.toLowerCase()]);
