@@ -2,28 +2,24 @@ import './blocks.css';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     AlertTriangle,
-    Bookmark,
     ChartNoAxesCombined,
     Check,
     Database,
     FileCode2,
     FilePlus2,
     HelpCircle,
-    LayoutGrid,
     Loader2,
     MousePointerClick,
     Network,
     RotateCw,
     Save,
     Sparkles,
-    Wand2,
     X,
 } from 'lucide-react';
 import { maybeStartEditorTour, startEditorTour } from '../GuidedTour';
-import ErdAuthoring from '../erd/ErdAuthoring';
-import { inferRelationships } from '../erd/model';
+import ErdEditor, { type ErdSavedModel } from '../erd/ErdEditor';
 import type { ErdRelationship, ErdTable } from '../erd/model';
-import { loadSchemaModel, mergeRelationships, saveSchemaModel } from './model-io';
+import { loadSchemaModel, saveSchemaModel } from './model-io';
 import QueryPane from '../sqleditor/QueryPane';
 import AiPane from '../sqleditor/AiPane';
 import type { SqlRunResult, SqlStudioColumn, SqlStudioTable } from '../sqleditor/types';
@@ -43,6 +39,7 @@ import UnsavedQueryDialog from './UnsavedQueryDialog';
 import { generateSql } from './builder-sql';
 import SelectedColumns from './SelectedColumns';
 import { chartContext } from './chart-context';
+import { clearDistinctCache, distinctValues } from './distinct-values';
 import ChartShapeStrip from './ChartShapeStrip';
 import type { ColumnOption } from './ColumnPicker';
 import FiltersPanel from './FiltersPanel';
@@ -90,19 +87,6 @@ import {
     withQueryHeader,
     type SavedQuery,
 } from './query-io';
-import JoinLibraryPanel from './JoinLibraryPanel';
-import {
-    applicableJoins,
-    exportJoinLibrary,
-    importJoinLibrary,
-    loadJoinLibrary,
-    removeJoin,
-    saveJoinLibrary,
-    toSavedJoin,
-    upsertJoin,
-    type JoinScope,
-    type SavedJoin,
-} from './join-library';
 import type { BlockSource, BlockStep } from './types';
 
 interface BlocksStudioProps {
@@ -167,11 +151,6 @@ export default function BlocksStudio({
      * only matters after a rescan, which is exactly when it is least expected.
      */
     const [selectedIds, setSelectedIds] = useState<string[] | null>(null);
-    /** The saved-join library, both scopes combined. */
-    const [library, setLibrary] = useState<SavedJoin[]>([]);
-    const [libraryOpen, setLibraryOpen] = useState(false);
-    /** Bumped to re-run auto-arrange on the diagram. */
-    const [arrangeNonce, setArrangeNonce] = useState(0);
     /** Whether the AI pane is showing. The pane itself is always mounted. */
     const [showAi, setShowAi] = useState(false);
     // The AI's editable draft; non-null splits the SQL step into two panes.
@@ -247,6 +226,11 @@ export default function BlocksStudio({
             }
             setLoading(true);
             setError(null);
+            // Remembered filter values describe the data as it was. A rescan is
+            // the moment somebody expects to see a pipeline's new output, so
+            // serving yesterday's value list from cache would be the one time
+            // it is actually misleading.
+            clearDistinctCache();
             try {
                 const view = rebuild
                     ? await workspaceCatalogRebuild(workspacePath)
@@ -356,58 +340,34 @@ export default function BlocksStudio({
             })),
         [shown, schema],
     );
-    // The authored ER model. Seeded from what was saved, falling back to
-    // inference the first time. Held as state rather than derived, because past
-    // this point it is the user's document, not a function of the catalog.
+    /**
+     * A read-only MIRROR of the ER model, which `ErdEditor` owns.
+     *
+     * The SQL step builds queries from the relationships, so this surface needs
+     * to read them — but not to write them. Keeping one owner is the point:
+     * two copies of this model is how the Working DB node and this studio
+     * drifted apart.
+     */
     const [relationships, setRelationships] = useState<ErdRelationship[]>([]);
-    const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
-    /** Tables whose edges are not drawn. See the toggle on each diagram node. */
-    const [hiddenRelations, setHiddenRelations] = useState<string[]>([]);
-    // A ref for the same reason `probedRef` is one: writing it inside the effect
-    // that also depends on it makes the effect cancel its own in-flight load.
-    const seededRef = useRef(false);
 
-    // Seed the model: whatever was saved, else what inference suggests.
-    //
-    // Gated on COLUMNS, not just on tables. The catalog gives us table names
-    // immediately but no columns — those arrive later from the probe — and
-    // `inferRelationships` matches on column names, so seeding early produced
-    // an empty set and then never retried. That is why the joins only appeared
-    // after pressing Auto-infer.
-    useEffect(() => {
-        if (seededRef.current || !workspacePath || erdTables.length === 0) return;
-        if (!erdTables.some(t => t.columns.length > 0)) return;
-        let cancelled = false;
-        seededRef.current = true;
-        void Promise.all([loadSchemaModel(workspacePath), loadJoinLibrary(workspacePath)])
-            .then(([saved, lib]) => {
-                if (cancelled) return;
-                setLibrary(lib);
-                setRelationships(
-                    mergeRelationships(
-                        saved.relationships,
-                        inferRelationships(erdTables),
-                        erdTables,
-                        applicableJoins(lib, erdTables),
-                    ),
-                );
-                setHiddenRelations(saved.hiddenRelations);
-            })
-            .catch(() => {
-                // A model we cannot read must not block authoring a new one.
-                if (!cancelled) setRelationships(inferRelationships(erdTables));
-            });
-        return () => {
-            cancelled = true;
-        };
-    }, [workspacePath, erdTables]);
-
-    const edit = useCallback((next: ErdRelationship[]) => {
-        setRelationships(next);
-        setSaveState('idle');
-    }, []);
-
-    const reinfer = useCallback(() => edit(inferRelationships(erdTables)), [edit, erdTables]);
+    /** Where this surface stores its ER model: a file in the workspace. The
+     *  Working DB node stores its own on the node instead — that difference is
+     *  the whole reason `ErdEditor` takes an adapter. */
+    const erdPersistence = useMemo(
+        () => ({
+            key: `workspace:${workspacePath ?? ''}`,
+            saveLabel: 'Save model',
+            load: () =>
+                workspacePath
+                    ? loadSchemaModel(workspacePath)
+                    : Promise.resolve({ relationships: [], hiddenRelations: [] }),
+            save: (model: ErdSavedModel) =>
+                workspacePath
+                    ? saveSchemaModel(workspacePath, model.relationships, model.hiddenRelations)
+                    : Promise.resolve(false),
+        }),
+        [workspacePath],
+    );
 
     // Toggling resolves `null` to the current full set first, so the first
     // un-tick turns "everything" into an explicit choice rather than clearing it.
@@ -432,88 +392,6 @@ export default function BlocksStudio({
             }),
         [sources],
     );
-
-    // Library mutations all write through one place, so the two stores (the
-    // workspace file and localStorage) can never drift from what is on screen.
-    const commitLibrary = useCallback(
-        (next: SavedJoin[]) => {
-            setLibrary(next);
-            void saveJoinLibrary(workspacePath, next);
-        },
-        [workspacePath],
-    );
-
-    const savedJoinIds = useMemo(() => new Set(library.map(j => j.id)), [library]);
-
-    const saveJoins = useCallback(
-        (rels: ErdRelationship[]) => {
-            // Saved into the WORKSPACE by default. Promoting to global is a
-            // deliberate second step in the panel: a join that happens to work
-            // here is not yet a claim about every future engagement.
-            let next = library;
-            for (const r of rels) next = upsertJoin(next, toSavedJoin(r, 'workspace'));
-            commitLibrary(next);
-            setLibraryOpen(true);
-        },
-        [library, commitLibrary],
-    );
-
-    const applyJoin = useCallback((join: SavedJoin) => {
-        setRelationships(prev =>
-            prev.some(r => r.id === join.id)
-                ? prev
-                : [
-                      ...prev,
-                      {
-                          id: join.id,
-                          fromTable: join.fromTable,
-                          fromColumn: join.fromColumn,
-                          toTable: join.toTable,
-                          toColumn: join.toColumn,
-                          inferred: false,
-                      },
-                  ],
-        );
-        setSaveState('idle');
-    }, []);
-
-    const rescopeJoin = useCallback(
-        (join: SavedJoin, scope: JoinScope) =>
-            commitLibrary(upsertJoin(removeJoin(library, join.id, join.scope), { ...join, scope })),
-        [library, commitLibrary],
-    );
-
-    const importLibrary = useCallback(async () => {
-        try {
-            const imported = await importJoinLibrary();
-            if (!imported) return;
-            let next = library;
-            for (const j of imported) next = upsertJoin(next, j);
-            commitLibrary(next);
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
-        }
-    }, [library, commitLibrary]);
-
-    const exportLibrary = useCallback(async () => {
-        const res = await exportJoinLibrary(library);
-        if (res !== 'ok' && res !== 'cancelled') setError(`Export failed: ${res}`);
-    }, [library]);
-
-    const toggleRelations = useCallback((table: string) => {
-        setHiddenRelations(prev =>
-            prev.includes(table) ? prev.filter(t => t !== table) : [...prev, table],
-        );
-        setSaveState('idle');
-    }, []);
-
-    const save = useCallback(async () => {
-        if (!workspacePath) return;
-        setSaveState('saving');
-        const ok = await saveSchemaModel(workspacePath, relationships, hiddenRelations);
-        setSaveState(ok ? 'saved' : 'idle');
-        if (!ok) setError('Could not save the ER model.');
-    }, [workspacePath, relationships, hiddenRelations]);
 
     // The database files the catalog knows about, and the one a query attaches.
     const groups = useMemo(() => databaseGroups(sources), [sources]);
@@ -622,6 +500,27 @@ export default function BlocksStudio({
         [builder.columns],
     );
 
+    /**
+     * The values in one column, for a filter's dropdown.
+     *
+     * Needs the table's ADDRESS, not its name — `duckle_src."Item"` or a
+     * parquet read — which only the catalog knows, so this is assembled here
+     * and handed down rather than looked up in the panel.
+     */
+    const fetchFilterValues = useCallback(
+        (table: string, column: string) => {
+            const t = paneTables.find(x => x.name.toLowerCase() === table.toLowerCase());
+            if (!t?.from) return Promise.resolve([]);
+            return distinctValues({
+                from: t.from,
+                column,
+                workspacePath,
+                database: activeGroup?.dbPath ?? null,
+            });
+        },
+        [paneTables, workspacePath, activeGroup],
+    );
+
     /** What a row filter may compare: every column of every reachable table. */
     const filterOptions = useMemo(
         (): ColumnOption[] =>
@@ -683,6 +582,21 @@ export default function BlocksStudio({
         () => chartContext(lastRun?.result, { aggregated: lastRun?.aggregated }),
         [lastRun],
     );
+
+    /**
+     * Throw away the result on screen, and everything derived from it.
+     *
+     * Three places hold a view of the last run and all three go together: the
+     * pane's own grid (via `resetToken`), the available-charts strip that reads
+     * it, and the copy the AI pane is given as context. Leaving any one behind
+     * describes a query that is no longer on screen — the AI pane confidently
+     * answering about columns nobody can see is the worst of the three.
+     */
+    const [resetToken, setResetToken] = useState(0);
+    const clearResults = useCallback(() => {
+        setResetToken(t => t + 1);
+        setLastRun(null);
+    }, []);
 
     /** Bring a relationship's tables in without selecting from them. */
     const addJoinTable = useCallback(
@@ -836,6 +750,7 @@ export default function BlocksStudio({
         setAiDraft(null);
         setBuilderMode(false);
         setBuilder(emptyBuilder());
+        clearResults();
     }, []);
 
     /**
@@ -855,6 +770,7 @@ export default function BlocksStudio({
         // Back to the default the studio opens in, not to whatever mode the
         // last query happened to leave behind.
         setBuilderMode(true);
+        clearResults();
     }, []);
 
     const activeSaved = useMemo(
@@ -1127,6 +1043,7 @@ export default function BlocksStudio({
                                         onRemove={id =>
                                             setBuilder(b => removeFilterNode(b, id, relationships))
                                         }
+                                        fetchValues={fetchFilterValues}
                                     />
                                 ) : undefined
                             }
@@ -1159,18 +1076,6 @@ export default function BlocksStudio({
                             pipelineNames={pipelineNames}
                         />
                     )}
-                    {libraryOpen ? (
-                        <JoinLibraryPanel
-                            joins={library}
-                            tables={erdTables}
-                            onApply={applyJoin}
-                            onRemove={(id, scope) => commitLibrary(removeJoin(library, id, scope))}
-                            onRescope={rescopeJoin}
-                            onExport={() => void exportLibrary()}
-                            onImport={() => void importLibrary()}
-                            onClose={() => setLibraryOpen(false)}
-                        />
-                    ) : null}
                     {/* Second left panel, beside the catalog — the same slot the
                         Join Library takes on the Schema step, and only on the
                         step that can act on it. */}
@@ -1195,63 +1100,15 @@ export default function BlocksStudio({
                     {step === 'schema' ? (
                         erdTables.length > 0 ? (
                             <div className="blk-erd">
-                                <div className="blk-bar">
-                                    <span className="blk-bar-title">
-                                        ER Model
-                                        <small>
-                                            {erdTables.length} durable dataset
-                                            {erdTables.length === 1 ? '' : 's'}
-                                        </small>
-                                    </span>
-                                    <span className="blk-bar-spacer" />
-                                    <button
-                                        className={`erd-btn${libraryOpen ? ' erd-btn--on' : ''}`}
-                                        onClick={() => setLibraryOpen(o => !o)}
-                                        title="Saved joins you can reuse here and in other workspaces"
-                                    >
-                                        <Bookmark size={14} /> Library
-                                        {library.length > 0 ? ` (${library.length})` : ''}
-                                    </button>
-                                    <button
-                                        className="erd-btn"
-                                        onClick={() => setArrangeNonce(n => n + 1)}
-                                        title="Arrange the tables by how they connect"
-                                    >
-                                        <LayoutGrid size={14} /> Arrange
-                                    </button>
-                                    <button
-                                        className="erd-btn"
-                                        onClick={reinfer}
-                                        title="Re-infer all relationships from column names"
-                                    >
-                                        <Wand2 size={14} /> Auto-infer all
-                                    </button>
-                                    <button
-                                        className="erd-btn erd-btn--primary"
-                                        onClick={() => void save()}
-                                        disabled={saveState !== 'idle'}
-                                    >
-                                        {saveState === 'saved' ? (
-                                            <>
-                                                <Check size={14} /> Saved
-                                            </>
-                                        ) : (
-                                            <>
-                                                <Save size={14} />{' '}
-                                                {saveState === 'saving' ? 'Saving…' : 'Save model'}
-                                            </>
-                                        )}
-                                    </button>
-                                </div>
-                                <ErdAuthoring
+                                <ErdEditor
                                     tables={erdTables}
-                                    relationships={relationships}
-                                    onRelationshipsChange={edit}
-                                    hiddenRelations={hiddenRelations}
-                                    onToggleRelations={toggleRelations}
-                                    arrangeNonce={arrangeNonce}
-                                    onSaveJoins={saveJoins}
-                                    savedJoinIds={savedJoinIds}
+                                    subtitle={`${erdTables.length} durable dataset${
+                                        erdTables.length === 1 ? '' : 's'
+                                    }`}
+                                    persistence={erdPersistence}
+                                    workspacePath={workspacePath}
+                                    onError={setError}
+                                    onModelChange={m => setRelationships(m.relationships)}
                                 />
                             </div>
                         ) : (
@@ -1419,6 +1276,7 @@ export default function BlocksStudio({
                                         />
                                     )}
                                     onResult={noteRun}
+                                    resetToken={resetToken}
                                 />
                                 {aiDraft != null && (
                                     <QueryPane

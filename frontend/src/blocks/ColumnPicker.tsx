@@ -11,9 +11,10 @@
 // So: a text input that tracks TYPING separately from the COMMITTED value, and
 // filters only while typing. Same shape as the fix that worked there.
 
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { Aggregate } from './builder-types';
+import { useAnchoredPopup, useClickAway } from './popup';
 
 export interface ColumnOption {
     table: string;
@@ -45,56 +46,17 @@ export default function ColumnPicker({ value, options, onChange, className }: Co
     const [typed, setTyped] = useState<string | null>(null);
     const [open, setOpen] = useState(false);
     const box = useRef<HTMLDivElement>(null);
-    /**
-     * Where to draw the list, in viewport coordinates.
-     *
-     * The list is PORTALLED to the body and positioned fixed, because the
-     * accordion section it lives in scrolls — and a scroll container clips
-     * anything absolutely positioned inside it, however high the z-index. The
-     * dropdown was being cut off at the section's edge.
-     */
-    const [at, setAt] = useState<{ left: number; top: number; width: number } | null>(null);
-
-    useLayoutEffect(() => {
-        if (!open) return;
-        const place = () => {
-            const r = box.current?.getBoundingClientRect();
-            if (!r) return;
-            // Flip above when there is more room there — near the bottom of a
-            // laptop screen the list would otherwise open off-screen.
-            const below = window.innerHeight - r.bottom;
-            const height = Math.min(220, below > 160 ? below - 8 : r.top - 8);
-            setAt({
-                left: r.left,
-                top: below > 160 ? r.bottom + 2 : r.top - height - 2,
-                width: r.width,
-            });
-        };
-        place();
-        // Capture phase: the section scrolls, not the window, so the event does
-        // not bubble to us.
-        window.addEventListener('scroll', place, true);
-        window.addEventListener('resize', place);
-        return () => {
-            window.removeEventListener('scroll', place, true);
-            window.removeEventListener('resize', place);
-        };
-    }, [open]);
+    // Portalled to `body` and positioned in viewport coordinates — see
+    // `popup.ts` for why a dropdown inside a scrolling section cannot simply be
+    // absolutely positioned.
+    const at = useAnchoredPopup(open, box);
 
     // Clicking anywhere else commits what is there and closes.
-    useEffect(() => {
-        if (!open) return;
-        const away = (e: MouseEvent) => {
-            const t = e.target as Node;
-            const inList = (t as HTMLElement).closest?.('.blk-colpick-list');
-            if (box.current && !box.current.contains(t) && !inList) {
-                setOpen(false);
-                setTyped(null);
-            }
-        };
-        document.addEventListener('mousedown', away);
-        return () => document.removeEventListener('mousedown', away);
-    }, [open]);
+    const close = useCallback(() => {
+        setOpen(false);
+        setTyped(null);
+    }, []);
+    useClickAway(open, box, 'blk-colpick-list', close);
 
     const q = (typed ?? '').trim().toLowerCase();
     // Filter only while TYPING. With a committed value the list stays whole, so

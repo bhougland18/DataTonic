@@ -8,8 +8,13 @@ import {
     upsertJoin,
     type SavedJoin,
 } from './join-library';
-import { mergeRelationships } from './model-io';
-import { joinSql, qualifierSql, type ErdRelationship, type ErdTable } from '../erd/model';
+import {
+    joinSql,
+    mergeRelationships,
+    qualifierSql,
+    type ErdRelationship,
+    type ErdTable,
+} from './model';
 
 function saved(over: Partial<SavedJoin> = {}): SavedJoin {
     const base = {

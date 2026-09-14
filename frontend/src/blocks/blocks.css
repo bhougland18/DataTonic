@@ -95,29 +95,12 @@
     opacity: 0.5;
     cursor: default;
 }
-/* ---- Join library (secondary panel) ---- */
-.blk-lib {
-    width: 290px;
-    flex-shrink: 0;
-    display: flex;
-    flex-direction: column;
-    padding: 8px;
-    overflow-y: auto;
-    border-right: 1px solid var(--border);
-    background: var(--bg-1);
-}
-.blk-lib-head {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 2px 4px 8px;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-2);
-}
-.blk-lib-head span {
-    margin-right: auto;
-}
+/* ---- Secondary-panel primitives ----
+   Shared by the Filters, Saved Queries, Selected Columns and SQL Catalog
+   panels. They were first written for the join library, which has since moved
+   to `erd/` with the editor and taken its own `erd-lib-*` copies; these keep
+   the `blk-lib-*` names the four Blocks panels already use, and stay here so
+   a Blocks panel is never styled from the ERD stylesheet. */
 .blk-lib-icon {
     display: inline-flex;
     align-items: center;
@@ -134,21 +117,17 @@
     background: var(--bg-2);
     color: var(--text-1);
 }
-.blk-lib-section {
-    margin-bottom: 10px;
-}
-.blk-lib-section-head {
+.blk-lib-head {
     display: flex;
     align-items: center;
-    gap: 5px;
-    padding: 4px;
-    font-size: 11px;
+    gap: 6px;
+    padding: 2px 4px 8px;
+    font-size: 12px;
     font-weight: 600;
-    color: var(--text-3);
+    color: var(--text-2);
 }
-.blk-lib-section-head small {
-    margin-left: auto;
-    font-weight: 500;
+.blk-lib-head span {
+    margin-right: auto;
 }
 .blk-lib-hint {
     margin: 0;
@@ -177,43 +156,6 @@
     color: var(--text-1);
     font-size: 11.5px;
 }
-/* Pair grouping, deliberately the same shape as the relationship list on the
-   right: a saved join and a live one are the same kind of thing. */
-.blk-lib-group {
-    margin-bottom: 4px;
-}
-.blk-lib-group-head {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    width: 100%;
-    padding: 3px 4px;
-    background: none;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    color: var(--text-2);
-}
-.blk-lib-group-head:hover {
-    color: var(--text-1);
-}
-.blk-lib-group-head .pair {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 11.5px;
-    font-weight: 600;
-}
-.blk-lib-group-head .cnt {
-    margin-left: auto;
-    flex-shrink: 0;
-    font-size: 10px;
-    color: var(--accent);
-}
-.blk-lib-group .blk-lib-row {
-    margin-left: 12px;
-}
 .blk-lib-row {
     display: flex;
     align-items: center;
@@ -223,8 +165,6 @@
 .blk-lib-row:hover {
     background: var(--bg-2);
 }
-/* An entry that cannot apply here is dimmed, not hidden: a library that shows
-   fewer rows in some workspaces is one you stop trusting. */
 .blk-lib-row--off {
     opacity: 0.45;
 }
@@ -634,7 +574,7 @@
 }
 /* The search reuses the join library's input. Wider gutters here to line up
    with the database selector above it. */
-.blk-catalog .blk-lib-search {
+.blk-catalog .erd-lib-search {
     flex-shrink: 0;
     margin: 0 8px 8px;
 }
@@ -1324,11 +1264,8 @@
     border-color: var(--accent);
 }
 .blk-colpick-list {
-    position: absolute;
+    position: fixed;
     z-index: 20;
-    top: 100%;
-    left: 0;
-    right: 0;
     max-height: 220px;
     overflow-y: auto;
     margin: 2px 0 0;
@@ -1468,4 +1405,74 @@ button.blk-shape-chip:hover {
     color: var(--text-3);
     font-family: var(--mono, ui-monospace, monospace);
     font-size: 11.5px;
+}
+
+/* ---- Filter value picker ---- */
+/* Portalled to `body` and positioned in VIEWPORT coordinates (see popup.ts),
+   so `fixed` rather than `absolute` — the two only look the same here because
+   this app never scrolls the body. */
+.blk-valpick {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+}
+.blk-valpick .blk-filter-val {
+    width: 100%;
+}
+.blk-valpick-list {
+    position: fixed;
+    z-index: 20;
+    max-height: 220px;
+    overflow-y: auto;
+    margin: 0;
+    padding: 2px;
+    list-style: none;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.blk-valpick-list button {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    width: 100%;
+    padding: 4px 6px;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    text-align: left;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+.blk-valpick-list button:hover {
+    background: var(--bg-2);
+}
+.blk-valpick-v {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* The row count, right-aligned and tabular so the column of numbers lines up —
+   it answers "will this filter return anything" before the query is run. */
+.blk-valpick-n {
+    flex-shrink: 0;
+    color: var(--text-4);
+    font-variant-numeric: tabular-nums;
+}
+.blk-valpick-note {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 6px;
+    font-size: 11px;
+    color: var(--text-3);
+}
+.blk-valpick-cap {
+    border-top: 1px solid var(--border);
+    margin-top: 2px;
 }

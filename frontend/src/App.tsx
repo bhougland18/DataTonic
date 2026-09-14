@@ -1720,6 +1720,7 @@ export default function App() {
                 nodeName: (wdb.data.alias || wdb.data.label || wdb.id).toString(),
                 tables,
                 relationships: model.relationships,
+                hiddenRelations: persisted?.hiddenRelations ?? [],
             }));
             setMode('erd');
         },
@@ -3418,6 +3419,7 @@ export default function App() {
                         openRequest={erdRequest}
                         onSave={handleSaveErd}
                         onClose={() => setMode('canvas')}
+                        workspacePath={workspacePathState}
                     />
                 </div>
                 {/* Regex Studio — kept mounted (hidden when inactive) so an

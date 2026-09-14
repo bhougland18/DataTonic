@@ -515,6 +515,26 @@
     color: var(--text-1);
     overflow: hidden;
 }
+
+/* The editor shell, mounted by BOTH hosts: the Working DB node's rail surface
+   and the Blocks schema step. Column, because it stacks its toolbar above the
+   working area. */
+.erd-ed {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+/* Row: the join library (when open) beside the diagram + relationship panel,
+   which `ErdAuthoring` renders as its own row. */
+.erd-ed-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+}
 .erd-ws-empty {
     flex: 1;
     display: flex;
@@ -760,3 +780,164 @@
     text-align: center;
     padding: 1px 6px;
 }
+
+/* ---- Join library panel (shared by both ERD hosts) ---- */
+.erd-lib {
+    width: 290px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 8px;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+    background: var(--bg-1);
+}
+.erd-lib-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-2);
+}
+.erd-lib-head span {
+    margin-right: auto;
+}
+.erd-lib-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 4px;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    color: var(--text-3);
+    cursor: pointer;
+    font-size: 13px;
+}
+.erd-lib-icon:hover {
+    background: var(--bg-2);
+    color: var(--text-1);
+}
+.erd-lib-section {
+    margin-bottom: 10px;
+}
+.erd-lib-section-head {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-3);
+}
+.erd-lib-section-head small {
+    margin-left: auto;
+    font-weight: 500;
+}
+.erd-lib-hint {
+    margin: 0;
+    padding: 2px 6px 6px;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-3);
+}
+.erd-lib-search {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin: 0 2px 8px;
+    padding: 4px 6px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text-3);
+}
+.erd-lib-search input {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text-1);
+    font-size: 11.5px;
+}
+/* Pair grouping, deliberately the same shape as the relationship list on the
+   right: a saved join and a live one are the same kind of thing. */
+.erd-lib-group {
+    margin-bottom: 4px;
+}
+.erd-lib-group-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    padding: 3px 4px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    color: var(--text-2);
+}
+.erd-lib-group-head:hover {
+    color: var(--text-1);
+}
+.erd-lib-group-head .pair {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    font-weight: 600;
+}
+.erd-lib-group-head .cnt {
+    margin-left: auto;
+    flex-shrink: 0;
+    font-size: 10px;
+    color: var(--accent);
+}
+.erd-lib-group .erd-lib-row {
+    margin-left: 12px;
+}
+.erd-lib-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    border-radius: 4px;
+}
+.erd-lib-row:hover {
+    background: var(--bg-2);
+}
+/* An entry that cannot apply here is dimmed, not hidden: a library that shows
+   fewer rows in some workspaces is one you stop trusting. */
+.erd-lib-row--off {
+    opacity: 0.45;
+}
+.erd-lib-apply {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 4px 6px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+}
+.erd-lib-apply:disabled {
+    cursor: default;
+}
+.erd-lib-apply code {
+    font-size: 10.5px;
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.erd-lib-notes {
+    font-size: 10.5px;
+    color: var(--text-3);
+}
+

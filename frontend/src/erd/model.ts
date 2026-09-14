@@ -103,6 +103,10 @@ export interface ErdRelationship {
 export interface ErdModel {
     tables: ErdTable[];
     relationships: ErdRelationship[];
+    /** Tables whose edges are not drawn. View state, but AUTHORED view state:
+     *  deciding a derived table's joins are noise is a judgement worth keeping.
+     *  Optional so older persisted models load unchanged. */
+    hiddenRelations?: string[];
 }
 
 /** One step of a route through the model: a relationship, and the table it adds. */
@@ -241,9 +245,58 @@ export function inferBetween(tables: TableLike[], a: string, b: string): ErdRela
 
 // Build a model from tables, using a persisted model's relationships when
 // present (so user edits on the Working DB survive) and inferring otherwise.
-export function buildErdModel(tables: ErdTable[], persisted?: ErdModel | null): ErdModel {
-    if (persisted && persisted.relationships && persisted.relationships.length > 0) {
-        return { tables, relationships: persisted.relationships };
+/**
+ * Reconcile a saved model with the tables actually present.
+ *
+ * Three tiers, and the order is the whole design: what was SAVED wins, then the
+ * LIBRARY (knowledge carried in deliberately), then INFERENCE (a guess from
+ * column names).
+ *
+ * Saved relationships are filtered to tables that still exist. Without that, a
+ * model outlives its sources — a Working DB node whose upstream changes, or a
+ * pipeline that stops writing a table, leaves edges pointing at nothing.
+ *
+ * The saved tier is all-or-nothing on purpose: if anything was authored, that
+ * IS the model. Topping it up with inference would resurrect relationships the
+ * user deleted, which makes deletion impossible — the edit silently undoes
+ * itself on the next load.
+ *
+ * Library joins are listed before inferred ones and inference only adds what
+ * the library did not already cover, so a curated join is never displaced by a
+ * name-matching guess between the same two columns.
+ */
+export function mergeRelationships(
+    saved: ErdRelationship[],
+    inferred: ErdRelationship[],
+    tables: ErdTable[],
+    library: ErdRelationship[] = [],
+): ErdRelationship[] {
+    const known = new Set(tables.map(t => t.name));
+    const keep = saved.filter(r => known.has(r.fromTable) && known.has(r.toTable));
+    if (keep.length > 0) return keep;
+
+    if (library.length > 0) {
+        const have = new Set(library.map(r => r.id));
+        return [...library, ...inferred.filter(r => !have.has(r.id))];
     }
-    return { tables, relationships: inferRelationships(tables) };
+    return inferred;
+}
+
+/**
+ * The model for a set of tables, reconciled against what was persisted.
+ *
+ * Delegates to `mergeRelationships` rather than carrying its own rule. It used
+ * to keep every persisted relationship unconditionally, which meant a Working
+ * DB node whose upstream sources changed held on to edges naming tables that
+ * were no longer there.
+ */
+export function buildErdModel(tables: ErdTable[], persisted?: ErdModel | null): ErdModel {
+    return {
+        tables,
+        relationships: mergeRelationships(
+            persisted?.relationships ?? [],
+            inferRelationships(tables),
+            tables,
+        ),
+    };
 }

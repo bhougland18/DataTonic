@@ -29,7 +29,8 @@ import {
     FolderGit2,
 } from 'lucide-react';
 import type { SavedJoin, JoinScope } from './join-library';
-import type { ErdTable } from '../erd/model';
+import type { ErdTable } from './model';
+import './erd.css';
 
 export interface JoinLibraryPanelProps {
     joins: SavedJoin[];
@@ -109,8 +110,8 @@ function Section({
         });
 
     return (
-        <section className="blk-lib-section">
-            <header className="blk-lib-section-head">
+        <section className="erd-lib-section">
+            <header className="erd-lib-section-head">
                 {scope === 'global' ? <Globe size={12} /> : <FolderGit2 size={12} />}
                 <span>{label}</span>
                 <small>{joins.length}</small>
@@ -119,15 +120,15 @@ function Section({
             {joins.length === 0 ? (
                 // Distinguishes "nothing saved" from "nothing matched", which
                 // otherwise look identical and mean opposite things.
-                <p className="blk-lib-hint">{query ? 'No matches here.' : hint}</p>
+                <p className="erd-lib-hint">{query ? 'No matches here.' : hint}</p>
             ) : (
                 groups.map(g => {
                     const shut = collapsed.has(g.key);
                     return (
-                        <div className="blk-lib-group" key={g.key}>
+                        <div className="erd-lib-group" key={g.key}>
                             <button
                                 type="button"
-                                className="blk-lib-group-head"
+                                className="erd-lib-group-head"
                                 onClick={() => toggle(g.key)}
                                 aria-expanded={!shut}
                             >
@@ -146,11 +147,11 @@ function Section({
                                       return (
                                           <div
                                               key={`${j.scope}:${j.id}`}
-                                              className={`blk-lib-row${ok ? '' : ' blk-lib-row--off'}`}
+                                              className={`erd-lib-row${ok ? '' : ' erd-lib-row--off'}`}
                                           >
                                               <button
                                                   type="button"
-                                                  className="blk-lib-apply"
+                                                  className="erd-lib-apply"
                                                   disabled={!ok}
                                                   title={
                                                       ok
@@ -164,12 +165,12 @@ function Section({
                                                       {j.toColumn}
                                                   </code>
                                                   {j.notes ? (
-                                                      <span className="blk-lib-notes">{j.notes}</span>
+                                                      <span className="erd-lib-notes">{j.notes}</span>
                                                   ) : null}
                                               </button>
                                               <button
                                                   type="button"
-                                                  className="blk-lib-icon"
+                                                  className="erd-lib-icon"
                                                   title={
                                                       other === 'global'
                                                           ? 'Promote to the global library (every workspace)'
@@ -186,7 +187,7 @@ function Section({
                                               </button>
                                               <button
                                                   type="button"
-                                                  className="blk-lib-icon"
+                                                  className="erd-lib-icon"
                                                   title="Remove from the library"
                                                   aria-label="Remove from the library"
                                                   onClick={() => onRemove(j.id, j.scope)}
@@ -226,19 +227,19 @@ export default function JoinLibraryPanel({
     const found = useMemo(() => joins.filter(j => matches(j, query)), [joins, query]);
 
     return (
-        <aside className="blk-lib">
-            <div className="blk-lib-head">
+        <aside className="erd-lib">
+            <div className="erd-lib-head">
                 <Bookmark size={13} />
                 <span>Join library</span>
-                <button type="button" className="blk-lib-icon" title="Import" onClick={onImport}>
+                <button type="button" className="erd-lib-icon" title="Import" onClick={onImport}>
                     <Upload size={13} />
                 </button>
-                <button type="button" className="blk-lib-icon" title="Export" onClick={onExport}>
+                <button type="button" className="erd-lib-icon" title="Export" onClick={onExport}>
                     <Download size={13} />
                 </button>
                 <button
                     type="button"
-                    className="blk-lib-icon"
+                    className="erd-lib-icon"
                     title="Collapse panel"
                     aria-label="Collapse panel"
                     onClick={onClose}
@@ -247,7 +248,7 @@ export default function JoinLibraryPanel({
                 </button>
             </div>
 
-            <label className="blk-lib-search">
+            <label className="erd-lib-search">
                 <Search size={12} />
                 <input
                     value={query}

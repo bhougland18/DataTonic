@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Play, Loader2, AlertTriangle } from 'lucide-react';
 import CodeMirror from '@uiw/react-codemirror';
 import { sqlExtensions } from './cm';
@@ -38,6 +38,16 @@ interface QueryPaneProps {
      * the source of truth.
      */
     onResult?: (result: SqlRunResult) => void;
+    /**
+     * Change this to throw the current result away.
+     *
+     * The pane owns its result — two panes run independently, and lifting that
+     * state would entangle them — so clearing it has to be asked for from
+     * outside rather than done to it. Starting a new query or opening a saved
+     * one leaves a grid of rows belonging to a query that is no longer on
+     * screen, which reads as the new query's answer.
+     */
+    resetToken?: number | string;
 }
 
 // One editor + its own results grid. Used full-width for the main query and,
@@ -55,10 +65,19 @@ export default function QueryPane({
     readOnly,
     resultInfo,
     onResult,
+    resetToken,
 }: QueryPaneProps) {
     const [result, setResult] = useState<SqlRunResult | null>(null);
     const [running, setRunning] = useState(false);
     const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' } | null>(null);
+
+    // The sort goes with the result: a column ordering is about the grid that
+    // is being cleared, and keeping it would apply a dead column's sort to
+    // whatever runs next.
+    useEffect(() => {
+        setResult(null);
+        setSort(null);
+    }, [resetToken]);
 
     const runRef = useRef<() => void>(() => {});
     const doRun = useCallback(async () => {

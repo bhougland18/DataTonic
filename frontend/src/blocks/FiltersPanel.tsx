@@ -11,8 +11,11 @@
 // cannot show `VendorItemDescription`. Height is the cheaper thing to spend —
 // the section collapses when you are done with it.
 
+import { useCallback } from 'react';
 import { FolderPlus, Plus, Trash2 } from 'lucide-react';
 import ColumnPicker, { type ColumnOption } from './ColumnPicker';
+import ValuePicker from './ValuePicker';
+import type { ValueOption } from './distinct-values';
 import {
     arity,
     filterIsComplete,
@@ -40,6 +43,14 @@ export interface FiltersPanelProps {
     onUpdate: (node: FilterNode) => void;
     onAdd: (groupId: string, child: FilterNode) => void;
     onRemove: (id: string) => void;
+    /**
+     * The values actually in a column, for the value box's dropdown.
+     *
+     * Absent for the GROUPING filter: its left-hand side is `count(...)`, and
+     * the distinct values of a count are not something to look up — they are
+     * whatever the grouping happens to produce.
+     */
+    fetchValues?: (table: string, column: string) => Promise<ValueOption[]>;
 }
 
 export default function FiltersPanel({
@@ -48,6 +59,7 @@ export default function FiltersPanel({
     onUpdate,
     onAdd,
     onRemove,
+    fetchValues,
 }: FiltersPanelProps) {
     return (
         <div className="blk-filters">
@@ -58,6 +70,7 @@ export default function FiltersPanel({
                 onUpdate={onUpdate}
                 onAdd={onAdd}
                 onRemove={onRemove}
+                fetchValues={fetchValues}
             />
         </div>
     );
@@ -70,6 +83,7 @@ function GroupEditor({
     onUpdate,
     onAdd,
     onRemove,
+    fetchValues,
 }: {
     group: FilterGroup;
     options: ColumnOption[];
@@ -77,6 +91,7 @@ function GroupEditor({
     onUpdate: (node: FilterNode) => void;
     onAdd: (groupId: string, child: FilterNode) => void;
     onRemove: (id: string) => void;
+    fetchValues?: (table: string, column: string) => Promise<ValueOption[]>;
 }) {
     const first = options[0];
     return (
@@ -150,6 +165,7 @@ function GroupEditor({
                         options={options}
                         onUpdate={onUpdate}
                         onRemove={onRemove}
+                        fetchValues={fetchValues}
                     />
                 ) : (
                     <GroupEditor
@@ -160,6 +176,7 @@ function GroupEditor({
                         onUpdate={onUpdate}
                         onAdd={onAdd}
                         onRemove={onRemove}
+                        fetchValues={fetchValues}
                     />
                 ),
             )}
@@ -172,11 +189,13 @@ function RuleEditor({
     options,
     onUpdate,
     onRemove,
+    fetchValues,
 }: {
     rule: FilterRule;
     options: ColumnOption[];
     onUpdate: (node: FilterNode) => void;
     onRemove: (id: string) => void;
+    fetchValues?: (table: string, column: string) => Promise<ValueOption[]>;
 }) {
     const n = arity(rule.op);
     // A rule that is started but not finished is dropped from the SQL. Marked,
@@ -184,6 +203,19 @@ function RuleEditor({
     const incomplete = !filterIsComplete(rule);
     const operators = operatorsFor(rule.aggregate);
     const numeric = isNumericAggregate(rule.aggregate);
+
+    // Bound to THIS rule's column, and only once the column is chosen — a
+    // half-built rule has nothing to look values up in.
+    const { table, column } = rule;
+    const lookUp = useCallback(
+        () => (fetchValues && table && column ? fetchValues(table, column) : Promise.resolve([])),
+        [fetchValues, table, column],
+    );
+    // Undefined, not a function returning nothing: `ValuePicker` uses absence to
+    // decide whether the field has a dropdown at all, so handing it a lookup
+    // that always comes back empty would open a list saying "No values" where
+    // there was never a list to open.
+    const fetchOptions = fetchValues && table && column ? lookUp : undefined;
 
     return (
         <div className={`blk-filter${incomplete ? ' blk-filter--incomplete' : ''}`}>
@@ -246,36 +278,47 @@ function RuleEditor({
                     ))}
                 </select>
                 {n === 0 ? null : n === 'many' ? (
-                    <input
-                        className="blk-filter-val"
+                    <ValuePicker
                         value={rule.values.join(', ')}
                         placeholder="a, b, c"
-                        onChange={e =>
-                            onUpdate({
-                                ...rule,
-                                values: e.target.value.split(',').map(v => v.trim()),
-                            })
+                        ariaLabel="Values"
+                        fetch={fetchOptions}
+                        onChange={next =>
+                            onUpdate({ ...rule, values: next.split(',').map(v => v.trim()) })
                         }
-                        aria-label="Values"
+                        // `in` holds a LIST, so picking adds rather than
+                        // replaces — choosing a second vendor should not throw
+                        // away the first. Already-present values are skipped so
+                        // clicking twice does not duplicate.
+                        onPick={picked => {
+                            const have = rule.values.map(v => v.trim()).filter(v => v !== '');
+                            if (have.includes(picked)) return;
+                            onUpdate({ ...rule, values: [...have, picked] });
+                        }}
                     />
                 ) : (
                     Array.from({ length: n }).map((_, i) => (
-                        <input
+                        <ValuePicker
                             key={i}
-                            className="blk-filter-val"
                             value={rule.values[i] ?? ''}
-                            // Still a text input: the value stays text in the
-                            // state (plan §7) and a number input would refuse a
-                            // partially typed `-` or `1.`. `inputMode` only
-                            // changes which keyboard a touch device offers.
+                            // Still a text input underneath: the value stays
+                            // text in the state (plan §7) and a number input
+                            // would refuse a partially typed `-` or `1.`.
+                            // `inputMode` only changes which keyboard a touch
+                            // device offers.
                             inputMode={numeric ? 'decimal' : undefined}
                             placeholder={n === 2 ? (i === 0 ? 'from' : 'to') : numeric ? 'number' : 'value'}
-                            onChange={e => {
+                            ariaLabel={`Value ${i + 1}`}
+                            // No list for a numeric comparison: `> 10` is a
+                            // threshold somebody chooses, not a value to look
+                            // up, and the column's own values would be a
+                            // misleading thing to offer.
+                            fetch={numeric ? undefined : fetchOptions}
+                            onChange={v => {
                                 const values = [...rule.values];
-                                values[i] = e.target.value;
+                                values[i] = v;
                                 onUpdate({ ...rule, values });
                             }}
-                            aria-label={`Value ${i + 1}`}
                         />
                     ))
                 )}

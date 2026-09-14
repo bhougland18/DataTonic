@@ -19,7 +19,7 @@
 
 import { isTauri, tauriOpenFile, tauriSavePath } from '../tauri-dialog';
 import { loadItemPayload, saveItemPayload } from '../workspace';
-import type { ErdQualifier, ErdRelationship, ErdTable } from '../erd/model';
+import type { ErdQualifier, ErdRelationship, ErdTable } from './model';
 
 export type JoinScope = 'workspace' | 'global';
 

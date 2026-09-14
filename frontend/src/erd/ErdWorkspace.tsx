@@ -1,13 +1,6 @@
-import { useEffect, useState } from 'react';
-import { Network, Save, Wand2, HelpCircle } from 'lucide-react';
-import ErdAuthoring from './ErdAuthoring';
-import { maybeStartEditorTour, startEditorTour } from '../GuidedTour';
-import {
-    inferRelationships,
-    type ErdModel,
-    type ErdRelationship,
-    type ErdTable,
-} from './model';
+import { useEffect, useMemo, useState } from 'react';
+import ErdEditor, { type ErdSavedModel } from './ErdEditor';
+import type { ErdModel, ErdRelationship, ErdTable } from './model';
 import './erd.css';
 
 export interface ErdWorkspaceRequest {
@@ -16,42 +9,65 @@ export interface ErdWorkspaceRequest {
     nodeName?: string;
     tables: ErdTable[];
     relationships: ErdRelationship[];
+    /** Tables whose edges the node has saved as hidden. */
+    hiddenRelations?: string[];
 }
 
 interface ErdWorkspaceProps {
     openRequest: ErdWorkspaceRequest | null;
     onSave: (nodeId: string, model: ErdModel) => void;
     onClose: () => void;
+    /** Enables the join library, which is stored per workspace and globally. */
+    workspacePath?: string | null;
 }
 
-// Full-surface ER-model authoring for the Working DB (SE-11). Rail-mounted for
-// space. Draw a relationship by dragging one table onto another (join column
-// auto-inferred), or add an exact From→To pair with the (searchable) form.
-// Relationships are grouped by table pair; edges on the diagram aggregate per
-// pair and clicking one filters the list. Save persists onto the node.
-//
-// The diagram and relationship panel live in `ErdAuthoring`, shared with the
-// Blocks studio. What remains here is the node binding: which node's model is
-// open, and that Save writes back to it.
-export default function ErdWorkspace({ openRequest, onSave, onClose }: ErdWorkspaceProps) {
-    const [nodeId, setNodeId] = useState<string | null>(null);
-    const [nodeName, setNodeName] = useState<string | undefined>(undefined);
-    const [tables, setTables] = useState<ErdTable[]>([]);
-    const [relationships, setRelationships] = useState<ErdRelationship[]>([]);
+/**
+ * ER-model authoring for the Working DB node (SE-11), rail-mounted for space.
+ *
+ * All the editing lives in `ErdEditor`, shared with the Blocks studio. What
+ * remains here is the node binding: which node is open, where its tables come
+ * from (the sources attached to that node, supplied in the open request), and
+ * that Save writes back onto the node rather than into the workspace.
+ */
+export default function ErdWorkspace({
+    openRequest,
+    onSave,
+    onClose,
+    workspacePath,
+}: ErdWorkspaceProps) {
+    const [open, setOpen] = useState<ErdWorkspaceRequest | null>(null);
     const [lastNonce, setLastNonce] = useState(-1);
 
     useEffect(() => {
         if (!openRequest || openRequest.nonce === lastNonce) return;
         setLastNonce(openRequest.nonce);
-        setNodeId(openRequest.nodeId);
-        setNodeName(openRequest.nodeName);
-        setTables(openRequest.tables);
-        setRelationships(openRequest.relationships);
-        // First time this editor is opened, walk the ER Model tour once.
-        maybeStartEditorTour('erd');
+        setOpen(openRequest);
     }, [openRequest, lastNonce]);
 
-    if (nodeId == null) {
+    // The node IS the store. Keyed by node id so opening a second Working DB
+    // node re-seeds the editor rather than showing the first node's model.
+    const persistence = useMemo(() => {
+        const nodeId = open?.nodeId ?? '';
+        const tables = open?.tables ?? [];
+        return {
+            key: `node:${nodeId}`,
+            saveLabel: 'Save to node',
+            load: async (): Promise<ErdSavedModel> => ({
+                relationships: open?.relationships ?? [],
+                hiddenRelations: open?.hiddenRelations ?? [],
+            }),
+            save: async (model: ErdSavedModel) => {
+                onSave(nodeId, {
+                    tables,
+                    relationships: model.relationships,
+                    hiddenRelations: model.hiddenRelations,
+                });
+                return true;
+            },
+        };
+    }, [open, onSave]);
+
+    if (!open) {
         return (
             <div className="erd-ws">
                 <div className="erd-ws-empty">
@@ -61,52 +77,19 @@ export default function ErdWorkspace({ openRequest, onSave, onClose }: ErdWorksp
         );
     }
 
-    const reinfer = () => setRelationships(inferRelationships(tables));
-
     return (
         <div className="erd-ws">
-            <div className="erd-ws-top">
-                <span className="erd-ws-glyph">
-                    <Network size={15} />
-                </span>
-                <div className="erd-ws-titles">
-                    <b>ER Model</b>
-                    <small>{nodeName ? `Working DB · ${nodeName}` : 'Working DB'}</small>
-                </div>
-                <span className="erd-ws-spacer" />
-                <button
-                    type="button"
-                    className="editor-help-btn"
-                    onClick={() => startEditorTour('erd')}
-                    title="Show the ER Model tour"
-                    aria-label="Show the ER Model tour"
-                >
-                    <HelpCircle size={16} />
-                </button>
-                <button
-                    className="erd-btn"
-                    onClick={reinfer}
-                    title="Re-infer all relationships"
-                    data-tour="erd-infer"
-                >
-                    <Wand2 size={14} /> Auto-infer all
-                </button>
-                <button className="erd-btn" onClick={onClose}>
-                    Close
-                </button>
-                <button
-                    className="erd-btn erd-btn--primary"
-                    onClick={() => onSave(nodeId, { tables, relationships })}
-                    data-tour="erd-save"
-                >
-                    <Save size={14} /> Save to node
-                </button>
-            </div>
-
-            <ErdAuthoring
-                tables={tables}
-                relationships={relationships}
-                onRelationshipsChange={setRelationships}
+            <ErdEditor
+                tables={open.tables}
+                subtitle={open.nodeName ? `Working DB · ${open.nodeName}` : 'Working DB'}
+                persistence={persistence}
+                workspacePath={workspacePath}
+                tourId="erd"
+                extraActions={
+                    <button className="erd-btn" onClick={onClose}>
+                        Close
+                    </button>
+                }
             />
         </div>
     );
