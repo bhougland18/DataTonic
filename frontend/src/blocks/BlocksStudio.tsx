@@ -653,8 +653,36 @@ export default function BlocksStudio({
      * which is how "what do I need for a line chart" came back recommending
      * matplotlib.
      */
-    const [lastResult, setLastResult] = useState<SqlRunResult | null>(null);
-    const aiContext = useMemo(() => chartContext(lastResult), [lastResult]);
+    const [lastRun, setLastRun] = useState<{
+        result: SqlRunResult;
+        /** Undefined outside builder mode — hand-written SQL does not say. */
+        aggregated?: boolean;
+    } | null>(null);
+
+    /**
+     * Snapshot what produced the result, not what the builder holds NOW.
+     *
+     * Taken at run time because the two drift: removing an aggregate after
+     * running leaves a grouped result on screen while the builder says
+     * otherwise, and the strip would then judge the visible rows against a
+     * query nobody has run.
+     */
+    const noteRun = useCallback(
+        (result: SqlRunResult) => {
+            setLastRun({
+                result,
+                aggregated: builderMode
+                    ? builder.columns.some(c => (c.aggregate ?? 'none') !== 'none')
+                    : undefined,
+            });
+        },
+        [builderMode, builder.columns],
+    );
+
+    const aiContext = useMemo(
+        () => chartContext(lastRun?.result, { aggregated: lastRun?.aggregated }),
+        [lastRun],
+    );
 
     /** Bring a relationship's tables in without selecting from them. */
     const addJoinTable = useCallback(
@@ -1387,9 +1415,10 @@ export default function BlocksStudio({
                                         <ChartShapeStrip
                                             columns={r.columns}
                                             rowCount={r.rows.length}
+                                            aggregated={lastRun?.aggregated}
                                         />
                                     )}
-                                    onResult={setLastResult}
+                                    onResult={noteRun}
                                 />
                                 {aiDraft != null && (
                                     <QueryPane

@@ -62,7 +62,14 @@ export interface ChartShapeStripProps {
      * part of whether the chart is worth offering at all.
      */
     rowCount?: number;
-    /** Once a chart type is chosen (DAA.100), judge that one instead of listing. */
+    /**
+     * The result is one row per group — a GROUP BY, not a window function.
+     *
+     * Undefined for hand-written SQL, where telling the two apart would mean
+     * parsing; unknown stays unknown rather than being guessed.
+     */
+    aggregated?: boolean;
+    /** Once a chart type is chosen, judge that one instead of listing. */
     chart?: ChartType;
     /** Wired by the picker. Without it the chips are labels, not controls. */
     onPick?: (chart: ChartType) => void;
@@ -71,11 +78,12 @@ export interface ChartShapeStripProps {
 export default function ChartShapeStrip({
     columns,
     rowCount,
+    aggregated,
     chart,
     onPick,
 }: ChartShapeStripProps) {
     const fields = fieldsFromColumns(columns);
-    const ctx = { rowCount };
+    const ctx = { rowCount, aggregated };
 
     if (fields.length === 0) {
         return (

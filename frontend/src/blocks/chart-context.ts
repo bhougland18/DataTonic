@@ -24,6 +24,7 @@ import {
     shapeFor,
     suggestCharts,
     vlTypeOf,
+    type ShapeContext,
     type Verdict,
 } from './chart-shapes';
 
@@ -53,7 +54,10 @@ const line = (v: Verdict): string => {
  * Returns '' when there is no result — a prompt that describes an empty result
  * invites the model to reason about one.
  */
-export function chartContext(result: SqlRunResult | null | undefined): string {
+export function chartContext(
+    result: SqlRunResult | null | undefined,
+    ctx?: ShapeContext,
+): string {
     if (!result || result.error || result.columns.length === 0) return '';
 
     const fields = fieldsFromColumns(result.columns);
@@ -68,9 +72,12 @@ export function chartContext(result: SqlRunResult | null | undefined): string {
         );
     }
 
-    // Same row count the strip uses, so the pane and the strip never disagree
+    // Same context the strip uses, so the pane and the strip never disagree
     // about whether a box plot is worth drawing.
-    const suggestions = suggestCharts(fields, true, { rowCount: result.rows.length });
+    const suggestions = suggestCharts(fields, true, {
+        rowCount: result.rows.length,
+        ...ctx,
+    });
     const fits = suggestions.filter(v => v.kind === 'fits');
     const near = suggestions.filter(v => v.kind === 'close').slice(0, MAX_NEAR);
 

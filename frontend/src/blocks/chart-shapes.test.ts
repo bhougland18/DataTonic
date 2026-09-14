@@ -172,6 +172,50 @@ describe('distribution charts need a crowd', () => {
     });
 });
 
+describe('distribution charts and grain', () => {
+    // Ben's rule: a box plot of a GROUP BY aggregate summarises summaries. No
+    // row count rescues it — 500 groups is still one value per group.
+    const AGGREGATED = { rowCount: 500, aggregated: true };
+
+    it.each(['boxplot', 'histogram'] as const)('refuses %s over an aggregate', chart => {
+        const v = checkShape(VENDOR_COUNT, chart, AGGREGATED);
+        expect(v.kind).toBe('unsuitable');
+        expect(missingSummary(v)).toContain('already one value per group');
+    });
+
+    it('prefers the grain reason over the row-count one', () => {
+        const v = checkShape(VENDOR_COUNT, 'boxplot', { rowCount: 3, aggregated: true });
+        expect(missingSummary(v)).toContain('already one value per group');
+    });
+
+    /**
+     * The exclusion Ben asked for. A window function returns a value per ROW,
+     * so the result keeps its raw grain — `aggregated` is false and the chart
+     * stands. In the builder this holds by construction: `SelectedColumn` only
+     * carries GROUP BY aggregates.
+     */
+    it('allows a distribution over a window function result', () => {
+        expect(checkShape(VENDOR_COUNT, 'boxplot', { rowCount: 500, aggregated: false }).kind)
+            .toBe('fits');
+    });
+
+    it('does not judge grain when it is unknown', () => {
+        expect(checkShape(VENDOR_COUNT, 'boxplot', { rowCount: 500 }).kind).toBe('fits');
+    });
+
+    it('leaves charts that are not about distribution alone', () => {
+        expect(checkShape(VENDOR_COUNT, 'bar', AGGREGATED).kind).toBe('fits');
+        expect(checkShape(VENDOR_COUNT, 'arc', AGGREGATED).kind).toBe('fits');
+    });
+
+    it('keeps them out of the suggestion list', () => {
+        const charts = suggestCharts(VENDOR_COUNT, true, AGGREGATED).map(v => v.chart);
+        expect(charts).not.toContain('boxplot');
+        expect(charts).not.toContain('histogram');
+        expect(charts).toContain('bar');
+    });
+});
+
 describe('checkShape — near misses', () => {
     it('calls a category with no measure close, and names the fix', () => {
         const v = checkShape([f('Vendor', 'nominal')], 'bar');

@@ -76,6 +76,22 @@ export interface ChartShape {
 export interface ShapeContext {
     /** Rows in the result. */
     rowCount?: number;
+    /**
+     * The measures are GROUP BY aggregates — one row per group.
+     *
+     * **Window functions are deliberately NOT aggregates by this definition.**
+     * `avg(x) OVER (…)` returns a value per ROW and collapses nothing, so the
+     * result keeps its raw grain and a distribution of it is a real
+     * distribution. `avg(x) … GROUP BY g` returns one value per group, and
+     * summarising those summarises summaries.
+     *
+     * In the builder that distinction holds by construction: `SelectedColumn`
+     * only ever carries a GROUP BY aggregate, because the builder has no window
+     * functions. Hand-written SQL leaves this undefined rather than guessing —
+     * telling the two apart means parsing, and a wrong guess here silently
+     * removes a chart somebody wanted.
+     */
+    aggregated?: boolean;
 }
 
 /**
@@ -522,18 +538,25 @@ export function checkShape(fields: Field[], chart: ChartType, ctx?: ShapeContext
     // matching so the verdict can name the variant it would have been, and only
     // against a fit — telling somebody their box plot needs more rows when it
     // also has no number to plot buries the thing they can act on.
-    if (
-        best.kind === 'fits' &&
-        shape.distribution &&
-        ctx?.rowCount != null &&
-        ctx.rowCount < MIN_DISTRIBUTION_ROWS
-    ) {
-        return {
-            kind: 'unsuitable',
-            chart,
-            variant: best.variant,
-            reason: `needs more rows — ${ctx.rowCount} is too few to show a distribution`,
-        };
+    if (best.kind === 'fits' && shape.distribution) {
+        // Grain first, because it is the stronger statement: no number of rows
+        // rescues a distribution drawn over one value per group.
+        if (ctx?.aggregated) {
+            return {
+                kind: 'unsuitable',
+                chart,
+                variant: best.variant,
+                reason: 'needs raw rows — this is already one value per group',
+            };
+        }
+        if (ctx?.rowCount != null && ctx.rowCount < MIN_DISTRIBUTION_ROWS) {
+            return {
+                kind: 'unsuitable',
+                chart,
+                variant: best.variant,
+                reason: `needs more rows — ${ctx.rowCount} is too few to show a distribution`,
+            };
+        }
     }
     return best;
 }
