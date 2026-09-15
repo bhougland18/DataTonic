@@ -356,6 +356,35 @@ export function setAggregate(
 }
 
 /**
+ * Name one selected column's output.
+ *
+ * An alias is NOT a transformation, which is why it is edited where columns are
+ * chosen rather than in Column Transformations. Nothing is computed: the same
+ * value comes back under a different heading. A transformation makes a column
+ * that did not exist; this renames one that does.
+ *
+ * An alias equal to the column's own name is CLEARED rather than stored. It
+ * would emit `Item AS Item` — legal, and noise in output that is meant to be
+ * read — and it would make the Column Ordering list show a name the person
+ * never really chose.
+ */
+export function setColumnAlias(
+    state: BuilderState,
+    table: string,
+    column: string,
+    alias: string,
+): BuilderState {
+    const trimmed = alias.trim();
+    const next = trimmed === '' || trimmed === column ? undefined : trimmed;
+    return {
+        ...state,
+        columns: state.columns.map(c =>
+            eq(c.table, table) && eq(c.column, column) ? { ...c, alias: next } : c,
+        ),
+    };
+}
+
+/**
  * Round a temporal column to a day/week/month/quarter/year.
  *
  * Independent of `setAggregate` on purpose: bucketing a date and counting it

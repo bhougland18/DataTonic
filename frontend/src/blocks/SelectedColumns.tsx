@@ -49,15 +49,30 @@ export default function SelectedColumns({ columns, onMove, onRemove }: SelectedC
                         setDragging(null);
                         setOver(null);
                     }}
-                    title={`${c.table}.${c.column}`}
+                    title={c.alias ? `${c.alias} — ${c.table}.${c.column}` : `${c.table}.${c.column}`}
                 >
                     <GripVertical size={13} className="blk-selcol-grip" />
                     <span className="blk-selcol-name">
-                        {/* The table is dimmed, the column is not: the column is
-                            what you are looking for, the table is how you tell
-                            two columns of the same name apart. */}
-                        <i>{c.table}.</i>
-                        {c.column}
+                        {/* POST-alias, deliberately. This list is the OUTPUT in
+                            output order, so it shows what actually comes back:
+                            once a column is named, that name is the column as
+                            far as the result, the charts and anything reading
+                            the grid are concerned, and showing the source here
+                            would mean the list and the result disagreed.
+
+                            Unaliased, the table is dimmed and the column is not:
+                            the column is what you are looking for, the table is
+                            how you tell two columns of the same name apart. An
+                            alias needs no such help — it is unique by the time
+                            somebody has typed it. */}
+                        {c.alias ? (
+                            c.alias
+                        ) : (
+                            <>
+                                <i>{c.table}.</i>
+                                {c.column}
+                            </>
+                        )}
                     </span>
                     {c.aggregate && c.aggregate !== 'none' ? (
                         <em className="blk-selcol-agg">{c.aggregate}</em>

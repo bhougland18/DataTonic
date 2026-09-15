@@ -45,6 +45,29 @@ export default function TransformsPanel({
 
     return (
         <div className="blk-xforms">
+            {/* Head, hint, then rows — the same order and the same controls the
+                Sort and Filter sections use. A section that invents its own add
+                button teaches the panel twice. */}
+            <div className="blk-fgroup-head">
+                <span className="blk-join-gap" />
+                <button
+                    type="button"
+                    className="blk-lib-icon"
+                    onClick={() => setEditing({})}
+                    title="Build a new column"
+                    aria-label="New column"
+                >
+                    <Plus size={13} />
+                </button>
+            </div>
+
+            {transforms.length === 0 ? (
+                <p className="blk-lib-hint">
+                    No computed columns. Anything built from a column goes here —
+                    an aggregate, a function, a CASE — each under a name you choose.
+                </p>
+            ) : null}
+
             {transforms.map(t => {
                 const expr = transformExpression(t);
                 // Incomplete means it will be DROPPED from the SQL, not that it
@@ -107,20 +130,6 @@ export default function TransformsPanel({
                     </div>
                 );
             })}
-            <button
-                type="button"
-                className="blk-xform-add"
-                onClick={() => setEditing({})}
-            >
-                <Plus size={13} />
-                <span>New column</span>
-            </button>
-            {transforms.length === 0 ? (
-                <p className="blk-xform-empty">
-                    Totals, dates, labels — anything the source columns do not
-                    already say.
-                </p>
-            ) : null}
             {editing ? (
                 <TransformDialog
                     initial={editing.transform}

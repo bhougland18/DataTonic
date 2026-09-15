@@ -7,11 +7,13 @@ import { ShareView } from './ShareView';
 import { ThemeProvider } from './theme';
 import { isTauri } from './tauri-dialog';
 import { applyFontSize, getFontSize } from './font-size';
+import { applyPanelWidth, getPanelWidth } from './panel-width';
 import './styles.css';
 
 // Apply the saved UI font size before first paint so the app renders at the
 // user's chosen size with no flash of the default.
 applyFontSize(getFontSize());
+applyPanelWidth(getPanelWidth());
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {

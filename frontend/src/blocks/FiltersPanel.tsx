@@ -6,10 +6,12 @@
 // settled this shape (`playground/providers/infor/FilterBuilder.tsx`); this is
 // the same tree over columns rather than Infor fields.
 //
-// Stacked two lines per rule rather than three controls across: the panel is
-// 260px, and column/operator/value side by side gives each about eighty, which
-// cannot show `VendorItemDescription`. Height is the cheaper thing to spend —
-// the section collapses when you are done with it.
+// Stacked two lines per rule rather than three controls across: column,
+// operator and value side by side give each about ninety, which cannot show
+// `VendorItemDescription`. Height is the cheaper thing to spend — the section
+// collapses when you are done with it. (The panel was 260px when this was
+// decided and is `--builder-panel-w` now; widening it did not change the
+// answer, and would need to roughly double to.)
 
 import { useCallback } from 'react';
 import { FolderPlus, Plus, Trash2 } from 'lucide-react';

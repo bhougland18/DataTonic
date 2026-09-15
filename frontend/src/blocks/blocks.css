@@ -197,7 +197,7 @@
 
 /* ---- Sources panel ---- */
 .blk-sources {
-    width: 260px;
+    width: var(--builder-panel-w);
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
@@ -474,7 +474,8 @@
    switching steps should move the content, not the layout — and it reuses the
    node Studio's `sqlstudio-tnode` tree rather than restyling one. */
 .blk-catalog {
-    width: 260px;
+    position: relative;
+    width: var(--builder-panel-w);
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
@@ -486,6 +487,32 @@
 .blk-catalog .blk-sources-head {
     padding: 2px 12px 8px;
     flex-shrink: 0;
+}
+
+/* ---- Resizing the panel ---- */
+/* Sits ON the border rather than beside it, so the panel loses no width to a
+   control that is mostly invisible. Four pixels wide and eight of hit area via
+   the negative offsets: a one-pixel target is a border people fight with. */
+.blk-resizer {
+    position: absolute;
+    top: 0;
+    right: -3px;
+    bottom: 0;
+    z-index: 2;
+    width: 6px;
+    cursor: col-resize;
+}
+/* Shown only on approach. A permanent divider down the panel edge is furniture
+   competing with the border that is already there. */
+.blk-resizer:hover::after,
+.blk-resizer:active::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 2px;
+    width: 2px;
+    background: var(--accent);
 }
 
 /* ---- Collapsing the panel ---- */
@@ -1197,9 +1224,10 @@
 }
 
 /* ---- Where clause ---- */
-/* Two lines per row, not three controls across: 260px minus padding gives each
-   about eighty, and a column picker cannot show VendorItemDescription in that.
-   Height is the cheaper thing to spend — the section collapses. */
+/* Two lines per row, not three controls across: the panel minus padding gives
+   each about ninety, and a column picker cannot show VendorItemDescription in
+   that. Height is the cheaper thing to spend — the section collapses.
+   (Still true at 300px; it was about eighty at the original 260.) */
 .blk-filters {
     display: flex;
     flex-direction: column;
@@ -1299,10 +1327,15 @@
 }
 
 /* ---- Column transformations ---- */
+/* The same box as `.blk-filters` and `.blk-sortlist`. The side padding is what
+   puts every section's add button on one vertical line down the panel; without
+   it this one sat 8px further right than Sort's and read as misaligned,
+   because it was. */
 .blk-xforms {
     display: flex;
     flex-direction: column;
     gap: 4px;
+    padding: 0 8px 8px;
 }
 .blk-xform {
     display: flex;
@@ -1353,30 +1386,6 @@
     font-size: 10px;
     text-overflow: ellipsis;
     white-space: nowrap;
-}
-.blk-xform-add {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-    padding: 4px;
-    background: none;
-    border: 1px dashed var(--border);
-    border-radius: 6px;
-    color: var(--text-2);
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-}
-.blk-xform-add:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-}
-.blk-xform-empty {
-    margin: 2px 2px 0;
-    color: var(--text-3);
-    font-size: 10px;
-    line-height: 1.4;
 }
 
 /* ---- The transformation dialog ---- */

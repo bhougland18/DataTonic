@@ -20,11 +20,17 @@ import type { SqlStudioTable } from './types';
  * Optional, so the node's SQL Studio — which has no builder — gets exactly the
  * read-only tree it had before. When present, every row grows a checkbox.
  *
- * A checkbox and nothing else, deliberately. This tree answers WHICH COLUMNS;
- * what they become is Column Transformations' question, and for a while this
- * row answered both — an aggregate dropdown, then a date bucket beside it — in
- * a list that scrolls past several hundred entries. Anything tempted back in
- * here belongs there instead.
+ * A checkbox and a NAME, and deliberately nothing else. This tree answers which
+ * columns and what they are called; what a column BECOMES is Column
+ * Transformations' question, and for a while this row answered that too — an
+ * aggregate dropdown, then a date bucket beside it — in a list that scrolls
+ * past several hundred entries.
+ *
+ * The line is between naming and computing. A transformation makes a column
+ * that did not exist and has parameters that must be filled in, which is what
+ * the dialog is for. An alias renames one already ticked, has no parameters,
+ * and belongs beside the tick that chose it. Anything with arguments belongs in
+ * Column Transformations instead.
  */
 export interface CatalogSelection {
     /** Is this column in the query? */
@@ -32,6 +38,10 @@ export interface CatalogSelection {
     onToggle: (column: string) => void;
     /** The table-level checkbox: tick or clear every column. */
     onToggleAll: () => void;
+    /** The output name for a ticked column, and how to change it. Empty means
+     *  the column comes back under its own name. */
+    aliasOf?: (column: string) => string;
+    onAlias?: (column: string, alias: string) => void;
     /** Off when the ER model cannot connect this table to the query. */
     reachable?: boolean;
 }
@@ -123,6 +133,21 @@ export default function CatalogTable({
                                 ) : null}
                                 <span className="cn">{c.name}</span>
                                 {c.primaryKey && <span className="pk">PK</span>}
+                                {/* Only once ticked: an unticked column is not
+                                    in the output, so it has no output name to
+                                    give. The placeholder is the column's own
+                                    name, so an empty box reads as "comes back
+                                    as itself" rather than as unfinished. */}
+                                {ticked && selection?.onAlias ? (
+                                    <input
+                                        className="sqlstudio-alias"
+                                        value={selection.aliasOf?.(c.name) ?? ''}
+                                        placeholder={c.name}
+                                        onChange={e => selection.onAlias?.(c.name, e.target.value)}
+                                        title="What this column is called in the result"
+                                        aria-label={`Name for ${c.name}`}
+                                    />
+                                ) : null}
                                 {/* The TYPE is back, and now it earns its place.
                                     It was dropped when this row carried an
                                     aggregate dropdown, on the grounds that every

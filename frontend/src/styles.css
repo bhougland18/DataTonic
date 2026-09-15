@@ -3,6 +3,15 @@
        inheriting text scales from this; the default matches the historical
        13px. Set on document.documentElement at startup (see font-size.ts). */
     --app-font-size: 13px;
+    /* The left panel on the Sources step, the SQL step and the node's SQL
+       Studio. ONE value because switching steps should move the content, not
+       the layout — the three were the same 260px written out three times, and
+       three magic numbers is how that stops being true.
+
+       Widened from 260px: the builder grew Column Transformations and an alias
+       box per ticked column, and SQL is narrow text that was never using the
+       space this takes from it. */
+    --builder-panel-w: 300px;
     /* DuckDB-inspired dark - lemon-yellow brand accent on deep charcoal,
        with a slate-blue selection accent and the DuckDB secondary palette
        (maya blue / hot orange) across the component kinds. */

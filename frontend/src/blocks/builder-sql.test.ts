@@ -34,6 +34,7 @@ import {
     normalizeBuilder,
     removeTransform,
     requiredTables,
+    setColumnAlias,
     setTransformEnabled,
     upsertTransform,
 } from './builder-ops';
@@ -1702,5 +1703,83 @@ describe('literals beside a transformation', () => {
             poOpts,
         );
         expect(sql).toContain("WHERE Month >= '2024-01-01'");
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Naming a plain column (DAA.106)
+// ---------------------------------------------------------------------------
+//
+// Edited where columns are CHOSEN, not in Column Transformations. Nothing is
+// computed: the same value comes back under a different heading. A
+// transformation makes a column that did not exist; this renames one that does.
+
+describe('setColumnAlias', () => {
+    const start = () =>
+        build({ anchor: 'Item', columns: [col('Item', 'ItemGroup'), col('Item', 'Item')] });
+
+    it('names the column it is given and leaves the others alone', () => {
+        const next = setColumnAlias(start(), 'Item', 'ItemGroup', 'Group');
+        expect(next.columns[0].alias).toBe('Group');
+        expect(next.columns[1].alias).toBeUndefined();
+    });
+
+    it('trims what was typed', () => {
+        expect(setColumnAlias(start(), 'Item', 'ItemGroup', '  Group  ').columns[0].alias).toBe(
+            'Group',
+        );
+    });
+
+    it('clears the alias when the box is emptied', () => {
+        const named = setColumnAlias(start(), 'Item', 'ItemGroup', 'Group');
+        expect(setColumnAlias(named, 'Item', 'ItemGroup', '').columns[0].alias).toBeUndefined();
+    });
+
+    // `Item AS Item` is legal and is noise in output meant to be read - and it
+    // would make Column Ordering show a name nobody really chose.
+    it('stores nothing when the name matches the column', () => {
+        expect(
+            setColumnAlias(start(), 'Item', 'ItemGroup', 'ItemGroup').columns[0].alias,
+        ).toBeUndefined();
+    });
+
+    it('matches the column case-insensitively', () => {
+        expect(setColumnAlias(start(), 'item', 'itemgroup', 'Group').columns[0].alias).toBe(
+            'Group',
+        );
+    });
+});
+
+describe('a named column in the SQL', () => {
+    it('comes back under the name it was given', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'Item',
+                columns: [col('Item', 'ItemGroup', { alias: 'Group' })],
+            }),
+            opts,
+        );
+        expect(sql).toContain('SELECT Item.ItemGroup AS Group');
+    });
+
+    it('quotes a name that needs it', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'Item',
+                columns: [col('Item', 'ItemGroup', { alias: 'Item Group' })],
+            }),
+            opts,
+        );
+        expect(sql).toContain('AS "Item Group"');
+    });
+
+    // The collision rule fills in a name only where the author has not. Somebody
+    // who named a column owns it, even into a clash.
+    it('is left alone by the collision rule', () => {
+        const named = withCollisionAliases([
+            col('Item', 'Item', { alias: 'Mine' }),
+            col('VendorItem', 'Item'),
+        ]);
+        expect(named[0].alias).toBe('Mine');
     });
 });

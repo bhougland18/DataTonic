@@ -21,6 +21,7 @@ import CatalogTable, { type CatalogSelection } from '../sqleditor/TableCatalog';
 import type { SqlStudioTable } from '../sqleditor/types';
 import type { ErdRelationship } from '../erd/model';
 import JoinsList from './JoinsList';
+import PanelResizer from './PanelResizer';
 import PanelSection, { readPanelOpen, writePanelOpen } from './PanelSection';
 import type { JoinMode } from './builder-types';
 
@@ -196,6 +197,7 @@ export default function BuilderPanel({
 
     return (
         <aside className="blk-catalog">
+            <PanelResizer />
             <div className="blk-catalog-bar">
                 <button
                     type="button"

@@ -38,6 +38,7 @@ import {
     removeTransform,
     setTransformEnabled,
     upsertTransform,
+    setColumnAlias,
     setJoinMode,
     tablesInScope,
     toggleAllColumns,
@@ -225,6 +226,14 @@ export function useQueryBuilder({
                         relationships,
                     ),
                 ),
+            aliasOf: column =>
+                state.columns.find(
+                    c =>
+                        c.table.toLowerCase() === table.name.toLowerCase() &&
+                        c.column.toLowerCase() === column.toLowerCase(),
+                )?.alias ?? '',
+            onAlias: (column, alias) =>
+                setState(b => setColumnAlias(b, table.name, column, alias)),
             reachable: canReach(state, table.name, relationships),
         }),
         [state, relationships],
