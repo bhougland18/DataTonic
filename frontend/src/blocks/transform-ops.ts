@@ -38,7 +38,15 @@ import {
  * They are declared now, unused by the aggregate family, so the modal can be
  * written against the full set rather than grown a field type at a time.
  */
-export type ParamType = 'text' | 'number' | 'choice' | 'column' | 'columns' | 'branches';
+export type ParamType =
+    | 'text'
+    | 'number'
+    | 'choice'
+    | 'column'
+    | 'columns'
+    | 'branches'
+    /** What a window is OF: a source column, or another computed column. */
+    | 'source';
 
 export interface TransformParam {
     name: string;
@@ -70,8 +78,14 @@ export interface TransformOp {
      */
     accepts: (type?: string) => boolean;
     params: TransformParam[];
-    /** The SQL fragment, given the already-quoted column reference. */
-    sql: (col: string, args: Record<string, TransformArg>) => string;
+    /**
+     * The SQL fragment.
+     *
+     * `col` is the already-quoted source column. `of` is the resolved `source`
+     * parameter — the expression of whatever the operation is OF, with a
+     * sibling transformation already inlined. Only the window family uses it.
+     */
+    sql: (col: string, args: Record<string, TransformArg>, of: string) => string;
     /**
      * The DuckDB type of the result, when it can be known from the input.
      *
@@ -331,7 +345,148 @@ const caseOp: TransformOp = {
     },
 };
 
+// ---------------------------------------------------------------------------
+// Window — named recipes, not a window builder
+// ---------------------------------------------------------------------------
+//
+// Six intents rather than an OVER clause with the parts exposed. Each takes
+// "of what", "within what" and "ordered by"; the RECIPE supplies the frame,
+// which is the part nobody remembers and the part that silently gives the
+// wrong number when it is wrong.
+//
+// **What a window is "of" can be another computed column, and usually is.**
+// Measured: in a grouped query a window over a raw column fails outright —
+// `column "PurchaseOrder" must appear in the GROUP BY clause` — because the
+// window runs after grouping. The reporting case is a running total OF a
+// count, so the argument has to be the aggregate.
+//
+// The sibling's expression is INLINED rather than referenced by alias. DuckDB
+// would accept the alias, but then SELECT-list order would decide whether the
+// query parses, and Column Ordering lets it be dragged anywhere
+// (`column-transformations.md` §2). Inlining is order-independent.
+
+/** A column list for PARTITION BY / ORDER BY. Empty means omit the clause. */
+function columnList(args: Record<string, TransformArg>, name: string): string[] {
+    const v = args[name];
+    if (!Array.isArray(v)) return [];
+    return (v as string[])
+        .filter((s): s is string => typeof s === 'string' && s !== '')
+        .map(s => {
+            const [table, column] = unaddr(s);
+            return table ? `${quoteIdent(table)}.${quoteIdent(column)}` : quoteIdent(column);
+        });
+}
+
+/** The OVER clause, with whichever parts were given. */
+function over(args: Record<string, TransformArg>, frame = '', ordered = true): string {
+    const parts: string[] = [];
+    const partition = columnList(args, 'partitionBy');
+    // `ordered: false` ignores any order ARGUMENT, not just the field. A recipe
+    // that dropped the control would still read a value left behind by an
+    // earlier edit — and for a share of a total, an order silently turns the
+    // denominator into a running sum.
+    const order = ordered ? columnList(args, 'orderBy') : [];
+    if (partition.length) parts.push(`PARTITION BY ${partition.join(', ')}`);
+    if (order.length) parts.push(`ORDER BY ${order.join(', ')}`);
+    // A frame without an ORDER BY is meaningless and DuckDB rejects some
+    // combinations outright, so it only goes on when there is an order to
+    // frame against.
+    if (frame && order.length) parts.push(frame);
+    return `OVER (${parts.join(' ')})`;
+}
+
+/** The prefix the window recipes share: kind, no type gate, the same params. */
+function windowOp(
+    id: string,
+    label: string,
+    sql: TransformOp['sql'],
+    extra: TransformParam[] = [],
+    needsOf = true,
+    /**
+     * Whether an order makes sense at all.
+     *
+     * A share of a TOTAL must not take one. `sum(x) OVER (ORDER BY y)` is a
+     * RUNNING sum — DuckDB's default frame with an order is everything up to
+     * this row — so the share came back as a share of the running total, which
+     * looked plausible and summed to nothing sensible. Measured: shares of
+     * 1.0, 0.78, 0.027 down a column that should have summed to 1.
+     *
+     * Not merely ignored: the field is not offered, because a control that
+     * changes nothing is worse than one that is missing.
+     */
+    ordered = true,
+): TransformOp {
+    return {
+        id,
+        kind: 'window',
+        label,
+        accepts: () => true,
+        params: [
+            ...(needsOf
+                ? [{ name: 'of', label: 'Of', type: 'source' as ParamType }]
+                : []),
+            {
+                name: 'partitionBy',
+                label: 'Within',
+                type: 'columns',
+                optional: true,
+                hint: 'Restart for each of these. Left empty, the whole result is one group.',
+            },
+            ...(ordered
+                ? [{ name: 'orderBy', label: 'Ordered by', type: 'columns' as ParamType, optional: true }]
+                : []),
+            ...extra,
+        ],
+        sql,
+    };
+}
+
+const WINDOW_OPS: TransformOp[] = [
+    windowOp(
+        'running_total',
+        'Running total',
+        (_c, a, of) => `sum(${of}) ${over(a, 'ROWS UNBOUNDED PRECEDING')}`,
+    ),
+    windowOp('rank', 'Rank', (_c, a) => `rank() ${over(a)}`, [], false),
+    windowOp('row_number', 'Row number', (_c, a) => `row_number() ${over(a)}`, [], false),
+    windowOp(
+        'pct_of_total',
+        'Share of total',
+        // Cast so integer division does not quietly floor every share to 0 —
+        // `24 / 316` is 0 in integer arithmetic and 0.0759 in the answer
+        // somebody wanted.
+        //
+        // No ORDER BY, ever: see `ordered` on `windowOp`. This is the only
+        // recipe whose frame must be the WHOLE partition.
+        (_c, a, of) => `CAST(${of} AS DOUBLE) / sum(${of}) ${over(a, '', false)}`,
+        [],
+        true,
+        false,
+    ),
+    windowOp(
+        'change_from_previous',
+        'Change from previous',
+        (_c, a, of) => `${of} - lag(${of}) ${over(a)}`,
+    ),
+    windowOp(
+        'moving_average',
+        'Moving average',
+        (_c, a, of) =>
+            `avg(${of}) ${over(a, `ROWS BETWEEN ${Math.max(1, Number(argText(a, 'periods')) || 3) - 1} PRECEDING AND CURRENT ROW`)}`,
+        [
+            {
+                name: 'periods',
+                label: 'Over how many',
+                type: 'number',
+                default: '3',
+                hint: 'Counting this row. 3 averages this row and the two before it.',
+            },
+        ],
+    ),
+];
+
 export const TRANSFORM_OPS: TransformOp[] = [
+    ...WINDOW_OPS,
     dateTrunc,
     literal,
     caseOp,
@@ -366,11 +521,56 @@ export function opsFor(kind: TransformKind, type?: string): TransformOp[] {
  * operation that has since been renamed should not silently emit something
  * else. The caller drops it and the panel can say so.
  */
-export function transformExpression(t: ColumnTransform): string | null {
+/** A source parameter that names another computed column, rather than a table's. */
+const TX = 'tx:';
+
+export function sourceOfTransform(id: string): string {
+    return TX + id;
+}
+
+export function isTransformSource(v: string): boolean {
+    return v.startsWith(TX);
+}
+
+/**
+ * What a window is OF, as SQL.
+ *
+ * A sibling transformation is INLINED — its whole expression, not its name.
+ * DuckDB would accept the alias, but that makes SELECT-list order decide
+ * whether the query parses, and Column Ordering lets it be dragged anywhere.
+ * Inlining is order-independent (`column-transformations.md` §2).
+ *
+ * Only ONE level: the sibling is resolved with no siblings of its own, so a
+ * window OF a window cannot recurse. Nothing offers that combination, and a
+ * cycle here would hang the editor rather than produce bad SQL.
+ */
+function resolveSource(
+    v: string,
+    siblings: ColumnTransform[],
+): string | null {
+    if (!v) return null;
+    if (!isTransformSource(v)) {
+        const [table, column] = unaddr(v);
+        if (!column) return null;
+        return table ? `${quoteIdent(table)}.${quoteIdent(column)}` : quoteIdent(column);
+    }
+    const found = siblings.find(s => s.id === v.slice(TX.length));
+    return found ? transformExpression(found, []) : null;
+}
+
+export function transformExpression(
+    t: ColumnTransform,
+    /** The other computed columns, so a window can be OF one of them. */
+    siblings: ColumnTransform[] = [],
+): string | null {
     const op = opById(t.op);
     if (!op) return null;
     const col = t.table && t.column ? `${quoteIdent(t.table)}.${quoteIdent(t.column)}` : '*';
-    return op.sql(col, t.args);
+    const of = resolveSource(argText(t.args, 'of'), siblings);
+    // A window whose source has gone is not an expression at all — better no
+    // column than one silently computed over something else.
+    if (op.params.some(p => p.type === 'source') && of === null) return null;
+    return op.sql(col, t.args, of ?? col);
 }
 
 /**
@@ -394,18 +594,31 @@ export function transformProblem(t: ColumnTransform): string | null {
     const op = opById(t.op);
     if (!op) return t.op ? `"${t.op}" is no longer available.` : 'Pick an operation.';
     if (!t.alias.trim()) return 'Give the column a name.';
-    // Three kinds need no column of their own: `count` alone is `count(*)`, a
-    // ROW count; a literal reads nothing at all; and a CASE names its columns
-    // inside its branches, where this record cannot see them.
+    // Four kinds need no column of their own: `count` alone is `count(*)`, a
+    // ROW count; a literal reads nothing at all; a CASE names its columns
+    // inside its branches; and a WINDOW names what it is OF in a parameter,
+    // which is usually another computed column rather than a table's.
     const needsColumn =
         !(t.kind === 'aggregate' && t.op === 'count') &&
         t.kind !== 'literal' &&
-        t.kind !== 'case';
+        t.kind !== 'case' &&
+        t.kind !== 'window';
     if (needsColumn && !(t.table && t.column)) return 'Pick a column.';
+    // Only the SCALAR parameters can be checked this way. `argText` reads an
+    // array as empty, so a filled-in column list would report itself missing.
     const missing = op.params.find(
-        p => !p.optional && p.type !== 'branches' && argText(t.args, p.name).trim() === '',
+        p =>
+            !p.optional &&
+            p.type !== 'branches' &&
+            p.type !== 'columns' &&
+            argText(t.args, p.name).trim() === '',
     );
     if (missing) return `${missing.label} is empty.`;
+    // Array parameters, checked as arrays.
+    const emptyList = op.params.find(
+        p => !p.optional && p.type === 'columns' && columnList(t.args, p.name).length === 0,
+    );
+    if (emptyList) return `${emptyList.label} is empty.`;
     return op.validate?.(t.args) ?? null;
 }
 

@@ -44,6 +44,8 @@ import {
 import {
     addrOf,
     argText,
+    sourceOfTransform,
+    isTransformSource,
     opsFor,
     unaddr,
     suggestedAlias,
@@ -81,6 +83,8 @@ export interface TransformDialogProps {
     initial?: ColumnTransform;
     /** Everything selectable as a source column. */
     tables: SqlStudioTable[];
+    /** The other computed columns, so a window can be OF one of them. */
+    siblings: ColumnTransform[];
     onSubmit: (transform: ColumnTransform) => void;
     onCancel: () => void;
 }
@@ -89,6 +93,7 @@ export interface TransformDialogProps {
 export default function TransformDialog({
     initial,
     tables,
+    siblings,
     onSubmit,
     onCancel,
 }: TransformDialogProps) {
@@ -151,13 +156,33 @@ export default function TransformDialog({
         [draft.kind, columnOptions],
     );
 
+    /**
+     * What a window can be OF.
+     *
+     * Computed columns LEAD, and that is not a nicety: in a grouped query a
+     * window over a raw column fails outright, so the aggregate beside it is
+     * almost always the right answer.
+     */
+    const sourceOptions = useMemo<ColumnOption[]>(
+        () => [
+            ...siblings.map(s => ({
+                table: s.table ?? '',
+                column: s.column ?? '',
+                transformId: s.id,
+                label: s.alias || 'unnamed',
+            })),
+            ...columnOptions,
+        ],
+        [siblings, columnOptions],
+    );
+
     const branches = Array.isArray(draft.args.branches)
         ? (draft.args.branches as CaseBranch[])
         : [];
 
     const problem = transformProblem(draft);
     const complete = problem === null;
-    const preview = transformExpression(draft);
+    const preview = transformExpression(draft, siblings);
 
     const submit = () => {
         if (complete) onSubmit(draft);
@@ -308,7 +333,38 @@ export default function TransformDialog({
                     ) : null}
 
                     {op?.params.map(p =>
-                        p.type === 'branches' ? (
+                        p.type === 'source' ? (
+                            <label className="blk-ced-field" key={p.name}>
+                                <span>{p.label}</span>
+                                {/* A window is usually OF a computed column —
+                                    a running total of a COUNT — because in a
+                                    grouped query a window over a raw column
+                                    does not run at all. Computed columns lead
+                                    the list for that reason. */}
+                                <ColumnPicker
+                                    value={sourceValue(argText(draft.args, p.name), siblings)}
+                                    options={sourceOptions}
+                                    placeholder="Search for a column"
+                                    onChange={o =>
+                                        setArg(
+                                            p.name,
+                                            o.transformId
+                                                ? sourceOfTransform(o.transformId)
+                                                : addrOf(o.table, o.column),
+                                        )
+                                    }
+                                />
+                                {p.hint ? <em className="blk-xfd-phint">{p.hint}</em> : null}
+                            </label>
+                        ) : p.type === 'columns' ? (
+                            <ColumnList
+                                key={p.name}
+                                param={p}
+                                value={Array.isArray(draft.args[p.name]) ? (draft.args[p.name] as string[]) : []}
+                                options={columnOptions}
+                                onChange={next => setArg(p.name, next)}
+                            />
+                        ) : p.type === 'branches' ? (
                             <CaseBranches
                                 key={p.name}
                                 branches={branches}
@@ -607,4 +663,76 @@ function seededBranch(seed?: ColumnOption): CaseBranch {
     const b = newCaseBranch();
     if (!seed) return b;
     return { ...b, when: newGroup('and', [newRule(seed.table, seed.column)]) };
+}
+
+/**
+ * An ORDERED list of columns — what a window partitions or orders by.
+ *
+ * A list rather than one picker, because both of these genuinely take several:
+ * "within company and location", "ordered by year then month". Order matters
+ * for ORDER BY and not for PARTITION BY, but one control for both is worth more
+ * than two that differ in a way nobody would notice.
+ */
+function ColumnList({
+    param,
+    value,
+    options,
+    onChange,
+}: {
+    param: TransformParam;
+    value: string[];
+    options: ColumnOption[];
+    onChange: (next: string[]) => void;
+}) {
+    return (
+        <div className="blk-ced-field">
+            <span>{param.label}</span>
+            {value.map((v, i) => {
+                const [table, column] = unaddr(v);
+                return (
+                    <div className="blk-xfd-collist-row" key={`${v}-${i}`}>
+                        <ColumnPicker
+                            value={{ table, column }}
+                            options={options}
+                            onChange={o =>
+                                onChange(value.map((x, k) => (k === i ? addrOf(o.table, o.column) : x)))
+                            }
+                        />
+                        <button
+                            type="button"
+                            className="blk-lib-icon"
+                            onClick={() => onChange(value.filter((_, k) => k !== i))}
+                            title="Remove"
+                            aria-label={`Remove ${column || 'column'}`}
+                        >
+                            <Trash2 size={12} />
+                        </button>
+                    </div>
+                );
+            })}
+            <button
+                type="button"
+                className="blk-xfd-addbranch"
+                onClick={() => onChange([...value, ''])}
+            >
+                <Plus size={12} />
+                <span>{value.length === 0 ? `Add a column` : `Add another`}</span>
+            </button>
+            {param.hint ? <em className="blk-xfd-phint">{param.hint}</em> : null}
+        </div>
+    );
+}
+
+/** A stored `source` argument as something the picker can show. */
+function sourceValue(v: string, siblings: ColumnTransform[]): ColumnOption {
+    if (!v) return { table: '', column: '' };
+    if (isTransformSource(v)) {
+        const id = v.slice('tx:'.length);
+        const found = siblings.find(s => s.id === id);
+        return found
+            ? { table: '', column: '', transformId: found.id, label: found.alias || 'unnamed' }
+            : { table: '', column: '' };
+    }
+    const [table, column] = unaddr(v);
+    return { table, column };
 }

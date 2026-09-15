@@ -20,11 +20,13 @@ export { filterSql, filterNodeSql } from './filter-sql';
 import { transformExpression, transformIsComplete } from './transform-ops';
 import {
     activeTransforms,
+    clauseFor,
     mapRules,
     type Aggregate,
     type DateBucket,
     type BuilderState,
     type ColumnTransform,
+    type FilterNode,
     type FilterRule,
     type SelectedColumn,
     type SortColumn,
@@ -201,8 +203,8 @@ export function emittableTransforms(state: BuilderState): ColumnTransform[] {
  * something a person typed — "Total Qty", "% of Group" — and the ordinary path
  * through `quoteIdent` would leave a bare `Total Qty` in the SQL.
  */
-export function transformSelect(t: ColumnTransform): string | null {
-    const expr = transformExpression(t);
+export function transformSelect(t: ColumnTransform, siblings: ColumnTransform[] = []): string | null {
+    const expr = transformExpression(t, siblings);
     return expr === null ? null : `${expr} AS ${quoteIdent(t.alias)}`;
 }
 
@@ -247,7 +249,8 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
     // a person reading the query back finds their bearings.
     const selectParts = [
         ...columns.map(selectExpression),
-        ...transforms.map(transformSelect).filter((s): s is string => s !== null),
+        // Not point-free, for the reason given below.
+        ...transforms.map(x => transformSelect(x, transforms)).filter((s): s is string => s !== null),
     ];
     selectParts.forEach((part, i) => {
         // Both prefixes are seven wide, so a wrapped expression lines up under
@@ -332,11 +335,30 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
     const withTransformAggregate = (rule: FilterRule): FilterRule => {
         if (!rule.transformId || rule.aggregate) return rule;
         const t = transforms.find(x => x.id === rule.transformId);
-        if (!t || t.kind !== 'aggregate') return rule;
-        return { ...rule, aggregate: t.op as Aggregate };
+        if (!t) return rule;
+        if (t.kind === 'aggregate') return { ...rule, aggregate: t.op as Aggregate };
+        // A WINDOW recipe always returns a number — a rank, a row number, a
+        // running total, a share. `aggregate` is being used here purely as the
+        // "write the literal bare" signal `filterSql` already reads; `count`
+        // is the cheapest numeric one to name. Nothing downstream resolves a
+        // window rule by its aggregate, because it is found by id.
+        if (t.kind === 'window') return { ...rule, aggregate: 'count' };
+        return rule;
     };
 
+    // Window rules are lifted OUT of here and into QUALIFY below. Left in, they
+    // would be emitted twice — and the WHERE copy would not even parse, since
+    // DuckDB rejects a window function there.
+    const windowIds = new Set(
+        transforms.filter(t => clauseFor(t.kind) === 'qualify').map(t => t.id),
+    );
+    const isWindowRule = (n: FilterNode): boolean =>
+        n.kind === 'rule'
+            ? !!n.transformId && windowIds.has(n.transformId)
+            : n.children.some(isWindowRule);
+
     const predicates = state.filters.children
+        .filter(c => !isWindowRule(c))
         .map(c => filterNodeSql(mapRules(c, withTransformAggregate), leftOfRule))
         .filter((s): s is string => s !== null);
     predicates.forEach((p, i) =>
@@ -360,7 +382,10 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
             // see the note on the columns above.
             ...transforms
                 .filter(isGroupingTransform)
-                .map(transformExpression)
+                // NOT point-free: `map` would hand the INDEX in as the
+                // sibling list, which typechecks as nothing and silently
+                // stops a window resolving what it is of.
+                .map(x => transformExpression(x, transforms))
                 .filter((s): s is string => s !== null),
         ];
         grouped.forEach((expr, i) => {
@@ -426,6 +451,31 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
             .filter((s): s is string => s !== null);
         groupPredicates.forEach((p, i) =>
             lines.push(i === 0 ? `HAVING ${p}` : `   ${conjH} ${p}`),
+        );
+    }
+
+    /**
+     * QUALIFY — filtering on a WINDOW.
+     *
+     * The third destination, and the one that keeps Top-N-per-group inside the
+     * no-subquery line. DuckDB rejects a window in WHERE outright (`WHERE
+     * clause cannot contain window functions`) and in HAVING it would be
+     * filtering groups rather than rows, so neither of the existing clauses can
+     * carry it.
+     *
+     * Rules arrive in the ordinary filter tree and are routed OUT of it by the
+     * transformation's kind — nothing for anybody to choose, the same way the
+     * WHERE/HAVING split already works. Unlike HAVING there is no separate
+     * section to author them in; a window filter is written where every other
+     * row filter is.
+     */
+    if (windowIds.size > 0) {
+        const qualifyPredicates = state.filters.children
+            .filter(isWindowRule)
+            .map(c => filterNodeSql(mapRules(c, withTransformAggregate), leftOfRule))
+            .filter((s): s is string => s !== null);
+        qualifyPredicates.forEach((p, i) =>
+            lines.push(i === 0 ? `QUALIFY ${p}` : `    ${conj} ${p}`),
         );
     }
 

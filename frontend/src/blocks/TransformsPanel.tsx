@@ -69,7 +69,7 @@ export default function TransformsPanel({
             ) : null}
 
             {transforms.map(t => {
-                const expr = transformExpression(t);
+                const expr = transformExpression(t, transforms);
                 // Incomplete means it will be DROPPED from the SQL, not that it
                 // will fail. Marked for the same reason a half-built filter rule
                 // is: a silent no-op is something somebody hunts for later.
@@ -134,6 +134,9 @@ export default function TransformsPanel({
                 <TransformDialog
                     initial={editing.transform}
                     tables={tables}
+                    // A window can be OF another computed column; editing one
+                    // must not offer ITSELF as its own source.
+                    siblings={transforms.filter(x => x.id !== editing.transform?.id)}
                     onSubmit={next => {
                         onUpsert(next);
                         setEditing(null);

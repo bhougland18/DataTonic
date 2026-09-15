@@ -4,6 +4,7 @@ import {
     argText,
     opById,
     opsFor,
+    sourceOfTransform,
     suggestedAlias,
     transformExpression,
     transformIsComplete,
@@ -19,6 +20,7 @@ import {
     type ColumnTransform,
 } from './builder-types';
 import { isGroupingTransform } from './builder-sql';
+import { clauseFor } from './builder-types';
 
 const t = (over: Partial<ColumnTransform> = {}): ColumnTransform => ({
     ...newTransform('aggregate', 'sum'),
@@ -58,8 +60,15 @@ describe('opsFor', () => {
     });
 
     it('offers nothing for a kind with no operations yet', () => {
-        expect(opsFor('window', 'INTEGER')).toEqual([]);
         expect(opsFor('regex', 'VARCHAR')).toEqual([]);
+    });
+
+    // A window recipe is about a VALUE, not about the column the row was
+    // started from, so no type gates it out.
+    it('offers every window recipe whatever the column', () => {
+        for (const type of ['VARCHAR', 'DATE', undefined]) {
+            expect(opsFor('window', type).map(o => o.id)).toContain('running_total');
+        }
     });
 });
 
@@ -368,5 +377,82 @@ describe('case otherwise', () => {
     // Still optional: no ELSE is legal and returns NULL.
     it('omits it entirely when empty, whatever the flag says', () => {
         expect(transformExpression(withElse('', true))).not.toContain('ELSE');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Window recipes (DAA.118)
+// ---------------------------------------------------------------------------
+
+describe('window recipes', () => {
+    const orders: ColumnTransform = { ...newTransform('aggregate', 'count'), alias: 'Orders' };
+    const win = (op: string, args: Record<string, unknown> = {}): ColumnTransform => ({
+        ...newTransform('window', op),
+        args: { of: sourceOfTransform(orders.id), ...args },
+        alias: 'W',
+    });
+    const expr = (t: ColumnTransform) => transformExpression(t, [orders]);
+
+    // In a grouped query a window over a RAW column fails outright, so the
+    // argument has to be the aggregate. Inlined, not referenced by alias:
+    // an alias would make SELECT-list order decide whether the query parses.
+    it('inlines the sibling it is OF', () => {
+        expect(expr(win('running_total'))).toContain('sum(count(*))');
+    });
+
+    it('has nothing to emit when its source is gone', () => {
+        expect(transformExpression(win('running_total'), [])).toBeNull();
+    });
+
+    it('frames a running total to everything up to this row', () => {
+        expect(expr(win('running_total', { orderBy: [addrOf('PO', 'Vendor')] }))).toBe(
+            'sum(count(*)) OVER (ORDER BY PO.Vendor ROWS UNBOUNDED PRECEDING)',
+        );
+    });
+
+    it('needs no source for a rank or a row number', () => {
+        expect(opById('rank')?.params.some(p => p.type === 'source')).toBe(false);
+        expect(opById('row_number')?.params.some(p => p.type === 'source')).toBe(false);
+    });
+
+    // THE bug this recipe exists to prevent. `sum(x) OVER (ORDER BY y)` is a
+    // RUNNING sum, so with an order the share came back as a share of the
+    // running total - measured as 1.0, 0.78, 0.027 down a column that should
+    // sum to 1. The order is neither offered nor read.
+    it('never orders a share of the total', () => {
+        expect(opById('pct_of_total')?.params.some(p => p.name === 'orderBy')).toBe(false);
+        expect(expr(win('pct_of_total', { orderBy: [addrOf('PO', 'Vendor')] }))).toBe(
+            'CAST(count(*) AS DOUBLE) / sum(count(*)) OVER ()',
+        );
+    });
+
+    // `24 / 316` is 0 in integer arithmetic.
+    it('casts before dividing', () => {
+        expect(expr(win('pct_of_total'))).toContain('CAST(');
+    });
+
+    it('counts the current row in a moving average', () => {
+        expect(expr(win('moving_average', { periods: '3', orderBy: [addrOf('PO', 'V')] }))).toContain(
+            'ROWS BETWEEN 2 PRECEDING AND CURRENT ROW',
+        );
+    });
+
+    it('omits a frame when there is no order to frame against', () => {
+        expect(expr(win('running_total'))).toBe('sum(count(*)) OVER ()');
+    });
+
+    it('partitions on several columns', () => {
+        expect(
+            expr(win('rank', { partitionBy: [addrOf('PO', 'A'), addrOf('PO', 'B')] })),
+        ).toBe('rank() OVER (PARTITION BY PO.A, PO.B)');
+    });
+
+    // Windows are computed AFTER grouping, so they are never grouping keys.
+    it('is not a grouping key', () => {
+        expect(isGroupingTransform(win('rank'))).toBe(false);
+    });
+
+    it('filters into QUALIFY, not WHERE or HAVING', () => {
+        expect(clauseFor('window')).toBe('qualify');
     });
 });
