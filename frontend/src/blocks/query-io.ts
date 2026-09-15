@@ -4,13 +4,19 @@
 // node's `sql` prop. Above the graph there is no node, so a query that is not
 // saved is a query that is lost on the next step change. This is that place.
 //
-// SHAPED AS A DIVE MINUS ITS CHART, deliberately. `Dive` is
-// `{ id, title, query, chart, … }` and `parseDive` refuses a dive without a
-// chart — so "a saved query" is exactly the half of a dive that exists before
-// the Charts step (DAA.72) supplies the other half. Storing it in dive's own
-// vocabulary (`query.sql`, `title`, `meta`) means promotion later is adding a
-// field, not translating a record. Anything else would need a migration to
-// become the thing it was always going to become.
+// SHAPED AS A DIVE, deliberately, and that promotion has now happened: the
+// previous session stored the half of a dive that exists before a chart, and the
+// Charts step supplies `chart` (Ben's call, `chart-editor-handoff.md` §7a — the
+// SQL, the chart and what holds them together are ONE artefact). Every field
+// lines up with `Dive` by name and meaning, so this record can become a dive
+// file without translating anything.
+//
+// One correction to §7a worth recording, because it changes what is left to do:
+// `parseDive` does NOT refuse a chartless dive. It requires `chart` to be an
+// OBJECT, and `DiveModal` already writes `chart: {}` for a manual dive. So the
+// remaining difference between this and a dive file is purely WHERE it lives —
+// dives are repo items enumerated from `repository.json` through `App.tsx`,
+// which means new props on `BlocksStudio`, not a format change here.
 //
 // ONE FILE, not one per query, for now. The blocks payload directory is shared
 // with the ER model, and per-item files only start paying off once blocks are
@@ -19,8 +25,10 @@
 // that hid every pipeline in a real workspace. Splitting the file is the easy
 // half of that change; the folder entry is the half worth doing deliberately.
 
+import type { DiveChart } from '../dives/dive-types';
 import { isTauri, tauriOpenFile, tauriSavePath } from '../tauri-dialog';
 import { loadItemPayload, saveItemPayload } from '../workspace';
+import type { BuilderState } from './builder-types';
 
 const EXPORT_VERSION = 1;
 
@@ -36,13 +44,37 @@ export const SAVED_QUERIES_ID = 'queries';
 export interface SavedQuery {
     id: string;
     title: string;
-    /** Dive's own shape, so a chart is all that is missing later. */
+    /** Dive's own shape. */
     query: { sql: string };
     /** What the query is for, in the author's words. `description` rather than
      *  a name of our own because `Dive` already has this exact field — the
      *  point of borrowing dive's vocabulary is that promotion adds a chart and
      *  changes nothing else. */
     description?: string;
+    /**
+     * The Vega-Lite spec the Charts step built, with no data and no size.
+     *
+     * OPTIONAL, because a query worth keeping is often not a chart yet — and
+     * because every query saved before the Charts step existed has none. Absent
+     * and `{}` mean the same thing here, which is also what `DiveModal` writes
+     * for a dive with no chart.
+     */
+    chart?: DiveChart;
+    /**
+     * How the query was AUTHORED, when it was built rather than written.
+     *
+     * A sibling of `query`, not part of it and not inside a `state` bag —
+     * `DiveState` is what you are LOOKING at (params, sort, drill, row limit),
+     * whereas this is what PRODUCED the SQL. The SQL Studio node made the same
+     * call two hours earlier by keeping `builder` beside `sql` in node props
+     * (`f568c963`).
+     *
+     * Its absence is meaningful and must stay tolerated: that is a hand-written
+     * query, and it reopens in SQL mode exactly as the node does. Reconstructing
+     * builder state from arbitrary SQL is the text-to-SQL problem the builder
+     * exists to avoid.
+     */
+    builder?: BuilderState;
     meta?: { createdAt?: string; updatedAt?: string };
 }
 
@@ -78,6 +110,33 @@ function isQuery(v: unknown): v is SavedQuery {
 }
 
 /**
+ * Strip an optional field that is not the shape it claims to be.
+ *
+ * Finer-grained than dropping the row, and deliberately: the SQL is the part
+ * worth keeping, so a chart spec that arrived as a string should cost the chart
+ * and not the query. Both of these reach code that indexes into them —
+ * `readSpec` and the builder — and a string there is a crash rather than an
+ * empty panel.
+ */
+function sound(q: SavedQuery): SavedQuery {
+    const out = { ...q };
+    if (out.chart !== undefined && (typeof out.chart !== 'object' || out.chart === null)) {
+        delete out.chart;
+    }
+    const b = out.builder as unknown;
+    if (
+        b !== undefined &&
+        (typeof b !== 'object' ||
+            b === null ||
+            !Array.isArray((b as { columns?: unknown }).columns) ||
+            !Array.isArray((b as { joins?: unknown }).joins))
+    ) {
+        delete out.builder;
+    }
+    return out;
+}
+
+/**
  * Load the saved queries, dropping any malformed entry.
  *
  * Dropped rather than thrown on, the same call `loadSchemaModel` makes and for
@@ -89,7 +148,7 @@ export async function loadSavedQueries(workspacePath: string): Promise<SavedQuer
     const raw = await loadItemPayload<unknown>(workspacePath, 'block', SAVED_QUERIES_ID);
     if (typeof raw !== 'object' || raw === null) return [];
     const o = raw as Record<string, unknown>;
-    return Array.isArray(o.queries) ? o.queries.filter(isQuery) : [];
+    return Array.isArray(o.queries) ? o.queries.filter(isQuery).map(sound) : [];
 }
 
 export async function saveSavedQueries(
@@ -169,7 +228,7 @@ function isQueryFile(v: unknown): v is QueryFile {
 export function parseQueryFile(text: string): SavedQuery[] {
     const raw = JSON.parse(text) as unknown;
     if (!isQueryFile(raw)) throw new Error('Not a Duckle saved-queries file.');
-    return raw.queries.filter(isQuery);
+    return raw.queries.filter(isQuery).map(sound);
 }
 
 export async function exportQueries(

@@ -40,11 +40,27 @@ export function DiveModal({ item, workspacePath, theme, onClose, onSave }: DiveM
     const [preview, setPreview] = useState<Dive | null>(existing ?? null);
     const [genChart, setGenChart] = useState<Dive['chart'] | null>(null);
 
+    /**
+     * The dive as this modal would save it.
+     *
+     * SPREADS `existing` first, and that is load-bearing. This used to build a
+     * fresh object listing six fields, which silently DROPPED every field the
+     * modal does not edit — `source`, `description`, `state`, `question`,
+     * `query.params`, and the `builder` a Blocks-authored dive carries.
+     *
+     * The damage was not cosmetic: `source` is the database a dive needs
+     * ATTACHed, so a dive authored in Blocks and then opened and saved here
+     * came back unrunnable with `schema "duckle_src" does not exist` — on a
+     * dashboard, which is the one place nobody is watching for it. A field this
+     * editor has never heard of belongs to whoever wrote it, and the only safe
+     * default is to carry it through untouched.
+     */
     const draft = (): Dive => ({
+        ...(existing ?? {}),
         diveSchemaVersion: DIVE_SCHEMA_VERSION,
         id: existing?.id ?? newId(),
         title: title.trim() || 'Untitled dive',
-        query: { sql },
+        query: { ...(existing?.query ?? {}), sql },
         chart: genChart ?? existing?.chart ?? {},
         meta: { ...(existing?.meta ?? {}), generator: genChart ? 'duckie' : 'manual' },
     });

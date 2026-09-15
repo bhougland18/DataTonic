@@ -27,6 +27,7 @@ import {
     type ShapeContext,
     type Verdict,
 } from './chart-shapes';
+import { encodedChannels, markType, buildSpec, type ChartSpecState } from './chart-spec';
 
 /** How many near misses to describe. The rest are noise in a prompt. */
 const MAX_NEAR = 4;
@@ -57,6 +58,15 @@ const line = (v: Verdict): string => {
 export function chartContext(
     result: SqlRunResult | null | undefined,
     ctx?: ShapeContext,
+    /**
+     * The chart being edited, when one has been picked.
+     *
+     * Changes what the pane is being asked. Before a chart exists the question
+     * is "what could this be"; afterwards it is almost always "why does THIS
+     * one look wrong", and answering that from the list of everything that fits
+     * is answering a question nobody asked.
+     */
+    chosen?: ChartSpecState | null,
 ): string {
     if (!result || result.error || result.columns.length === 0) return '';
 
@@ -100,14 +110,48 @@ export function chartContext(
         'column, an aggregate, or a date — not the chart library. Answer in terms of',
         'which column to add and where it would go.',
     );
+
+    if (chosen) lines.push('', ...chosenLines(chosen, fields, ctx));
     return lines.join('\n');
 }
 
-/** The verdict for one chart, phrased for a prompt. Used when a type is chosen. */
-export function chartVerdictLine(
-    result: SqlRunResult | null | undefined,
-    chart: Parameters<typeof checkShape>[1],
-): string {
-    if (!result || result.error || result.columns.length === 0) return '';
-    return line(checkShape(fieldsFromColumns(result.columns), chart));
+/**
+ * The chart on the Charts step, described as a chart rather than as JSON.
+ *
+ * The channels, not the spec: asked "why is my bar chart empty", the useful
+ * answer turns on which column is on which channel, and a model given raw JSON
+ * spends its answer restating the JSON. The mark name is given too, because it
+ * is the word the user will see if they open the spec.
+ */
+function chosenLines(
+    chosen: ChartSpecState,
+    fields: Parameters<typeof checkShape>[0],
+    ctx?: ShapeContext,
+): string[] {
+    const shape = shapeFor(chosen.chart);
+    const verdict = checkShape(fields, chosen.chart, ctx);
+    const out = [
+        'THE CHART THE USER IS EDITING',
+        `${shape?.label ?? chosen.chart} — Vega-Lite mark "${markType(buildSpec(chosen)) ?? chosen.chart}".`,
+    ];
+    for (const ch of encodedChannels(chosen)) {
+        const c = chosen.encoding[ch];
+        if (!c) continue;
+        const what = c.count ? 'a count of rows' : c.field;
+        out.push(`  - ${ch} = ${what} (${c.type})${c.bin ? ', binned by the spec' : ''}`);
+    }
+    if (chosen.title?.trim()) out.push(`Titled "${chosen.title.trim()}".`);
+    out.push(
+        verdict.kind === 'fits'
+            ? 'The result fits this chart.'
+            : `The result does not fit it: ${missingSummary(verdict)}.`,
+    );
+    // Says where the edit lands, so the answer is something the user can do
+    // rather than a spec they have nowhere to put.
+    out.push(
+        'The user adjusts it with the chart controls — which column is on which channel,',
+        'titles, sort, scale, colour, legend, number format — or by editing the Vega-Lite',
+        'spec directly. Shaping the data is done in the SQL, never in the spec.',
+    );
+    return out;
 }

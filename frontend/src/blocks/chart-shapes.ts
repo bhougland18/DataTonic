@@ -17,11 +17,12 @@ import type { SqlStudioColumn } from '../sqleditor/types';
 /** Vega-Lite's four measurement types. */
 export type VlType = 'nominal' | 'ordinal' | 'quantitative' | 'temporal';
 
-/** The encoding channels the first eight marks need between them. */
+/** The encoding channels the built-in marks need between them. */
 export type Channel = 'x' | 'y' | 'color' | 'theta' | 'size';
 
 export type ChartType =
     | 'bar'
+    | 'barh'
     | 'line'
     | 'area'
     | 'point'
@@ -216,7 +217,7 @@ const measure = (channel: Channel, required = true, label = 'a number'): Channel
 });
 
 /**
- * The eight shapes, and why each accepts what it does.
+ * The built-in shapes, and why each accepts what it does.
  *
  * Variants, not one shape per chart (plan §3) — the biggest correctness risk in
  * the whole feature. A contract naming only the simple case tells somebody
@@ -238,6 +239,31 @@ export const CHART_SHAPES: ChartShape[] = [
                 needs: [
                     category('x'),
                     measure('y'),
+                    category('color', false, 'a second category to split by'),
+                ],
+            },
+        ],
+    },
+    {
+        type: 'barh',
+        label: 'Horizontal bars',
+        variants: [
+            {
+                id: 'barsh',
+                label: 'Ranked categories',
+                // The MEASURE is on x and the CATEGORY on y — the transpose of
+                // `bar`, not a styling flag on it, because which channel holds
+                // which type is the whole contract.
+                //
+                // Worth its own card rather than a variant of the bar chart:
+                // the gallery is visual, and a person choosing between upright
+                // and sideways bars is choosing a picture, not a setting. It
+                // also earns its place — long category names are unreadable
+                // rotated under an upright axis, which is the usual reason to
+                // turn a bar chart on its side.
+                needs: [
+                    category('y'),
+                    measure('x'),
                     category('color', false, 'a second category to split by'),
                 ],
             },
@@ -485,6 +511,26 @@ function materialise(needs: ChannelNeed[], fields: Field[], plan: Plan): Encodin
     return encoding;
 }
 
+/**
+ * Assign columns to a bare list of channel needs.
+ *
+ * Exported because a saved CUSTOM chart is matched by exactly this logic: its
+ * encoding is a contract too, just one written by a person rather than by
+ * `CHART_SHAPES`. Sharing the assignment is what gives a custom template the
+ * same honest verdict as a built-in — "needs a number", rather than a chart
+ * that silently draws nothing because its field names came from another query.
+ */
+export function matchNeeds(
+    needs: ChannelNeed[],
+    fields: Field[],
+): { encoding: Encoding; missing: ChannelNeed[] } {
+    const plan = bestPlan(needs, fields);
+    return {
+        encoding: materialise(needs, fields, plan),
+        missing: needs.filter((n, i) => n.required && !plan[i]),
+    };
+}
+
 function checkVariant(chart: ChartType, variant: ShapeVariant, fields: Field[]): Verdict {
     const plan = bestPlan(variant.needs, fields);
     const missing = variant.needs.filter((n, i) => n.required && !plan[i]);
@@ -579,18 +625,30 @@ export function suggestCharts(
     includeClose = true,
     ctx?: ShapeContext,
 ): Verdict[] {
-    return CHART_SHAPES.map(s => checkShape(fields, s.type, ctx))
-        // `unsuitable` is dropped alongside `wrong`. It is a real answer to
-        // "can I chart this", but this list is a recommendation, and a chart
-        // that would mislead does not belong in one.
-        .filter(v =>
-            includeClose ? v.kind === 'fits' || v.kind === 'close' : v.kind === 'fits',
-        )
-        .sort((a, b) => {
-            const [ar, au] = verdictScore(a);
-            const [br, bu] = verdictScore(b);
-            return ar - br || au - bu;
-        });
+    // `unsuitable` is dropped alongside `wrong`. It is a real answer to "can I
+    // chart this", but this list is a RECOMMENDATION, and a chart that would
+    // mislead does not belong in one.
+    return allCharts(fields, ctx).filter(v =>
+        includeClose ? v.kind === 'fits' || v.kind === 'close' : v.kind === 'fits',
+    );
+}
+
+/**
+ * Every chart with its verdict, best first — including the ones that do not fit.
+ *
+ * What the gallery needs and `suggestCharts` deliberately will not give it. A
+ * gallery is a PICKER, not a recommendation: it shows every mark and says
+ * what each one still wants, which is the difference between "your data is
+ * wrong" and "add a count and this becomes a bar chart". Keeping both behind
+ * one sort means the strip and the gallery can never disagree about which
+ * chart is the better fit.
+ */
+export function allCharts(fields: Field[], ctx?: ShapeContext): Verdict[] {
+    return CHART_SHAPES.map(s => checkShape(fields, s.type, ctx)).sort((a, b) => {
+        const [ar, au] = verdictScore(a);
+        const [br, bu] = verdictScore(b);
+        return ar - br || au - bu;
+    });
 }
 
 /** The encoding a fitting verdict implies, or null when it does not fit. */

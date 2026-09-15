@@ -65,11 +65,39 @@ export async function runDive(
         dive.query.params,
         paramValues ?? dive.state?.paramValues ?? {},
     );
+    // `src.duckdb` when the dive names a database to ATTACH, `code.sql` when it
+    // is self-contained.
+    //
+    // Without this a dive saved from the Blocks SQL step was unrunnable
+    // anywhere else. Blocks queries through `src.duckdb`, whose stage prelude
+    // emits `ATTACH '<database>' AS duckle_src`, so its SQL says
+    // `duckle_src."Vendor"` — and opening that dive on a dashboard failed with
+    // `schema "duckle_src" does not exist`. The format anticipated exactly this
+    // (`DiveSource`'s duckdb case, "a later phase"); this is that phase.
+    const attach = dive.source?.kind === 'duckdb' ? dive.source.database : null;
+
+    // A dive whose SQL names the attach alias but carries no database to attach
+    // cannot run, and DuckDB's own words for that — `schema "duckle_src" does
+    // not exist` — name the symptom rather than the cause. Said here, where the
+    // cause is known, because the place this surfaces is a dashboard tile that
+    // nobody is debugging.
+    if (!attach && /\bduckle_src\b/.test(sql)) {
+        throw new Error(
+            `"${dive.title}" reads an attached database but does not record which one, so it ` +
+                'cannot run outside the step that made it. Re-save it from the Blocks Charts step.',
+        );
+    }
     const node: Node<DuckleNodeData> = {
         id: 'dive_sql',
         type: 'duckle',
         position: { x: 0, y: 0 },
-        data: { label: dive.title || 'Dive', componentId: 'code.sql', properties: { sql } },
+        data: attach
+            ? {
+                  label: dive.title || 'Dive',
+                  componentId: 'src.duckdb',
+                  properties: { database: attach, sql },
+              }
+            : { label: dive.title || 'Dive', componentId: 'code.sql', properties: { sql } },
     };
     const result = await runPipeline([node], [], undefined, dive.id, workspacePath ?? null, dive.title);
     if (!result) throw new Error('No backend available to run the dive.');

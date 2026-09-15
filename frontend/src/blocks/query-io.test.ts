@@ -134,3 +134,67 @@ describe('parseQueryFile', () => {
         expect(parseQueryFile(file)).toHaveLength(1);
     });
 });
+
+// §7a: the SQL, the chart and the builder state that produced it are ONE
+// artefact. These pin the two fields that make a saved query a whole dive.
+describe('a saved query carries its chart and its builder state', () => {
+    const full = q({
+        id: 'a',
+        title: 'Items per vendor',
+        chart: { mark: 'bar', encoding: { x: { field: 'Vendor', type: 'nominal' } } },
+        builder: { schemaVersion: 1, columns: [], joins: [], filters: undefined } as never,
+    });
+
+    it('keeps both through an export/import round trip', () => {
+        const file = JSON.stringify({
+            kind: 'duckle.saved-queries',
+            version: 1,
+            queries: [full],
+        });
+        const [back] = parseQueryFile(file);
+        expect(back.chart).toEqual(full.chart);
+        expect(back.builder).toEqual(full.builder);
+    });
+
+    // A query saved before the Charts step existed, and a hand-written one.
+    // Both are ordinary, so neither may be dropped.
+    it('still accepts a query with neither', () => {
+        const file = JSON.stringify({
+            kind: 'duckle.saved-queries',
+            version: 1,
+            queries: [{ id: 'a', title: 'A', query: { sql: 'SELECT 1' } }],
+        });
+        const [back] = parseQueryFile(file);
+        expect(back.chart).toBeUndefined();
+        expect(back.builder).toBeUndefined();
+    });
+
+    // The SQL is the part worth keeping, so a bad optional field costs itself
+    // rather than the query. Both reach code that indexes into them.
+    it('strips a chart that is not an object, keeping the query', () => {
+        const file = JSON.stringify({
+            kind: 'duckle.saved-queries',
+            version: 1,
+            queries: [{ id: 'a', title: 'A', query: { sql: 'SELECT 1' }, chart: 'bar' }],
+        });
+        const [back] = parseQueryFile(file);
+        expect(back.query.sql).toBe('SELECT 1');
+        expect(back.chart).toBeUndefined();
+    });
+
+    it('strips builder state that is not builder state', () => {
+        const file = JSON.stringify({
+            kind: 'duckle.saved-queries',
+            version: 1,
+            queries: [{ id: 'a', title: 'A', query: { sql: 'SELECT 1' }, builder: { columns: 3 } }],
+        });
+        const [back] = parseQueryFile(file);
+        expect(back.builder).toBeUndefined();
+    });
+
+    it('carries both through an upsert', () => {
+        const [back] = upsertQuery([], full);
+        expect(back.chart).toEqual(full.chart);
+        expect(back.builder).toEqual(full.builder);
+    });
+});

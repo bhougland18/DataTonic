@@ -48,6 +48,18 @@ interface QueryPaneProps {
      * screen, which reads as the new query's answer.
      */
     resetToken?: number | string;
+    /**
+     * Change this to RUN the pane's SQL from outside.
+     *
+     * The pane owns the run and the result, the same way it owns clearing it
+     * (`resetToken`), so a caller that needs a run ASKS for one rather than
+     * running the query itself and holding a second copy of the answer — two
+     * copies is how the grid and the chart would come to disagree.
+     *
+     * Opening a saved dive is the case this exists for: the SQL arrives from a
+     * list, and the chart has to be drawn over a result nobody pressed Run for.
+     */
+    runToken?: number | string;
 }
 
 // One editor + its own results grid. Used full-width for the main query and,
@@ -66,6 +78,7 @@ export default function QueryPane({
     resultInfo,
     onResult,
     resetToken,
+    runToken,
 }: QueryPaneProps) {
     const [result, setResult] = useState<SqlRunResult | null>(null);
     const [running, setRunning] = useState(false);
@@ -105,6 +118,23 @@ export default function QueryPane({
     runRef.current = doRun;
 
     const extensions = useMemo(() => sqlExtensions(tables, runRef), [tables]);
+
+    // Run when the caller asks. Through `runRef`, which is reassigned on every
+    // render, so the run uses the SQL as it is NOW — a caller that sets the SQL
+    // and bumps the token in one handler gets the new query, not the old one.
+    //
+    // The first pass is skipped deliberately: mounting is not a request to run,
+    // and treating it as one would fire a DuckDB spawn for every pane that
+    // appears.
+    const askedRef = useRef(true);
+    useEffect(() => {
+        if (askedRef.current) {
+            askedRef.current = false;
+            return;
+        }
+        if (runToken === undefined) return;
+        runRef.current();
+    }, [runToken]);
 
     const sortedRows = useMemo(() => {
         if (!result || !sort) return result?.rows ?? [];

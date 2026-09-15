@@ -10,7 +10,15 @@ export const DIVE_SCHEMA_VERSION = 1;
  * which the run's temp DB deletes after each run.
  */
 export type DiveSource =
-    | { kind: 'duckdb'; database: string; table: string }
+    /**
+     * A DuckDB file to ATTACH before the query runs.
+     *
+     * `table` is OPTIONAL because an attach-based dive may read several tables
+     * — the Blocks SQL step joins across them freely — and the load-bearing
+     * part is the database. It stays for the single-table case, where recording
+     * what the dive reads is worth having.
+     */
+    | { kind: 'duckdb'; database: string; table?: string }
     | { kind: 'parquet'; path: string }
     | { kind: 'csv'; path: string };
 

@@ -8,6 +8,7 @@ import type { Dive } from './dive-types';
 import { runDive, type DiveResult } from './dive-run';
 import { VegaChart } from './VegaChart';
 import { suggestChart } from './suggest-chart';
+import { unescapeField } from '../blocks/chart-spec';
 
 interface DivePanelProps {
     dive: Dive;
@@ -15,13 +16,21 @@ interface DivePanelProps {
     theme?: 'light' | 'dark';
 }
 
-/** Field names referenced by a Vega-Lite spec's encoding channels. */
+/**
+ * Column names referenced by a Vega-Lite spec's encoding channels.
+ *
+ * UNESCAPED, because these are compared against the result's actual column
+ * names. Vega-Lite reads `.` in a field reference as nested access, so a column
+ * called `count Item.Item` is written `count Item\.Item` in the spec — and
+ * comparing that literal against the column name would call every dotted
+ * column missing and fall back to the table for a chart that was fine.
+ */
 function encodingFields(spec: Record<string, unknown>): string[] {
     const enc = (spec.encoding ?? {}) as Record<string, unknown>;
     const fields: string[] = [];
     for (const channel of Object.values(enc)) {
         const f = (channel as Record<string, unknown> | null)?.field;
-        if (typeof f === 'string') fields.push(f);
+        if (typeof f === 'string') fields.push(unescapeField(f));
     }
     return fields;
 }

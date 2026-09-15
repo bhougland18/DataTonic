@@ -326,10 +326,19 @@
 }
 
 /* ---- Step tabs ---- */
+/* CENTRED in the header, not pushed right. Absolutely positioned rather than
+   flexed between two spacers, so the centre stays the centre of the SURFACE
+   however wide the dataset count on the left happens to be — the tabs are the
+   surface's primary navigation and should not drift as its text changes. */
+.blk-head {
+    position: relative;
+}
 .blk-steps {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
     display: flex;
     gap: 2px;
-    margin-left: auto;
 }
 .blk-step {
     display: inline-flex;
@@ -347,11 +356,20 @@
     background: var(--bg-2);
     color: var(--text-1);
 }
+/* The ACCENT, not a slightly different grey. `bg-2` over `bg-1` is nearly
+   invisible in the light theme, so the tab you were on read the same as the two
+   you were not — and these tabs are the surface's primary navigation. Follows
+   `erd-btn--on` and `blk-src-db--active`, which already mark "this is the one"
+   with the accent. */
 .blk-step--active {
-    background: var(--bg-2);
-    border-color: var(--border);
-    color: var(--text-1);
+    background: var(--accent-soft);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    color: var(--accent);
     font-weight: 600;
+}
+.blk-step--active:hover {
+    background: var(--accent-soft);
+    color: var(--accent);
 }
 
 /* ---- Notes ---- */
@@ -372,6 +390,13 @@
 .blk-note--warn {
     background: color-mix(in srgb, var(--warn, #f5a524) 14%, transparent);
     color: var(--text-1);
+}
+/* A note that is neither an error nor a warning — the chart editor's "this spec
+   does something the controls do not model". Stating a fact, so it is quiet:
+   the modifier-less class had no colour of its own and read as body text. */
+.blk-note:not([class*='blk-note--']) {
+    background: var(--bg-1);
+    color: var(--text-3);
 }
 
 /* ---- Panels ---- */
@@ -1358,9 +1383,10 @@
     color: var(--text-3);
     flex-shrink: 0;
 }
-/* A chip is a <span> until a picker exists to click it (DAA.100); the button
-   rules only bite once `onPick` is passed, so nothing here looks interactive
-   before it is. */
+/* A chip is a <span> where nothing can be done with it and a <button> where
+   something can — in Blocks it now carries `onPick` into the Charts step, so
+   the button rules below do bite. Both forms share the chip look deliberately:
+   the verdict reads the same whether or not this host can act on it. */
 .blk-shape-chip {
     display: inline-flex;
     align-items: center;
@@ -1475,4 +1501,524 @@ button.blk-shape-chip:hover {
 .blk-valpick-cap {
     border-top: 1px solid var(--border);
     margin-top: 2px;
+}
+
+/* ---- Charts step ---- */
+/* The third step: the gallery until a chart is chosen, then controls beside a
+   live render of it. One or the other, never both — the thumbnail of what you
+   picked sitting next to the real chart reads as two answers to one question. */
+.blk-charts {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+/* Save lives on the SQL step, with the query, because a block is one artefact.
+   Said quietly here so nobody hunts for a Save button that should not exist. */
+.blk-charts-hint {
+    font-size: 11.5px;
+    color: var(--text-3);
+}
+.blk-charts-work {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+}
+.blk-charts-panel {
+    width: 300px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    background: var(--bg-0);
+    overflow-y: auto;
+}
+.blk-charts-view {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 16px;
+    overflow: auto;
+}
+/* `width: container` needs a parent with a definite width, which is what the
+   block display and `min-width: 0` on the flex child give it. */
+.blk-charts-vega {
+    width: 100%;
+    min-height: 260px;
+}
+.blk-charts-cap {
+    margin: 0;
+    font-size: 11.5px;
+    color: var(--text-3);
+}
+
+/* ---- Chart gallery (DAA.100) ---- */
+.blk-gal {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    padding: 14px 16px 20px;
+}
+.blk-gal-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+}
+.blk-gal-lbl {
+    font-weight: 600;
+    color: var(--text-1);
+    font-size: 13px;
+}
+.blk-gal-note {
+    font-size: 11.5px;
+    color: var(--text-3);
+}
+/* Fixed card width rather than fractions: the thumbnails are a fixed 76x46, so
+   letting the columns stretch would leave each drawing floating in its cell. */
+.blk-gal-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+    gap: 10px;
+}
+.blk-gal-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 10px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-1);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+.blk-gal-card:hover:not(:disabled) {
+    border-color: var(--accent);
+}
+.blk-gal-card--on {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+/* A chart that does not fit stays on the wall, greyed, saying what it needs —
+   that message is the whole reason `checkShape` has four verdicts, and it can
+   only be said next to the chart it is about. */
+.blk-gal-card--off {
+    cursor: default;
+    opacity: 0.55;
+}
+.blk-gal-thumb {
+    display: block;
+    width: 100%;
+    min-height: 46px;
+}
+.blk-gal-vega {
+    display: block;
+}
+.blk-gal-name {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-weight: 600;
+    font-size: 12.5px;
+}
+.blk-gal-why {
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--text-3);
+}
+
+/* ---- Chart editor panel ---- */
+.blk-ced {
+    display: flex;
+    flex-direction: column;
+    min-height: 100%;
+}
+.blk-ced-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+}
+.blk-ced-title {
+    display: flex;
+    flex-direction: column;
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-1);
+}
+.blk-ced-title small {
+    font-weight: 400;
+    font-size: 11px;
+    color: var(--text-3);
+}
+/* `.blk-sec-body` has no horizontal padding — the builder's own children each
+   bring theirs — so these fields need it or they sit flush against the panel
+   edge. 10px lines them up with the section header above them. */
+.blk-ced .blk-sec-body {
+    padding: 0 10px;
+}
+/* A label above its control rather than beside it: the panel is 300px wide and
+   a column name is long, so side-by-side truncated every select. */
+.blk-ced-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 8px;
+    font-size: 12px;
+}
+.blk-ced-field > span {
+    color: var(--text-3);
+}
+.blk-ced-field > span small {
+    font-size: 10.5px;
+    color: var(--text-4, var(--text-3));
+}
+.blk-ced-field input,
+.blk-ced-field select {
+    padding: 4px 7px;
+    background: var(--bg-0);
+    color: var(--text-1);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    font: inherit;
+    font-size: 12px;
+    min-width: 0;
+}
+.blk-ced-field input:disabled {
+    opacity: 0.5;
+}
+.blk-ced-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+    font-size: 12px;
+    color: var(--text-2);
+    cursor: pointer;
+}
+/* One channel is a group, so it needs a visible edge — without it the six
+   controls under "Across (x)" read as belonging to whatever came before. */
+.blk-ced-ch {
+    padding: 8px 0 2px;
+    border-top: 1px solid var(--border);
+}
+.blk-ced-ch:first-child {
+    border-top: none;
+    padding-top: 2px;
+}
+.blk-ced-ch--empty .blk-ced-field {
+    margin-bottom: 2px;
+}
+/* The refinements are indented under the column that carries them, so "Label"
+   reads as this channel's label and not as the chart's. */
+.blk-ced-opts {
+    padding-left: 10px;
+    border-left: 2px solid var(--border);
+}
+.blk-ced-hint {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-3);
+}
+/* A histogram's count has no column behind it. Stated rather than shown as an
+   empty select, which would read as something missing. */
+.blk-ced-fixed {
+    display: flex;
+    flex-direction: column;
+    padding: 4px 7px;
+    border: 1px dashed var(--border);
+    border-radius: 5px;
+    color: var(--text-2);
+}
+.blk-ced-fixed small {
+    font-size: 10.5px;
+    color: var(--text-3);
+}
+.blk-ced-json {
+    flex: 1;
+    min-height: 260px;
+    margin: 10px;
+    padding: 8px;
+    background: var(--bg-0);
+    color: var(--text-1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 12px;
+    line-height: 1.5;
+    resize: vertical;
+}
+
+/* ---- Dives strip (Charts step) ---- */
+/* One query, many dives (Ben, 2026-09-14): a dataset has several stories in it
+   and each is a dive, so this is the set of pictures drawn from the query on
+   screen — not a file browser. A strip rather than a third panel, because the
+   Charts step already has the chart's controls on the left and two panels made
+   the chart itself the narrowest thing on the screen. */
+.blk-dives {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 8px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-1);
+    font-size: 12px;
+    flex-shrink: 0;
+}
+.blk-dives-lbl {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-3);
+    flex-shrink: 0;
+}
+.blk-dives-none,
+.blk-dives-hint {
+    color: var(--text-3);
+}
+/* Separates the facets of THIS query from dives over another one. Opening one
+   of those replaces the SQL, which is a bigger move than switching facets. */
+.blk-dives-sep {
+    margin-left: 6px;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-4, var(--text-3));
+}
+/* A chip is two buttons in one shell: open, and delete. The shell carries the
+   border so the two read as one object rather than as two controls. */
+.blk-dive-chip {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    background: var(--bg-2);
+    overflow: hidden;
+}
+.blk-dive-chip--on {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+.blk-dive-chip--other {
+    opacity: 0.7;
+}
+.blk-dive-open,
+.blk-dive-del {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    background: none;
+    border: none;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+/* The mark, so two facets of one query are told apart at a glance — they
+   usually share a title stem and differ only in the picture. */
+.blk-dive-open small {
+    color: var(--text-3);
+    font-size: 10.5px;
+}
+.blk-dive-open:hover {
+    color: var(--accent);
+}
+.blk-dive-del {
+    padding: 2px 6px 2px 2px;
+    color: var(--text-4, var(--text-3));
+}
+.blk-dive-del:hover {
+    color: var(--danger, #e5484d);
+}
+
+/* ---- Custom chart templates ---- */
+/* Their own area BELOW the built-ins, which is where Ben asked for them and
+   also what they are: the built-ins are a closed set this build understands,
+   these are whatever somebody saved. */
+.blk-gal-head--sub {
+    margin-top: 22px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+}
+/* A custom card is a <div> holding two buttons (pick, delete) rather than one
+   button, because a button inside a button is not valid HTML — the built-in
+   cards have no delete and so stay a single button. */
+.blk-gal-card--custom {
+    position: relative;
+    padding: 0;
+}
+.blk-gal-pick {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    width: 100%;
+    padding: 10px;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+/* Not greyed out like a built-in that does not fit: this one still LOADS, so
+   that it can be corrected by hand. Marked rather than disabled. */
+.blk-gal-card--warn {
+    border-color: color-mix(in srgb, var(--warn, #f5a524) 45%, var(--border));
+}
+.blk-gal-del {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    display: inline-flex;
+    padding: 3px;
+    background: var(--bg-1);
+    border: none;
+    border-radius: 4px;
+    color: var(--text-4, var(--text-3));
+    cursor: pointer;
+    opacity: 0;
+}
+.blk-gal-card--custom:hover .blk-gal-del,
+.blk-gal-del:focus-visible {
+    opacity: 1;
+}
+.blk-gal-del:hover {
+    color: var(--danger, #e5484d);
+}
+/* A layered template has no contract to invent rows for, so there is no
+   thumbnail to draw. Says so rather than leaving a gap. */
+.blk-gal-noThumb {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 46px;
+    border: 1px dashed var(--border);
+    border-radius: 4px;
+    color: var(--text-4, var(--text-3));
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 10.5px;
+}
+
+/* A paragraph and a note inside a modal body. The naming dialog needs both:
+   what the name is for, and whether it is about to replace something. */
+.blk-modal-p {
+    margin: 0 0 10px;
+}
+.blk-modal-note {
+    margin: 6px 0 0;
+    font-size: 11.5px;
+    color: var(--warn, #f5a524);
+}
+
+/* ---- Dives panel (Charts step) ---- */
+/* Reuses `blk-catalog` for its footprint and `blk-lib-*` for its rows, so it
+   sits exactly where the SQL step's catalog and saved-queries panels do —
+   switching steps should move the content, not the layout. */
+.blk-dive-group {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 8px 6px 4px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-3);
+}
+.blk-dive-group small {
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--text-4, var(--text-3));
+}
+.blk-dive-row--on {
+    background: var(--accent-soft);
+}
+.blk-dive-name {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* The mark, because two facets of one query usually share a title stem. */
+.blk-dive-name small {
+    color: var(--text-3);
+    font-size: 10px;
+}
+.blk-dive-danger {
+    color: var(--danger, #e5484d);
+    font-size: 11px;
+}
+/* The Custom Chart button, between the built-in grid and the saved templates. */
+.blk-gal-new {
+    display: flex;
+    margin-bottom: 12px;
+}
+/* The blank state can offer more than one way out, so its buttons need a row. */
+.blk-blank-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+/* ---- Builder | JSON tabs (chart panel) ---- */
+/* Tabs rather than a JSON button plus a way back: with a button, leaving was a
+   different gesture from arriving, and the moment you most want to leave is
+   when the spec is broken and Apply refuses. */
+.blk-ced-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 8px 10px 0;
+    flex-shrink: 0;
+}
+.blk-ced-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 5px 5px 0 0;
+    color: var(--text-3);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+.blk-ced-tab:hover:not(:disabled) {
+    color: var(--text-1);
+}
+.blk-ced-tab--on {
+    background: var(--accent-soft);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    border-bottom-color: transparent;
+    color: var(--accent);
+    font-weight: 600;
+}
+/* Disabled and NOT the current tab means the spec has no form — a layered or
+   transformed one. The cursor says so before the tooltip does. */
+.blk-ced-tab:disabled:not(.blk-ced-tab--on) {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.blk-ced-tab:disabled.blk-ced-tab--on {
+    cursor: default;
 }

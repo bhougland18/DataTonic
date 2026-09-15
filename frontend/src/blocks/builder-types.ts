@@ -17,8 +17,17 @@ export type Aggregate = 'none' | 'count' | 'count distinct' | 'sum' | 'avg' | 'm
 const ANY_TYPE: Aggregate[] = ['none', 'count', 'count distinct', 'min', 'max'];
 const NUMERIC: Aggregate[] = ['none', 'count', 'count distinct', 'sum', 'avg', 'min', 'max'];
 
+// Both vocabularies, because both arrive. A DESCRIBE gives SQL spellings
+// (`BIGINT`, `DECIMAL(18,3)`); a run's preview gives Duckle's own names, which
+// `crates/metadata` serializes as `int64`, `float64` — so the digits are part of
+// the token and `\bfloat\b` does not match `float64`.
+//
+// `float\d*` rather than `float`: without the digits, every DOUBLE column in a
+// run result read as non-numeric. That cost `sum`/`avg` in the aggregate picker
+// and, once `vlTypeOf` started sharing this list, typed the column `nominal` —
+// so a result with a perfectly good measure in it was told it needed a number.
 const NUMERIC_TYPES =
-    /\b(tinyint|smallint|integer|bigint|hugeint|int\d*|decimal|numeric|double|float|real)\b/i;
+    /\b(tinyint|smallint|integer|bigint|hugeint|int\d*|decimal|numeric|double|float\d*|real)\b/i;
 
 /**
  * Does this DuckDB type hold a number?

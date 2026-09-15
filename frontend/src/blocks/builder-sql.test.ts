@@ -672,5 +672,19 @@ describe('aggregatesFor', () => {
     it('offers everything when the type is unknown', () => {
         expect(aggregatesFor(undefined)).toContain('sum');
     });
+
+    // A run's preview reports Duckle's own type names, not SQL ones, and the
+    // digits are part of the token. `float64` matched nothing, so every DOUBLE
+    // column in a result was offered the text aggregates only.
+    it.each(['int32', 'int64', 'float32', 'float64', 'decimal'])(
+        'recognises %s, the name a run actually reports',
+        type => {
+            expect(aggregatesFor(type)).toContain('sum');
+        },
+    );
+
+    it.each(['string', 'bool', 'json', 'binary'])('still withholds sum from %s', type => {
+        expect(aggregatesFor(type)).not.toContain('sum');
+    });
 });
 

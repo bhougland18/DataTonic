@@ -15,6 +15,7 @@
 
 import {
     ChartArea,
+    ChartBarDecreasing,
     ChartCandlestick,
     ChartColumn,
     ChartColumnBig,
@@ -38,6 +39,9 @@ import {
 
 const ICONS: Record<ChartType, LucideIcon> = {
     bar: ChartColumn,
+    // Lucide draws this one as horizontal bars already sorted descending, which
+    // is exactly the chart.
+    barh: ChartBarDecreasing,
     histogram: ChartColumnBig,
     line: ChartLine,
     area: ChartArea,
@@ -71,7 +75,14 @@ export interface ChartShapeStripProps {
     aggregated?: boolean;
     /** Once a chart type is chosen, judge that one instead of listing. */
     chart?: ChartType;
-    /** Wired by the picker. Without it the chips are labels, not controls. */
+    /**
+     * Take this chart and go and refine it.
+     *
+     * Optional because the SQL Editor NODE mounts the same result pane and has
+     * no Charts step to go to — a node writes a table, not a picture. Blocks
+     * passes it (DAA.102) and the chips become the way in; without it they stay
+     * labels, which is the honest state on a surface with nowhere to go.
+     */
     onPick?: (chart: ChartType) => void;
 }
 

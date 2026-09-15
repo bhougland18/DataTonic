@@ -31,6 +31,25 @@ describe('vlTypeOf', () => {
         expect(vlTypeOf(duck)).toBe(vl);
     });
 
+    // A DESCRIBE gives SQL spellings; a RUN's preview gives Duckle's own names
+    // (`crates/metadata` serializes them), and this matcher reads results from
+    // both. `float64` used to fall through to `nominal`, so a DOUBLE measure was
+    // reported as a category and every chart wanting a number said it was
+    // missing one.
+    it.each([
+        ['int32', 'quantitative'],
+        ['int64', 'quantitative'],
+        ['float32', 'quantitative'],
+        ['float64', 'quantitative'],
+        ['decimal', 'quantitative'],
+        ['string', 'nominal'],
+        ['bool', 'nominal'],
+        ['date', 'temporal'],
+        ['timestamp', 'temporal'],
+    ] as const)('maps the run-reported %s to %s', (duck, vl) => {
+        expect(vlTypeOf(duck)).toBe(vl);
+    });
+
     // A list of numbers is not a number, and `INTEGER[]` contains "integer".
     it.each(['INTEGER[]', 'VARCHAR[]', 'STRUCT(a INTEGER)', 'MAP(VARCHAR, INTEGER)'])(
         'refuses %s',

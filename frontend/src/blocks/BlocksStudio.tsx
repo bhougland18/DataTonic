@@ -11,12 +11,15 @@ import {
     Loader2,
     MousePointerClick,
     Network,
+    RotateCcw,
     RotateCw,
     Save,
     Sparkles,
     X,
 } from 'lucide-react';
 import { maybeStartEditorTour, startEditorTour } from '../GuidedTour';
+import { useTheme } from '../theme';
+import { VegaChart } from '../dives/VegaChart';
 import ErdEditor, { type ErdSavedModel } from '../erd/ErdEditor';
 import type { ErdRelationship, ErdTable } from '../erd/model';
 import { loadSchemaModel, saveSchemaModel } from './model-io';
@@ -42,6 +45,23 @@ import { addressOf } from './join-insert';
 import { useQueryBuilder } from './useQueryBuilder';
 import { clearDistinctCache, distinctValues } from './distinct-values';
 import ChartShapeStrip from './ChartShapeStrip';
+import ChartGallery from './ChartGallery';
+import ChartEditorPanel from './ChartEditorPanel';
+import DivesPanel from './DivesPanel';
+import NameDialog from './NameDialog';
+import { useChartEditor } from './useChartEditor';
+import { asDive, sameDataset, toDive, type BlockDive } from './dive-promote';
+import {
+    CUSTOM_CHARTS_ID,
+    customId,
+    parseCustomCharts,
+    removeCustom,
+    storedCustomCharts,
+    upsertCustom,
+    type CustomChart,
+} from './custom-charts';
+import { loadItemPayload, saveItemPayload } from '../workspace';
+import { shapeFor } from './chart-shapes';
 import FiltersPanel from './FiltersPanel';
 import JoinReviewDialog from './JoinReviewDialog';
 import { countRules } from './builder-types';
@@ -72,6 +92,19 @@ interface BlocksStudioProps {
     /** Pipeline id -> display name, for provenance. The catalog cannot supply
      *  this: it records each pipeline's id as its name. */
     pipelineNames?: Record<string, string>;
+    /**
+     * The workspace's dives, as repo item payloads.
+     *
+     * Passed in rather than read here because dives are REPO ITEMS: they are
+     * enumerated from `repository.json`, they appear in the sidebar tree and the
+     * Dives gallery, and `App.tsx` owns that list. Saved queries are different
+     * — they are one payload this surface owns outright — which is exactly why
+     * only this half needs threading.
+     */
+    dives?: unknown[];
+    /** Write a dive. `App.tsx` upserts the repo item; persistence is automatic. */
+    onSaveDive?: (dive: BlockDive) => void;
+    onDeleteDive?: (id: string) => void;
 }
 
 /** Remembers "do not tell me about join types again", across workspaces. */
@@ -105,6 +138,9 @@ export default function BlocksStudio({
     workspacePath,
     active = false,
     pipelineNames,
+    dives: divePayloads,
+    onSaveDive,
+    onDeleteDive,
 }: BlocksStudioProps) {
     const [step, setStep] = useState<BlockStep>('schema');
     const [sources, setSources] = useState<BlockSource[]>([]);
@@ -486,6 +522,25 @@ export default function BlocksStudio({
      */
     const [lastRun, setLastRun] = useState<{
         result: SqlRunResult;
+        /**
+         * The SQL that produced it.
+         *
+         * Not the same as what the editor holds NOW, and the difference is
+         * load-bearing: the dives strip decides whether a saved dive is another
+         * facet of what is on screen by comparing SQL, and comparing against an
+         * editor edited since the run would draw a chart over somebody else's
+         * result. Same drift `aggregated` is snapshotted for.
+         */
+        sql: string;
+        /**
+         * The database it was ATTACHed against, or null for self-contained SQL.
+         *
+         * Snapshotted with the result for the same reason as `sql`: a dive
+         * records this so it can run anywhere, and reading it from current
+         * state at SAVE time is a different question from "what did this
+         * result actually come from". One dive was written without it that way.
+         */
+        database: string | null;
         /** Undefined outside builder mode — hand-written SQL does not say. */
         aggregated?: boolean;
     } | null>(null);
@@ -502,17 +557,64 @@ export default function BlocksStudio({
         (result: SqlRunResult) => {
             setLastRun({
                 result,
+                // What the pane just ran is its `sql` prop, which is `editorSql`,
+                // against the database `run` passes — read from the same place.
+                sql: editorSql,
+                database: activeGroup?.dbPath ?? null,
                 aggregated: builderMode
                     ? qb.aggregated
                     : undefined,
             });
         },
-        [builderMode, builder.columns],
+        [builderMode, builder.columns, editorSql, qb.aggregated, activeGroup],
     );
 
+    // One payload this surface owns outright, like the saved queries and unlike
+    // the dives — a template is not a workspace item anybody else shows, so it
+    // needs no repo plumbing.
+    const [customs, setCustoms] = useState<CustomChart[]>([]);
+
+    /**
+     * The chart, over the result on screen.
+     *
+     * Mounted HERE rather than inside the Charts step, for the same reason the
+     * AI pane is always mounted: a chart half-refined is work, and stepping back
+     * to SQL to look at the query it is drawn over must not throw it away.
+     *
+     * Fed the LAST RUN's columns, not the builder's current ones. The chart is
+     * drawn over rows that exist, and judging it against a query nobody has run
+     * is the drift `noteRun` was written to avoid.
+     */
+    const chart = useChartEditor({
+        columns: lastRun?.result.columns ?? [],
+        rowCount: lastRun?.result.rows.length,
+        aggregated: lastRun?.aggregated,
+        customs,
+    });
+    const { theme } = useTheme();
+
     const aiContext = useMemo(
-        () => chartContext(lastRun?.result, { aggregated: lastRun?.aggregated }),
-        [lastRun],
+        // `chart.state` as well as the result: once a chart is picked, the
+        // question the pane gets is about THAT chart, and answering it from the
+        // list of everything that fits answers something nobody asked.
+        () => chartContext(lastRun?.result, { aggregated: lastRun?.aggregated }, chart.state),
+        [lastRun, chart.state],
+    );
+
+    /**
+     * Take a chart from the strip under the results and go and refine it.
+     *
+     * `DAA.102`, and the step's seam with the SQL step: the strip already knows
+     * which chart was chosen and the matcher already knows which column goes on
+     * which channel, so the Charts step opens on a working spec. Writing that
+     * mapping a second time over there is exactly how the two would disagree.
+     */
+    const pickChart = useCallback(
+        (type: Parameters<typeof chart.pick>[0]) => {
+            chart.pick(type);
+            setStep('charts');
+        },
+        [chart],
     );
 
     /**
@@ -529,6 +631,280 @@ export default function BlocksStudio({
         setResetToken(t => t + 1);
         setLastRun(null);
     }, []);
+
+    // ---- Dives: one query, many charts ------------------------------------
+    //
+    // Ben's framing (2026-09-14): a dataset has several stories in it, and each
+    // is a dive. So saving makes ANOTHER one rather than replacing the chart on
+    // the query, and switching between two facets of one dataset must not
+    // re-run a query whose answer is already on screen.
+
+    /** Only the payloads that really are dives. A bad one costs itself. */
+    const dives = useMemo(
+        () => (divePayloads ?? []).map(asDive).filter((d): d is BlockDive => d !== null),
+        [divePayloads],
+    );
+    /** The dive being edited, so Save can overwrite it rather than fork it. */
+    const [activeDiveId, setActiveDiveId] = useState<string | null>(null);
+    /** Whether the dives panel is showing, like `savedOpen` on the SQL step. */
+    const [divesOpen, setDivesOpen] = useState(true);
+    /**
+     * A dive save waiting on the query being named (Ben, 2026-09-14).
+     *
+     * Held as an intention rather than done immediately, the same shape
+     * `pending` uses for the unsaved-edits dialog: Cancel has to leave
+     * everything as it was, so the save cannot have started.
+     *
+     * Why ask at all — a dive names its query in `-- name:` and is listed by
+     * it, so a dive over an unsaved query produces "Untitled query · Bar chart"
+     * and a SQL library that never learns about the query the dive depends on.
+     * Asking once, here, is the only moment somebody has both in mind.
+     */
+    const [namingQueryFor, setNamingQueryFor] = useState<'new' | 'update' | null>(null);
+    const activeDive = useMemo(
+        () => dives.find(d => d.id === activeDiveId) ?? null,
+        [dives, activeDiveId],
+    );
+    /** Bumped to ask `QueryPane` to run — it owns the run and the result. */
+    const [runToken, setRunToken] = useState(0);
+
+    /**
+     * What to call a dive nobody has named.
+     *
+     * The chart's own title first, then the query's title plus the chart type.
+     * The fallback matters more than it looks: saving two facets of one query
+     * without typing anything gives "group by example · Bar chart" and
+     * "group by example · Pie chart" rather than two identical names, which is
+     * the difference between a usable list and a guessing game.
+     */
+    const diveName = useCallback(
+        (
+            /** The query's title, when the caller has a fresher one than state. */
+            stemOverride?: string,
+        ): string => {
+            const own = chart.state?.title?.trim();
+            if (own) return own;
+            const stem = (stemOverride ?? queryTitle).trim() || 'Untitled query';
+            const label = chart.state ? shapeFor(chart.state.chart)?.label : null;
+            return label ? `${stem} · ${label}` : stem;
+        },
+        [chart.state, queryTitle],
+    );
+
+    /**
+     * The editor has moved on from the result the chart is drawn over.
+     *
+     * A dive re-runs its own SQL on every open, so saving one in this state
+     * would store a query whose result no longer has the columns the chart
+     * names — and Vega-Lite draws that as an EMPTY chart rather than an error.
+     * Refusing with a reason beats writing an artefact that is broken the first
+     * time anybody opens it.
+     */
+    const runStale = !!lastRun && !sameDataset(lastRun.sql, editorSql);
+
+    /**
+     * Is the query behind this chart in the SQL library, as it stands NOW?
+     *
+     * Not merely "has a title": an edited-since-save query is one the library
+     * does not have, and a dive over it would reference SQL that exists only in
+     * this editor.
+     *
+     * A REF, read at call time, because it derives from `activeSaved` and
+     * `dirty` — both declared below, with the saved-queries state they belong
+     * to. Hoisting those above the chart editor purely to satisfy this would
+     * move a lot of code for one boolean. Same trick `activeDbRef` uses.
+     */
+    const queryIsSavedRef = useRef(false);
+
+    const saveDive = useCallback(
+        (asNew: boolean) => {
+            if (!onSaveDive || !chart.spec) return;
+            // Name and file the query first — a dive is (query, chart), and
+            // half of it living nowhere but this editor is how the pair comes
+            // apart later.
+            if (!queryIsSavedRef.current) {
+                setNamingQueryFor(asNew ? 'new' : 'update');
+                return;
+            }
+            const existing = asNew ? null : activeDive;
+            const dive = toDive({
+                id: existing?.id,
+                createdAt: existing?.meta?.createdAt,
+                title: existing && !asNew ? existing.title : diveName(),
+                description: queryDesc,
+                // The STORED form, header and all, so the dive explains itself
+                // wherever it ends up — the same reason `saveQuery` does it.
+                sql: withQueryHeader(editorSql, queryTitle.trim() || 'Untitled query', queryDesc),
+                chart: chart.spec,
+                builder: builderMode ? builder : undefined,
+                // The database this SQL needs ATTACHed, taken from the RUN
+                // rather than from current state. Blocks reads through
+                // `src.duckdb`, so the SQL says `duckle_src."Vendor"` and a
+                // dive without this is unrunnable outside this step — which is
+                // how one got saved broken.
+                source: lastRun?.database
+                    ? {
+                          kind: 'duckdb',
+                          database: lastRun.database,
+                          table: builderMode ? builder.anchor : undefined,
+                      }
+                    : undefined,
+            });
+            onSaveDive(dive);
+            setActiveDiveId(dive.id);
+        },
+        [
+            onSaveDive,
+            chart.spec,
+            activeDive,
+            diveName,
+            editorSql,
+            queryTitle,
+            queryDesc,
+            builderMode,
+            builder,
+            lastRun,
+        ],
+    );
+
+
+
+    /**
+     * Open a dive — either a different FACET of what is on screen, or a
+     * different query altogether.
+     *
+     * The two are genuinely different moves and the distinction is the whole
+     * point of `sameDataset`: swapping facets is instant and touches nothing but
+     * the chart, whereas a dive over another query replaces the SQL and has to
+     * be run. Re-running a query whose answer is already on screen would make
+     * flipping between two views of one dataset cost a DuckDB spawn each time.
+     */
+    const openDive = useCallback(
+        (dive: BlockDive) => {
+            setActiveDiveId(dive.id);
+            if (lastRun && sameDataset(dive.query.sql, lastRun.sql)) {
+                chart.load(dive.chart);
+                setStep('charts');
+                return;
+            }
+            setSql(dive.query.sql);
+            // If the SQL library already holds this query, the editor joins
+            // THAT query rather than floating free — so Save, the dirty dot and
+            // the unsaved-edits prompt all behave as they would had you opened
+            // it from the SQL step. Its title is the QUERY's name; the dive's
+            // title names the picture, which is a different thing.
+            const sameQuery = saved.find(q => sameDataset(q.query.sql, dive.query.sql)) ?? null;
+            setQueryTitle(sameQuery?.title ?? dive.title);
+            setQueryDesc(sameQuery?.description ?? dive.description ?? '');
+            setActiveQueryId(sameQuery?.id ?? null);
+            setAiDraft(null);
+            if (dive.builder) {
+                qb.setState(dive.builder);
+                setBuilderMode(true);
+            } else {
+                qb.reset();
+                setBuilderMode(false);
+            }
+            chart.load(dive.chart);
+            clearResults();
+            // A dive re-runs on every open — that is what `dive-types.ts` means
+            // by never-stale, and the chart has nothing to draw over until it
+            // has. Asked of the pane rather than run here, so one result exists.
+            setRunToken(t => t + 1);
+            setStep('charts');
+        },
+        [lastRun, editorSql, chart, qb, clearResults, saved],
+    );
+
+    // ---- Custom chart templates --------------------------------------------
+    //
+    // The list itself is declared above, because the chart editor is fed it.
+
+    useEffect(() => {
+        if (!workspacePath) return;
+        let cancelled = false;
+        void loadItemPayload<unknown>(workspacePath, 'block', CUSTOM_CHARTS_ID).then(raw => {
+            if (!cancelled) setCustoms(parseCustomCharts(raw));
+        });
+        return () => {
+            cancelled = true;
+        };
+    }, [workspacePath]);
+
+    const commitCustoms = useCallback(
+        (next: CustomChart[]) => {
+            setCustoms(next);
+            if (workspacePath) {
+                void saveItemPayload(
+                    workspacePath,
+                    'block',
+                    CUSTOM_CHARTS_ID,
+                    storedCustomCharts(next),
+                );
+            }
+        },
+        [workspacePath],
+    );
+
+    /**
+     * Naming a template. Non-null while the dialog is open.
+     *
+     * NOT `window.prompt`: WebView2 does not implement it, so on the desktop
+     * build the button would have done nothing at all and said nothing about
+     * why. See `NameDialog`.
+     */
+    const [namingCustom, setNamingCustom] = useState(false);
+
+    /** Find a template already filed under this name, case-insensitively. */
+    const customNamed = useCallback(
+        (name: string) => customs.find(c => c.name.toLowerCase() === name.trim().toLowerCase()),
+        [customs],
+    );
+
+    /**
+     * Keep the spec on screen as a template.
+     *
+     * Named here rather than in the panel, because the host owns the list and
+     * therefore owns what a duplicate name means. Re-saving under an existing
+     * name REVISES that template instead of growing a second one nobody can
+     * tell apart — the dialog says "Replace" when that is what Save will do.
+     */
+    const saveCustom = useCallback(
+        (name: string) => {
+            if (!chart.spec) return;
+            const existing = customNamed(name);
+            commitCustoms(
+                upsertCustom(customs, {
+                    id: existing?.id ?? customId(name),
+                    name,
+                    spec: chart.spec,
+                    createdAt: existing?.createdAt ?? new Date().toISOString(),
+                }),
+            );
+            setNamingCustom(false);
+        },
+        [chart.spec, customs, customNamed, commitCustoms],
+    );
+
+    const deleteCustom = useCallback(
+        (id: string) => {
+            const c = customs.find(x => x.id === id);
+            if (c && !window.confirm(`Delete the template "${c.name}"?`)) return;
+            commitCustoms(removeCustom(customs, id));
+        },
+        [customs, commitCustoms],
+    );
+
+    const deleteDive = useCallback(
+        (id: string) => {
+            if (!onDeleteDive) return;
+            const d = dives.find(x => x.id === id);
+            if (d && !window.confirm(`Delete the dive "${d.title}"? This cannot be undone.`)) return;
+            onDeleteDive(id);
+            if (id === activeDiveId) setActiveDiveId(null);
+        },
+        [onDeleteDive, dives, activeDiveId],
+    );
 
 
     /** Hand the query over, or take it back. */
@@ -582,8 +958,22 @@ export default function BlocksStudio({
      * the wrong one made Save look broken — it was disabled on an empty string
      * while a perfectly good query was on screen.
      */
-    const saveQuery = useCallback(() => {
-        const title = queryTitle.trim();
+    const saveQuery = useCallback(
+        (
+            /**
+             * Override the editor's title/description.
+             *
+             * Needed because a caller that collects them in a dialog cannot set
+             * state and then call this in the same tick — the closure would
+             * still hold the old values. Passing them is the honest fix; an
+             * effect that saves when the title changes would save on every
+             * keystroke.
+             */
+            titleArg?: string,
+            descArg?: string,
+        ) => {
+        const title = (titleArg ?? queryTitle).trim();
+        const desc = descArg ?? queryDesc;
         const text = builderMode ? builderSql : sql;
         if (!text.trim() || !title) return;
         const current = saved.find(q => q.id === activeQueryId);
@@ -593,7 +983,7 @@ export default function BlocksStudio({
         // the editor holding different text from the record, which is exactly
         // the state `dirty` reads as unsaved edits — so saving would leave the
         // query looking unsaved.
-        const stored = withQueryHeader(text, title, queryDesc);
+        const stored = withQueryHeader(text, title, desc);
         // Only the hand-written text is written back. In builder mode the SQL is
         // regenerated from state on every render, so pushing into `sql` would be
         // overwritten immediately — the header is already in `builderSql`
@@ -602,40 +992,82 @@ export default function BlocksStudio({
         const next = upsertQuery(saved, {
             id,
             title,
-            description: queryDesc.trim() || undefined,
+            description: desc.trim() || undefined,
             query: { sql: stored },
+            // The query and the chart are saved TOGETHER, as one artefact
+            // (§7a). Not a second Save on the Charts step: a block is a dive,
+            // and half a dive saved separately from its other half is two
+            // records that can disagree.
+            chart: chart.spec ?? undefined,
+            // How it was authored, so reopening returns to the builder rather
+            // than to SQL it would have to parse. Only in builder mode — in
+            // hand-written mode the builder is dormant and its state describes
+            // a different query.
+            builder: builderMode ? builder : undefined,
             meta: { createdAt: current?.meta?.createdAt ?? new Date().toISOString() },
         });
         commitSaved(next);
+        // Reflected back into the editor's own fields when they came from a
+        // dialog, or the title bar would go on showing the old name while the
+        // record has the new one.
+        if (titleArg !== undefined) setQueryTitle(title);
+        if (descArg !== undefined) setQueryDesc(desc);
         // `upsertQuery` may have merged onto an existing entry of the same
         // title, so take the id back from the list rather than assuming ours.
         setActiveQueryId(next[0]?.id ?? id);
         setSavedOpen(true);
-    }, [sql, queryTitle, queryDesc, saved, activeQueryId, commitSaved]);
+        return next[0]?.id ?? id;
+    }, [
+        sql,
+        builderMode,
+        builderSql,
+        builder,
+        chart.spec,
+        queryTitle,
+        queryDesc,
+        saved,
+        activeQueryId,
+        commitSaved,
+        ],
+    );
 
     /**
-     * Load a saved query — SQL, title and description together.
+     * Load a saved query — SQL, chart, builder state, title and description.
      *
-     * Always lands in HAND-WRITTEN mode, and empties the builder on the way.
-     * A `SavedQuery` stores SQL and nothing else (builder persistence is still
-     * unbuilt, plan §12 phase 5), so there is no builder state to restore and
-     * reconstructing one from arbitrary SQL is the text-to-SQL problem the
-     * builder exists to avoid.
+     * Which MODE it lands in is decided by the record, not by a default. A
+     * query saved from the builder carries the builder state that produced it
+     * (§7a), so it reopens in the builder; one without carries none, which is
+     * the honest signal that it was hand-written, and it opens in SQL mode
+     * exactly as the SQL Studio node does. Reconstructing builder state from
+     * arbitrary SQL is the text-to-SQL problem the builder exists to avoid.
      *
-     * Clearing the builder matters as much as switching off it. Left behind, it
-     * would still be generating the PREVIOUS query, so toggling the builder back
-     * on would silently replace the query just opened with the one before it.
+     * Clearing the builder when there is nothing to restore matters as much as
+     * switching off it. Left behind, it would still be generating the PREVIOUS
+     * query, so toggling the builder back on would silently replace the query
+     * just opened with the one before it.
      */
-    const openQuery = useCallback((q: SavedQuery) => {
-        setSql(q.query.sql);
-        setQueryTitle(q.title);
-        setQueryDesc(q.description ?? '');
-        setActiveQueryId(q.id);
-        setAiDraft(null);
-        setBuilderMode(false);
-        qb.reset();
-        clearResults();
-    }, []);
+    const openQuery = useCallback(
+        (q: SavedQuery) => {
+            setSql(q.query.sql);
+            setQueryTitle(q.title);
+            setQueryDesc(q.description ?? '');
+            setActiveQueryId(q.id);
+            setAiDraft(null);
+            if (q.builder) {
+                qb.setState(q.builder);
+                setBuilderMode(true);
+            } else {
+                qb.reset();
+                setBuilderMode(false);
+            }
+            // The chart comes back with the query, because they are one
+            // artefact. `load` decides whether it opens in the controls or in
+            // JSON — a spec the controls cannot model stays text.
+            chart.load(q.chart ?? null);
+            clearResults();
+        },
+        [qb, chart, clearResults],
+    );
 
     /**
      * Leave whatever is open and start from nothing.
@@ -654,8 +1086,12 @@ export default function BlocksStudio({
         // Back to the default the studio opens in, not to whatever mode the
         // last query happened to leave behind.
         setBuilderMode(true);
+        // The chart goes with the query. A chart left behind would be drawn
+        // over a result belonging to a query nobody has open — the same class
+        // of mistake `clearResults` exists to prevent.
+        chart.clear();
         clearResults();
-    }, []);
+    }, [qb, chart, clearResults]);
 
     const activeSaved = useMemo(
         () => saved.find(q => q.id === activeQueryId) ?? null,
@@ -686,11 +1122,78 @@ export default function BlocksStudio({
             return (
                 withQueryHeader(editorSql, queryTitle, queryDesc) !== activeSaved.query.sql ||
                 queryTitle !== activeSaved.title ||
-                queryDesc !== (activeSaved.description ?? '')
+                queryDesc !== (activeSaved.description ?? '') ||
+                // The chart counts, because the chart is half the artefact.
+                // Without this, an afternoon spent refining a spec left no
+                // trace of being unsaved and the dialog never appeared for it.
+                // Compared as JSON: the spec is rebuilt from state on every
+                // render, so it is never the same object twice.
+                JSON.stringify(chart.spec ?? null) !== JSON.stringify(activeSaved.chart ?? null)
             );
         }
         return !!(editorSql.trim() || queryTitle.trim() || queryDesc.trim());
-    }, [activeSaved, editorSql, queryTitle, queryDesc]);
+    }, [activeSaved, editorSql, queryTitle, queryDesc, chart.spec]);
+
+    // Kept current for `saveDive`, which runs above this point.
+    //
+    // A DIVE counts as well as a saved query, and missing that was a bug worth
+    // recording: opening a dive clears `activeQueryId` (it is not a saved
+    // query), so re-saving an already-saved dive asked to name the query it had
+    // just opened. A dive carries `query.sql` — the SQL is durable the moment a
+    // dive holds it, whether or not the SQL library has a copy.
+    queryIsSavedRef.current =
+        (!!activeSaved && !dirty) ||
+        (!!activeDive && sameDataset(activeDive.query.sql, editorSql));
+
+    /**
+     * The query was just named: file it, then make the dive that was waiting.
+     *
+     * `saveQuery` is given the values explicitly because state set in this tick
+     * is not readable from the closure that follows it — and the dive's SQL
+     * header has to carry the name the person just typed, not the blank it
+     * replaced.
+     */
+    const nameQueryThenSaveDive = useCallback(
+        (title: string, description?: string) => {
+            const asNew = namingQueryFor === 'new';
+            setNamingQueryFor(null);
+            saveQuery(title, description ?? '');
+            if (!onSaveDive || !chart.spec) return;
+            const existing = asNew ? null : activeDive;
+            const dive = toDive({
+                id: existing?.id,
+                createdAt: existing?.meta?.createdAt,
+                // `diveName(title)` rather than the editor's title: the name
+                // was typed a moment ago and state does not have it yet.
+                title: existing && !asNew ? existing.title : diveName(title),
+                description,
+                sql: withQueryHeader(editorSql, title, description ?? ''),
+                chart: chart.spec,
+                builder: builderMode ? builder : undefined,
+                source: lastRun?.database
+                    ? {
+                          kind: 'duckdb',
+                          database: lastRun.database,
+                          table: builderMode ? builder.anchor : undefined,
+                      }
+                    : undefined,
+            });
+            onSaveDive(dive);
+            setActiveDiveId(dive.id);
+        },
+        [
+            namingQueryFor,
+            saveQuery,
+            onSaveDive,
+            chart.spec,
+            diveName,
+            activeDive,
+            editorSql,
+            builderMode,
+            builder,
+            lastRun,
+        ],
+    );
 
     /** Ask first when leaving would lose edits; otherwise just go. */
     const requestNew = useCallback(() => {
@@ -911,8 +1414,7 @@ export default function BlocksStudio({
                                 ) : undefined
                             }
                         />
-                    ) : (
-
+                    ) : step === 'schema' ? (
                         <SourcesPanel
                             sources={sources}
                             groups={groups}
@@ -923,7 +1425,26 @@ export default function BlocksStudio({
                             onSelectDb={setActiveDb}
                             pipelineNames={pipelineNames}
                         />
-                    )}
+                    ) : step === 'charts' && onSaveDive ? (
+                        // Always mounted: collapsed it is a RAIL, which is what
+                        // keeps its own reopen control on screen.
+                        <DivesPanel
+                            dives={dives}
+                            currentSql={editorSql}
+                            activeId={activeDiveId}
+                            onOpen={openDive}
+                            onDelete={deleteDive}
+                            collapsed={!divesOpen}
+                            onToggle={() => setDivesOpen(o => !o)}
+                        />
+                    ) : null}
+                    {/* Neither of the other two panels, which is what the note
+                        above was waiting for: it brings its own panel (the
+                        chart's controls), and a list of sources beside it is a
+                        question already answered — the chart is drawn over a
+                        result, not over a dataset you pick here. Two panels
+                        also left the chart itself the narrowest thing on a
+                        screen that exists to show it. */}
                     {/* Second left panel, beside the catalog — the same slot the
                         Join Library takes on the Schema step, and only on the
                         step that can act on it. */}
@@ -970,8 +1491,20 @@ export default function BlocksStudio({
                         )
                     ) : null}
 
-                    {step === 'sql' ? (
-                        <div className="blk-sql">
+                    {/* ALWAYS MOUNTED, hidden when another step is open — the
+                        same trick `App.tsx` uses to keep Blocks and Reporting
+                        alive behind each other, and for the same reason.
+
+                        `QueryPane` owns its own result (two panes run
+                        independently, and lifting that state would entangle
+                        them), so unmounting this threw the result away: going
+                        SQL → Charts → SQL came back to "No results yet" and the
+                        query had to be re-run. Nobody noticed before the Charts
+                        step existed, because there was nowhere worth going. */}
+                    <div
+                        className="blk-sql"
+                        style={{ display: step === 'sql' ? 'flex' : 'none' }}
+                    >
                             <div className="blk-bar">
                                 <span className="blk-bar-title">
                                     SQL
@@ -1053,7 +1586,7 @@ export default function BlocksStudio({
                                     the dialog asks about, said quietly first. */}
                                 <button
                                     className="erd-btn erd-btn--accent blk-qmeta-save"
-                                    onClick={saveQuery}
+                                    onClick={() => saveQuery()}
                                     disabled={!editorSql.trim() || !queryTitle.trim()}
                                     title={
                                         !editorSql.trim()
@@ -1121,10 +1654,17 @@ export default function BlocksStudio({
                                             columns={r.columns}
                                             rowCount={r.rows.length}
                                             aggregated={lastRun?.aggregated}
+                                            // Wiring this turns the chips from
+                                            // labels into the way into the
+                                            // Charts step (DAA.98/DAA.102).
+                                            // The judgement was already beside
+                                            // the data; now so is the action.
+                                            onPick={pickChart}
                                         />
                                     )}
                                     onResult={noteRun}
                                     resetToken={resetToken}
+                                    runToken={runToken}
                                 />
                                 {aiDraft != null && (
                                     <QueryPane
@@ -1160,18 +1700,152 @@ export default function BlocksStudio({
                                     />
                                 )}
                             </div>
-                        </div>
-                    ) : null}
+                    </div>
 
                     {step === 'charts' ? (
-                        <div className="blk-blank">
-                            <p>
-                                The Vega-Lite chart editor lands next (DAA.72): GUI controls over a
-                                spec you can drop into JSON at any point and edit by hand or with
-                                the AI pane. One spec, rendered by vega-embed wherever the chart is
-                                shown — editor, report preview, PDF export and deck alike.
-                            </p>
-                        </div>
+                        // The dives strip sits ABOVE the run check, because a
+                        // saved dive is the way back INTO a result — telling
+                        // somebody to go and run a query while hiding the list
+                        // of queries they have already saved would be the one
+                        // moment the list is most useful.
+                        <>
+                        {!lastRun || lastRun.result.error ? (
+                            // Nothing to chart is not the same as no chart. A
+                            // spec is drawn over ROWS, and the honest thing to
+                            // say when there are none is which step produces
+                            // them — not an empty canvas that looks broken.
+                            <div className="blk-blank">
+                                <p>
+                                    Run a query on the SQL step first — or open a saved dive, which
+                                    brings its own query with it. A chart is drawn over the result,
+                                    so what this step can offer depends on the columns that come
+                                    back.
+                                </p>
+                                <div className="blk-blank-actions">
+                                    <button className="erd-btn" onClick={() => setStep('sql')}>
+                                        <Database size={14} /> Go to SQL
+                                    </button>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="blk-charts">
+                                <div className="blk-bar">
+                                    <span className="blk-bar-title">
+                                        {queryTitle.trim() || 'Untitled block'}
+                                        <small>
+                                            {lastRun.result.rows.length} row
+                                            {lastRun.result.rows.length === 1 ? '' : 's'} ·{' '}
+                                            {lastRun.result.columns.length} column
+                                            {lastRun.result.columns.length === 1 ? '' : 's'}
+                                        </small>
+                                    </span>
+                                    <span className="blk-bar-spacer" />
+                                    {/* The dive controls live here now that the
+                                        list is a panel: a dive is what this step
+                                        PRODUCES, so its Save belongs with the
+                                        step rather than inside the list of ones
+                                        already saved. */}
+                                    {runStale ? (
+                                        <span className="blk-charts-hint">
+                                            The SQL changed since this ran — run it again to save.
+                                        </span>
+                                    ) : !chart.spec ? (
+                                        <span className="blk-charts-hint">
+                                            Pick a chart to save this as a dive.
+                                        </span>
+                                    ) : null}
+                                    {/* Beside Save as dive (Ben, 2026-09-14).
+                                        Both act on the WHOLE chart, so they
+                                        belong together in the step's bar rather
+                                        than one being buried in the panel that
+                                        edits the chart's details. */}
+                                    {chart.state || chart.jsonOnly ? (
+                                        <button
+                                            type="button"
+                                            className="erd-btn"
+                                            onClick={chart.clear}
+                                            title="Go back to the gallery and pick a different chart"
+                                        >
+                                            <RotateCcw size={14} /> Change chart
+                                        </button>
+                                    ) : null}
+                                    {onSaveDive && activeDive && chart.spec && !runStale ? (
+                                        <button
+                                            type="button"
+                                            className="erd-btn"
+                                            onClick={() => saveDive(false)}
+                                            title={`Overwrite "${activeDive.title}" with the chart on screen`}
+                                        >
+                                            <Save size={14} /> Save dive
+                                        </button>
+                                    ) : null}
+                                    {onSaveDive && chart.spec && !runStale ? (
+                                        <button
+                                            type="button"
+                                            className="erd-btn erd-btn--accent"
+                                            onClick={() => saveDive(true)}
+                                            title="Keep the chart on screen as another dive over this query"
+                                        >
+                                            <FilePlus2 size={14} />{' '}
+                                            {activeDive ? 'Save as new dive' : 'Save as dive'}
+                                        </button>
+                                    ) : null}
+                                </div>
+
+                                {/* The gallery goes away once a chart is chosen
+                                    and comes back through "Change chart". Both
+                                    on screen at once would leave the thumbnail
+                                    of what you picked sitting beside the real
+                                    chart, which reads as two answers. */}
+                                {chart.state || chart.jsonOnly ? (
+                                    <div className="blk-charts-work">
+                                        <div className="blk-charts-panel">
+                                            <ChartEditorPanel
+                                                editor={chart}
+                                                onSaveCustom={() => setNamingCustom(true)}
+                                            />
+                                        </div>
+                                        <div className="blk-charts-view">
+                                            {chart.spec ? (
+                                                <VegaChart
+                                                    spec={chart.spec}
+                                                    rows={lastRun.result.rows}
+                                                    theme={theme === 'light' ? 'light' : 'dark'}
+                                                    fit
+                                                    height={340}
+                                                    className="blk-charts-vega"
+                                                />
+                                            ) : null}
+                                            {/* The row cap is the engine's
+                                                preview limit, not this step's.
+                                                Said because a chart over a
+                                                truncated result is a chart that
+                                                means something slightly
+                                                different. */}
+                                            {lastRun.result.rows.length >= 100 ? (
+                                                <p className="blk-charts-cap">
+                                                    Drawn over the first{' '}
+                                                    {lastRun.result.rows.length} rows — a run
+                                                    returns a preview, not the whole result.
+                                                </p>
+                                            ) : null}
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <ChartGallery
+                                        charts={chart.charts}
+                                        onPick={chart.pick}
+                                        theme={theme === 'light' ? 'light' : 'dark'}
+                                        note="Pick one to refine it. Greyed cards say what they still need."
+                                        customs={chart.customCharts}
+                                        onPickCustom={chart.pickCustom}
+                                        onDeleteCustom={deleteCustom}
+                                        onNewCustom={chart.startCustom}
+                                    />
+                                )}
+                            </div>
+                        )}
+                        </>
                     ) : null}
                 </div>
 
@@ -1197,6 +1871,40 @@ export default function BlocksStudio({
                             if (remember) localStorage.setItem(JOIN_PROMPT_KEY, 'off');
                             setJoinPrompt(false);
                         }}
+                    />
+                ) : null}
+
+                {/* A dive is (query, chart), so the query has to be somewhere
+                    other than this editor before the pair is worth saving.
+                    Asked here because this is the one moment somebody has both
+                    the query and the picture in mind. */}
+                {namingQueryFor ? (
+                    <NameDialog
+                        title="Name this query first"
+                        body="A dive saves the query alongside the chart, so the query needs a name. It is added to the SQL library too, where you can reopen it."
+                        initial={queryTitle.trim() || 'Untitled query'}
+                        label="Query title"
+                        placeholder="Total spend by vendor"
+                        descriptionLabel="Description (optional)"
+                        initialDescription={queryDesc}
+                        descriptionPlaceholder="What this query answers"
+                        onSubmit={nameQueryThenSaveDive}
+                        onCancel={() => setNamingQueryFor(null)}
+                    />
+                ) : null}
+
+                {namingCustom ? (
+                    <NameDialog
+                        title="Save as a custom chart"
+                        body="Kept in this workspace and offered under Custom charts, matched to any result of the same shape."
+                        initial={chart.state?.title?.trim() || diveName()}
+                        label="Template name"
+                        placeholder="Ranked bars, our house style"
+                        takenLabel={n =>
+                            customNamed(n) ? `Replaces the existing "${customNamed(n)!.name}" template.` : null
+                        }
+                        onSubmit={saveCustom}
+                        onCancel={() => setNamingCustom(false)}
                     />
                 ) : null}
 

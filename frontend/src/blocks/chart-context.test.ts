@@ -80,3 +80,65 @@ describe('chartContext', () => {
         }
     });
 });
+
+// Once a chart is picked the pane is almost never being asked "what could this
+// be" any more — it is being asked why THIS one looks wrong.
+describe('chartContext with a chart chosen', () => {
+    const bars = {
+        chart: 'bar' as const,
+        title: 'Items per group',
+        encoding: {
+            x: { field: 'ItemGroup', type: 'nominal' as const },
+            y: { field: 'UOMConversion', type: 'quantitative' as const },
+        },
+    };
+
+    it('says nothing extra until one is picked', () => {
+        expect(chartContext(MEDLINE)).not.toContain('THE CHART THE USER IS EDITING');
+    });
+
+    it('describes the chart by its channels, not as JSON', () => {
+        const text = chartContext(MEDLINE, undefined, bars);
+        expect(text).toContain('THE CHART THE USER IS EDITING');
+        expect(text).toContain('x = ItemGroup (nominal)');
+        expect(text).toContain('y = UOMConversion (quantitative)');
+        expect(text).toContain('Titled "Items per group"');
+    });
+
+    it('names the mark, which is the word the spec will show', () => {
+        expect(chartContext(MEDLINE, undefined, bars)).toContain('mark "bar"');
+    });
+
+    it('says whether the result still fits it', () => {
+        expect(chartContext(MEDLINE, undefined, bars)).toContain('The result fits this chart.');
+        const gone = chartContext(result([{ name: 'ItemGroup', type: 'VARCHAR' }], 4), undefined, bars);
+        expect(gone).toContain('does not fit it');
+    });
+
+    // A histogram's count has no column behind it, so naming one would be a
+    // lie the model would then repeat back.
+    it('describes a binned count as what it is', () => {
+        const hist = {
+            chart: 'histogram' as const,
+            encoding: {
+                x: { field: 'UOMConversion', type: 'quantitative' as const, bin: true },
+                y: { count: true, type: 'quantitative' as const },
+            },
+        };
+        const text = chartContext(MEDLINE, undefined, hist);
+        expect(text).toContain('x = UOMConversion (quantitative), binned by the spec');
+        expect(text).toContain('y = a count of rows');
+    });
+
+    // The rule that keeps the two halves of the product straight (plan §9).
+    it('still points reshaping at the SQL', () => {
+        expect(chartContext(MEDLINE, undefined, bars)).toContain('Shaping the data is done in the SQL');
+    });
+
+    it('never names a chart library', () => {
+        const text = chartContext(MEDLINE, undefined, bars).toLowerCase();
+        for (const tool of ['matplotlib', 'seaborn', 'plotly', 'ggplot', 'python', 'excel']) {
+            expect(text).not.toContain(tool);
+        }
+    });
+});

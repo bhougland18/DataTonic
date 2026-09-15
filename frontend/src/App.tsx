@@ -3072,6 +3072,48 @@ export default function App() {
         (name: string, payload: Dashboard) => upsertRepoItem('dashboard', name, payload),
         [upsertRepoItem],
     );
+    /**
+     * Save a dive from Blocks, without the modal editor flow.
+     *
+     * `upsertRepoItem` cannot serve this: it reads `repoEditor` to decide which
+     * item it is writing, which only exists while a modal is open. Same shape as
+     * `handlePlaygroundSaveConnection` and for the same reason — a surface that
+     * creates repo items outside the tree still has to land in `repo`, not in a
+     * parallel store of its own.
+     *
+     * Keyed by the dive's OWN id rather than a fresh one, because Blocks decides
+     * whether it is making another facet or revising this one (one query, many
+     * dives) — and it says so by reusing the id or not. Writing the payload to
+     * disk is the debounced repo autosave's job; nothing to do here.
+     */
+    const handleBlocksSaveDive = useCallback((dive: Dive) => {
+        setRepo(r => {
+            const at = r.findIndex(i => i.id === dive.id);
+            const item: RepoItem = {
+                id: dive.id,
+                name: dive.title,
+                type: 'dive',
+                parentId: 'dives',
+                payload: dive as unknown as RepoItem['payload'],
+            };
+            if (at < 0) return [...r, item];
+            // Keep wherever the person filed it, replace what it holds.
+            const next = [...r];
+            next[at] = { ...next[at], name: dive.title, payload: item.payload };
+            return next;
+        });
+    }, []);
+    // Dropping it from `repo` is the whole job: the debounced autosave above
+    // already deletes the payload of any item that has left the list, so
+    // removing the file here too would be a second owner of the same delete.
+    const handleBlocksDeleteDive = useCallback((id: string) => {
+        setRepo(r => r.filter(i => i.id !== id));
+    }, []);
+    /** The dive payloads Blocks lists. Repo items carry them hydrated on load. */
+    const blocksDives = useMemo(
+        () => repo.filter(r => r.type === 'dive').map(r => r.payload).filter(Boolean),
+        [repo],
+    );
     // #105: the Plan tab compiles the RESOLVED nodes (context vars / ${...}
     // placeholders substituted, like a run does), so the preview matches what
     // executes instead of showing raw ${VAR} the run would have replaced. The
@@ -3455,6 +3497,12 @@ export default function App() {
                     <BlocksStudio
                         workspacePath={workspacePathState}
                         active={mode === 'blocks'}
+                        // Dives are repo items, so this surface cannot own the
+                        // list — it appears in the sidebar tree and the Dives
+                        // gallery too.
+                        dives={blocksDives}
+                        onSaveDive={handleBlocksSaveDive}
+                        onDeleteDive={handleBlocksDeleteDive}
                         // The catalog records a pipeline's id as its name, so
                         // provenance would read `p_mtw3t3op_8wx0m`. The open
                         // workspace is the only place the real names live.
