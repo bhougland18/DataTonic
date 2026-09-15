@@ -284,6 +284,11 @@ export default function BuilderPanel({
             {relationships.length > 0 ? (
                 <PanelSection
                     title="Joins"
+                    // `from`, not `join`: this section decides the whole FROM
+                    // chain, and the anchor table lands in FROM rather than in
+                    // a JOIN. Labelling it `join` would also have been the same
+                    // word twice.
+                    sqlName="from"
                     storageKey="duckle.builder.sec.joins"
                     badge={activeJoins ? `${activeJoins.size} in use` : relationships.length}
                 >
