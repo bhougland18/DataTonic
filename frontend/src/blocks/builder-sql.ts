@@ -148,6 +148,13 @@ export function withCollisionAliases(
  */
 export function filterSql(f: FilterRule, left?: string): string | null {
     if (f.enabled === false || !filterIsComplete(f)) return null;
+    // Nothing to compare: a rule naming a computed column that has since been
+    // deleted — or dropped for being incomplete — and carrying no column to
+    // fall back on. `filterIsComplete` cannot catch this, because it is handed
+    // one rule and the answer depends on the transformation list. Without the
+    // guard the generator emits `"".""`, which is a syntax error rather than a
+    // wrong answer, but an avoidable one.
+    if (!left && (!f.table || !f.column)) return null;
     const col = left ?? ref(f.table, f.column);
     const v = f.values.map(x => x.trim()).filter(x => x !== '');
     // Quoted, EXCEPT against a count/sum/avg, where the comparison is arithmetic
@@ -192,8 +199,15 @@ export function filterSql(f: FilterRule, left?: string): string | null {
  */
 export function filterNodeSql(
     node: FilterNode,
-    /** Left-hand side per rule — supplied for HAVING, omitted for WHERE. */
-    leftOf?: (rule: FilterRule) => string,
+    /**
+     * Left-hand side per rule.
+     *
+     * Supplied for HAVING, and for WHERE once a rule can name a computed
+     * column. Returning `undefined` for a given rule means 'use the ordinary
+     * column reference', which is how one resolver can serve a tree holding
+     * both kinds of rule.
+     */
+    leftOf?: (rule: FilterRule) => string | undefined,
 ): string | null {
     if (node.kind === 'rule') return filterSql(node, leftOf?.(node));
     const parts = node.children
@@ -357,8 +371,47 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
     // would need indent tracking for a shape the builder rarely produces.
     const conj = state.filters.conj === 'or' ? 'OR' : 'AND';
     // Not point-free: `map` would hand the index in as `leftOf`.
+    /**
+     * The left-hand side for a rule that names a computed column.
+     *
+     * Its ALIAS, quoted. DuckDB supports lateral column aliases — a SELECT
+     * alias can be named in WHERE, GROUP BY, HAVING, QUALIFY and ORDER BY —
+     * which is precisely what lets the builder do this without a subquery
+     * (`column-transformations.md` §2, §4).
+     *
+     * Falls through to the ordinary column reference for rules that do not name
+     * one, and for a rule whose transformation has since been deleted: the rule
+     * is stale either way and the SQL should say so rather than vanish.
+     */
+    const leftOfRule = (rule: FilterRule): string | undefined => {
+        if (!rule.transformId) return undefined;
+        const t = transforms.find(x => x.id === rule.transformId);
+        return t ? quoteIdent(t.alias) : undefined;
+    };
+
+    /**
+     * Fill in a rule's aggregate from the transformation it names.
+     *
+     * Only so the literal comes out right. `filterSql` writes a number bare
+     * against a count/sum/avg and quoted otherwise, and the rule itself no
+     * longer carries the aggregate once it points at a transformation — so
+     * without this, `HAVING Orders > '5'` is generated. It runs, because DuckDB
+     * casts an untyped literal, but the output is meant to be READ and a quoted
+     * number beside a count reads as a string comparison.
+     *
+     * Scalar transformations are deliberately left alone: a `date_trunc` column
+     * compared against `'2024-01-01'` wants its quotes exactly as a plain
+     * column would.
+     */
+    const withTransformAggregate = (rule: FilterRule): FilterRule => {
+        if (!rule.transformId || rule.aggregate) return rule;
+        const t = transforms.find(x => x.id === rule.transformId);
+        if (!t || t.kind !== 'aggregate') return rule;
+        return { ...rule, aggregate: t.op as Aggregate };
+    };
+
     const predicates = state.filters.children
-        .map(c => filterNodeSql(c))
+        .map(c => filterNodeSql(mapRules(c, withTransformAggregate), leftOfRule))
         .filter((s): s is string => s !== null);
     predicates.forEach((p, i) =>
         lines.push(i === 0 ? `WHERE ${p}` : `  ${conj} ${p}`),
@@ -424,11 +477,18 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
         // so whether `> 5` is written bare follows from the left-hand side that
         // actually gets emitted rather than from what the panel recorded. A
         // query saved before rules carried an aggregate still comes out right.
-        const resolved = (rule: FilterRule): FilterRule => ({
-            ...rule,
-            aggregate: selectedFor(rule)?.aggregate ?? rule.aggregate,
-        });
+        const resolved = (rule: FilterRule): FilterRule =>
+            // A rule naming a transformation says outright which one, so there
+            // is nothing to resolve against the SELECT list — only the literal
+            // formatting to settle.
+            rule.transformId
+                ? withTransformAggregate(rule)
+                : { ...rule, aggregate: selectedFor(rule)?.aggregate ?? rule.aggregate };
         const leftOf = (rule: FilterRule) => {
+            // A rule naming a computed column wins outright: it says exactly
+            // which one, so there is nothing to resolve against the SELECT list.
+            const byId = leftOfRule(rule);
+            if (byId) return byId;
             const c = selectedFor(rule);
             // Falls back to the bare column for a rule whose column has since
             // been unticked; the rule is stale either way and the SQL says so.
@@ -456,6 +516,16 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
      * change. Same resolution HAVING does, and the same reason.
      */
     const sortExpression = (s: SortColumn): string => {
+        // A computed column sorts by its ALIAS. It has to: the expression may
+        // be an aggregate, which ORDER BY accepts, or a window, which it does
+        // not — and the alias is right for both. It is also what somebody would
+        // have written by hand.
+        if (s.transformId) {
+            const t = transforms.find(x => x.id === s.transformId);
+            // Deleted since: fall through to the column reference, which is
+            // wrong in a legible way rather than silently dropping the sort.
+            if (t) return quoteIdent(t.alias);
+        }
         const matches = columns.filter(
             c =>
                 c.table.toLowerCase() === s.table.toLowerCase() &&

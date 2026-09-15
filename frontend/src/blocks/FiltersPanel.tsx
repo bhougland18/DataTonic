@@ -229,11 +229,26 @@ function RuleEditor({
                     aria-label="Apply this condition"
                 />
                 <ColumnPicker
-                    value={{ table: rule.table, column: rule.column, aggregate: rule.aggregate }}
+                    value={
+                        // A computed column has no name but the one it was
+                        // given, so the field shows the option's own label
+                        // rather than deriving `table.column` from two empties.
+                        options.find(o => rule.transformId && o.transformId === rule.transformId) ?? {
+                            table: rule.table,
+                            column: rule.column,
+                            aggregate: rule.aggregate,
+                        }
+                    }
                     options={options}
                     onChange={o =>
                         onUpdate({
                             ...rule,
+                            // Carried through so the generator can resolve the
+                            // computed column's alias. Explicitly cleared when
+                            // switching BACK to a source column — left behind,
+                            // it would keep comparing the old transformation
+                            // while the row showed the new column.
+                            transformId: o.transformId,
                             table: o.table,
                             column: o.column,
                             aggregate: o.aggregate,

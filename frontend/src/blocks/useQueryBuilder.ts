@@ -47,13 +47,17 @@ import {
     updateHavingNode,
 } from './builder-ops';
 import {
+    activeTransforms,
+    clauseFor,
     emptyBuilder,
+    sameSortKey,
     type ColumnTransform,
     type BuilderState,
     type FilterNode,
     type JoinMode,
     type SelectedColumn,
     type SortColumn,
+    type SortKey,
 } from './builder-types';
 import type { ColumnOption } from './ColumnPicker';
 
@@ -102,7 +106,7 @@ export interface QueryBuilder {
     /** Reorder the sort keys. ORDER BY is positional — the first key wins. */
     moveSort: (from: number, to: number) => void;
     /** Append a key. The caller picks a sensible column to start from. */
-    addSort: (table: string, column: string) => void;
+    addSort: (key: SortKey) => void;
     removeSortAt: (index: number) => void;
     /** Change one key's column or direction in place, keeping its priority. */
     setSortAt: (index: number, patch: Partial<SortColumn>) => void;
@@ -143,20 +147,46 @@ export function useQueryBuilder({
      * than five" because the operators on a text column are the text ones.
      */
     const havingOptions = useMemo(
-        (): ColumnOption[] =>
-            state.columns
+        (): ColumnOption[] => [
+            ...state.columns
                 .filter(c => (c.aggregate ?? 'none') !== 'none')
                 .map(c => ({ table: c.table, column: c.column, aggregate: c.aggregate })),
-        [state.columns],
+            // Aggregate TRANSFORMATIONS, which is where summarising lives now.
+            // Without these the grouping filter went empty the moment a saved
+            // query was migrated - the aggregate was still in the query, just
+            // no longer anywhere this list was looking.
+            ...activeTransforms(state.transforms)
+                .filter(t => t.kind === 'aggregate')
+                .map(t => ({
+                    table: t.table ?? '',
+                    column: t.column ?? '',
+                    transformId: t.id,
+                    label: t.alias,
+                })),
+        ],
+        [state.columns, state.transforms],
     );
 
     const filterOptions = useMemo(
-        (): ColumnOption[] =>
-            tables
+        (): ColumnOption[] => [
+            ...tables
                 // A filter on a table the model cannot connect is a query that
                 // cannot run.
                 .filter(t => canReach(state, t.name, relationships))
                 .flatMap(t => t.columns.map(c => ({ table: t.name, column: c.name }))),
+            // SCALAR computed columns. Not the aggregates: DuckDB answers
+            // `WHERE clause cannot contain aggregates`, so offering one here
+            // would be offering a query that cannot run - the same reason
+            // `aggregatesFor` withholds `sum` from a VARCHAR.
+            ...activeTransforms(state.transforms)
+                .filter(t => clauseFor(t.kind) === 'where')
+                .map(t => ({
+                    table: t.table ?? '',
+                    column: t.column ?? '',
+                    transformId: t.id,
+                    label: t.alias,
+                })),
+        ],
         [tables, state, relationships],
     );
 
@@ -289,18 +319,15 @@ export function useQueryBuilder({
             [],
         ),
         addSort: useCallback(
-            (table: string, column: string) =>
+            (key: SortKey) =>
                 setState(b =>
-                    // Never twice: a column already in ORDER BY sorts no harder
+                    // Never twice: a key already in ORDER BY sorts no harder
                     // for being named again, and the duplicate row would be a
-                    // control that does nothing.
-                    b.sort.some(
-                        s =>
-                            s.table.toLowerCase() === table.toLowerCase() &&
-                            s.column.toLowerCase() === column.toLowerCase(),
-                    )
+                    // control that does nothing. A computed column is compared
+                    // by id, since two of them can read the same source column.
+                    b.sort.some(s => sameSortKey(s, key))
                         ? b
-                        : { ...b, sort: [...b.sort, { table, column, dir: 'asc' }] },
+                        : { ...b, sort: [...b.sort, { ...key, dir: 'asc' }] },
                 ),
             [],
         ),

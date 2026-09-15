@@ -17,11 +17,13 @@ import {
     clauseFor,
     emptyBuilder,
     filterIsComplete,
+    filterTables,
     newCaseBranch,
     newGroup,
     newRule,
     newTransform,
     operatorsFor,
+    sameSortKey,
     type BuilderState,
     type ColumnTransform,
     type FilterRule,
@@ -1437,5 +1439,268 @@ describe('normalizeBuilder', () => {
         });
         const after = normalizeBuilder(before);
         expect(generateSql(after, opts)).toBe(generateSql(before, opts));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Filters and Sort naming a transformation (DAA.113)
+// ---------------------------------------------------------------------------
+//
+// The left-hand side is the transformation's ALIAS. DuckDB supports lateral
+// column aliases - a SELECT alias may be named in WHERE, GROUP BY, HAVING,
+// QUALIFY and ORDER BY - which is exactly what lets this work without the
+// subquery the builder has ruled out.
+
+describe('filters on a transformation', () => {
+    // A real catalog operation: a transformation whose op is unknown is
+    // DROPPED as incomplete, and then there is nothing for the rule to name.
+    const month: ColumnTransform = {
+        ...newTransform('function', 'date_trunc'),
+        table: 'PurchaseOrder',
+        column: 'PurchaseOrderDate',
+        args: { unit: 'month' },
+        alias: 'Code',
+    };
+    const orders: ColumnTransform = {
+        ...newTransform('aggregate', 'count'),
+        alias: 'Orders',
+    };
+
+    const ruleOn = (t: ColumnTransform, over: Partial<FilterRule> = {}): FilterRule => ({
+        id: 'r1',
+        kind: 'rule',
+        transformId: t.id,
+        table: '',
+        column: '',
+        op: '=',
+        values: ['X'],
+        ...over,
+    });
+
+    // A rule naming a computed column has no table, and requiring one is what
+    // would silently drop every such filter from the SQL.
+    it('counts as complete without a table or column', () => {
+        expect(filterIsComplete(ruleOn(month))).toBe(true);
+    });
+
+    it('still rejects a source-column rule with no column', () => {
+        expect(
+            filterIsComplete({ ...ruleOn(month), transformId: undefined }),
+        ).toBe(false);
+    });
+
+    // The transformation's table is reached through the TRANSFORM, not through
+    // the rule - counting it here would count it twice, and would count an
+    // empty string for a literal.
+    it('names no table in the filter tree', () => {
+        expect(filterTables(newGroup('and', [ruleOn(month)]))).toEqual([]);
+    });
+
+    it('compares the alias in WHERE', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [month],
+                filters: newGroup('and', [ruleOn(month, { values: ['ABC'] })]),
+            }),
+            poOpts,
+        );
+        expect(sql).toContain("WHERE Code = 'ABC'");
+    });
+
+    it('compares the alias in HAVING', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [orders],
+                having: newGroup('and', [
+                    ruleOn(orders, { op: '>', values: ['5'] }),
+                ]),
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('HAVING Orders > ');
+    });
+
+    // Quoted, because the name is something a person typed.
+    it('quotes an alias that needs it', () => {
+        const spaced = { ...month, alias: 'PO Code' };
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [spaced],
+                filters: newGroup('and', [ruleOn(spaced, { values: ['ABC'] })]),
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('WHERE "PO Code" = \'ABC\'');
+    });
+
+    // Stale either way; the SQL should say so rather than the rule vanishing.
+    it('falls back to the column reference when the transformation is gone', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [],
+                filters: newGroup('and', [
+                    ruleOn(month, { table: 'PurchaseOrder', column: 'POCode' }),
+                ]),
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('WHERE PurchaseOrder.POCode');
+    });
+});
+
+describe('sorting by a transformation', () => {
+    const orders: ColumnTransform = {
+        ...newTransform('aggregate', 'count'),
+        alias: 'Orders',
+    };
+
+    it('orders by the alias', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [orders],
+                sort: [{ transformId: orders.id, table: '', column: '', dir: 'desc' }],
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('ORDER BY Orders DESC');
+    });
+
+    it('leaves a source-column sort alone', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [orders],
+                sort: [{ table: 'PurchaseOrder', column: 'Vendor', dir: 'asc' }],
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('ORDER BY PurchaseOrder.Vendor');
+    });
+});
+
+describe('sameSortKey', () => {
+    // Two transformations can read the same source column - a date rounded to
+    // a month and to a year - so they must compare by ID, not by column.
+    it('tells two transformations on one column apart', () => {
+        const a = { table: 'PO', column: 'Date', transformId: 'x' };
+        const b = { table: 'PO', column: 'Date', transformId: 'y' };
+        expect(sameSortKey(a, b)).toBe(false);
+        expect(sameSortKey(a, { ...a })).toBe(true);
+    });
+
+    it('never confuses a transformation with its own source column', () => {
+        expect(
+            sameSortKey(
+                { table: 'PO', column: 'Date', transformId: 'x' },
+                { table: 'PO', column: 'Date' },
+            ),
+        ).toBe(false);
+    });
+
+    it('compares source columns case-insensitively', () => {
+        expect(sameSortKey({ table: 'po', column: 'date' }, { table: 'PO', column: 'Date' })).toBe(
+            true,
+        );
+    });
+});
+
+// The guard added when a real op was first put through these tests: a rule
+// naming a transformation that no longer exists, with no column to fall back
+// on, has nothing to compare. Emitted, it is `"".""` - a syntax error rather
+// than a wrong answer, but an avoidable one.
+describe('a rule with nothing left to name', () => {
+    it('is dropped rather than emitted empty', () => {
+        expect(
+            filterSql({
+                id: 'r',
+                kind: 'rule',
+                transformId: 'gone',
+                table: '',
+                column: '',
+                op: '=',
+                values: ['X'],
+            }),
+        ).toBeNull();
+    });
+
+    it('still emits when a column remains to fall back on', () => {
+        expect(
+            filterSql({
+                id: 'r',
+                kind: 'rule',
+                transformId: 'gone',
+                table: 'Vendor',
+                column: 'VendorName',
+                op: '=',
+                values: ['X'],
+            }),
+        ).toBe("Vendor.VendorName = 'X'");
+    });
+});
+
+// The literal beside a count must be BARE. `count(x) > '5'` runs - DuckDB casts
+// an untyped literal - but the generated SQL is meant to be read, and a quoted
+// number next to a count reads as a string comparison. The rule no longer
+// carries the aggregate once it names a transformation, so the generator fills
+// it in from the transformation's own operation.
+describe('literals beside a transformation', () => {
+    const orders: ColumnTransform = {
+        ...newTransform('aggregate', 'count'),
+        alias: 'Orders',
+    };
+    const month: ColumnTransform = {
+        ...newTransform('function', 'date_trunc'),
+        table: 'PurchaseOrder',
+        column: 'PurchaseOrderDate',
+        args: { unit: 'month' },
+        alias: 'Month',
+    };
+    const rule = (t: ColumnTransform, op: FilterRule['op'], v: string): FilterRule => ({
+        id: 'r',
+        kind: 'rule',
+        transformId: t.id,
+        table: '',
+        column: '',
+        op,
+        values: [v],
+    });
+
+    it('writes a number bare against an aggregate transformation', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [orders],
+                having: newGroup('and', [rule(orders, '>', '5')]),
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('HAVING Orders > 5');
+    });
+
+    // A date_trunc column compared against a date wants its quotes exactly as
+    // a plain column would, so scalar transformations are left alone.
+    it('keeps the quotes against a scalar transformation', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [],
+                transforms: [month, orders],
+                filters: newGroup('and', [rule(month, '>=', '2024-01-01')]),
+            }),
+            poOpts,
+        );
+        expect(sql).toContain("WHERE Month >= '2024-01-01'");
     });
 });

@@ -20,25 +20,31 @@
 import { useState } from 'react';
 import { ArrowDown, ArrowUp, GripVertical, Plus, Trash2 } from 'lucide-react';
 import ColumnPicker, { type ColumnOption } from './ColumnPicker';
-import type { SelectedColumn, SortColumn } from './builder-types';
+import {
+    sameSortKey,
+    type ColumnTransform,
+    type SelectedColumn,
+    type SortColumn,
+    type SortKey,
+} from './builder-types';
 
 export interface SortListProps {
     sort: SortColumn[];
     /** What may be sorted on — the columns the query selects. */
     columns: SelectedColumn[];
-    onAdd: (table: string, column: string) => void;
+    /** And the computed ones, which are just as sortable and often the point:
+     *  sorting by a total is the commonest thing anybody wants. */
+    transforms: ColumnTransform[];
+    onAdd: (key: SortKey) => void;
     onRemove: (index: number) => void;
     onChange: (index: number, patch: Partial<SortColumn>) => void;
     onMove: (from: number, to: number) => void;
 }
 
-const same = (a: { table: string; column: string }, b: { table: string; column: string }) =>
-    a.table.toLowerCase() === b.table.toLowerCase() &&
-    a.column.toLowerCase() === b.column.toLowerCase();
-
 export default function SortList({
     sort,
     columns,
+    transforms,
     onAdd,
     onRemove,
     onChange,
@@ -47,10 +53,27 @@ export default function SortList({
     const [dragging, setDragging] = useState<number | null>(null);
     const [over, setOver] = useState<number | null>(null);
 
-    const options: ColumnOption[] = columns.map(c => ({ table: c.table, column: c.column }));
-    // The first column not already a key, so the add button starts somewhere
-    // useful rather than on a duplicate that would be ignored.
-    const next = columns.find(c => !sort.some(s => same(s, c)));
+    const options: ColumnOption[] = [
+        ...columns.map(c => ({ table: c.table, column: c.column })),
+        // Shown by the name the person gave it, which is its only name.
+        ...transforms.map(x => ({
+            table: x.table ?? '',
+            column: x.column ?? '',
+            transformId: x.id,
+            label: x.alias,
+        })),
+    ];
+    // The first key not already used, so the add button starts somewhere useful
+    // rather than on a duplicate that would be ignored.
+    const keys: SortKey[] = [
+        ...columns.map(c => ({ table: c.table, column: c.column })),
+        ...transforms.map(x => ({
+            table: x.table ?? '',
+            column: x.column ?? '',
+            transformId: x.id,
+        })),
+    ];
+    const next = keys.find(k => !sort.some(s => sameSortKey(s, k)));
 
     return (
         <div className="blk-sortlist">
@@ -59,14 +82,14 @@ export default function SortList({
                 <button
                     type="button"
                     className="blk-lib-icon"
-                    onClick={() => next && onAdd(next.table, next.column)}
+                    onClick={() => next && onAdd(next)}
                     disabled={!next}
                     title={
-                        columns.length === 0
+                        options.length === 0
                             ? 'Pick some columns first'
                             : next
                               ? 'Sort by another column'
-                              : 'Every selected column is already a sort key'
+                              : 'Everything the query selects is already a sort key'
                     }
                 >
                     <Plus size={13} />
@@ -113,9 +136,22 @@ export default function SortList({
                     </span>
                     <span className="blk-sort-rank">{i + 1}</span>
                     <ColumnPicker
-                        value={{ table: s.table, column: s.column }}
+                        value={
+                            options.find(
+                                o => s.transformId && o.transformId === s.transformId,
+                            ) ?? { table: s.table, column: s.column }
+                        }
                         options={options}
-                        onChange={o => onChange(i, { table: o.table, column: o.column })}
+                        onChange={o =>
+                            onChange(i, {
+                                // Cleared when switching back to a source
+                                // column, or the key would keep pointing at the
+                                // transformation while the row showed otherwise.
+                                transformId: o.transformId,
+                                table: o.table,
+                                column: o.column,
+                            })
+                        }
                     />
                     <button
                         type="button"

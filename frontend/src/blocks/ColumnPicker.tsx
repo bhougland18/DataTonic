@@ -27,6 +27,16 @@ export interface ColumnOption {
      * against a value the grouped query does not have.
      */
     aggregate?: Aggregate;
+    /**
+     * Set when the option is a COMPUTED column rather than a source one.
+     *
+     * It shows and searches by the name the person gave it, because that is
+     * the only name it has — `Total Qty`, not `sum(Line.Quantity)`. The rule
+     * carries this id through, and the generator turns it into the alias.
+     */
+    transformId?: string;
+    /** Overrides the derived label. Set for computed columns. */
+    label?: string;
 }
 
 export interface ColumnPickerProps {
@@ -38,9 +48,10 @@ export interface ColumnPickerProps {
 
 /** What the field shows and what typing is matched against. */
 const label = (o: ColumnOption) =>
-    o.aggregate && o.aggregate !== 'none'
+    o.label ??
+    (o.aggregate && o.aggregate !== 'none'
         ? `${o.aggregate}(${o.table}.${o.column})`
-        : `${o.table}.${o.column}`;
+        : `${o.table}.${o.column}`);
 
 export default function ColumnPicker({ value, options, onChange, className }: ColumnPickerProps) {
     const [typed, setTyped] = useState<string | null>(null);

@@ -248,6 +248,7 @@ export default function SqlEditor({
                             <SortList
                                 sort={qb.state.sort}
                                 columns={qb.state.columns}
+                                transforms={qb.state.transforms ?? []}
                                 onAdd={qb.addSort}
                                 onRemove={qb.removeSortAt}
                                 onChange={qb.setSortAt}

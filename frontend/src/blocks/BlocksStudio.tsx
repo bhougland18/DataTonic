@@ -1425,6 +1425,7 @@ export default function BlocksStudio({
                                     <SortList
                                         sort={builder.sort}
                                         columns={builder.columns}
+                                        transforms={builder.transforms ?? []}
                                         onAdd={qb.addSort}
                                         onRemove={qb.removeSortAt}
                                         onChange={qb.setSortAt}

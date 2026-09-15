@@ -205,6 +205,18 @@ export function operatorsFor(agg?: Aggregate): FilterOperator[] {
 export interface FilterRule {
     id: string;
     kind: 'rule';
+    /**
+     * The computed column this compares, when it is one.
+     *
+     * Set INSTEAD of `table`/`column`, which stay empty — a transformation is
+     * not a column of any table and pretending otherwise would put a name in
+     * `requiredTables` that no catalog can resolve. The generator compares its
+     * ALIAS, which DuckDB allows in every clause the builder emits.
+     *
+     * Which clause the rule lands in follows from the transformation's KIND,
+     * not from which section it was authored in — see `clauseFor`.
+     */
+    transformId?: string;
     table: string;
     column: string;
     /**
@@ -264,7 +276,11 @@ export function emptyFilterGroup(): FilterGroup {
 
 /** Every table any rule in the tree names. */
 export function filterTables(node: FilterNode): string[] {
-    if (node.kind === 'rule') return node.table ? [node.table] : [];
+    // A rule on a computed column names none. Its table comes from the
+    // TRANSFORMATION, which `requiredTables` reads separately — counting it
+    // here would be counting the same table twice, and counting an empty
+    // string when the transformation is a literal.
+    if (node.kind === 'rule') return node.transformId || !node.table ? [] : [node.table];
     return node.children.flatMap(filterTables);
 }
 
@@ -306,7 +322,28 @@ export function addToGroup(root: FilterGroup, groupId: string, child: FilterNode
     };
 }
 
+/** What a sort key POINTS AT, without saying which way. */
+export type SortKey = Pick<SortColumn, 'table' | 'column' | 'transformId'>;
+
+/**
+ * Two sort keys naming the same thing.
+ *
+ * Computed columns compare by ID, not by source column: two transformations can
+ * read `PurchaseOrderDate` — rounded to a month and to a year — and they are
+ * different sort keys despite agreeing on table and column.
+ */
+export function sameSortKey(a: SortKey, b: SortKey): boolean {
+    if (a.transformId || b.transformId) return a.transformId === b.transformId;
+    return (
+        a.table.toLowerCase() === b.table.toLowerCase() &&
+        a.column.toLowerCase() === b.column.toLowerCase()
+    );
+}
+
 export interface SortColumn {
+    /** The computed column this sorts by, when it is one. Set INSTEAD of
+     *  `table`/`column`, for the reason given on `FilterRule.transformId`. */
+    transformId?: string;
     table: string;
     column: string;
     dir: 'asc' | 'desc';
@@ -528,7 +565,9 @@ export function arity(op: FilterOperator): 0 | 1 | 2 | 'many' {
 
 /** Whether a rule has everything it needs to become SQL. */
 export function filterIsComplete(f: FilterRule): boolean {
-    if (!f.table || !f.column) return false;
+    // A rule on a computed column names no table, and requiring one here is
+    // what would silently drop every filter on a transformation from the SQL.
+    if (!f.transformId && (!f.table || !f.column)) return false;
     const n = arity(f.op);
     const given = f.values.filter(v => v.trim() !== '').length;
     if (n === 0) return true;
