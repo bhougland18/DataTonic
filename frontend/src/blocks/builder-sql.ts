@@ -10,7 +10,7 @@
 // builder off hands this text to a person, so it has to read like something a
 // person wrote: leading commas, one clause per line, table names as aliases.
 
-import { joinSql, quoteIdent, type ErdRelationship } from '../erd/model';
+import { joinSql, parallelJoins, quoteIdent, type ErdRelationship } from '../erd/model';
 import { addressOf } from './join-insert';
 import type { SqlStudioTable } from '../sqleditor/types';
 import {
@@ -22,6 +22,7 @@ import {
     type FilterNode,
     type FilterRule,
     type SelectedColumn,
+    type SortColumn,
 } from './builder-types';
 
 /** `SELECT ` is seven characters, so a leading comma at six sits under its T. */
@@ -177,13 +178,19 @@ export function filterNodeSql(
  * becoming an inner one.
  */
 function joinClause(
-    rel: ErdRelationship,
+    rels: ErdRelationship[],
     joined: string,
     keyword: string,
     tables: SqlStudioTable[],
 ): string {
     const addr = addressOf(joined, tables);
-    return `${keyword} ${addr} AS ${quoteIdent(joined)}\n  ON ${joinSql(rel)}`;
+    // EVERY relationship between these two tables, ANDed — a composite key is
+    // one join with several conditions. Joining on part of one does not fail,
+    // it multiplies rows, and the result is a total that is quietly too large.
+    // Each condition gets its own line: a composite key is exactly the join
+    // somebody needs to be able to read back.
+    const on = rels.map(r => joinSql(r)).join('\n AND ');
+    return `${keyword} ${addr} AS ${quoteIdent(joined)}\n  ON ${on}`;
 }
 
 export interface GenerateOptions {
@@ -245,7 +252,15 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
             j.mode !== 'inner' && keptSide.toLowerCase() !== joined.toLowerCase()
                 ? 'LEFT JOIN'
                 : 'JOIN';
-        lines.push(joinClause(rel, joined, keyword, tables));
+        // Read from the FULL relationship list, not from `state.joins`: a
+        // composite key is a fact about the schema rather than something the
+        // person ticked, so the second arm must come along even though nothing
+        // selected it. Exclusions still apply — ruling a route out can mean
+        // ruling out one arm.
+        const all = parallelJoins(joined, inScope, relationships, state.excludedJoins);
+        // `rel` leads: it is the one the route chose, and the rest qualify it.
+        const ordered = [rel, ...all.filter(r => r.id !== rel.id)];
+        lines.push(joinClause(ordered, joined, keyword, tables));
         inScope.add(joined.toLowerCase());
     }
 
@@ -321,9 +336,40 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
         );
     }
 
+    /**
+     * What to ORDER BY for a sort key — which is not always the column.
+     *
+     * Once anything is aggregated the raw column is gone: DuckDB answers
+     * `column "Quantity" must appear in the GROUP BY clause or be part of an
+     * aggregate`. A sort on a summarised column has to name the SUMMARY, and the
+     * output alias is the readable way to say it — `ORDER BY "count …" DESC` is
+     * the same thing somebody would have written by hand.
+     *
+     * A GROUP BY key still sorts by the column itself; only the summarised ones
+     * change. Same resolution HAVING does, and the same reason.
+     */
+    const sortExpression = (s: SortColumn): string => {
+        if (!aggregated) return ref(s.table, s.column);
+        const matches = columns.filter(
+            c =>
+                c.table.toLowerCase() === s.table.toLowerCase() &&
+                c.column.toLowerCase() === s.column.toLowerCase(),
+        );
+        // A grouping key wins over a summary of the same column: it is the one
+        // that still exists under its own name.
+        if (matches.some(c => (c.aggregate ?? 'none') === 'none')) return ref(s.table, s.column);
+        const agg = matches.find(c => (c.aggregate ?? 'none') !== 'none');
+        // `withCollisionAliases` names every aggregate, so the alias is always
+        // there; the expression is a fallback that should not be reachable.
+        if (agg) return agg.alias ? quoteIdent(agg.alias) : columnExpression(agg);
+        // Sorting by something the query does not select, in a grouped query.
+        // Left as-is so the engine says so, rather than being dropped silently.
+        return ref(s.table, s.column);
+    };
+
     state.sort.forEach((s, i) => {
         const dir = s.dir === 'desc' ? ' DESC' : '';
-        lines.push(`${i === 0 ? 'ORDER BY ' : '       , '}${ref(s.table, s.column)}${dir}`);
+        lines.push(`${i === 0 ? 'ORDER BY ' : '       , '}${sortExpression(s)}${dir}`);
     });
 
     // No terminator: the engine wraps the body in `({sql})`, where a trailing

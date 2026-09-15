@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
     CHART_SHAPES,
+    allCharts,
+    identifierColumns,
     checkShape,
     fieldsFromColumns,
     missingSummary,
@@ -400,5 +402,98 @@ describe('verdicts stay well-formed', () => {
         if (v.kind !== 'fits') throw new Error('expected a fit');
         const used = Object.values(v.encoding).map(e => e.field);
         expect(new Set(used).size).toBe(used.length);
+    });
+});
+
+// Found by Ben, on a real result: `Vendor` is an int64 foreign key, so it read
+// as a measure and a LINE CHART over vendor ID numbers ranked first — above the
+// bar chart, which was itself offered with the ID as its bar heights.
+describe('key columns are categories, not measures', () => {
+    const COLUMNS = [
+        { name: 'Vendor', type: 'int64' },
+        { name: 'VendorName', type: 'string' },
+        { name: 'count Item.Item', type: 'int64' },
+    ];
+    const KEYS = identifierColumns([
+        { fromColumn: 'Vendor', toColumn: 'Vendor' },
+        { fromColumn: 'Item', toColumn: 'Item' },
+    ]);
+
+    it('collects the join keys the ER model declares', () => {
+        expect([...KEYS].sort()).toEqual(['Item', 'Vendor']);
+    });
+
+    it('also takes a primary key the probe reported', () => {
+        const keys = identifierColumns([], [{ name: 'Id', type: 'int64', primaryKey: true }]);
+        expect(keys.has('Id')).toBe(true);
+    });
+
+    it('retypes a numeric key as a category', () => {
+        const fields = fieldsFromColumns(COLUMNS, KEYS);
+        expect(fields.map(f => `${f.name}=${f.vlType}`)).toEqual([
+            'Vendor=nominal',
+            'VendorName=nominal',
+            'count Item.Item=quantitative',
+        ]);
+    });
+
+    // Retyped rather than dropped: counting by vendor ID is a real chart.
+    it('keeps the key plottable as a category', () => {
+        const fields = fieldsFromColumns(COLUMNS, KEYS);
+        expect(fields.map(f => f.name)).toContain('Vendor');
+    });
+
+    it('leaves a text or date key alone', () => {
+        const fields = fieldsFromColumns(
+            [
+                { name: 'Item', type: 'string' },
+                { name: 'AddedDate', type: 'date' },
+            ],
+            identifierColumns([{ fromColumn: 'Item', toColumn: 'AddedDate' }]),
+        );
+        expect(fields.map(f => f.vlType)).toEqual(['nominal', 'temporal']);
+    });
+
+    // The whole point. Before: line/area/scatter fit with x = the ID.
+    it('stops offering a line over an ID column', () => {
+        const before = checkShape(fieldsFromColumns(COLUMNS), 'line');
+        expect(before.kind).toBe('fits');
+        expect(before.kind === 'fits' && before.encoding.x?.field).toBe('Vendor');
+
+        // `close`, and the message is about Y rather than X: with only one
+        // measure left the matcher puts `count` on the x axis and then has
+        // nothing for y. Either way it is no longer on offer, and "needs a
+        // number" is the thing to act on.
+        const after = checkShape(fieldsFromColumns(COLUMNS, KEYS), 'line');
+        expect(after.kind).toBe('close');
+        expect(missingSummary(after)).toBe('needs a number');
+    });
+
+    // And the bar chart stops plotting the ID as its measure.
+    it('gives the bar chart the count, not the key, for its measure', () => {
+        const before = checkShape(fieldsFromColumns(COLUMNS), 'bar');
+        expect(before.kind === 'fits' && before.encoding.y?.field).toBe('Vendor');
+        const after = checkShape(fieldsFromColumns(COLUMNS, KEYS), 'bar');
+        expect(after.kind === 'fits' && after.encoding.y?.field).toBe('count Item.Item');
+    });
+
+    // Ranking follows: the nonsense charts no longer beat the real one on
+    // "fewer unused columns".
+    it('ranks the bar chart first now', () => {
+        const ranked = allCharts(fieldsFromColumns(COLUMNS, KEYS), {
+            rowCount: 13,
+            aggregated: true,
+        }).filter(v => v.kind === 'fits');
+        expect(ranked[0].chart).toBe('bar');
+        expect(ranked.map(v => v.chart)).not.toContain('line');
+    });
+
+    // Unknown stays unknown — the SQL Editor node has no ER model to ask.
+    it('changes nothing when no keys are given', () => {
+        expect(fieldsFromColumns(COLUMNS).map(f => f.vlType)).toEqual([
+            'quantitative',
+            'nominal',
+            'quantitative',
+        ]);
     });
 });

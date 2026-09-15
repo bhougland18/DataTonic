@@ -79,6 +79,14 @@ export interface ChartEditorInput {
      * same way it owns the saved queries — this only matches and applies them.
      */
     customs?: CustomChart[];
+    /**
+     * Columns that are KEYS rather than measures.
+     *
+     * From the host, because only it has the ER model. Without it a foreign
+     * key reads as a number and a line chart over vendor IDs ranks first —
+     * see `fieldsFromColumns`.
+     */
+    identifiers?: ReadonlySet<string>;
 }
 
 export interface ChartEditor {
@@ -170,6 +178,7 @@ export function useChartEditor({
     rowCount,
     aggregated,
     customs,
+    identifiers,
 }: ChartEditorInput): ChartEditor {
     const [state, setState] = useState<ChartSpecState | null>(null);
     const [mode, setMode] = useState<ChartEditMode>('gui');
@@ -184,7 +193,7 @@ export function useChartEditor({
      */
     const [rawSpec, setRawSpec] = useState<DiveChart | null>(null);
 
-    const fields = useMemo(() => fieldsFromColumns(columns), [columns]);
+    const fields = useMemo(() => fieldsFromColumns(columns, identifiers), [columns, identifiers]);
     const ctx = useMemo(() => ({ rowCount, aggregated }), [rowCount, aggregated]);
     const charts = useMemo(() => allCharts(fields, ctx), [fields, ctx]);
     // Same matcher as the built-ins (`matchNeeds`), so a custom card can say

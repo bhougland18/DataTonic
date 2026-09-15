@@ -73,6 +73,14 @@ export interface ChartShapeStripProps {
      * parsing; unknown stays unknown rather than being guessed.
      */
     aggregated?: boolean;
+    /**
+     * Columns that are KEYS rather than measures, from the host's ER model.
+     *
+     * The strip and the gallery must agree, so this is passed here too — a
+     * result where the strip offers a line chart and the Charts step does not
+     * would be worse than either answer alone.
+     */
+    identifiers?: ReadonlySet<string>;
     /** Once a chart type is chosen, judge that one instead of listing. */
     chart?: ChartType;
     /**
@@ -90,10 +98,11 @@ export default function ChartShapeStrip({
     columns,
     rowCount,
     aggregated,
+    identifiers,
     chart,
     onPick,
 }: ChartShapeStripProps) {
-    const fields = fieldsFromColumns(columns);
+    const fields = fieldsFromColumns(columns, identifiers);
     const ctx = { rowCount, aggregated };
 
     if (fields.length === 0) {

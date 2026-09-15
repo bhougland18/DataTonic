@@ -79,6 +79,8 @@ export interface BuilderPanelProps {
     filterCount?: number;
     having?: ReactNode;
     havingCount?: number;
+    sort?: ReactNode;
+    sortCount?: number;
 }
 
 export default function BuilderPanel({
@@ -103,6 +105,8 @@ export default function BuilderPanel({
     filterCount,
     having,
     havingCount,
+    sort,
+    sortCount,
 }: BuilderPanelProps) {
     const [query, setQuery] = useState('');
     const [open, setOpen] = useState(() => readPanelOpen(PANEL_KEY, true));
@@ -269,6 +273,7 @@ export default function BuilderPanel({
             {selected ? (
                 <PanelSection
                     title="Column Ordering"
+                    sqlName="select"
                     storageKey="duckle.builder.sec.ordering"
                     badge={selectedCount}
                 >
@@ -303,7 +308,8 @@ export default function BuilderPanel({
                 what order, joined how — and only then which rows. */}
             {filters ? (
                 <PanelSection
-                    title="Where"
+                    title="Filter"
+                    sqlName="where"
                     storageKey="duckle.builder.sec.where"
                     badge={filterCount || undefined}
                 >
@@ -317,11 +323,27 @@ export default function BuilderPanel({
                 Column Ordering waits for a column. */}
             {having ? (
                 <PanelSection
-                    title="Grouping filter"
+                    title="Grouping Filter"
+                    sqlName="having"
                     storageKey="duckle.builder.sec.having"
                     badge={havingCount || undefined}
                 >
                     {having}
+                </PanelSection>
+            ) : null}
+
+            {/* Last, and last in the SQL too: ORDER BY is the only clause that
+                runs after the rows are decided. Putting it below the grouping
+                filter keeps the panel in the order the query is read, which is
+                the cheapest way to teach the shape of a SELECT. */}
+            {sort ? (
+                <PanelSection
+                    title="Sort"
+                    sqlName="order by"
+                    storageKey="duckle.builder.sec.sort"
+                    badge={sortCount || undefined}
+                >
+                    {sort}
                 </PanelSection>
             ) : null}
         </aside>

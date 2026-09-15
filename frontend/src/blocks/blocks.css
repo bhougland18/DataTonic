@@ -1143,6 +1143,29 @@
     text-transform: none;
     color: var(--text-4);
 }
+/* The SQL clause the section is. Deliberately the quietest thing in the header
+   — lighter, smaller and lower-case against the title's uppercase — so it reads
+   as an annotation on the word beside it rather than as a second heading. It is
+   there to be learnt, not to be navigated by. */
+.blk-sec-sql {
+    flex-shrink: 0;
+    margin-left: -1px;
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 9.5px;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: lowercase;
+    color: var(--text-4);
+    opacity: 0.85;
+}
+/* The title stops pushing the clause off when the panel is narrow: the title
+   ellipsises, the clause keeps its place. */
+.blk-sec-head .blk-sec-title {
+    flex: 0 1 auto;
+}
+.blk-sec-head .blk-sec-badge {
+    margin-left: auto;
+}
 .blk-sec-body {
     flex: 1 1 auto;
     min-height: 0;
@@ -2021,4 +2044,74 @@ button.blk-shape-chip:hover {
 }
 .blk-ced-tab:disabled.blk-ced-tab--on {
     cursor: default;
+}
+
+/* ---- Sort (ORDER BY) ---- */
+.blk-sortlist {
+    padding: 0 8px 8px;
+}
+.blk-sort {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 2px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    font-size: 11.5px;
+}
+.blk-sort--dragging {
+    opacity: 0.4;
+}
+.blk-sort--over {
+    border-color: var(--accent);
+}
+/* Only the GRIP drags. The row holds a text input, and a draggable ancestor
+   swallows the drag that selects text inside it — the field becomes unusable. */
+.blk-sort-grip {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: var(--text-4);
+    cursor: grab;
+}
+.blk-sort-grip:active {
+    cursor: grabbing;
+}
+/* The picker takes the room; everything else is fixed-width, so the row costs
+   the same whether the query has four columns or four hundred. */
+.blk-sort .blk-colpick {
+    flex: 1;
+    min-width: 0;
+}
+/* The priority number, not decoration: ORDER BY is positional, so 1 decides and
+   2 only breaks its ties. */
+.blk-sort-rank {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 9.5px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+.blk-sort-dir {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-0);
+    color: var(--accent);
+    cursor: pointer;
+}
+.blk-sort-dir:hover {
+    border-color: var(--accent);
 }

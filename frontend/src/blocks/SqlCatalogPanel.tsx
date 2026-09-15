@@ -56,6 +56,9 @@ export interface SqlCatalogPanelProps {
     /** The HAVING rows — present only once something is aggregated. */
     having?: ReactNode;
     havingCount?: number;
+    /** The ORDER BY keys, in priority order. */
+    sort?: ReactNode;
+    sortCount?: number;
     /** Builder mode: which joins are in the query, and how to change them. */
     activeJoins?: Map<string, JoinMode>;
     onSetJoinMode?: (relationshipId: string, mode: JoinMode) => void;

@@ -34,27 +34,32 @@ export interface StoredSchemaModel {
      *  deciding a derived table's joins are noise is a judgement worth keeping,
      *  and having to re-hide it on every open would make the toggle pointless. */
     hiddenRelations?: string[];
+    /** Canvas layout by table name. Arranging a schema readably is real work;
+     *  re-doing it on every open would waste it. */
+    positions?: Record<string, { x: number; y: number }>;
 }
 
 /**
- * Save the authored relationships.
+ * Save the authored model.
  *
- * Relationships only — NOT tables. The tables come from the workspace catalog
- * and are re-read on every load, so persisting them would create a second,
- * staler copy that silently disagrees with the catalog the moment a pipeline
- * writes a new column. Relationships are the part a human authored and the only
- * part that cannot be recovered by looking at the data.
+ * Relationships, the hidden set and the layout — NOT tables. The tables come
+ * from the workspace catalog and are re-read on every load, so persisting them
+ * would create a second, staler copy that silently disagrees with the catalog
+ * the moment a pipeline writes a new column. What is stored here is the part a
+ * human authored and the only part that cannot be recovered from the data.
  */
 export async function saveSchemaModel(
     workspacePath: string,
     relationships: ErdRelationship[],
     hiddenRelations: string[] = [],
+    positions: Record<string, { x: number; y: number }> = {},
 ): Promise<boolean> {
     const payload: StoredSchemaModel = {
         schemaVersion: 1,
         kind: 'model',
         relationships,
         hiddenRelations,
+        positions,
     };
     return saveItemPayload(workspacePath, 'block', SCHEMA_MODEL_ID, payload);
 }
@@ -80,11 +85,13 @@ function isRelationship(v: unknown): v is ErdRelationship {
  * outcome than refusing to open the schema step at all — unlike a dive, where
  * a broken query has no partial meaning.
  */
-export async function loadSchemaModel(
-    workspacePath: string,
-): Promise<{ relationships: ErdRelationship[]; hiddenRelations: string[] }> {
+export async function loadSchemaModel(workspacePath: string): Promise<{
+    relationships: ErdRelationship[];
+    hiddenRelations: string[];
+    positions: Record<string, { x: number; y: number }>;
+}> {
     const raw = await loadItemPayload<unknown>(workspacePath, 'block', SCHEMA_MODEL_ID);
-    const empty = { relationships: [], hiddenRelations: [] };
+    const empty = { relationships: [], hiddenRelations: [], positions: {} };
     if (typeof raw !== 'object' || raw === null) return empty;
     const o = raw as Record<string, unknown>;
     return {
@@ -92,7 +99,19 @@ export async function loadSchemaModel(
         hiddenRelations: Array.isArray(o.hiddenRelations)
             ? o.hiddenRelations.filter((v): v is string => typeof v === 'string')
             : [],
+        positions: isPositionMap(o.positions) ? o.positions : {},
     };
+}
+
+/** A position map with usable numbers. Guarded because a NaN or a missing axis
+ *  would place a table off-canvas, where it cannot be dragged back. */
+function isPositionMap(v: unknown): v is Record<string, { x: number; y: number }> {
+    if (typeof v !== 'object' || v === null) return false;
+    return Object.values(v as Record<string, unknown>).every(p => {
+        if (typeof p !== 'object' || p === null) return false;
+        const { x, y } = p as { x?: unknown; y?: unknown };
+        return Number.isFinite(x) && Number.isFinite(y);
+    });
 }
 
 /**

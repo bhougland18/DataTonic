@@ -85,6 +85,45 @@ export function joinSql(r: ErdRelationship): string {
     return parts.join(' AND ');
 }
 
+/**
+ * Every relationship that connects `table` to something already in hand.
+ *
+ * **A composite key is ONE join with several conditions, not several joins.**
+ * `PurchaseOrder` and `PurchaseOrderLine` are related on both `PurchaseOrder`
+ * and `Company`; joining on only the first multiplies rows, and the symptom is
+ * a total that is silently too big rather than an error.
+ *
+ * The builder treated each relationship as its own edge, so a path reached the
+ * table through one of them and the rest were skipped as "both ends already in
+ * scope". This is what the caller uses to gather the ones that got dropped.
+ *
+ * `exclude` is honoured: a route the person ruled out stays out, and that
+ * includes ruling out one arm of a composite key.
+ *
+ * Note this cannot express two SEPARATE joins to the same table — a ship-to and
+ * a bill-to address both pointing at `Address`. That needs the table twice under
+ * different aliases, which the builder has no vocabulary for (aliases ARE table
+ * names), so the case is already inexpressible rather than newly broken.
+ */
+export function parallelJoins(
+    table: string,
+    present: Iterable<string>,
+    relationships: ErdRelationship[],
+    exclude?: Iterable<string>,
+): ErdRelationship[] {
+    const target = table.toLowerCase();
+    const have = new Set([...present].map(s => s.toLowerCase()));
+    const barred = new Set(exclude ?? []);
+    return relationships.filter(r => {
+        if (barred.has(r.id)) return false;
+        const from = r.fromTable.toLowerCase();
+        const to = r.toTable.toLowerCase();
+        if (from === target) return have.has(to);
+        if (to === target) return have.has(from);
+        return false;
+    });
+}
+
 export interface ErdRelationship {
     id: string;
     fromTable: string;
@@ -107,6 +146,11 @@ export interface ErdModel {
      *  deciding a derived table's joins are noise is a judgement worth keeping.
      *  Optional so older persisted models load unchanged. */
     hiddenRelations?: string[];
+    /** Where each table sits on the canvas, by table name. Laying a schema out
+     *  readably is real work, and re-doing it on every open would make the
+     *  effort pointless. Keyed by NAME, not node id, so it survives a rebuild
+     *  of the diagram; a table that has since gone simply has no entry. */
+    positions?: Record<string, { x: number; y: number }>;
 }
 
 /** One step of a route through the model: a relationship, and the table it adds. */

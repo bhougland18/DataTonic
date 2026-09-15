@@ -11,6 +11,8 @@ export interface ErdWorkspaceRequest {
     relationships: ErdRelationship[];
     /** Tables whose edges the node has saved as hidden. */
     hiddenRelations?: string[];
+    /** The layout the node last saved. */
+    positions?: Record<string, { x: number; y: number }>;
 }
 
 interface ErdWorkspaceProps {
@@ -55,12 +57,14 @@ export default function ErdWorkspace({
             load: async (): Promise<ErdSavedModel> => ({
                 relationships: open?.relationships ?? [],
                 hiddenRelations: open?.hiddenRelations ?? [],
+                positions: open?.positions,
             }),
             save: async (model: ErdSavedModel) => {
                 onSave(nodeId, {
                     tables,
                     relationships: model.relationships,
                     hiddenRelations: model.hiddenRelations,
+                    positions: model.positions,
                 });
                 return true;
             },

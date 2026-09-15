@@ -194,6 +194,9 @@ export interface ErdAuthoringProps {
     onToggleRelations?: (table: string) => void;
     /** Bump to re-run auto-arrange on the diagram. */
     arrangeNonce?: number;
+    /** Saved canvas layout, and a report of it when the user moves a table. */
+    positions?: Record<string, { x: number; y: number }>;
+    onPositionsChange?: (p: Record<string, { x: number; y: number }>) => void;
     /** Save a table pair's joins to the library. Omitted when the host has no
      *  library (the Working DB node edits one model and never reuses it). */
     onSaveJoins?: (rels: ErdRelationship[]) => void;
@@ -208,6 +211,8 @@ export default function ErdAuthoring({
     hiddenRelations,
     onToggleRelations,
     arrangeNonce,
+    positions,
+    onPositionsChange,
     onSaveJoins,
     savedJoinIds,
 }: ErdAuthoringProps) {
@@ -331,6 +336,8 @@ export default function ErdAuthoring({
                 hiddenRelations={hiddenRelations}
                 onToggleRelations={onToggleRelations}
                 arrangeNonce={arrangeNonce}
+                positions={positions}
+                onPositionsChange={onPositionsChange}
             />
             <div
                 className="erd-ws-grip"

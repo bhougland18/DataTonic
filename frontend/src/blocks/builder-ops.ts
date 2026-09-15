@@ -9,7 +9,7 @@
 // That is the same bargain as the rest of the redesign: make the wrong thing
 // unconstructable instead of detectable.
 
-import { relationshipPath, type ErdRelationship } from '../erd/model';
+import { parallelJoins, relationshipPath, type ErdRelationship } from '../erd/model';
 import { addToGroup, filterTables, removeNode, replaceNode } from './builder-types';
 import type {
     Aggregate,
@@ -80,6 +80,22 @@ export function rebuildJoins(state: BuilderState, relationships: ErdRelationship
                 relationshipId: hop.rel.id,
                 mode: modes.get(hop.rel.id) ?? 'inner',
             });
+            // The other arms of a composite key come along. They are recorded
+            // so the Joins list shows them as IN USE — the generator emits them
+            // regardless, and a list offering to "add" a join already in the ON
+            // clause is a list nobody can reason from.
+            for (const also of parallelJoins(
+                hop.joined,
+                scope,
+                relationships,
+                state.excludedJoins,
+            )) {
+                if (also.id === hop.rel.id) continue;
+                if (joins.some(j => j.relationshipId === also.id)) continue;
+                // The mode belongs to the JOIN, not to each condition in it, so
+                // the extra arms follow whatever the hop chose.
+                joins.push({ relationshipId: also.id, mode: modes.get(hop.rel.id) ?? 'inner' });
+            }
             scope.add(hop.joined.toLowerCase());
         }
     }

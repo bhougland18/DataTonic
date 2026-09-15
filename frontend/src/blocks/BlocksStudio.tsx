@@ -40,6 +40,7 @@ import SqlCatalogPanel from './SqlCatalogPanel';
 import SavedQueriesPanel from './SavedQueriesPanel';
 import UnsavedQueryDialog from './UnsavedQueryDialog';
 import SelectedColumns from './SelectedColumns';
+import SortList from './SortList';
 import { chartContext } from './chart-context';
 import { addressOf } from './join-insert';
 import { useQueryBuilder } from './useQueryBuilder';
@@ -61,7 +62,7 @@ import {
     type CustomChart,
 } from './custom-charts';
 import { loadItemPayload, saveItemPayload } from '../workspace';
-import { shapeFor } from './chart-shapes';
+import { identifierColumns, shapeFor } from './chart-shapes';
 import FiltersPanel from './FiltersPanel';
 import JoinReviewDialog from './JoinReviewDialog';
 import { countRules } from './builder-types';
@@ -376,7 +377,12 @@ export default function BlocksStudio({
                     : Promise.resolve({ relationships: [], hiddenRelations: [] }),
             save: (model: ErdSavedModel) =>
                 workspacePath
-                    ? saveSchemaModel(workspacePath, model.relationships, model.hiddenRelations)
+                    ? saveSchemaModel(
+                          workspacePath,
+                          model.relationships,
+                          model.hiddenRelations,
+                          model.positions,
+                      )
                     : Promise.resolve(false),
         }),
         [workspacePath],
@@ -575,6 +581,20 @@ export default function BlocksStudio({
     const [customs, setCustoms] = useState<CustomChart[]>([]);
 
     /**
+     * Columns that identify a row rather than measure it.
+     *
+     * From facts the workspace already holds — the joins drawn on the Schema
+     * step, and any primary key the probe reported. A foreign key is an
+     * integer, so without this a line chart over vendor ID NUMBERS ranked
+     * first and the bar chart was offered with the ID as its bar heights.
+     * See `fieldsFromColumns`.
+     */
+    const identifiers = useMemo(
+        () => identifierColumns(relationships, Object.values(schema).flat()),
+        [relationships, schema],
+    );
+
+    /**
      * The chart, over the result on screen.
      *
      * Mounted HERE rather than inside the Charts step, for the same reason the
@@ -590,6 +610,7 @@ export default function BlocksStudio({
         rowCount: lastRun?.result.rows.length,
         aggregated: lastRun?.aggregated,
         customs,
+        identifiers,
     });
     const { theme } = useTheme();
 
@@ -597,8 +618,14 @@ export default function BlocksStudio({
         // `chart.state` as well as the result: once a chart is picked, the
         // question the pane gets is about THAT chart, and answering it from the
         // list of everything that fits answers something nobody asked.
-        () => chartContext(lastRun?.result, { aggregated: lastRun?.aggregated }, chart.state),
-        [lastRun, chart.state],
+        () =>
+            chartContext(
+                lastRun?.result,
+                { aggregated: lastRun?.aggregated },
+                chart.state,
+                identifiers,
+            ),
+        [lastRun, chart.state, identifiers],
     );
 
     /**
@@ -1378,6 +1405,19 @@ export default function BlocksStudio({
                             selectedCount={builder.columns.length}
                             filterCount={countRules(builder.filters)}
                             havingCount={countRules(builder.having)}
+                            sortCount={builder.sort.length}
+                            sort={
+                                builderMode ? (
+                                    <SortList
+                                        sort={builder.sort}
+                                        columns={builder.columns}
+                                        onAdd={qb.addSort}
+                                        onRemove={qb.removeSortAt}
+                                        onChange={qb.setSortAt}
+                                        onMove={qb.moveSort}
+                                    />
+                                ) : undefined
+                            }
                             having={
                                 builderMode && qb.havingOptions.length > 0 ? (
                                     <FiltersPanel
@@ -1654,6 +1694,9 @@ export default function BlocksStudio({
                                             columns={r.columns}
                                             rowCount={r.rows.length}
                                             aggregated={lastRun?.aggregated}
+                                            // The strip and the gallery must
+                                            // agree about what is a measure.
+                                            identifiers={identifiers}
                                             // Wiring this turns the chips from
                                             // labels into the way into the
                                             // Charts step (DAA.98/DAA.102).

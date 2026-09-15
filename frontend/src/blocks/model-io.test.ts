@@ -1,6 +1,50 @@
-import { describe, expect, it } from 'vitest';
-import { mergeRelationships } from './model-io';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { ErdRelationship, ErdTable } from '../erd/model';
+
+const payload = vi.hoisted(() => ({ load: vi.fn(), save: vi.fn() }));
+vi.mock('../workspace', () => ({
+    loadItemPayload: payload.load,
+    saveItemPayload: payload.save,
+}));
+
+const { mergeRelationships, loadSchemaModel, saveSchemaModel } = await import('./model-io');
+
+beforeEach(() => {
+    payload.load.mockReset();
+    payload.save.mockReset().mockResolvedValue(true);
+});
+
+describe('schema model persistence', () => {
+    it('round-trips the layout alongside relationships and hidden tables', async () => {
+        await saveSchemaModel('/w', [], ['Item'], { Item: { x: 10, y: 20 } });
+        const stored = payload.save.mock.calls[0][3];
+        expect(stored.positions).toEqual({ Item: { x: 10, y: 20 } });
+        expect(stored.hiddenRelations).toEqual(['Item']);
+
+        payload.load.mockResolvedValue(stored);
+        const back = await loadSchemaModel('/w');
+        expect(back.positions).toEqual({ Item: { x: 10, y: 20 } });
+    });
+
+    it('defaults to an empty layout for a model saved before positions existed', async () => {
+        payload.load.mockResolvedValue({ schemaVersion: 1, kind: 'model', relationships: [] });
+        expect((await loadSchemaModel('/w')).positions).toEqual({});
+    });
+
+    // A NaN or a missing axis would place a table off-canvas, where it cannot
+    // be dragged back — worse than losing the layout entirely.
+    it('rejects a position map with an unusable coordinate', async () => {
+        for (const bad of [
+            { Item: { x: 1 } },
+            { Item: { x: 1, y: Number.NaN } },
+            { Item: null },
+            { Item: { x: '3', y: 4 } },
+        ]) {
+            payload.load.mockResolvedValue({ relationships: [], positions: bad });
+            expect((await loadSchemaModel('/w')).positions).toEqual({});
+        }
+    });
+});
 
 function rel(over: Partial<ErdRelationship> & { id: string }): ErdRelationship {
     return {

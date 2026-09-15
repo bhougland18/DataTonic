@@ -29,6 +29,7 @@ import {
     addHavingNode,
     canExcludeJoin,
     canReach,
+    cycleSort,
     excludeJoin,
     moveColumn,
     removeFilterNode,
@@ -51,6 +52,7 @@ import {
     type FilterNode,
     type JoinMode,
     type SelectedColumn,
+    type SortColumn,
 } from './builder-types';
 import type { ColumnOption } from './ColumnPicker';
 
@@ -89,6 +91,17 @@ export interface QueryBuilder {
     canExcludeJoin: (relationshipId: string) => boolean;
     moveColumn: (from: number, to: number) => void;
     removeColumn: (c: SelectedColumn) => void;
+    /** Cycle one column unsorted → ascending → descending → unsorted. */
+    cycleSort: (table: string, column: string) => void;
+    /** Which way a column is sorted, or undefined when it is not. */
+    sortDirOf: (table: string, column: string) => 'asc' | 'desc' | undefined;
+    /** Reorder the sort keys. ORDER BY is positional — the first key wins. */
+    moveSort: (from: number, to: number) => void;
+    /** Append a key. The caller picks a sensible column to start from. */
+    addSort: (table: string, column: string) => void;
+    removeSortAt: (index: number) => void;
+    /** Change one key's column or direction in place, keeping its priority. */
+    setSortAt: (index: number, patch: Partial<SortColumn>) => void;
     updateFilter: (node: FilterNode) => void;
     addFilter: (groupId: string, child: FilterNode) => void;
     removeFilter: (id: string) => void;
@@ -239,6 +252,62 @@ export function useQueryBuilder({
             [state, relationships],
         ),
         moveColumn: useCallback((from: number, to: number) => setState(b => moveColumn(b, from, to)), []),
+        cycleSort: useCallback(
+            (table: string, column: string) => setState(b => cycleSort(b, table, column)),
+            [],
+        ),
+        sortDirOf: useCallback(
+            (table: string, column: string) =>
+                state.sort.find(
+                    s =>
+                        s.table.toLowerCase() === table.toLowerCase() &&
+                        s.column.toLowerCase() === column.toLowerCase(),
+                )?.dir,
+            [state.sort],
+        ),
+        // ORDER BY is POSITIONAL — the first key decides, later ones only break
+        // its ties — so the order of this list is a real choice, not a display
+        // detail, and has to be reorderable.
+        moveSort: useCallback(
+            (from: number, to: number) =>
+                setState(b => {
+                    const sort = [...b.sort];
+                    const [moved] = sort.splice(from, 1);
+                    if (!moved) return b;
+                    sort.splice(to, 0, moved);
+                    return { ...b, sort };
+                }),
+            [],
+        ),
+        addSort: useCallback(
+            (table: string, column: string) =>
+                setState(b =>
+                    // Never twice: a column already in ORDER BY sorts no harder
+                    // for being named again, and the duplicate row would be a
+                    // control that does nothing.
+                    b.sort.some(
+                        s =>
+                            s.table.toLowerCase() === table.toLowerCase() &&
+                            s.column.toLowerCase() === column.toLowerCase(),
+                    )
+                        ? b
+                        : { ...b, sort: [...b.sort, { table, column, dir: 'asc' }] },
+                ),
+            [],
+        ),
+        removeSortAt: useCallback(
+            (index: number) =>
+                setState(b => ({ ...b, sort: b.sort.filter((_, i) => i !== index) })),
+            [],
+        ),
+        setSortAt: useCallback(
+            (index: number, patch: Partial<SortColumn>) =>
+                setState(b => ({
+                    ...b,
+                    sort: b.sort.map((s, i) => (i === index ? { ...s, ...patch } : s)),
+                })),
+            [],
+        ),
         removeColumn: useCallback(
             (c: SelectedColumn) =>
                 setState(b => toggleColumn(b, c.table, c.column, relationships)),

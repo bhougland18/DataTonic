@@ -67,18 +67,25 @@ export function chartContext(
      * is answering a question nobody asked.
      */
     chosen?: ChartSpecState | null,
+    /** Key columns, so the pane's advice matches the strip's verdicts. */
+    identifiers?: ReadonlySet<string>,
 ): string {
     if (!result || result.error || result.columns.length === 0) return '';
 
-    const fields = fieldsFromColumns(result.columns);
+    const fields = fieldsFromColumns(result.columns, identifiers);
     const lines: string[] = [
         'THE RESULT CURRENTLY ON SCREEN',
         `${result.rows.length} row${result.rows.length === 1 ? '' : 's'}. Columns, with their Vega-Lite types:`,
     ];
+    // The type the MATCHER uses, not `vlTypeOf` alone. A key column is retyped
+    // a category, and reporting the raw answer here would have the pane telling
+    // somebody `Vendor` is a number while every verdict treats it as a label.
+    const byName = new Map(fields.map(f => [f.name, f.vlType]));
     for (const c of result.columns) {
-        const vl = vlTypeOf(c.type);
+        const vl = byName.get(c.name) ?? vlTypeOf(c.type);
+        const key = identifiers?.has(c.name) ? ' (a key, so a category)' : '';
         lines.push(
-            `  - ${c.name}: ${c.type ?? 'unknown'} -> ${vl ?? 'not chartable'}`,
+            `  - ${c.name}: ${c.type ?? 'unknown'} -> ${vl ?? 'not chartable'}${key}`,
         );
     }
 

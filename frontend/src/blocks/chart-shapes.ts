@@ -188,14 +188,70 @@ export function vlTypeOf(duckdbType?: string): VlType | null {
  *
  * Column ORDER is preserved and load-bearing: where several columns share a
  * type, the matcher takes the first, which is the order the person put them in.
+ *
+ * `identifiers` names the columns that are KEYS rather than measures. Nothing
+ * in a column's type can say that — see the note on the parameter — so the
+ * caller supplies it from what the workspace already records.
  */
-export function fieldsFromColumns(columns: SqlStudioColumn[]): Field[] {
+export function fieldsFromColumns(
+    columns: SqlStudioColumn[],
+    /**
+     * Columns that identify a row rather than measure it.
+     *
+     * A foreign key is an integer, so `vlTypeOf` calls it `quantitative` and
+     * every chart wanting a number accepts it. The damage that did was not
+     * subtle: over `Vendor`(int64) / `VendorName` / `count`, a LINE CHART
+     * ranked first with vendor ID NUMBERS along the x axis — and the bar chart,
+     * which was right, was offered with the ID as its bar heights, because
+     * `Vendor` precedes `count` among the quantitative columns.
+     *
+     * Retyped `nominal`, not dropped: counting by vendor ID is a real chart,
+     * and an ID makes a perfectly good category. What it is not is a magnitude.
+     *
+     * OPTIONAL, and unknown stays unknown — the same rule `aggregated` follows.
+     * The SQL Editor node has no ER model to ask, so it passes nothing and
+     * behaves exactly as before rather than guessing from column names.
+     */
+    identifiers?: ReadonlySet<string>,
+): Field[] {
     const out: Field[] = [];
     for (const c of columns) {
         const vlType = vlTypeOf(c.type);
-        if (vlType) out.push({ name: c.name, vlType });
+        if (!vlType) continue;
+        // Only a NUMERIC key needs retyping; a text key is already a category,
+        // and a temporal one is a date somebody joined on and still a date.
+        const isKey = vlType === 'quantitative' && identifiers?.has(c.name);
+        out.push({ name: c.name, vlType: isKey ? 'nominal' : vlType });
     }
     return out;
+}
+
+/**
+ * The key columns an ER model and a probe between them declare.
+ *
+ * Both halves are RECORDED FACTS rather than inference: a relationship is a
+ * join somebody drew (or confirmed), and a primary key comes from the probe.
+ * That is the same standard `builder-sql.ts` holds itself to, and it is why
+ * this can be trusted enough to change a chart's verdict — a heuristic on
+ * column names would be wrong often enough to make the whole matcher
+ * ignorable.
+ *
+ * Matched by column NAME, because that is all a result carries. A column
+ * called `Vendor` in an unrelated query is therefore also read as a key, which
+ * is the right answer nearly always and a harmless one otherwise: it becomes a
+ * category instead of a measure.
+ */
+export function identifierColumns(
+    relationships: { fromColumn: string; toColumn: string }[],
+    columns: SqlStudioColumn[] = [],
+): Set<string> {
+    const keys = new Set<string>();
+    for (const r of relationships) {
+        if (r.fromColumn) keys.add(r.fromColumn);
+        if (r.toColumn) keys.add(r.toColumn);
+    }
+    for (const c of columns) if (c.primaryKey) keys.add(c.name);
+    return keys;
 }
 
 // ---------------------------------------------------------------------------

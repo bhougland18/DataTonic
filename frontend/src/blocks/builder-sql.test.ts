@@ -688,3 +688,140 @@ describe('aggregatesFor', () => {
     });
 });
 
+
+// Ben's real model, 2026-09-15. `PurchaseOrder` and `PurchaseOrderLine` are
+// related on BOTH `PurchaseOrder` and `Company` — a composite key, entered as
+// two relationships because that is how the ERD records them.
+//
+// Joining on only the first does not fail. It multiplies rows, and the symptom
+// was two vendors numbered 2 with identical sums: a total quietly too large.
+const COMPOSITE_TABLES = [
+    t('Vendor', ['Company', 'Vendor', 'VendorName'], 'duckle_src."Vendor"'),
+    t('PurchaseOrder', ['Company', 'PurchaseOrder', 'Vendor'], 'duckle_src."PurchaseOrder"'),
+    t(
+        'PurchaseOrderLine',
+        ['Company', 'PurchaseOrder', 'Quantity'],
+        'duckle_src."PurchaseOrderLine"',
+    ),
+];
+
+const COMPOSITE_RELS: ErdRelationship[] = [
+    {
+        id: 'v-po',
+        fromTable: 'Vendor',
+        fromColumn: 'Vendor',
+        toTable: 'PurchaseOrder',
+        toColumn: 'Vendor',
+    },
+    {
+        id: 'po-pol-key',
+        fromTable: 'PurchaseOrder',
+        fromColumn: 'PurchaseOrder',
+        toTable: 'PurchaseOrderLine',
+        toColumn: 'PurchaseOrder',
+    },
+    {
+        id: 'po-pol-company',
+        fromTable: 'PurchaseOrder',
+        fromColumn: 'Company',
+        toTable: 'PurchaseOrderLine',
+        toColumn: 'Company',
+    },
+];
+
+describe('composite keys join on every column', () => {
+    const state = build({
+        anchor: 'Vendor',
+        columns: [col('Vendor', 'VendorName'), col('PurchaseOrderLine', 'Quantity')],
+        joins: [
+            { relationshipId: 'v-po', mode: 'inner' },
+            { relationshipId: 'po-pol-key', mode: 'inner' },
+        ],
+    });
+    const sql = generateSql(state, {
+        tables: COMPOSITE_TABLES,
+        relationships: COMPOSITE_RELS,
+    });
+
+    it('ANDs the second arm into the same ON clause', () => {
+        expect(sql).toContain('PurchaseOrder.PurchaseOrder = PurchaseOrderLine.PurchaseOrder');
+        expect(sql).toContain('PurchaseOrder.Company = PurchaseOrderLine.Company');
+    });
+
+    // The arm nothing selected still has to come along: a composite key is a
+    // fact about the schema, not something anybody ticked.
+    it('emits ONE join, not two', () => {
+        expect(sql.match(/JOIN duckle_src\."PurchaseOrderLine"/g)?.length).toBe(1);
+    });
+
+    it('leaves a single-column join alone', () => {
+        expect(sql).toContain('ON Vendor.Vendor = PurchaseOrder.Vendor');
+        expect(sql).not.toMatch(/ON Vendor\.Vendor[^\n]*\n AND/);
+    });
+
+    // Ruling out a route can mean ruling out one arm of a key.
+    it('honours an exclusion on the extra arm', () => {
+        const without = generateSql(
+            { ...state, excludedJoins: ['po-pol-company'] },
+            { tables: COMPOSITE_TABLES, relationships: COMPOSITE_RELS },
+        );
+        expect(without).not.toContain('PurchaseOrderLine.Company');
+    });
+});
+
+// Sorting by a column that is SUMMARISED. The raw column is gone once anything
+// is grouped, and DuckDB says so: `column "Quantity" must appear in the GROUP BY
+// clause or be part of an aggregate`. Hit live on 2026-09-15.
+describe('ORDER BY in an aggregated query', () => {
+    const grouped = (sort: BuilderState['sort']) =>
+        generateSql(
+            build({
+                anchor: 'Item',
+                columns: [
+                    col('Item', 'ItemGroup'),
+                    col('Item', 'Item', { aggregate: 'count' }),
+                ],
+                sort,
+            }),
+            opts,
+        );
+
+    it('orders by the aggregate alias, not the raw column', () => {
+        const sql = grouped([{ table: 'Item', column: 'Item', dir: 'desc' }]);
+        expect(sql).toContain('ORDER BY "count Item.Item" DESC');
+        expect(sql).not.toMatch(/ORDER BY Item\.Item/);
+    });
+
+    // A grouping key survives under its own name, so it sorts as itself.
+    it('orders by a GROUP BY key directly', () => {
+        expect(grouped([{ table: 'Item', column: 'ItemGroup', dir: 'asc' }])).toContain(
+            'ORDER BY Item.ItemGroup',
+        );
+    });
+
+    it('leaves an unaggregated query alone', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'Item',
+                columns: [col('Item', 'Item')],
+                sort: [{ table: 'Item', column: 'Item', dir: 'asc' }],
+            }),
+            opts,
+        );
+        expect(sql).toContain('ORDER BY Item.Item');
+    });
+
+    // One column both grouped and summarised: the grouping key is the one that
+    // still exists under its own name.
+    it('prefers the grouping key when a column is both', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'Item',
+                columns: [col('Item', 'Item'), col('Item', 'Item', { aggregate: 'count' })],
+                sort: [{ table: 'Item', column: 'Item', dir: 'asc' }],
+            }),
+            opts,
+        );
+        expect(sql).toContain('ORDER BY Item.Item');
+    });
+});

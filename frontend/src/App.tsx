@@ -1735,6 +1735,7 @@ export default function App() {
                 tables,
                 relationships: model.relationships,
                 hiddenRelations: persisted?.hiddenRelations ?? [],
+                positions: persisted?.positions,
             }));
             setMode('erd');
         },

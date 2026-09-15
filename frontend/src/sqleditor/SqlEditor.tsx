@@ -28,6 +28,7 @@ import { useQueryBuilder } from '../blocks/useQueryBuilder';
 import BuilderPanel from '../blocks/BuilderPanel';
 import FiltersPanel from '../blocks/FiltersPanel';
 import SelectedColumns from '../blocks/SelectedColumns';
+import SortList from '../blocks/SortList';
 import { addressOf } from '../blocks/join-insert';
 import { distinctValues, type ValueOption } from '../blocks/distinct-values';
 import { countRules, emptyBuilder, type BuilderState } from '../blocks/builder-types';
@@ -227,6 +228,19 @@ export default function SqlEditor({
                     selectedCount={qb.state.columns.length}
                     filterCount={countRules(qb.state.filters)}
                     havingCount={countRules(qb.state.having)}
+                    sortCount={qb.state.sort.length}
+                    sort={
+                        builderMode ? (
+                            <SortList
+                                sort={qb.state.sort}
+                                columns={qb.state.columns}
+                                onAdd={qb.addSort}
+                                onRemove={qb.removeSortAt}
+                                onChange={qb.setSortAt}
+                                onMove={qb.moveSort}
+                            />
+                        ) : undefined
+                    }
                     selected={
                         builderMode && qb.state.columns.length > 0 ? (
                             <SelectedColumns

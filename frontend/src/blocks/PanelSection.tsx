@@ -14,6 +14,20 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 
 export interface PanelSectionProps {
     title: string;
+    /**
+     * The SQL clause this section IS, shown small and quiet beside the title.
+     *
+     * "Filter" is what somebody is trying to do; `WHERE` is what it is called in
+     * the language they are generating. Naming only the first leaves the builder
+     * and the SQL below it looking like unrelated tools; naming only the second
+     * asks everyone to already know SQL, which is the thing the builder exists
+     * to not require.
+     *
+     * So both, with the plain word leading — and the clause quiet enough to be
+     * ignored by somebody who does not need it, and present enough to be learnt
+     * by somebody reading the generated query.
+     */
+    sqlName?: string;
     /** Right-aligned in the header — a count, or anything short. */
     badge?: ReactNode;
     /** Where the collapsed state is remembered. */
@@ -59,6 +73,7 @@ export function writePanelOpen(key: string, open: boolean): void {
 
 export default function PanelSection({
     title,
+    sqlName,
     badge,
     storageKey,
     shrink,
@@ -89,6 +104,11 @@ export default function PanelSection({
             >
                 {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                 <span className="blk-sec-title">{title}</span>
+                {/* Not inside the title span: the title truncates with an
+                    ellipsis when the panel is narrow, and the clause name would
+                    be the first thing eaten — which is the half somebody
+                    learning SQL is here for. */}
+                {sqlName ? <span className="blk-sec-sql">{sqlName}</span> : null}
                 {badge != null ? <span className="blk-sec-badge">{badge}</span> : null}
             </button>
             {open ? <div className="blk-sec-body">{children}</div> : null}

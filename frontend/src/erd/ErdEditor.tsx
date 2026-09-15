@@ -40,6 +40,9 @@ import './erd.css';
 export interface ErdSavedModel {
     relationships: ErdRelationship[];
     hiddenRelations: string[];
+    /** Canvas layout by table name. Optional so an older stored model, or a
+     *  host that does not keep one, still loads. */
+    positions?: Record<string, { x: number; y: number }>;
 }
 
 export interface ErdPersistence {
@@ -91,6 +94,17 @@ export default function ErdEditor({
     const [library, setLibrary] = useState<SavedJoin[]>([]);
     const [libraryOpen, setLibraryOpen] = useState(false);
     const [arrangeNonce, setArrangeNonce] = useState(0);
+
+    // The layout is held in TWO places on purpose.
+    //
+    // `loadedPositions` is what came from storage and is handed to the diagram
+    // to restore. `livePositions` is a ref the diagram writes back to as the
+    // user drags. Feeding drags back into the prop instead would re-enter the
+    // diagram's restore effect on every drag and snap the viewport back.
+    const [loadedPositions, setLoadedPositions] = useState<
+        Record<string, { x: number; y: number }> | undefined
+    >(undefined);
+    const livePositions = useRef<Record<string, { x: number; y: number }>>({});
 
     // Seeding state as REFS, not state. Writing a flag inside the effect that
     // also depends on it makes the effect re-run and cancel its own in-flight
@@ -146,6 +160,8 @@ export default function ErdEditor({
                     ),
                 );
                 setHiddenRelations(saved.hiddenRelations);
+                setLoadedPositions(saved.positions);
+                livePositions.current = saved.positions ?? {};
                 setSaveState('idle');
             })
             .catch(() => {
@@ -177,10 +193,20 @@ export default function ErdEditor({
 
     const save = useCallback(async () => {
         setSaveState('saving');
-        const ok = await io.current.save({ relationships, hiddenRelations });
+        const ok = await io.current.save({
+            relationships,
+            hiddenRelations,
+            positions: livePositions.current,
+        });
         setSaveState(ok ? 'saved' : 'idle');
         if (!ok) notify.current?.('Could not save the ER model.');
     }, [relationships, hiddenRelations]);
+
+    /** A moved table is unsaved work, so Save stops reading as done. */
+    const onPositionsChange = useCallback((p: Record<string, { x: number; y: number }>) => {
+        livePositions.current = p;
+        setSaveState(s => (s === 'saved' ? 'idle' : s));
+    }, []);
 
     // ---- Join library ----
 
@@ -326,6 +352,8 @@ export default function ErdEditor({
                     arrangeNonce={arrangeNonce}
                     onSaveJoins={saveJoins}
                     savedJoinIds={savedJoinIds}
+                    positions={loadedPositions}
+                    onPositionsChange={onPositionsChange}
                 />
             </div>
         </div>
