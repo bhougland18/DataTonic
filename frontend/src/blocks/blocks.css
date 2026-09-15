@@ -1435,6 +1435,79 @@
     font-size: 11px;
 }
 
+/* ---- CASE branches, inside the transformation dialog ---- */
+.blk-xfd-branches {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+/* Boxed, because a branch contains a whole filter tree and without an edge you
+   cannot see where one condition stops and the next starts. */
+.blk-xfd-branch {
+    padding: 4px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+.blk-xfd-branch-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 2px 2px;
+}
+.blk-xfd-when,
+.blk-xfd-then > span {
+    color: var(--accent);
+    font-size: 10px;
+    text-transform: uppercase;
+}
+.blk-xfd-then {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 2px 0;
+}
+.blk-xfd-then input[type='text'],
+.blk-xfd-then > input {
+    flex: 1;
+    min-width: 0;
+    padding: 2px 5px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-1);
+    font: inherit;
+    font-size: 11.5px;
+}
+.blk-xfd-iscol {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 3px;
+    color: var(--text-3);
+    font-size: 10px;
+    cursor: pointer;
+}
+.blk-xfd-addbranch {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 4px;
+    background: none;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    color: var(--text-2);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+.blk-xfd-addbranch:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
 /* ---- Column picker ---- */
 .blk-colpick {
     position: relative;

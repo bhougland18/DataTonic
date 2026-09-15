@@ -19,11 +19,13 @@
 // only shows up when somebody moves a query between the graph and the builder.
 
 import { quoteIdent } from '../erd/model';
+import { filterNodeSql } from './filter-sql';
 import {
     aggregatesFor,
     isNumericType,
     isTemporalType,
     type Aggregate,
+    type CaseBranch,
     type ColumnTransform,
     type TransformArg,
     type TransformKind,
@@ -79,6 +81,18 @@ export interface TransformOp {
      * `undefined` means "same as the input, or not worth claiming".
      */
     resultType?: (inputType?: string) => string | undefined;
+    /**
+     * Why these arguments cannot become SQL yet, or null when they can.
+     *
+     * `params` says which boxes must be non-empty; this says whether what is IN
+     * them makes sense. `1.10` is not a date and `Q1` is not a number, and both
+     * would reach DuckDB as a syntax error — in a query built entirely from
+     * controls, which is the thing the builder exists to make impossible.
+     *
+     * The message is shown in the dialog, so it is written for the person
+     * filling the box in.
+     */
+    validate?: (args: Record<string, TransformArg>) => string | null;
 }
 
 /** A scalar arg as a string; array args are not scalars and read as empty. */
@@ -166,8 +180,125 @@ const dateTrunc: TransformOp = {
     resultType: () => 'TIMESTAMP',
 };
 
+// ---------------------------------------------------------------------------
+// Literal — a fixed value on every row
+// ---------------------------------------------------------------------------
+//
+// The only operation that reads no column. Cheap, and genuinely useful: a
+// hard-coded label is how results from several queries get stacked into one
+// report and stay tellable apart.
+
+const LITERAL_TYPES = ['text', 'number', 'date'];
+
+/**
+ * A typed constant.
+ *
+ * The TYPE is asked for rather than guessed from the text. `2026` is a
+ * perfectly good label for a column of years, and sniffing would quietly turn
+ * it into a number; `1.10` is a version, and a number would make it `1.1`.
+ */
+function literalSql(value: string, type: string): string {
+    if (type === 'number') return value.trim();
+    if (type === 'date') return `DATE ${sqlString(value.trim())}`;
+    return sqlString(value);
+}
+
+const literal: TransformOp = {
+    id: 'literal',
+    kind: 'literal',
+    label: 'Fixed value',
+    accepts: () => true,
+    params: [
+        {
+            name: 'type',
+            label: 'Type',
+            type: 'choice',
+            options: LITERAL_TYPES,
+            default: 'text',
+        },
+        { name: 'value', label: 'Value', type: 'text', hint: 'The same on every row.' },
+    ],
+    sql: (_col, args) => literalSql(argText(args, 'value'), argText(args, 'type')),
+    resultType: () => undefined,
+    // A number that is not one, or a date DuckDB will not read, is a syntax
+    // error rather than a wrong answer — and it would be a syntax error in a
+    // query somebody built entirely from controls, which is the thing the
+    // builder exists to make impossible.
+    validate: args => {
+        const value = argText(args, 'value').trim();
+        const type = argText(args, 'type') || 'text';
+        if (type === 'number' && !/^-?\d+(\.\d+)?$/.test(value)) {
+            return 'That is not a number.';
+        }
+        if (type === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+            return 'Dates are YYYY-MM-DD.';
+        }
+        return null;
+    },
+};
+
+// ---------------------------------------------------------------------------
+// Case — different values under different conditions
+// ---------------------------------------------------------------------------
+
+/** A branch's THEN: a column reference, or a quoted literal. */
+function branchValue(b: CaseBranch): string {
+    const v = b.then.trim();
+    if (!b.thenIsColumn) return sqlString(b.then);
+    // `Table.Column`, quoted per part. Without `thenIsColumn` the generator
+    // could not tell `'Vendor'` the word from `Vendor` the column, and getting
+    // that wrong is silent — you get the word, on every row.
+    const dot = v.indexOf('.');
+    return dot < 0 ? quoteIdent(v) : `${quoteIdent(v.slice(0, dot))}.${quoteIdent(v.slice(dot + 1))}`;
+}
+
+const caseOp: TransformOp = {
+    id: 'case',
+    kind: 'case',
+    label: 'When / then',
+    accepts: () => true,
+    params: [
+        { name: 'branches', label: 'Conditions', type: 'branches' },
+        {
+            name: 'else',
+            label: 'Otherwise',
+            type: 'text',
+            optional: true,
+            hint: 'Left empty, anything that matches no condition comes back null.',
+        },
+    ],
+    sql: (_col, args) => {
+        const branches = Array.isArray(args.branches) ? (args.branches as CaseBranch[]) : [];
+        const whens = branches
+            .map(b => {
+                const when = filterNodeSql(b.when);
+                return when === null ? null : `WHEN ${when} THEN ${branchValue(b)}`;
+            })
+            .filter((s): s is string => s !== null);
+        const otherwise = argText(args, 'else').trim();
+        // No ELSE is legal and returns NULL — measured. So an empty box means
+        // "leave the rest alone" rather than an unfinished expression.
+        const tail = otherwise === '' ? '' : ` ELSE ${sqlString(otherwise)}`;
+        return `CASE ${whens.join(' ')}${tail} END`;
+    },
+    // Every branch's own condition has to be finished. An incomplete one is
+    // dropped by `filterNodeSql`, and a CASE that silently lost a branch gives
+    // wrong answers rather than failing.
+    validate: args => {
+        const branches = Array.isArray(args.branches) ? (args.branches as CaseBranch[]) : [];
+        if (branches.length === 0) return 'Add at least one condition.';
+        if (branches.some(b => filterNodeSql(b.when) === null)) {
+            return 'Every condition needs filling in.';
+        }
+        if (branches.some(b => b.then.trim() === '')) return 'Every condition needs a value.';
+        return null;
+    },
+};
+
 export const TRANSFORM_OPS: TransformOp[] = [
     dateTrunc,
+    literal,
+    caseOp,
     aggregateOp('sum'),
     aggregateOp('avg'),
     aggregateOp('count'),
@@ -214,13 +345,32 @@ export function transformExpression(t: ColumnTransform): string | null {
  * column has since been dropped — not something half-typed.
  */
 export function transformIsComplete(t: ColumnTransform): boolean {
+    return transformProblem(t) === null;
+}
+
+/**
+ * What stops this transformation becoming SQL, said in words.
+ *
+ * One function rather than a boolean and a separate message, so the dialog
+ * cannot disable the button for one reason while explaining another.
+ */
+export function transformProblem(t: ColumnTransform): string | null {
     const op = opById(t.op);
-    if (!op) return false;
-    if (!t.alias.trim()) return false;
-    // `count` alone may stand without a column: that is `count(*)`.
-    const needsColumn = !(t.kind === 'aggregate' && t.op === 'count');
-    if (needsColumn && !(t.table && t.column)) return false;
-    return op.params.every(p => p.optional || argText(t.args, p.name).trim() !== '');
+    if (!op) return t.op ? `"${t.op}" is no longer available.` : 'Pick an operation.';
+    if (!t.alias.trim()) return 'Give the column a name.';
+    // Three kinds need no column of their own: `count` alone is `count(*)`, a
+    // ROW count; a literal reads nothing at all; and a CASE names its columns
+    // inside its branches, where this record cannot see them.
+    const needsColumn =
+        !(t.kind === 'aggregate' && t.op === 'count') &&
+        t.kind !== 'literal' &&
+        t.kind !== 'case';
+    if (needsColumn && !(t.table && t.column)) return 'Pick a column.';
+    const missing = op.params.find(
+        p => !p.optional && p.type !== 'branches' && argText(t.args, p.name).trim() === '',
+    );
+    if (missing) return `${missing.label} is empty.`;
+    return op.validate?.(t.args) ?? null;
 }
 
 /**

@@ -6,9 +6,18 @@ import {
     suggestedAlias,
     transformExpression,
     transformIsComplete,
+    transformProblem,
     TRANSFORM_OPS,
 } from './transform-ops';
-import { aggregatesFor, newTransform, type ColumnTransform } from './builder-types';
+import {
+    aggregatesFor,
+    newCaseBranch,
+    newGroup,
+    newTransform,
+    type CaseBranch,
+    type ColumnTransform,
+} from './builder-types';
+import { isGroupingTransform } from './builder-sql';
 
 const t = (over: Partial<ColumnTransform> = {}): ColumnTransform => ({
     ...newTransform('aggregate', 'sum'),
@@ -155,5 +164,136 @@ describe('the catalog itself', () => {
     it('has no duplicate operation ids', () => {
         const ids = TRANSFORM_OPS.map(o => o.id);
         expect(new Set(ids).size).toBe(ids.length);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Literal and Case (DAA.117)
+// ---------------------------------------------------------------------------
+
+const lit = (value: string, type: string, alias = 'Period'): ColumnTransform => ({
+    ...newTransform('literal', 'literal'),
+    args: { value, type },
+    alias,
+});
+
+describe('literal', () => {
+    it('quotes text', () => {
+        expect(transformExpression(lit('Q1', 'text'))).toBe("'Q1'");
+    });
+
+    it('escapes a quote in the text', () => {
+        expect(transformExpression(lit("O'Brien", 'text'))).toBe("'O''Brien'");
+    });
+
+    it('writes a number bare', () => {
+        expect(transformExpression(lit('42', 'number'))).toBe('42');
+    });
+
+    it('spells a date out as DuckDB reads it', () => {
+        expect(transformExpression(lit('2026-01-01', 'date'))).toBe("DATE '2026-01-01'");
+    });
+
+    // The only kind that reads nothing at all. Anything assuming a source
+    // column breaks here.
+    it('needs no column', () => {
+        expect(transformIsComplete(lit('Q1', 'text'))).toBe(true);
+    });
+
+    // A syntax error in a query built entirely from controls is the thing the
+    // builder exists to make impossible.
+    it('refuses a number that is not one, and says why', () => {
+        expect(transformProblem(lit('Q1', 'number'))).toBe('That is not a number.');
+    });
+
+    it('refuses a date DuckDB would not read', () => {
+        expect(transformProblem(lit('01/01/2026', 'date'))).toBe('Dates are YYYY-MM-DD.');
+    });
+
+    it('still asks for a name', () => {
+        expect(transformProblem(lit('Q1', 'text', '  '))).toBe('Give the column a name.');
+    });
+
+    it('is not a grouping key — DuckDB folds a constant', () => {
+        expect(isGroupingTransform(lit('Q1', 'text'))).toBe(false);
+    });
+});
+
+describe('case', () => {
+    const branch = (
+        col: string,
+        value: string,
+        then: string,
+        thenIsColumn = false,
+    ): CaseBranch => ({
+        ...newCaseBranch(),
+        when: newGroup('and', [
+            {
+                id: `r-${col}-${value}`,
+                kind: 'rule' as const,
+                table: 'Vendor',
+                column: col,
+                op: 'starts with' as const,
+                values: [value],
+            },
+        ]),
+        then,
+        thenIsColumn,
+    });
+
+    const caseOf = (branches: CaseBranch[], otherwise?: string): ColumnTransform => ({
+        ...newTransform('case', 'case'),
+        args: otherwise === undefined ? { branches } : { branches, else: otherwise },
+        alias: 'Band',
+    });
+
+    it('builds a WHEN / THEN / ELSE', () => {
+        expect(transformExpression(caseOf([branch('VendorName', 'M', 'M vendors')], 'other'))).toBe(
+            "CASE WHEN Vendor.VendorName LIKE 'M%' THEN 'M vendors' ELSE 'other' END",
+        );
+    });
+
+    // Measured: `CASE WHEN 1=2 THEN 'x' END` returns NULL rather than failing,
+    // so an empty box means "leave the rest alone".
+    it('omits ELSE when it is empty', () => {
+        const sql = transformExpression(caseOf([branch('VendorName', 'M', 'M vendors')]));
+        expect(sql).toBe("CASE WHEN Vendor.VendorName LIKE 'M%' THEN 'M vendors' END");
+    });
+
+    it('keeps the branches in order, because CASE takes the first match', () => {
+        const sql = transformExpression(
+            caseOf([branch('VendorName', 'M', 'first'), branch('VendorName', 'Me', 'second')]),
+        );
+        expect(sql?.indexOf('first')).toBeLessThan(sql?.indexOf('second') ?? -1);
+    });
+
+    // Without `thenIsColumn` the generator cannot tell the word from the
+    // column, and guessing wrong is silent.
+    it('tells a column THEN from a text THEN', () => {
+        expect(transformExpression(caseOf([branch('VendorName', 'M', 'Vendor.VendorName', true)])))
+            .toContain('THEN Vendor.VendorName');
+        expect(transformExpression(caseOf([branch('VendorName', 'M', 'Vendor.VendorName')])))
+            .toContain("THEN 'Vendor.VendorName'");
+    });
+
+    it('asks for at least one condition', () => {
+        expect(transformProblem(caseOf([]))).toBe('Add at least one condition.');
+    });
+
+    // A dropped branch gives wrong answers rather than failing, so an
+    // unfinished one must stop the whole thing.
+    it('refuses a branch whose condition is unfinished', () => {
+        const empty = { ...newCaseBranch(), then: 'x' };
+        expect(transformProblem(caseOf([empty]))).toBe('Every condition needs filling in.');
+    });
+
+    it('refuses a branch with no value', () => {
+        expect(transformProblem(caseOf([branch('VendorName', 'M', '   ')]))).toBe(
+            'Every condition needs a value.',
+        );
+    });
+
+    it('IS a grouping key', () => {
+        expect(isGroupingTransform(caseOf([branch('VendorName', 'M', 'x')]))).toBe(true);
     });
 });
