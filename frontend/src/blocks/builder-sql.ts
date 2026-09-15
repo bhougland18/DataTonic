@@ -34,6 +34,22 @@ import {
 const COMMA_INDENT = '     , ';
 
 /**
+ * A multi-line expression, shifted to sit under the clause that introduces it.
+ *
+ * A CASE is emitted one branch per line, and dropped into a SELECT list as-is
+ * it would start under `SELECT ` and then jump back to column zero — which is
+ * worse than the single line it replaced. The first line keeps its prefix; the
+ * rest are indented to match it.
+ *
+ * Single-line expressions, which is nearly all of them, pass straight through.
+ */
+function indented(expr: string, width: number): string {
+    if (!expr.includes('\n')) return expr;
+    const pad = ' '.repeat(width);
+    return expr.split('\n').join(`\n${pad}`);
+}
+
+/**
  * The expression a column contributes, without its output name.
  *
  * Bucket first, aggregate outermost: `count(date_trunc('month', x))` counts the
@@ -234,7 +250,9 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
         ...transforms.map(transformSelect).filter((s): s is string => s !== null),
     ];
     selectParts.forEach((part, i) => {
-        lines.push(`${i === 0 ? 'SELECT ' : COMMA_INDENT}${part}`);
+        // Both prefixes are seven wide, so a wrapped expression lines up under
+        // either of them.
+        lines.push(`${i === 0 ? 'SELECT ' : COMMA_INDENT}${indented(part, 7)}`);
     });
 
     // FROM, then the joins in the order they were added. Order is already
@@ -352,7 +370,7 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
             // the raw column in the other is the mistake this control exists to
             // stop people making by hand — and it does not error, it groups by
             // the day and labels it the month.
-            lines.push(`${i === 0 ? 'GROUP BY ' : '       , '}${expr}`);
+            lines.push(`${i === 0 ? 'GROUP BY ' : '       , '}${indented(expr, 9)}`);
         });
     }
 

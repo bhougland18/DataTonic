@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+    addrOf,
     argText,
     opById,
     opsFor,
@@ -247,9 +248,16 @@ describe('case', () => {
         alias: 'Band',
     });
 
-    it('builds a WHEN / THEN / ELSE', () => {
+    // One branch per LINE. Four conditions on one line is a horizontal scroll
+    // bar, and generated SQL nobody can read is not worth generating.
+    it('builds a WHEN / THEN / ELSE, one per line', () => {
         expect(transformExpression(caseOf([branch('VendorName', 'M', 'M vendors')], 'other'))).toBe(
-            "CASE WHEN Vendor.VendorName LIKE 'M%' THEN 'M vendors' ELSE 'other' END",
+            [
+                'CASE',
+                "    WHEN Vendor.VendorName LIKE 'M%' THEN 'M vendors'",
+                "    ELSE 'other'",
+                'END',
+            ].join('\n'),
         );
     });
 
@@ -257,7 +265,9 @@ describe('case', () => {
     // so an empty box means "leave the rest alone".
     it('omits ELSE when it is empty', () => {
         const sql = transformExpression(caseOf([branch('VendorName', 'M', 'M vendors')]));
-        expect(sql).toBe("CASE WHEN Vendor.VendorName LIKE 'M%' THEN 'M vendors' END");
+        expect(sql).toBe(
+            ['CASE', "    WHEN Vendor.VendorName LIKE 'M%' THEN 'M vendors'", 'END'].join('\n'),
+        );
     });
 
     it('keeps the branches in order, because CASE takes the first match', () => {
@@ -295,5 +305,68 @@ describe('case', () => {
 
     it('IS a grouping key', () => {
         expect(isGroupingTransform(caseOf([branch('VendorName', 'M', 'x')]))).toBe(true);
+    });
+});
+
+// The ELSE can name a column too, not only a literal. Same reasoning as THEN:
+// without the flag the generator cannot tell `'Vendor'` the word from `Vendor`
+// the column, and getting it wrong is silent.
+describe('case otherwise', () => {
+    const b: CaseBranch = {
+        ...newCaseBranch(),
+        when: newGroup('and', [
+            {
+                id: 'r',
+                kind: 'rule',
+                table: 'Vendor',
+                column: 'VendorName',
+                op: 'starts with',
+                values: ['M'],
+            },
+        ]),
+        then: 'M vendors',
+    };
+    const withElse = (value: string, isColumn: boolean): ColumnTransform => ({
+        ...newTransform('case', 'case'),
+        args: { branches: [b], else: value, elseIsColumn: isColumn ? 'yes' : '' },
+        alias: 'Band',
+    });
+
+    it('quotes a literal otherwise', () => {
+        expect(transformExpression(withElse('other', false))).toContain("ELSE 'other'");
+    });
+
+    it('references a picked column', () => {
+        expect(transformExpression(withElse(addrOf('Vendor', 'VendorName'), true))).toContain(
+            'ELSE Vendor.VendorName',
+        );
+    });
+
+    // The case that killed the free-text version: this workspace has a table
+    // called `item_norm.parquet`, so there is no dot to split on that is right
+    // in both directions. Encoded, the pair survives intact.
+    it('survives a table name containing a dot', () => {
+        expect(transformExpression(withElse(addrOf('item_norm.parquet', 'Item'), true))).toContain(
+            'ELSE "item_norm.parquet".Item',
+        );
+    });
+
+    it('quotes a column name that needs it', () => {
+        expect(transformExpression(withElse(addrOf('Item', 'Qty On Hand'), true))).toContain(
+            'ELSE Item."Qty On Hand"',
+        );
+    });
+
+    // Saved before the encoding, or typed by hand. Split at the LAST dot: a
+    // table may contain one, a column name far less often.
+    it('still reads a plain Table.Column written by hand', () => {
+        expect(transformExpression(withElse('Vendor.VendorName', true))).toContain(
+            'ELSE Vendor.VendorName',
+        );
+    });
+
+    // Still optional: no ELSE is legal and returns NULL.
+    it('omits it entirely when empty, whatever the flag says', () => {
+        expect(transformExpression(withElse('', true))).not.toContain('ELSE');
     });
 });

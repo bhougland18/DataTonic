@@ -95,6 +95,34 @@ export interface TransformOp {
     validate?: (args: Record<string, TransformArg>) => string | null;
 }
 
+/**
+ * `Table.Column` as ONE value, since a column name alone is ambiguous.
+ *
+ * Encoded, not joined with a separator. Every separator can turn up in a real
+ * name: this workspace holds a table called `item_norm.parquet`, so splitting
+ * `item_norm.parquet.Item` at the first dot addresses a table called
+ * `item_norm` and a column called `parquet.Item`, neither of which exists. It
+ * would not error — it would resolve to nothing, or to the wrong column.
+ *
+ * Lives here rather than in the dialog because the GENERATOR has to read what
+ * the dialog wrote, and one encoding with two owners drifts.
+ */
+export function addrOf(table: string, column: string): string {
+    return JSON.stringify([table, column]);
+}
+
+export function unaddr(v: string): [string, string] {
+    try {
+        const [table, column] = JSON.parse(v) as [string, string];
+        return [table ?? '', column ?? ''];
+    } catch {
+        // Typed by hand, or saved before this was encoded. Split at the LAST
+        // dot: a table may contain one, a column name far less often.
+        const i = v.lastIndexOf('.');
+        return i < 0 ? ['', v] : [v.slice(0, i), v.slice(i + 1)];
+    }
+}
+
 /** A scalar arg as a string; array args are not scalars and read as empty. */
 export function argText(args: Record<string, TransformArg>, name: string): string {
     const v = args[name];
@@ -241,15 +269,17 @@ const literal: TransformOp = {
 // Case — different values under different conditions
 // ---------------------------------------------------------------------------
 
-/** A branch's THEN: a column reference, or a quoted literal. */
-function branchValue(b: CaseBranch): string {
-    const v = b.then.trim();
-    if (!b.thenIsColumn) return sqlString(b.then);
-    // `Table.Column`, quoted per part. Without `thenIsColumn` the generator
-    // could not tell `'Vendor'` the word from `Vendor` the column, and getting
-    // that wrong is silent — you get the word, on every row.
-    const dot = v.indexOf('.');
-    return dot < 0 ? quoteIdent(v) : `${quoteIdent(v.slice(0, dot))}.${quoteIdent(v.slice(dot + 1))}`;
+/**
+ * A THEN or an ELSE: a column reference, or a quoted literal.
+ *
+ * The flag is not a convenience. Without it the generator cannot tell
+ * `'Vendor'` the word from `Vendor` the column, and getting that wrong is
+ * silent — you get the word, on every row, and nothing errors.
+ */
+function valueSql(text: string, isColumn?: boolean): string {
+    if (!isColumn) return sqlString(text);
+    const [table, column] = unaddr(text.trim());
+    return table ? `${quoteIdent(table)}.${quoteIdent(column)}` : quoteIdent(column);
 }
 
 const caseOp: TransformOp = {
@@ -257,29 +287,35 @@ const caseOp: TransformOp = {
     kind: 'case',
     label: 'When / then',
     accepts: () => true,
-    params: [
-        { name: 'branches', label: 'Conditions', type: 'branches' },
-        {
-            name: 'else',
-            label: 'Otherwise',
-            type: 'text',
-            optional: true,
-            hint: 'Left empty, anything that matches no condition comes back null.',
-        },
-    ],
+    // Only the branches. A CASE gets a bespoke editor, and that editor owns the
+    // ELSE too — it belongs with the WHENs it completes, not in a field below
+    // them under a different name.
+    params: [{ name: 'branches', label: 'Conditions', type: 'branches' }],
     sql: (_col, args) => {
         const branches = Array.isArray(args.branches) ? (args.branches as CaseBranch[]) : [];
         const whens = branches
             .map(b => {
                 const when = filterNodeSql(b.when);
-                return when === null ? null : `WHEN ${when} THEN ${branchValue(b)}`;
+                return when === null
+                    ? null
+                    : `WHEN ${when} THEN ${valueSql(b.then, b.thenIsColumn)}`;
             })
             .filter((s): s is string => s !== null);
         const otherwise = argText(args, 'else').trim();
         // No ELSE is legal and returns NULL — measured. So an empty box means
         // "leave the rest alone" rather than an unfinished expression.
-        const tail = otherwise === '' ? '' : ` ELSE ${sqlString(otherwise)}`;
-        return `CASE ${whens.join(' ')}${tail} END`;
+        const tail =
+            otherwise === ''
+                ? []
+                : [`ELSE ${valueSql(otherwise, argText(args, 'elseIsColumn') === 'yes')}`];
+        // One branch per LINE. A case with four conditions on one line is a
+        // horizontal scroll bar in the editor, and the whole point of
+        // generating readable SQL is that somebody can check it. Indented four
+        // from the CASE, which `builder-sql` then shifts under whichever clause
+        // it lands in.
+        return ['CASE', ...whens.map(w => `    ${w}`), ...tail.map(e => `    ${e}`), 'END'].join(
+            '\n',
+        );
     },
     // Every branch's own condition has to be finished. An incomplete one is
     // dropped by `filterNodeSql`, and a CASE that silently lost a branch gives

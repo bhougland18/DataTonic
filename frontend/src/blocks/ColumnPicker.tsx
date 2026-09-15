@@ -44,16 +44,30 @@ export interface ColumnPickerProps {
     options: ColumnOption[];
     onChange: (option: ColumnOption) => void;
     className?: string;
+    /** Shown while nothing is chosen. The place to say what empty MEANS. */
+    placeholder?: string;
 }
 
 /** What the field shows and what typing is matched against. */
-const label = (o: ColumnOption) =>
-    o.label ??
-    (o.aggregate && o.aggregate !== 'none'
+const label = (o: ColumnOption) => {
+    if (o.label) return o.label;
+    // Nothing chosen yet reads as EMPTY, not as `.`. The field then shows its
+    // placeholder and is ready to be typed into — a default sitting in the box
+    // has to be deleted before it can be searched, which is the opposite of
+    // helpful.
+    if (!o.table && !o.column) return '';
+    return o.aggregate && o.aggregate !== 'none'
         ? `${o.aggregate}(${o.table}.${o.column})`
-        : `${o.table}.${o.column}`);
+        : `${o.table}.${o.column}`;
+};
 
-export default function ColumnPicker({ value, options, onChange, className }: ColumnPickerProps) {
+export default function ColumnPicker({
+    value,
+    options,
+    onChange,
+    className,
+    placeholder = 'Column',
+}: ColumnPickerProps) {
     const [typed, setTyped] = useState<string | null>(null);
     const [open, setOpen] = useState(false);
     const box = useRef<HTMLDivElement>(null);
@@ -86,7 +100,7 @@ export default function ColumnPicker({ value, options, onChange, className }: Co
         <div className={`blk-colpick${className ? ` ${className}` : ''}`} ref={box}>
             <input
                 value={typed ?? label(value)}
-                placeholder="Column"
+                placeholder={placeholder}
                 onChange={e => {
                     setTyped(e.target.value);
                     setOpen(true);

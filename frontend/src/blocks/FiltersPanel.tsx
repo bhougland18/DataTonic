@@ -42,6 +42,8 @@ export interface FiltersPanelProps {
      * so it builds the options.
      */
     options: ColumnOption[];
+    /** Which column a newly added rule starts on. Defaults to the first. */
+    seed?: ColumnOption;
     onUpdate: (node: FilterNode) => void;
     onAdd: (groupId: string, child: FilterNode) => void;
     onRemove: (id: string) => void;
@@ -58,6 +60,7 @@ export interface FiltersPanelProps {
 export default function FiltersPanel({
     root,
     options,
+    seed,
     onUpdate,
     onAdd,
     onRemove,
@@ -68,6 +71,7 @@ export default function FiltersPanel({
             <GroupEditor
                 group={root}
                 options={options}
+                seed={seed}
                 depth={0}
                 onUpdate={onUpdate}
                 onAdd={onAdd}
@@ -81,6 +85,7 @@ export default function FiltersPanel({
 function GroupEditor({
     group,
     options,
+    seed,
     depth,
     onUpdate,
     onAdd,
@@ -89,12 +94,18 @@ function GroupEditor({
 }: {
     group: FilterGroup;
     options: ColumnOption[];
+    seed?: ColumnOption;
     depth: number;
     onUpdate: (node: FilterNode) => void;
     onAdd: (groupId: string, child: FilterNode) => void;
     onRemove: (id: string) => void;
     fetchValues?: (table: string, column: string) => Promise<ValueOption[]>;
 }) {
+    // What a NEW rule starts on. The first option is only a fallback: a CASE
+    // branch should start on the column the case is about, and defaulting to
+    // whatever happens to be first in the catalog is how somebody builds three
+    // conditions on the wrong column without noticing. Seen in the wild.
+    const start = seed ?? options[0];
     const first = options[0];
     return (
         <div className={`blk-fgroup${depth > 0 ? ' blk-fgroup--nested' : ''}`}>
@@ -125,7 +136,7 @@ function GroupEditor({
                     onClick={() =>
                         onAdd(
                             group.id,
-                            newRule(first?.table ?? '', first?.column ?? '', first?.aggregate),
+                            newRule(start?.table ?? '', start?.column ?? '', start?.aggregate),
                         )
                     }
                     disabled={!first}
@@ -174,6 +185,7 @@ function GroupEditor({
                         key={child.id}
                         group={child}
                         options={options}
+                        seed={seed}
                         depth={depth + 1}
                         onUpdate={onUpdate}
                         onAdd={onAdd}
