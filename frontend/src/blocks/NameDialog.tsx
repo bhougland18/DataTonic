@@ -13,6 +13,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useBackdropDismiss } from './backdrop';
 
 export interface NameDialogProps {
     title: string;
@@ -69,13 +70,12 @@ export default function NameDialog({
         if (trimmed) onSubmit(trimmed, descriptionLabel ? description.trim() : undefined);
     };
 
+    // A press that began inside the dialog is not a click-away, however far
+    // the mouse travelled before it was released.
+    const backdrop = useBackdropDismiss(onCancel);
+
     return createPortal(
-        <div
-            className="blk-modal-backdrop"
-            onClick={e => {
-                if (e.target === e.currentTarget) onCancel();
-            }}
-        >
+        <div className="blk-modal-backdrop" {...backdrop}>
             <div className="blk-modal" role="dialog" aria-modal="true">
                 <div className="blk-modal-title">{title}</div>
                 <div className="blk-modal-body">
