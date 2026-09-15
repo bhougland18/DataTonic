@@ -18,8 +18,13 @@ import type { SqlStudioTable } from './types';
  * Turning the catalog into a picker.
  *
  * Optional, so the node's SQL Studio — which has no builder — gets exactly the
- * read-only tree it had before. When present, every row grows a checkbox and a
- * ticked column grows an aggregate control.
+ * read-only tree it had before. When present, every row grows a checkbox.
+ *
+ * A checkbox and nothing else, deliberately. This tree answers WHICH COLUMNS;
+ * what they become is Column Transformations' question, and for a while this
+ * row answered both — an aggregate dropdown, then a date bucket beside it — in
+ * a list that scrolls past several hundred entries. Anything tempted back in
+ * here belongs there instead.
  */
 export interface CatalogSelection {
     /** Is this column in the query? */
@@ -27,24 +32,9 @@ export interface CatalogSelection {
     onToggle: (column: string) => void;
     /** The table-level checkbox: tick or clear every column. */
     onToggleAll: () => void;
-    /** Current aggregate for a ticked column, and how to change it. */
-    aggregateOf?: (column: string) => string;
-    onAggregate?: (column: string, aggregate: string) => void;
-    /** Which aggregates this column's TYPE allows — `sum` over a VARCHAR does
-     *  not run, so it is not offered. */
-    aggregatesFor?: (column: string) => string[];
-    /** Current date bucket for a ticked column, and how to change it. */
-    bucketOf?: (column: string) => string;
-    onBucket?: (column: string, bucket: string) => void;
-    /** Which date buckets this column's TYPE allows — EMPTY for anything that
-     *  is not temporal, which is how the control stays absent rather than
-     *  appearing disabled on every column in the catalog. */
-    bucketsFor?: (column: string) => string[];
     /** Off when the ER model cannot connect this table to the query. */
     reachable?: boolean;
 }
-
-const AGGREGATES = ['none', 'count', 'count distinct', 'sum', 'avg', 'min', 'max'];
 
 export interface CatalogTableProps {
     table: SqlStudioTable;
@@ -119,11 +109,6 @@ export default function CatalogTable({
                 <div className="sqlstudio-cols">
                     {table.columns.map(c => {
                         const ticked = selection?.isSelected(c.name) ?? false;
-                        // Empty on every non-temporal column, which is almost
-                        // all of them — so the second control appears on the
-                        // handful of dates rather than being a disabled slot
-                        // down the whole catalog.
-                        const buckets = selection?.bucketsFor?.(c.name) ?? [];
                         return (
                             <div className="sqlstudio-col" key={c.name}>
                                 {selection ? (
@@ -138,47 +123,17 @@ export default function CatalogTable({
                                 ) : null}
                                 <span className="cn">{c.name}</span>
                                 {c.primaryKey && <span className="pk">PK</span>}
-                                {/* The TYPE is dropped once this is a picker
-                                    (plan §4): everything here is VARCHAR, so it
-                                    distinguishes nothing, and the space is
-                                    better spent on the aggregate. */}
-                                {!selection && c.type && <span className="ty">{c.type}</span>}
-                                {ticked && selection?.onAggregate ? (
-                                    <select
-                                        className="sqlstudio-agg"
-                                        value={selection.aggregateOf?.(c.name) ?? 'none'}
-                                        onChange={e =>
-                                            selection.onAggregate?.(c.name, e.target.value)
-                                        }
-                                        title="Summarise this column"
-                                        aria-label={`Aggregate for ${c.name}`}
-                                    >
-                                        {(selection.aggregatesFor?.(c.name) ?? AGGREGATES).map(
-                                            a => (
-                                                <option key={a} value={a}>
-                                                    {a === 'none' ? '—' : a}
-                                                </option>
-                                            ),
-                                        )}
-                                    </select>
-                                ) : null}
-                                {ticked && selection?.onBucket && buckets.length > 0 ? (
-                                    <select
-                                        className="sqlstudio-agg sqlstudio-bucket"
-                                        value={selection.bucketOf?.(c.name) ?? 'none'}
-                                        onChange={e =>
-                                            selection.onBucket?.(c.name, e.target.value)
-                                        }
-                                        title="Round this date before grouping — the control that turns a timestamp per row into a trend"
-                                        aria-label={`Date bucket for ${c.name}`}
-                                    >
-                                        {buckets.map(b => (
-                                            <option key={b} value={b}>
-                                                {b === 'none' ? '—' : `by ${b}`}
-                                            </option>
-                                        ))}
-                                    </select>
-                                ) : null}
+                                {/* The TYPE is back, and now it earns its place.
+                                    It was dropped when this row carried an
+                                    aggregate dropdown, on the grounds that every
+                                    column was VARCHAR so the type distinguished
+                                    nothing. Both halves of that have changed:
+                                    columns are properly typed since 2af12706,
+                                    and the controls have moved to Column
+                                    Transformations - so the space is free and
+                                    the type is the thing that tells you what you
+                                    can DO with the column. */}
+                                {c.type && <span className="ty">{c.type}</span>}
                             </div>
                         );
                     })}

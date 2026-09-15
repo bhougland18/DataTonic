@@ -73,6 +73,10 @@ export interface BuilderPanelProps {
     onRestoreJoin?: (relationshipId: string) => void;
     canExcludeJoin?: (relationshipId: string) => boolean;
 
+    /** The Column Transformations section — every computed column. */
+    transforms?: ReactNode;
+    transformCount?: number;
+
     selected?: ReactNode;
     selectedCount?: number;
     filters?: ReactNode;
@@ -91,6 +95,8 @@ export default function BuilderPanel({
     sql,
     onChangeSql,
     selectionFor,
+    transforms,
+    transformCount,
     activeJoins,
     onSetJoinMode,
     onAddJoinTable,
@@ -270,6 +276,22 @@ export default function BuilderPanel({
                 connect. The joins list is passed the UNFILTERED tables: the
                 search narrows what you are reading, and a join whose table is
                 hidden by a search term still has to insert the real address. */}
+            {/* Above Column Ordering, because this is where a column comes
+                INTO existence and that section only arranges what exists. Also
+                labelled `select`: both build the same clause, and pretending
+                otherwise to avoid the repetition would be the dishonest half
+                of the convention. */}
+            {transforms ? (
+                <PanelSection
+                    title="Column Transformations"
+                    sqlName="select"
+                    storageKey="duckle.builder.sec.transforms"
+                    badge={transformCount}
+                >
+                    {transforms}
+                </PanelSection>
+            ) : null}
+
             {selected ? (
                 <PanelSection
                     title="Column Ordering"

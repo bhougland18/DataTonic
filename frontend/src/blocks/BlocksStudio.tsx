@@ -1,5 +1,6 @@
 import './blocks.css';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { normalizeBuilder } from './builder-ops';
 import {
     AlertTriangle,
     ChartNoAxesCombined,
@@ -41,6 +42,7 @@ import SavedQueriesPanel from './SavedQueriesPanel';
 import UnsavedQueryDialog from './UnsavedQueryDialog';
 import SelectedColumns from './SelectedColumns';
 import SortList from './SortList';
+import TransformsPanel from './TransformsPanel';
 import { chartContext } from './chart-context';
 import { addressOf } from './join-insert';
 import { useQueryBuilder } from './useQueryBuilder';
@@ -826,7 +828,7 @@ export default function BlocksStudio({
             setActiveQueryId(sameQuery?.id ?? null);
             setAiDraft(null);
             if (dive.builder) {
-                qb.setState(dive.builder);
+                qb.setState(normalizeBuilder(dive.builder));
                 setBuilderMode(true);
             } else {
                 qb.reset();
@@ -1081,7 +1083,7 @@ export default function BlocksStudio({
             setActiveQueryId(q.id);
             setAiDraft(null);
             if (q.builder) {
-                qb.setState(q.builder);
+                qb.setState(normalizeBuilder(q.builder));
                 setBuilderMode(true);
             } else {
                 qb.reset();
@@ -1402,6 +1404,18 @@ export default function BlocksStudio({
                             onExcludeJoin={builderMode ? qb.excludeJoin : undefined}
                             onRestoreJoin={builderMode ? qb.restoreJoin : undefined}
                             canExcludeJoin={builderMode ? qb.canExcludeJoin : undefined}
+                            transformCount={(builder.transforms ?? []).length || undefined}
+                            transforms={
+                                builderMode ? (
+                                    <TransformsPanel
+                                        transforms={builder.transforms ?? []}
+                                        tables={paneTables}
+                                        onUpsert={qb.upsertTransform}
+                                        onRemove={qb.removeTransform}
+                                        onToggle={qb.setTransformEnabled}
+                                    />
+                                ) : undefined
+                            }
                             selectedCount={builder.columns.length}
                             filterCount={countRules(builder.filters)}
                             havingCount={countRules(builder.having)}

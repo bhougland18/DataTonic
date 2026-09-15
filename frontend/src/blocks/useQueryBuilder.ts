@@ -35,8 +35,9 @@ import {
     removeFilterNode,
     removeHavingNode,
     restoreJoin,
-    setAggregate,
-    setBucket,
+    removeTransform,
+    setTransformEnabled,
+    upsertTransform,
     setJoinMode,
     tablesInScope,
     toggleAllColumns,
@@ -46,11 +47,8 @@ import {
     updateHavingNode,
 } from './builder-ops';
 import {
-    aggregatesFor,
-    bucketsFor,
     emptyBuilder,
-    type Aggregate,
-    type DateBucket,
+    type ColumnTransform,
     type BuilderState,
     type FilterNode,
     type JoinMode,
@@ -87,6 +85,9 @@ export interface QueryBuilder {
     selectionFor: (table: SqlStudioTable) => CatalogSelection;
 
     // Every edit, named for what it does rather than for the module it lives in.
+    upsertTransform: (transform: ColumnTransform) => void;
+    removeTransform: (id: string) => void;
+    setTransformEnabled: (id: string, enabled: boolean) => void;
     addJoinTable: (rel: ErdRelationship) => void;
     setJoinMode: (relationshipId: string, mode: JoinMode) => void;
     excludeJoin: (relationshipId: string) => void;
@@ -194,26 +195,6 @@ export function useQueryBuilder({
                         relationships,
                     ),
                 ),
-            aggregateOf: column =>
-                state.columns.find(
-                    c =>
-                        c.table.toLowerCase() === table.name.toLowerCase() &&
-                        c.column.toLowerCase() === column.toLowerCase(),
-                )?.aggregate ?? 'none',
-            onAggregate: (column, aggregate) =>
-                setState(b => setAggregate(b, table.name, column, aggregate as Aggregate)),
-            aggregatesFor: column =>
-                aggregatesFor(table.columns.find(c => c.name === column)?.type),
-            bucketOf: column =>
-                state.columns.find(
-                    c =>
-                        c.table.toLowerCase() === table.name.toLowerCase() &&
-                        c.column.toLowerCase() === column.toLowerCase(),
-                )?.bucket ?? 'none',
-            onBucket: (column, bucket) =>
-                setState(b => setBucket(b, table.name, column, bucket as DateBucket)),
-            bucketsFor: column =>
-                bucketsFor(table.columns.find(c => c.name === column)?.type),
             reachable: canReach(state, table.name, relationships),
         }),
         [state, relationships],
@@ -245,6 +226,21 @@ export function useQueryBuilder({
         excludedJoinIds,
         aggregated,
         selectionFor,
+        // Computed columns. Every edit goes through `upsertTransform` rather
+        // than patching `state.transforms` here, because adding one can pull a
+        // whole table into the query and that is `rebuildJoins`' job.
+        upsertTransform: useCallback(
+            (t: ColumnTransform) => setState(b => upsertTransform(b, t, relationships)),
+            [relationships],
+        ),
+        removeTransform: useCallback(
+            (id: string) => setState(b => removeTransform(b, id, relationships)),
+            [relationships],
+        ),
+        setTransformEnabled: useCallback(
+            (id: string, enabled: boolean) => setState(b => setTransformEnabled(b, id, enabled)),
+            [],
+        ),
         addJoinTable,
         setJoinMode: useCallback(
             (id: string, mode: JoinMode) => setState(b => setJoinMode(b, id, mode)),

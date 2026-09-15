@@ -46,6 +46,10 @@ export interface SqlCatalogPanelProps {
     onChangeSql: (next: string) => void;
     /** Present only in builder mode — turns the catalog into a column picker. */
     selectionFor?: (table: SqlStudioTable) => CatalogSelection;
+    /** The Column Transformations section, above Column Ordering. */
+    transforms?: ReactNode;
+    /** How many computed columns there are, for the section's badge. */
+    transformCount?: number;
     /** The selected-columns list, rendered between tables and joins. */
     selected?: ReactNode;
     /** How many columns are selected, for the section's badge. */

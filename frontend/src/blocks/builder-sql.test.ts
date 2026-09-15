@@ -28,7 +28,13 @@ import {
 } from './builder-types';
 import type { SqlStudioTable } from '../sqleditor/types';
 import type { ErdRelationship } from '../erd/model';
-import { requiredTables } from './builder-ops';
+import {
+    normalizeBuilder,
+    removeTransform,
+    requiredTables,
+    setTransformEnabled,
+    upsertTransform,
+} from './builder-ops';
 import { vlTypeOf } from './chart-shapes';
 
 const t = (name: string, cols: string[], from: string): SqlStudioTable => ({
@@ -1233,5 +1239,203 @@ describe('requiredTables counts transformations', () => {
             ],
         });
         expect(requiredTables(state)).toContain('PurchaseOrderLine');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Transform state operations (DAA.112)
+// ---------------------------------------------------------------------------
+
+describe('transform state operations', () => {
+    const rels = RELS;
+
+    const sumOf = (table: string, column: string): ColumnTransform => ({
+        ...newTransform('aggregate', 'sum'),
+        table,
+        column,
+        alias: `sum ${table}.${column}`,
+    });
+
+    it('adds a transformation', () => {
+        const next = upsertTransform(
+            build({ anchor: 'Item', columns: [col('Item', 'Item')] }),
+            sumOf('Item', 'ItemGroup'),
+            rels,
+        );
+        expect(next.transforms).toHaveLength(1);
+    });
+
+    it('replaces one with the same id rather than adding a second', () => {
+        const first = sumOf('Item', 'ItemGroup');
+        const state = upsertTransform(
+            build({ anchor: 'Item', columns: [col('Item', 'Item')] }),
+            first,
+            rels,
+        );
+        const next = upsertTransform(state, { ...first, alias: 'Renamed' }, rels);
+        expect(next.transforms).toHaveLength(1);
+        expect(next.transforms?.[0].alias).toBe('Renamed');
+    });
+
+    // A transformation can be the ONLY reason a table is in the query, so
+    // adding one has to pull it in through the ER model exactly as ticking a
+    // column does — and removing it has to let it go again.
+    it('brings a table in, and lets it go again', () => {
+        const start = build({ anchor: 'Item', columns: [col('Item', 'Item')] });
+        const t = sumOf('Vendor', 'VendorName');
+        const added = upsertTransform(start, t, rels);
+        expect(added.joins.length).toBeGreaterThan(0);
+
+        const removed = removeTransform(added, t.id, rels);
+        expect(removed.transforms).toEqual([]);
+        expect(removed.joins).toEqual([]);
+    });
+
+    // Deliberate: `requiredTables` counts switched-off transformations, so
+    // toggling one back on cannot silently restructure the FROM chain.
+    it('keeps the joins when one is switched off', () => {
+        const t = sumOf('Vendor', 'VendorName');
+        const added = upsertTransform(
+            build({ anchor: 'Item', columns: [col('Item', 'Item')] }),
+            t,
+            rels,
+        );
+        const off = setTransformEnabled(added, t.id, false);
+        expect(off.transforms?.[0].enabled).toBe(false);
+        expect(off.joins).toEqual(added.joins);
+    });
+
+    it('leaves the other transformations alone when one is toggled', () => {
+        const a = sumOf('Item', 'ItemGroup');
+        const b = { ...sumOf('Item', 'Description'), id: 'second' };
+        let state = build({ anchor: 'Item', columns: [col('Item', 'Item')] });
+        state = upsertTransform(state, a, rels);
+        state = upsertTransform(state, b, rels);
+        const next = setTransformEnabled(state, a.id, false);
+        expect(next.transforms?.find(t => t.id === b.id)?.enabled).toBeUndefined();
+    });
+
+    // Every one of these must survive a state that predates the field.
+    it('works on a saved query that has no transforms key', () => {
+        const old = { ...build({ anchor: 'Item', columns: [col('Item', 'Item')] }) };
+        delete (old as { transforms?: unknown }).transforms;
+        expect(() => upsertTransform(old, sumOf('Item', 'ItemGroup'), rels)).not.toThrow();
+        expect(() => removeTransform(old, 'nope', rels)).not.toThrow();
+        expect(() => setTransformEnabled(old, 'nope', false)).not.toThrow();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Migration of saved queries (DAA.114)
+// ---------------------------------------------------------------------------
+//
+// The catalog's aggregate and bucket dropdowns are gone, so a query saved under
+// the old shape would otherwise open with an aggregation nobody can change or
+// see a reason for. Worse, the generator reads both shapes: a column left
+// summarised AND selected becomes `sum(x)` in SELECT and `x` in GROUP BY at the
+// same time, which changes every number in the result.
+
+describe('normalizeBuilder', () => {
+    it('turns a summarised column into an aggregate transformation', () => {
+        const next = normalizeBuilder(
+            build({
+                anchor: 'Item',
+                columns: [
+                    col('Item', 'ItemGroup'),
+                    col('Item', 'Item', { aggregate: 'count' }),
+                ],
+            }),
+        );
+        expect(next.columns).toHaveLength(1);
+        expect(next.columns[0].column).toBe('ItemGroup');
+        expect(next.transforms).toHaveLength(1);
+        expect(next.transforms?.[0]).toMatchObject({
+            kind: 'aggregate',
+            op: 'count',
+            table: 'Item',
+            column: 'Item',
+        });
+    });
+
+    // The heading a saved query already produced must not change underneath
+    // somebody - it may be referenced by a chart or pasted into a report.
+    it('keeps the alias the query was already generating', () => {
+        const next = normalizeBuilder(
+            build({
+                anchor: 'Item',
+                columns: [col('Item', 'Item', { aggregate: 'count', alias: 'Items' })],
+            }),
+        );
+        expect(next.transforms?.[0].alias).toBe('Items');
+    });
+
+    it('defaults the alias to what the generator used to emit', () => {
+        const next = normalizeBuilder(
+            build({ anchor: 'Item', columns: [col('Item', 'Item', { aggregate: 'count' })] }),
+        );
+        expect(next.transforms?.[0].alias).toBe('count Item.Item');
+    });
+
+    it('turns a bucketed column into a date_trunc transformation', () => {
+        const next = normalizeBuilder(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'month' })],
+            }),
+        );
+        expect(next.transforms?.[0]).toMatchObject({
+            kind: 'function',
+            op: 'date_trunc',
+            args: { unit: 'month' },
+        });
+        expect(next.columns).toEqual([]);
+    });
+
+    // Chaining is out of scope, so `count(date_trunc(...))` cannot be expressed
+    // as one row. Two rows keeps both halves rather than dropping either.
+    it('splits a column that was both bucketed and summarised', () => {
+        const next = normalizeBuilder(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [
+                    col('PurchaseOrder', 'PurchaseOrderDate', {
+                        bucket: 'month',
+                        aggregate: 'count',
+                    }),
+                ],
+            }),
+        );
+        expect(next.transforms?.map(t => t.op)).toEqual(['date_trunc', 'count']);
+    });
+
+    it('leaves a query with nothing legacy in it completely alone', () => {
+        const state = build({ anchor: 'Item', columns: [col('Item', 'Item')] });
+        expect(normalizeBuilder(state)).toBe(state);
+    });
+
+    it('is idempotent', () => {
+        const once = normalizeBuilder(
+            build({ anchor: 'Item', columns: [col('Item', 'Item', { aggregate: 'count' })] }),
+        );
+        expect(normalizeBuilder(once)).toBe(once);
+    });
+
+    it('survives a saved query with no transforms key at all', () => {
+        const old = build({
+            anchor: 'Item',
+            columns: [col('Item', 'Item', { aggregate: 'count' })],
+        });
+        delete (old as { transforms?: unknown }).transforms;
+        expect(normalizeBuilder(old).transforms).toHaveLength(1);
+    });
+
+    // The whole point: the numbers must not move.
+    it('generates the same SQL before and after migration', () => {
+        const before = build({
+            anchor: 'Item',
+            columns: [col('Item', 'ItemGroup'), col('Item', 'Item', { aggregate: 'count' })],
+        });
+        const after = normalizeBuilder(before);
+        expect(generateSql(after, opts)).toBe(generateSql(before, opts));
     });
 });

@@ -1298,6 +1298,134 @@
     border-color: var(--accent-warn, #d9880a);
 }
 
+/* ---- Column transformations ---- */
+.blk-xforms {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.blk-xform {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 5px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+/* Dashed and warm, exactly as a half-built filter rule is: both mean "this
+   will be DROPPED from the SQL", and two ways of saying one thing would make
+   the second one need explaining. */
+.blk-xform--incomplete {
+    border-style: dashed;
+    border-color: var(--accent-warn, #d9880a);
+}
+/* The row itself is the edit affordance. A row you can only edit via a small
+   pencil is a row people click uselessly first. */
+.blk-xform-main {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    flex-direction: column;
+    gap: 1px;
+    padding: 0;
+    background: none;
+    border: 0;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+.blk-xform-name {
+    overflow: hidden;
+    color: var(--text-1);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.blk-xform-name i {
+    color: var(--text-3);
+}
+/* What it was built from, quiet - it is how you tell two similar rows apart,
+   not what you are scanning for. */
+.blk-xform-from {
+    overflow: hidden;
+    color: var(--text-3);
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.blk-xform-add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 4px;
+    background: none;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    color: var(--text-2);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+.blk-xform-add:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+.blk-xform-empty {
+    margin: 2px 2px 0;
+    color: var(--text-3);
+    font-size: 10px;
+    line-height: 1.4;
+}
+
+/* ---- The transformation dialog ---- */
+.blk-xfd {
+    width: 460px;
+    max-width: 92vw;
+}
+.blk-xfd-hint {
+    margin: -4px 0 8px;
+    color: var(--text-3);
+    font-size: 10px;
+}
+/* Said out loud rather than shown as an empty dropdown: a list that is empty
+   because of the COLUMN reads as a broken dialog. */
+.blk-xfd-none {
+    margin: -4px 0 8px;
+    color: var(--accent-warn, #d9880a);
+    font-size: 10px;
+}
+.blk-xfd-phint {
+    display: block;
+    margin-top: 2px;
+    color: var(--text-3);
+    font-size: 10px;
+    font-style: normal;
+}
+/* The live fragment. Monospace and wrapping, because a regex or a case is
+   long and truncating the one honest check in the dialog defeats it. */
+.blk-xfd-preview {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+    padding: 6px 8px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+.blk-xfd-preview span {
+    flex-shrink: 0;
+    color: var(--text-3);
+    font-size: 10px;
+    text-transform: uppercase;
+}
+.blk-xfd-preview code {
+    overflow-wrap: anywhere;
+    color: var(--accent);
+    font-size: 11px;
+}
+
 /* ---- Column picker ---- */
 .blk-colpick {
     position: relative;

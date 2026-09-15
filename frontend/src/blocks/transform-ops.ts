@@ -22,6 +22,7 @@ import { quoteIdent } from '../erd/model';
 import {
     aggregatesFor,
     isNumericType,
+    isTemporalType,
     type Aggregate,
     type ColumnTransform,
     type TransformArg,
@@ -132,7 +133,41 @@ function aggregateOp(agg: Exclude<Aggregate, 'none'>): TransformOp {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Function — dates first, which is what reporting asks for
+// ---------------------------------------------------------------------------
+
+/** Units `date_trunc` takes, coarsest last. */
+const TRUNC_UNITS = ['day', 'week', 'month', 'quarter', 'year'];
+
+const sqlString = (s: string) => `'${s.replace(/'/g, "''")}'`;
+
+const dateTrunc: TransformOp = {
+    id: 'date_trunc',
+    kind: 'function',
+    label: 'Round date to…',
+    // `date_trunc('month', <varchar>)` is `No function matches the given name
+    // and argument types` — measured. The same dead end `sum` over a VARCHAR
+    // is, so the operation is absent rather than present and broken.
+    accepts: isTemporalType,
+    params: [
+        {
+            name: 'unit',
+            label: 'Round to',
+            type: 'choice',
+            options: TRUNC_UNITS,
+            default: 'month',
+            hint: 'A raw timestamp per row is noise on a line chart; bucketed, it is a trend.',
+        },
+    ],
+    sql: (col, args) => `date_trunc(${sqlString(argText(args, 'unit'))}, ${col})`,
+    // TIMESTAMP even for a DATE input — measured, and surprising. Declared
+    // because the chart matcher reads this to call the column `temporal`.
+    resultType: () => 'TIMESTAMP',
+};
+
 export const TRANSFORM_OPS: TransformOp[] = [
+    dateTrunc,
     aggregateOp('sum'),
     aggregateOp('avg'),
     aggregateOp('count'),

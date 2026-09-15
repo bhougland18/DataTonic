@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { normalizeBuilder } from '../blocks/builder-ops';
 import {
     Database,
     Lock,
@@ -29,6 +30,7 @@ import BuilderPanel from '../blocks/BuilderPanel';
 import FiltersPanel from '../blocks/FiltersPanel';
 import SelectedColumns from '../blocks/SelectedColumns';
 import SortList from '../blocks/SortList';
+import TransformsPanel from '../blocks/TransformsPanel';
 import { addressOf } from '../blocks/join-insert';
 import { distinctValues, type ValueOption } from '../blocks/distinct-values';
 import { countRules, emptyBuilder, type BuilderState } from '../blocks/builder-types';
@@ -88,7 +90,7 @@ export default function SqlEditor({
         // rather than in an effect on `builder`, so opening a DIFFERENT node
         // re-seeds — this editor stays mounted while you switch between them.
         const saved = openRequest.builder as BuilderState | undefined;
-        qb.setState(saved ?? emptyBuilder());
+        qb.setState(saved ? normalizeBuilder(saved) : emptyBuilder());
         setBuilderMode(!!saved);
         // First time this editor is opened, walk the SQL Studio tour once.
         maybeStartEditorTour('sql');
@@ -225,6 +227,18 @@ export default function SqlEditor({
                     onExcludeJoin={builderMode ? qb.excludeJoin : undefined}
                     onRestoreJoin={builderMode ? qb.restoreJoin : undefined}
                     canExcludeJoin={builderMode ? qb.canExcludeJoin : undefined}
+                    transformCount={(qb.state.transforms ?? []).length || undefined}
+                    transforms={
+                        builderMode ? (
+                            <TransformsPanel
+                                transforms={qb.state.transforms ?? []}
+                                tables={tables}
+                                onUpsert={qb.upsertTransform}
+                                onRemove={qb.removeTransform}
+                                onToggle={qb.setTransformEnabled}
+                            />
+                        ) : undefined
+                    }
                     selectedCount={qb.state.columns.length}
                     filterCount={countRules(qb.state.filters)}
                     havingCount={countRules(qb.state.having)}

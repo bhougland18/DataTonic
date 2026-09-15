@@ -10,7 +10,13 @@
 // unconstructable instead of detectable.
 
 import { parallelJoins, relationshipPath, type ErdRelationship } from '../erd/model';
-import { addToGroup, filterTables, removeNode, replaceNode } from './builder-types';
+import {
+    addToGroup,
+    filterTables,
+    newTransform,
+    removeNode,
+    replaceNode,
+} from './builder-types';
 import type {
     Aggregate,
     CaseBranch,
@@ -367,6 +373,130 @@ export function setBucket(
         columns: state.columns.map(c =>
             eq(c.table, table) && eq(c.column, column) ? { ...c, bucket } : c,
         ),
+    };
+}
+
+/**
+ * Bring a saved query up to date: legacy aggregates and buckets become
+ * transformations.
+ *
+ * Aggregation used to live on `SelectedColumn.aggregate`, and date bucketing on
+ * `.bucket`, both edited from dropdowns in the catalog tree. Those dropdowns are
+ * gone — the tree answers WHICH COLUMNS and nothing else now — so a query saved
+ * under the old shape would open with an aggregation nobody could change or see
+ * a reason for.
+ *
+ * Run on LOAD, at every point state enters the builder. `query-io` casts stored
+ * JSON straight back to `BuilderState` with no validation of its own, so this is
+ * the only place the old shape can be caught.
+ *
+ * The fields are CLEARED as they are converted. Leaving them would mean a column
+ * that is both summarised and a grouping key, and the generator reads both — the
+ * result would be `sum(x)` in SELECT and `x` in GROUP BY at the same time.
+ *
+ * Idempotent: state with nothing legacy in it comes back untouched, so calling
+ * it twice, or on a new query, costs nothing.
+ */
+export function normalizeBuilder(state: BuilderState): BuilderState {
+    const legacy = state.columns.filter(
+        c => (c.aggregate ?? 'none') !== 'none' || (c.bucket ?? 'none') !== 'none',
+    );
+    if (legacy.length === 0) return state;
+
+    const migrated: ColumnTransform[] = [];
+    for (const c of legacy) {
+        const agg = c.aggregate ?? 'none';
+        const bucket = c.bucket ?? 'none';
+        // A column that was BOTH bucketed and aggregated becomes two rows, not
+        // one: chaining is out of scope, so `count(date_trunc(…))` cannot be
+        // expressed, and the two halves are independently useful. Rare enough
+        // that splitting is better than dropping either.
+        if (bucket !== 'none') {
+            migrated.push({
+                ...newTransform('function', 'date_trunc'),
+                table: c.table,
+                column: c.column,
+                args: { unit: bucket },
+                alias: `${bucket} ${c.table}.${c.column}`,
+            });
+        }
+        if (agg !== 'none') {
+            migrated.push({
+                ...newTransform('aggregate', agg),
+                table: c.table,
+                column: c.column,
+                // The alias it was already generating, so a saved query's
+                // column headings do not change under somebody.
+                alias: c.alias ?? `${agg} ${c.table}.${c.column}`,
+            });
+        }
+    }
+
+    return {
+        ...state,
+        // The summarised column stops being a SELECTED column: it is now a
+        // transformation reading the same source. Left in, it would also become
+        // a grouping key and quietly change every number in the result.
+        columns: state.columns.filter(
+            c => (c.aggregate ?? 'none') === 'none' && (c.bucket ?? 'none') === 'none',
+        ),
+        transforms: [...(state.transforms ?? []), ...migrated],
+    };
+}
+
+/**
+ * Add, replace or drop one computed column.
+ *
+ * `rebuildJoins` runs on every one of these, because a transformation can be
+ * the ONLY reason a table is in the query — adding "sum of Line.Quantity" to a
+ * query about purchase orders has to bring `PurchaseOrderLine` in through the
+ * ER model, and removing it has to let the table go again. Exactly what
+ * ticking a column does, for the same reason.
+ */
+export function upsertTransform(
+    state: BuilderState,
+    transform: ColumnTransform,
+    relationships: ErdRelationship[],
+): BuilderState {
+    const existing = state.transforms ?? [];
+    const has = existing.some(t => t.id === transform.id);
+    return rebuildJoins(
+        {
+            ...state,
+            transforms: has
+                ? existing.map(t => (t.id === transform.id ? transform : t))
+                : [...existing, transform],
+        },
+        relationships,
+    );
+}
+
+export function removeTransform(
+    state: BuilderState,
+    id: string,
+    relationships: ErdRelationship[],
+): BuilderState {
+    return rebuildJoins(
+        { ...state, transforms: (state.transforms ?? []).filter(t => t.id !== id) },
+        relationships,
+    );
+}
+
+/**
+ * Switch one on or off without deleting it.
+ *
+ * No rebuild: `requiredTables` deliberately counts switched-off
+ * transformations, so that toggling one back on cannot silently restructure
+ * the FROM chain underneath somebody.
+ */
+export function setTransformEnabled(
+    state: BuilderState,
+    id: string,
+    enabled: boolean,
+): BuilderState {
+    return {
+        ...state,
+        transforms: (state.transforms ?? []).map(t => (t.id === id ? { ...t, enabled } : t)),
     };
 }
 
