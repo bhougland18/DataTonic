@@ -111,11 +111,19 @@ export default function ColumnPicker({ value, options, onChange, className }: Co
                           style={{ left: at.left, top: at.top, width: at.width }}
                       >
                           {shown.slice(0, 60).map(o => (
-                              <li key={label(o)}>
+                              <li key={o.transformId ?? label(o)}>
                                   <button
                                       type="button"
                                       className={
-                                          label(o) === label(value)
+                                          // By ID for a computed column: two of
+                                          // them may share a name, and the
+                                          // label is no longer unique once the
+                                          // person is the one choosing it.
+                                          (
+                                              o.transformId || value.transformId
+                                                  ? o.transformId === value.transformId
+                                                  : label(o) === label(value)
+                                          )
                                               ? 'blk-colpick-on'
                                               : undefined
                                       }
@@ -127,7 +135,19 @@ export default function ColumnPicker({ value, options, onChange, className }: Co
                                           commit(o);
                                       }}
                                   >
-                                      {o.aggregate && o.aggregate !== 'none' ? (
+                                      {/* A computed column shows the name the
+                                          person gave it, and ONLY that. Its
+                                          source column is not a name for it:
+                                          two transformations routinely read one
+                                          column — a date rounded to a month and
+                                          to a year — and `Item.AddedDate`
+                                          listed twice says nothing about which
+                                          is which. The generated SQL already
+                                          refers to it by this name, so the list
+                                          and the query agree. */}
+                                      {o.label ? (
+                                          o.label
+                                      ) : o.aggregate && o.aggregate !== 'none' ? (
                                           <>
                                               {o.aggregate}(<i>{o.table}.</i>
                                               {o.column})
