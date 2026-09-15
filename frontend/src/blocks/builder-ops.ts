@@ -13,6 +13,8 @@ import { parallelJoins, relationshipPath, type ErdRelationship } from '../erd/mo
 import { addToGroup, filterTables, removeNode, replaceNode } from './builder-types';
 import type {
     Aggregate,
+    CaseBranch,
+    ColumnTransform,
     DateBucket,
     BuilderJoin,
     BuilderState,
@@ -44,7 +46,29 @@ export function requiredTables(state: BuilderState): string[] {
     for (const t of state.extraTables ?? []) add(t);
     for (const t of filterTables(state.filters)) add(t);
     for (const s of state.sort) add(s.table);
+    // Transformations reach tables too, and a transformation is often the ONLY
+    // reason a table is in the query — "count the order lines" needs
+    // `PurchaseOrderLine` without ticking a single column of it. Left out, the
+    // generator would emit `count(PurchaseOrderLine.…)` against a table absent
+    // from FROM, which is a binder error rather than a wrong answer, but an
+    // avoidable one.
+    //
+    // Switched-off transformations still count. Their table stays joined so
+    // that toggling one back on does not silently restructure the FROM chain.
+    for (const t of state.transforms ?? []) {
+        if (t.table) add(t.table);
+        // A case names its columns inside its branches, not on the record.
+        for (const b of caseBranchesOf(t)) for (const tb of filterTables(b.when)) add(tb);
+    }
     return out;
+}
+
+/** The branches of a `case`, or nothing. Args are loose, so this narrows once. */
+export function caseBranchesOf(t: ColumnTransform): CaseBranch[] {
+    const v = t.args.branches;
+    return Array.isArray(v) && v.every(x => typeof x === 'object' && x && 'when' in x)
+        ? (v as CaseBranch[])
+        : [];
 }
 
 /**

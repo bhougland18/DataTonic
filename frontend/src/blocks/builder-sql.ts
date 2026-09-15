@@ -13,13 +13,16 @@
 import { joinSql, parallelJoins, quoteIdent, type ErdRelationship } from '../erd/model';
 import { addressOf } from './join-insert';
 import type { SqlStudioTable } from '../sqleditor/types';
+import { transformExpression, transformIsComplete } from './transform-ops';
 import {
+    activeTransforms,
     filterIsComplete,
     isNumericAggregate,
     mapRules,
     type Aggregate,
     type DateBucket,
     type BuilderState,
+    type ColumnTransform,
     type FilterNode,
     type FilterRule,
     type SelectedColumn,
@@ -111,11 +114,23 @@ export function collidingNames(columns: SelectedColumn[]): Set<string> {
  * what it is — and that also settles most collisions before the collision rule
  * runs, since a count and a raw column no longer share a heading.
  */
-export function withCollisionAliases(columns: SelectedColumn[]): SelectedColumn[] {
+export function withCollisionAliases(
+    columns: SelectedColumn[],
+    /** Transformation output names, which occupy the same heading space. A
+     *  transformation called "Vendor" beside the Vendor column produces two
+     *  columns under one heading exactly as two Vendor columns would, and the
+     *  person NAMED that one - so the plain column is the one that gets
+     *  qualified. */
+    transforms: ColumnTransform[] = [],
+): SelectedColumn[] {
     const named = columns.map(c =>
         !c.alias && isTransformed(c) ? { ...c, alias: transformAlias(c) } : c,
     );
-    const clash = collidingNames(named);
+    const taken = new Set(transforms.map(t => t.alias.toLowerCase()));
+    const clash = new Set([
+        ...collidingNames(named),
+        ...named.filter(c => !c.alias && taken.has(c.column.toLowerCase())).map(c => c.column.toLowerCase()),
+    ]);
     return named.map(c =>
         !c.alias && clash.has(c.column.toLowerCase())
             ? { ...c, alias: `${c.table}.${c.column}` }
@@ -228,11 +243,54 @@ export interface GenerateOptions {
  * not a query, and emitting `SELECT FROM` would put a syntax error in front of
  * somebody who has simply not started yet.
  */
+/**
+ * Transformations that will actually reach the SQL.
+ *
+ * Incomplete ones are DROPPED rather than emitted broken, the same way an
+ * unfinished filter rule is. The modal will not let anybody create one, so a
+ * transformation failing this is either older than a parameter the operation
+ * has since gained, or one whose column has been removed from the catalog —
+ * both cases where emitting half an expression is worse than emitting nothing.
+ */
+export function emittableTransforms(state: BuilderState): ColumnTransform[] {
+    return activeTransforms(state.transforms).filter(transformIsComplete);
+}
+
+/**
+ * A transformation as a SELECT entry.
+ *
+ * Its alias is always quoted, unlike a column's. A transformation's name is
+ * something a person typed — "Total Qty", "% of Group" — and the ordinary path
+ * through `quoteIdent` would leave a bare `Total Qty` in the SQL.
+ */
+export function transformSelect(t: ColumnTransform): string | null {
+    const expr = transformExpression(t);
+    return expr === null ? null : `${expr} AS ${quoteIdent(t.alias)}`;
+}
+
+/**
+ * Does this transformation become a GROUP BY key when the query is grouped?
+ *
+ * `aggregate` is what CAUSES the grouping, so no. `window` is computed AFTER
+ * grouping and DuckDB rejects it in GROUP BY. `literal` is a constant, which
+ * DuckDB folds — measured: `SELECT 'Q1' AS period, Vendor, count(*) … GROUP BY
+ * Vendor` runs and returns `Q1` on every row, so listing it would be noise in
+ * the generated SQL for no behaviour.
+ *
+ * That leaves the scalar column transforms, which genuinely must appear.
+ */
+export function isGroupingTransform(t: ColumnTransform): boolean {
+    return t.kind === 'function' || t.kind === 'regex' || t.kind === 'case';
+}
+
 export function generateSql(state: BuilderState, opts: GenerateOptions): string {
     const { tables, relationships } = opts;
-    if (state.columns.length === 0 || !state.anchor) return '';
+    const transforms = emittableTransforms(state);
+    // A query can be nothing BUT transformations — "how many purchase orders
+    // are there" ticks no column at all. So the emptiness test counts both.
+    if ((state.columns.length === 0 && transforms.length === 0) || !state.anchor) return '';
 
-    const columns = withCollisionAliases(state.columns);
+    const columns = withCollisionAliases(state.columns, transforms);
     const lines: string[] = [];
 
     if (opts.title?.trim()) {
@@ -244,8 +302,17 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
     }
 
     // SELECT — leading commas so the list scans down the left edge.
-    columns.forEach((c, i) => {
-        lines.push(`${i === 0 ? 'SELECT ' : COMMA_INDENT}${selectExpression(c)}`);
+    //
+    // Ticked columns first, then computed ones. Output ORDER is Column
+    // Ordering's to own; this is only the order they are emitted in before
+    // anybody has said otherwise, and putting the source columns first is how
+    // a person reading the query back finds their bearings.
+    const selectParts = [
+        ...columns.map(selectExpression),
+        ...transforms.map(transformSelect).filter((s): s is string => s !== null),
+    ];
+    selectParts.forEach((part, i) => {
+        lines.push(`${i === 0 ? 'SELECT ' : COMMA_INDENT}${part}`);
     });
 
     // FROM, then the joins in the order they were added. Order is already
@@ -300,17 +367,31 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
     // GROUP BY is a consequence, never a separate choice (plan §6): the moment
     // anything is aggregated, everything that is not gets grouped. Nothing for
     // the user to keep consistent, and "must appear in GROUP BY" cannot happen.
-    const aggregated = columns.some(c => (c.aggregate ?? 'none') !== 'none');
+    // Grouping is still a CONSEQUENCE, never a choice (plan §6) — it is just
+    // that an aggregate can now arrive from either place while the old field
+    // is still being read.
+    const aggregated =
+        columns.some(c => (c.aggregate ?? 'none') !== 'none') ||
+        transforms.some(x => x.kind === 'aggregate');
     if (aggregated) {
-        const grouped = columns.filter(c => (c.aggregate ?? 'none') === 'none');
-        grouped.forEach((c, i) => {
+        const grouped: string[] = [
+            ...columns.filter(c => (c.aggregate ?? 'none') === 'none').map(columnExpression),
+            // A scalar transformation is a grouping key like any other computed
+            // column, and has to be REPEATED here rather than named by alias -
+            // see the note on the columns above.
+            ...transforms
+                .filter(isGroupingTransform)
+                .map(transformExpression)
+                .filter((s): s is string => s !== null),
+        ];
+        grouped.forEach((expr, i) => {
             // `columnExpression`, NOT the bare column: a bucketed key is
             // `date_trunc('month', x)` in SELECT, and GROUP BY has to say the
             // same thing character for character. Writing the bucket in one and
             // the raw column in the other is the mistake this control exists to
             // stop people making by hand — and it does not error, it groups by
             // the day and labels it the month.
-            lines.push(`${i === 0 ? 'GROUP BY ' : '       , '}${columnExpression(c)}`);
+            lines.push(`${i === 0 ? 'GROUP BY ' : '       , '}${expr}`);
         });
     }
 

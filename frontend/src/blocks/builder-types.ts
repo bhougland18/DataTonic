@@ -238,22 +238,24 @@ export interface FilterGroup {
 
 export type FilterNode = FilterRule | FilterGroup;
 
-let filterIds = 0;
-function filterId(): string {
+let seq = 0;
+// Shared by filter nodes, transformations and case branches - all of them
+// just need an id that is unique within one document.
+function freshId(): string {
     try {
         return crypto.randomUUID();
     } catch {
-        filterIds += 1;
-        return `f${filterIds}`;
+        seq += 1;
+        return `f${seq}`;
     }
 }
 
 export function newRule(table = '', column = '', aggregate?: Aggregate): FilterRule {
-    return { id: filterId(), kind: 'rule', table, column, aggregate, op: '=', values: [''] };
+    return { id: freshId(), kind: 'rule', table, column, aggregate, op: '=', values: [''] };
 }
 
 export function newGroup(conj: 'and' | 'or' = 'and', children: FilterNode[] = []): FilterGroup {
-    return { id: filterId(), kind: 'group', conj, children };
+    return { id: freshId(), kind: 'group', conj, children };
 }
 
 export function emptyFilterGroup(): FilterGroup {
@@ -310,6 +312,128 @@ export interface SortColumn {
     dir: 'asc' | 'desc';
 }
 
+// ---------------------------------------------------------------------------
+// Column transformations
+// ---------------------------------------------------------------------------
+//
+// Every COMPUTED column, in one place. A ticked column in the catalog says
+// "include this"; a transformation says "and here is something new, built from
+// it, called this". They were the same control for a while — an aggregate
+// dropdown on each catalog row — and the catalog is a list that scrolls past
+// several hundred entries, so the second question was being asked in a bad
+// place (`column-transformations.md` §1).
+//
+// The builder does NOT generate subqueries or CTEs, deliberately and
+// permanently (§2). Everything here has to fit in one flat SELECT. That is
+// affordable because DuckDB allows a SELECT alias to be named in WHERE, GROUP
+// BY, HAVING, QUALIFY and ORDER BY — so a transformation is defined once and
+// referenced by name everywhere else.
+
+/** What kind of thing a transformation computes. */
+export type TransformKind =
+    | 'aggregate'
+    | 'function'
+    | 'window'
+    | 'regex'
+    | 'case'
+    | 'literal';
+
+/**
+ * One branch of a CASE.
+ *
+ * `when` is a `FilterNode` rather than a bespoke condition type: a WHEN is a
+ * predicate, the builder already has a good predicate editor, and a second one
+ * would drift from the first. Operators, the distinct-value picker and
+ * `filterIsComplete` all come along for free.
+ */
+export interface CaseBranch {
+    id: string;
+    when: FilterNode;
+    /** The value when it matches. */
+    then: string;
+    /** `then` names a COLUMN rather than being a literal. Without this the
+     *  generator cannot tell `'Vendor'` the string from `Vendor` the column,
+     *  and quoting the wrong one is silent: you get the word, on every row. */
+    thenIsColumn?: boolean;
+}
+
+/**
+ * A parameter value.
+ *
+ * Most are scalar. Windows take column LISTS (partition by, order by) and a
+ * case takes branches, so this is a union rather than a string.
+ */
+export type TransformArg = string | string[] | CaseBranch[];
+
+export interface ColumnTransform {
+    id: string;
+    kind: TransformKind;
+    /**
+     * The SOURCE column it reads.
+     *
+     * By NAME, never by index into the catalog — same reason `SelectedColumn`
+     * is (see this file's header): a rescan reorders the catalog and "the third
+     * column" would come to mean something else with nobody touching it.
+     *
+     * OPTIONAL, and genuinely so. A `literal` reads nothing at all, and a
+     * `case` names its columns inside its branches. Code that assumes every
+     * transformation has a source column breaks on two of the six kinds.
+     */
+    table?: string;
+    column?: string;
+    /** The operation: `sum`, `date_trunc`, `running_total`, `regexp_extract`. */
+    op: string;
+    /**
+     * Everything else the operation needs, by parameter name.
+     *
+     * Loose on purpose. `transform-ops.ts` defines each operation's parameter
+     * shape and the modal validates against it before letting anybody out, so
+     * a typed union here would buy nothing and would need editing every time a
+     * function is added.
+     */
+    args: Record<string, TransformArg>;
+    /**
+     * The output name. ALWAYS set.
+     *
+     * Everywhere else in the builder an alias is a fallback the generator fills
+     * in on collision. Here somebody is naming a thing that did not exist
+     * before, and an unnamed one comes back headed
+     * `regexp_extract(VendorName, ...)` — the expression, not a heading. The
+     * modal pre-fills a generated default, and editing it is a choice.
+     */
+    alias: string;
+    /** Off skips it without deleting it, like a filter rule. */
+    enabled?: boolean;
+}
+
+export function newTransform(kind: TransformKind, op = ''): ColumnTransform {
+    return { id: freshId(), kind, op, args: {}, alias: '' };
+}
+
+export function newCaseBranch(): CaseBranch {
+    return { id: freshId(), when: emptyFilterGroup(), then: '' };
+}
+
+/** Transformations that will actually appear in the SQL. */
+export function activeTransforms(transforms?: ColumnTransform[]): ColumnTransform[] {
+    return (transforms ?? []).filter(t => t.enabled !== false);
+}
+
+/**
+ * Which clause a filter on this transformation belongs in.
+ *
+ * Derived from the KIND, never chosen. DuckDB enforces all three and says so:
+ * `WHERE clause cannot contain aggregates` and `WHERE clause cannot contain
+ * window functions` are both real errors from the engine, measured. So there is
+ * nothing here for anybody to get right — the same reason GROUP BY is a
+ * consequence rather than a choice (query-builder plan §6).
+ */
+export function clauseFor(kind: TransformKind): 'where' | 'having' | 'qualify' {
+    if (kind === 'aggregate') return 'having';
+    if (kind === 'window') return 'qualify';
+    return 'where';
+}
+
 export interface BuilderState {
     schemaVersion: 1;
     /**
@@ -329,6 +453,23 @@ export interface BuilderState {
      *  instant they were added, since nothing else references them yet. */
     extraTables?: string[];
     columns: SelectedColumn[];
+    /**
+     * Computed columns, in the order they were created.
+     *
+     * Order here is NOT output order - Column Ordering owns that. It can be
+     * any order at all, because a transformation may only read SOURCE columns
+     * and never another transformation (`column-transformations.md` §2), so
+     * there is no dependency between two of these to violate. That restriction
+     * is what buys the freedom to drag output columns anywhere.
+     *
+     * OPTIONAL because saved queries predate it. `query-io` casts stored JSON
+     * straight back to `BuilderState` with no normalising layer, so a required
+     * field here would be a lie the type system cannot catch: every query saved
+     * before today would arrive with `transforms` undefined and the first
+     * `.filter()` on it would throw. Same reason `extraTables` and
+     * `excludedJoins` are optional. Read it as `state.transforms ?? []`.
+     */
+    transforms?: ColumnTransform[];
     joins: BuilderJoin[];
     /**
      * Relationships the router may NOT route through.
@@ -369,6 +510,7 @@ export function emptyBuilder(): BuilderState {
     return {
         schemaVersion: 1,
         columns: [],
+        transforms: [],
         joins: [],
         filters: emptyFilterGroup(),
         having: emptyFilterGroup(),

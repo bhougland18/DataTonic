@@ -2,6 +2,7 @@
 import {
     collidingNames,
     columnExpression,
+    isGroupingTransform,
     filterSql,
     generateSql,
     selectExpression,
@@ -9,18 +10,25 @@ import {
 } from './builder-sql';
 import {
     ALL_OPERATORS,
+    activeTransforms,
     aggregatesFor,
     arity,
     bucketsFor,
+    clauseFor,
     emptyBuilder,
     filterIsComplete,
+    newCaseBranch,
     newGroup,
+    newRule,
+    newTransform,
     operatorsFor,
     type BuilderState,
+    type ColumnTransform,
     type FilterRule,
 } from './builder-types';
 import type { SqlStudioTable } from '../sqleditor/types';
 import type { ErdRelationship } from '../erd/model';
+import { requiredTables } from './builder-ops';
 import { vlTypeOf } from './chart-shapes';
 
 const t = (name: string, cols: string[], from: string): SqlStudioTable => ({
@@ -1003,5 +1011,227 @@ describe('generateSql buckets dates', () => {
             datedOpts,
         );
         expect(sql).not.toContain('GROUP BY');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Column transformations — the state shape (DAA.109)
+// ---------------------------------------------------------------------------
+
+describe('transform state shape', () => {
+    it('starts empty', () => {
+        expect(emptyBuilder().transforms).toEqual([]);
+    });
+
+    // `query-io` casts stored JSON straight back to BuilderState with no
+    // normalising layer, so every query saved before today arrives without the
+    // key. Anything reading it directly would throw on the first `.filter()`.
+    it('survives a saved query that has no transforms at all', () => {
+        const old = { ...emptyBuilder() } as BuilderState;
+        delete (old as { transforms?: unknown }).transforms;
+        expect(activeTransforms(old.transforms)).toEqual([]);
+    });
+
+    it('drops switched-off transformations, keeps the rest', () => {
+        const on = newTransform('function', 'upper');
+        const off = { ...newTransform('function', 'lower'), enabled: false };
+        // `enabled` absent means ON — a transformation created and never
+        // touched has to appear, same rule filter rules follow.
+        expect(activeTransforms([on, off]).map(t => t.op)).toEqual(['upper']);
+    });
+
+    it('mints ids that do not collide with filter ids', () => {
+        const ids = [
+            newTransform('function').id,
+            newTransform('function').id,
+            newCaseBranch().id,
+            newRule().id,
+        ];
+        expect(new Set(ids).size).toBe(4);
+    });
+
+    // A literal reads nothing; a case names its columns inside its branches.
+    // Code that assumes a source column breaks on two of the six kinds.
+    it('allows a transformation with no source column', () => {
+        const lit = newTransform('literal');
+        expect(lit.table).toBeUndefined();
+        expect(lit.column).toBeUndefined();
+    });
+});
+
+describe('clauseFor', () => {
+    // All three enforced by DuckDB, and the two errors are real, measured
+    // strings: `WHERE clause cannot contain aggregates` and `WHERE clause
+    // cannot contain window functions`.
+    it('sends aggregates to HAVING and windows to QUALIFY', () => {
+        expect(clauseFor('aggregate')).toBe('having');
+        expect(clauseFor('window')).toBe('qualify');
+    });
+
+    it.each(['function', 'regex', 'case', 'literal'] as const)(
+        'sends %s to WHERE, because it is scalar',
+        kind => {
+            expect(clauseFor(kind)).toBe('where');
+        },
+    );
+});
+
+// ---------------------------------------------------------------------------
+// Transformations in the generated SQL (DAA.111)
+// ---------------------------------------------------------------------------
+
+const PO_TABLES: SqlStudioTable[] = [
+    {
+        name: 'PurchaseOrder',
+        kind: 'upstream',
+        columns: [
+            { name: 'PurchaseOrder', type: 'BIGINT' },
+            { name: 'PurchaseOrderDate', type: 'DATE' },
+            { name: 'Vendor', type: 'BIGINT' },
+            { name: 'POCode', type: 'VARCHAR' },
+        ],
+        from: 'duckle_src."PurchaseOrder"',
+    },
+];
+const poOpts = { tables: PO_TABLES, relationships: [] as ErdRelationship[] };
+
+const xf = (over: Partial<ColumnTransform>): ColumnTransform => ({
+    ...newTransform('aggregate', 'count'),
+    alias: 'Orders',
+    ...over,
+});
+
+describe('generateSql with transformations', () => {
+    it('emits a transformation with its alias quoted', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [xf({ alias: 'Total Orders' })],
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('count(*) AS "Total Orders"');
+    });
+
+    // "How many purchase orders are there" ticks no column at all.
+    it('builds a query that is nothing but a transformation', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [],
+                transforms: [xf({ table: 'PurchaseOrder', column: 'PurchaseOrder' })],
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('SELECT count(PurchaseOrder.PurchaseOrder) AS Orders');
+        expect(sql).toContain('FROM duckle_src."PurchaseOrder" AS PurchaseOrder');
+        expect(sql).not.toContain('GROUP BY');
+    });
+
+    it('still returns nothing when there is neither a column nor a transformation', () => {
+        expect(generateSql(build({ anchor: 'PurchaseOrder' }), poOpts)).toBe('');
+    });
+
+    // An aggregate transformation is what MAKES the query grouped; every ticked
+    // column that is not summarised becomes a key. Grouping stays a
+    // consequence, never a separate choice.
+    it('groups the ticked columns once a transformation aggregates', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [xf({})],
+            }),
+            poOpts,
+        );
+        expect(sql).toContain('GROUP BY PurchaseOrder.Vendor');
+    });
+
+    it('drops an incomplete transformation rather than emitting half of it', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                // `sum` with no column, and an unknown operation.
+                transforms: [
+                    xf({ op: 'sum', table: undefined, column: undefined }),
+                    xf({ op: 'median', table: 'PurchaseOrder', column: 'Vendor' }),
+                ],
+            }),
+            poOpts,
+        );
+        expect(sql).not.toContain('sum(');
+        expect(sql).not.toContain('median');
+        expect(sql).not.toContain('GROUP BY');
+    });
+
+    it('leaves a switched-off transformation out', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'Vendor')],
+                transforms: [xf({ enabled: false })],
+            }),
+            poOpts,
+        );
+        expect(sql).not.toContain('count(*)');
+    });
+});
+
+describe('a transformation name owns its heading', () => {
+    // Two columns under one heading is the failure `collidingNames` exists to
+    // stop; a transformation occupies the same heading space. The person NAMED
+    // the transformation, so the plain column is the one that gets qualified.
+    it('qualifies a plain column that clashes with a transformation alias', () => {
+        const [c] = withCollisionAliases(
+            [col('PurchaseOrder', 'Vendor')],
+            [xf({ alias: 'Vendor' })],
+        );
+        expect(c.alias).toBe('PurchaseOrder.Vendor');
+    });
+
+    it('leaves a column alone when nothing clashes', () => {
+        const [c] = withCollisionAliases(
+            [col('PurchaseOrder', 'Vendor')],
+            [xf({ alias: 'Orders' })],
+        );
+        expect(c.alias).toBeUndefined();
+    });
+});
+
+describe('isGroupingTransform', () => {
+    // An aggregate CAUSES the grouping; a window is computed after it and
+    // DuckDB rejects it in GROUP BY; a literal is constant-folded - measured,
+    // `SELECT 'Q1' AS p, Vendor, count(*) ... GROUP BY Vendor` runs.
+    it.each(['aggregate', 'window', 'literal'] as const)('keeps %s out of GROUP BY', kind => {
+        expect(isGroupingTransform(xf({ kind }))).toBe(false);
+    });
+
+    it.each(['function', 'regex', 'case'] as const)('makes %s a grouping key', kind => {
+        expect(isGroupingTransform(xf({ kind }))).toBe(true);
+    });
+});
+
+describe('requiredTables counts transformations', () => {
+    // "Count the order lines" needs the table joined without a single column of
+    // it being ticked. Left out, the generator names a table absent from FROM.
+    it('brings in a table only a transformation reaches', () => {
+        const state = build({
+            columns: [col('PurchaseOrder', 'Vendor')],
+            transforms: [xf({ table: 'PurchaseOrderLine', column: 'Quantity', op: 'sum' })],
+        });
+        expect(requiredTables(state)).toEqual(['PurchaseOrder', 'PurchaseOrderLine']);
+    });
+
+    // Toggling one back on must not silently restructure the FROM chain.
+    it('keeps the table of a switched-off transformation', () => {
+        const state = build({
+            columns: [col('PurchaseOrder', 'Vendor')],
+            transforms: [
+                xf({ table: 'PurchaseOrderLine', column: 'Quantity', enabled: false }),
+            ],
+        });
+        expect(requiredTables(state)).toContain('PurchaseOrderLine');
     });
 });
