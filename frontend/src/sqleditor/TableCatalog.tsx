@@ -33,6 +33,13 @@ export interface CatalogSelection {
     /** Which aggregates this column's TYPE allows — `sum` over a VARCHAR does
      *  not run, so it is not offered. */
     aggregatesFor?: (column: string) => string[];
+    /** Current date bucket for a ticked column, and how to change it. */
+    bucketOf?: (column: string) => string;
+    onBucket?: (column: string, bucket: string) => void;
+    /** Which date buckets this column's TYPE allows — EMPTY for anything that
+     *  is not temporal, which is how the control stays absent rather than
+     *  appearing disabled on every column in the catalog. */
+    bucketsFor?: (column: string) => string[];
     /** Off when the ER model cannot connect this table to the query. */
     reachable?: boolean;
 }
@@ -112,6 +119,11 @@ export default function CatalogTable({
                 <div className="sqlstudio-cols">
                     {table.columns.map(c => {
                         const ticked = selection?.isSelected(c.name) ?? false;
+                        // Empty on every non-temporal column, which is almost
+                        // all of them — so the second control appears on the
+                        // handful of dates rather than being a disabled slot
+                        // down the whole catalog.
+                        const buckets = selection?.bucketsFor?.(c.name) ?? [];
                         return (
                             <div className="sqlstudio-col" key={c.name}>
                                 {selection ? (
@@ -148,6 +160,23 @@ export default function CatalogTable({
                                                 </option>
                                             ),
                                         )}
+                                    </select>
+                                ) : null}
+                                {ticked && selection?.onBucket && buckets.length > 0 ? (
+                                    <select
+                                        className="sqlstudio-agg sqlstudio-bucket"
+                                        value={selection.bucketOf?.(c.name) ?? 'none'}
+                                        onChange={e =>
+                                            selection.onBucket?.(c.name, e.target.value)
+                                        }
+                                        title="Round this date before grouping — the control that turns a timestamp per row into a trend"
+                                        aria-label={`Date bucket for ${c.name}`}
+                                    >
+                                        {buckets.map(b => (
+                                            <option key={b} value={b}>
+                                                {b === 'none' ? '—' : `by ${b}`}
+                                            </option>
+                                        ))}
                                     </select>
                                 ) : null}
                             </div>

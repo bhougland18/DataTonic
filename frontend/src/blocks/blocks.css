@@ -969,6 +969,14 @@
     font-size: 10px;
     cursor: pointer;
 }
+/* The date bucket, when the column has one. Second control in the row, so it
+   must NOT inherit the `auto` margin: two auto margins split the free space
+   between them and the pair drifts apart across the row instead of reading as
+   two settings on one column. */
+.sqlstudio-bucket {
+    margin-left: 4px;
+    max-width: 84px;
+}
 
 /* ---- Selected columns ---- */
 .blk-selcols {

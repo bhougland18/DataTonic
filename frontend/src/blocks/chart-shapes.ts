@@ -11,7 +11,7 @@
 // the types gives an answer that is instant, testable without a browser, and
 // cannot invent a requirement that does not exist.
 
-import { isNumericType } from './builder-types';
+import { isNumericType, isTemporalType } from './builder-types';
 import type { SqlStudioColumn } from '../sqleditor/types';
 
 /** Vega-Lite's four measurement types. */
@@ -153,7 +153,7 @@ export type Verdict =
 
 /** Composite types have no single value to put on an axis. */
 const COMPOSITE = /^\s*(struct|map|union)\s*\(/i;
-const TEMPORAL = /\b(date|time|timestamp|timestamptz|datetime)\b/i;
+
 const BOOLEAN = /^\s*bool(ean)?\s*$/i;
 
 /**
@@ -177,7 +177,7 @@ export function vlTypeOf(duckdbType?: string): VlType | null {
     // Lists (`INTEGER[]`) and structs before anything else: `INTEGER[]` would
     // otherwise read as numeric, and a list of numbers is not a number.
     if (t.endsWith('[]') || COMPOSITE.test(t)) return null;
-    if (TEMPORAL.test(t)) return 'temporal';
+    if (isTemporalType(t)) return 'temporal';
     if (BOOLEAN.test(t)) return 'nominal';
     if (isNumericType(t)) return 'quantitative';
     return 'nominal';

@@ -13,6 +13,9 @@
 /** How a selected column is summarised. `none` is a plain column. */
 export type Aggregate = 'none' | 'count' | 'count distinct' | 'sum' | 'avg' | 'min' | 'max';
 
+/** How a temporal column is rounded before it is grouped. `none` is raw. */
+export type DateBucket = 'none' | 'day' | 'week' | 'month' | 'quarter' | 'year';
+
 /** Works on anything: counting rows and picking extremes need no arithmetic. */
 const ANY_TYPE: Aggregate[] = ['none', 'count', 'count distinct', 'min', 'max'];
 const NUMERIC: Aggregate[] = ['none', 'count', 'count distinct', 'sum', 'avg', 'min', 'max'];
@@ -59,6 +62,44 @@ export function aggregatesFor(type?: string): Aggregate[] {
     return NUMERIC_TYPES.test(type) ? NUMERIC : ANY_TYPE;
 }
 
+// `timestamptz` and `datetime` are aliases DuckDB accepts and echoes back in
+// some paths; `\b` rather than an anchor because a column can arrive as
+// `TIMESTAMP WITH TIME ZONE` or `TIMESTAMP_NS`.
+const TEMPORAL_TYPES = /\b(date|time|timestamp|timestamptz|datetime)\b/i;
+
+/**
+ * Does this DuckDB type hold a point in time?
+ *
+ * Lives here, beside `isNumericType`, for the reason that one does: the chart
+ * matcher and the bucket picker must agree on what a date IS. Two regexes would
+ * drift into a column that can be bucketed but plots as a category.
+ */
+export function isTemporalType(type?: string): boolean {
+    return !!type && TEMPORAL_TYPES.test(type);
+}
+
+/** Every bucket, in the order the picker lists them — coarsest last. */
+export const DATE_BUCKETS: DateBucket[] = ['none', 'day', 'week', 'month', 'quarter', 'year'];
+
+/**
+ * The date buckets a column's type allows — none at all, unless it is temporal.
+ *
+ * Measured, not assumed: `date_trunc('month', <varchar>)` is `No function
+ * matches the given name and argument types`, the same dead end `sum` over a
+ * VARCHAR is. So the control is absent rather than present-and-broken.
+ *
+ * **An UNKNOWN type gets NOTHING, which is the opposite of `aggregatesFor`.**
+ * The asymmetry is deliberate. There, being permissive costs one legible error
+ * on a column somebody actively chose to sum. Here, being permissive puts a
+ * date dropdown on EVERY column of a workspace whose columns were all text
+ * until `2af12706` typed them — hundreds of controls that cannot work, to avoid
+ * missing the handful that can. A date column that failed to probe is much
+ * rarer than a text column that did.
+ */
+export function bucketsFor(type?: string): DateBucket[] {
+    return isTemporalType(type) ? DATE_BUCKETS : [];
+}
+
 /**
  * Which rows a join keeps — the arrow in the Joins list.
  *
@@ -78,6 +119,14 @@ export interface SelectedColumn {
     column: string;
     /** `*` for a whole table, selected by the "All fields" checkbox. */
     aggregate?: Aggregate;
+    /**
+     * Round a temporal column before grouping it — `date_trunc(bucket, col)`.
+     *
+     * Separate from `aggregate` rather than sharing its dropdown, because the
+     * two are orthogonal: a date can be bucketed to a month AND be the thing
+     * counted. The generator composes them, aggregate outermost.
+     */
+    bucket?: DateBucket;
     /** Output name. Set by the generator on collision (plan §4), or by hand. */
     alias?: string;
 }

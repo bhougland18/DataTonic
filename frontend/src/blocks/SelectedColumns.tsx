@@ -62,6 +62,13 @@ export default function SelectedColumns({ columns, onMove, onRemove }: SelectedC
                     {c.aggregate && c.aggregate !== 'none' ? (
                         <em className="blk-selcol-agg">{c.aggregate}</em>
                     ) : null}
+                    {/* The bucket earns a badge for the same reason the
+                        aggregate has one: this list is where you check what the
+                        query is, and `AddedDate` grouped by month is a
+                        different column from `AddedDate`. */}
+                    {c.bucket && c.bucket !== 'none' ? (
+                        <em className="blk-selcol-agg">by {c.bucket}</em>
+                    ) : null}
                     <button
                         type="button"
                         className="blk-lib-icon"

@@ -13,6 +13,7 @@ import { parallelJoins, relationshipPath, type ErdRelationship } from '../erd/mo
 import { addToGroup, filterTables, removeNode, replaceNode } from './builder-types';
 import type {
     Aggregate,
+    DateBucket,
     BuilderJoin,
     BuilderState,
     FilterGroup,
@@ -320,6 +321,27 @@ export function setAggregate(
         ...state,
         columns: state.columns.map(c =>
             eq(c.table, table) && eq(c.column, column) ? { ...c, aggregate } : c,
+        ),
+    };
+}
+
+/**
+ * Round a temporal column to a day/week/month/quarter/year.
+ *
+ * Independent of `setAggregate` on purpose: bucketing a date and counting it
+ * are different questions, and a control that shared a slot would make
+ * "months, counted" unsayable.
+ */
+export function setBucket(
+    state: BuilderState,
+    table: string,
+    column: string,
+    bucket: DateBucket,
+): BuilderState {
+    return {
+        ...state,
+        columns: state.columns.map(c =>
+            eq(c.table, table) && eq(c.column, column) ? { ...c, bucket } : c,
         ),
     };
 }

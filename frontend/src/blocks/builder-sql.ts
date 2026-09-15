@@ -18,6 +18,7 @@ import {
     isNumericAggregate,
     mapRules,
     type Aggregate,
+    type DateBucket,
     type BuilderState,
     type FilterNode,
     type FilterRule,
@@ -40,24 +41,45 @@ function ref(table: string, column: string): string {
     return `${quoteIdent(table)}.${quoteIdent(column)}`;
 }
 
-/** The expression a column contributes, without its output name. */
+/**
+ * The expression a column contributes, without its output name.
+ *
+ * Bucket first, aggregate outermost: `count(date_trunc('month', x))` counts the
+ * months, whereas `date_trunc('month', count(x))` is not a thing. The two are
+ * orthogonal controls and this is the only order that composes.
+ */
 export function columnExpression(c: SelectedColumn): string {
-    const base = ref(c.table, c.column);
+    let base = ref(c.table, c.column);
+    const bucket: DateBucket = c.bucket ?? 'none';
+    if (bucket !== 'none') base = `date_trunc('${bucket}', ${base})`;
     const agg: Aggregate = c.aggregate ?? 'none';
     if (agg === 'none') return base;
     return agg === 'count distinct' ? `count(DISTINCT ${base})` : `${agg}(${base})`;
 }
 
 /**
- * The output name an aggregated column gets by default.
+ * The output name a transformed column gets by default.
  *
  * `count Item.Item`, not `Item.Item`. Without the prefix a summarised column
  * comes back headed the same as the raw one, so a grid of counts reads as a
  * grid of values — and the two are the kind of thing that get copied into a
  * report side by side.
+ *
+ * A bucket earns a name for a blunter reason: left alone, DuckDB heads the
+ * column `date_trunc('month', AddedDate)`, which is the expression rather than
+ * a heading. Both parts appear when both apply — `count month PO.Date` — read
+ * outside-in, the same order the expression nests.
  */
-export function aggregateAlias(c: SelectedColumn): string {
-    return `${c.aggregate} ${c.table}.${c.column}`;
+export function transformAlias(c: SelectedColumn): string {
+    const parts: string[] = [];
+    if ((c.aggregate ?? 'none') !== 'none') parts.push(c.aggregate as string);
+    if ((c.bucket ?? 'none') !== 'none') parts.push(c.bucket as string);
+    return `${parts.join(' ')} ${c.table}.${c.column}`;
+}
+
+/** True when the column's heading would otherwise be an expression or a clash. */
+export function isTransformed(c: SelectedColumn): boolean {
+    return (c.aggregate ?? 'none') !== 'none' || (c.bucket ?? 'none') !== 'none';
 }
 
 /** One entry in the SELECT list, aggregate and alias applied. */
@@ -83,17 +105,15 @@ export function collidingNames(columns: SelectedColumn[]): Set<string> {
 }
 
 /**
- * Fill in the output names: aggregates first, then whatever still collides.
+ * Fill in the output names: transforms first, then whatever still collides.
  *
- * Aggregates are named unconditionally — `count Item.Item` says what it is —
- * and that also settles most collisions before the collision rule runs, since
- * a count and a raw column no longer share a heading.
+ * Aggregates and buckets are named unconditionally — `count Item.Item` says
+ * what it is — and that also settles most collisions before the collision rule
+ * runs, since a count and a raw column no longer share a heading.
  */
 export function withCollisionAliases(columns: SelectedColumn[]): SelectedColumn[] {
     const named = columns.map(c =>
-        !c.alias && (c.aggregate ?? 'none') !== 'none'
-            ? { ...c, alias: aggregateAlias(c) }
-            : c,
+        !c.alias && isTransformed(c) ? { ...c, alias: transformAlias(c) } : c,
     );
     const clash = collidingNames(named);
     return named.map(c =>
@@ -284,7 +304,13 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
     if (aggregated) {
         const grouped = columns.filter(c => (c.aggregate ?? 'none') === 'none');
         grouped.forEach((c, i) => {
-            lines.push(`${i === 0 ? 'GROUP BY ' : '       , '}${ref(c.table, c.column)}`);
+            // `columnExpression`, NOT the bare column: a bucketed key is
+            // `date_trunc('month', x)` in SELECT, and GROUP BY has to say the
+            // same thing character for character. Writing the bucket in one and
+            // the raw column in the other is the mistake this control exists to
+            // stop people making by hand — and it does not error, it groups by
+            // the day and labels it the month.
+            lines.push(`${i === 0 ? 'GROUP BY ' : '       , '}${columnExpression(c)}`);
         });
     }
 
@@ -349,7 +375,6 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
      * change. Same resolution HAVING does, and the same reason.
      */
     const sortExpression = (s: SortColumn): string => {
-        if (!aggregated) return ref(s.table, s.column);
         const matches = columns.filter(
             c =>
                 c.table.toLowerCase() === s.table.toLowerCase() &&
@@ -357,7 +382,17 @@ export function generateSql(state: BuilderState, opts: GenerateOptions): string 
         );
         // A grouping key wins over a summary of the same column: it is the one
         // that still exists under its own name.
-        if (matches.some(c => (c.aggregate ?? 'none') === 'none')) return ref(s.table, s.column);
+        const key = matches.find(c => (c.aggregate ?? 'none') === 'none');
+        // Unless it is BUCKETED, in which case it does not exist under its own
+        // name either: the query says `date_trunc('month', x)` in SELECT and in
+        // GROUP BY, so the raw column is in neither and DuckDB rejects it. Same
+        // failure a summarised column has, and the alias is the same answer.
+        // Applied even ungrouped, where the raw column would still be legal —
+        // one rule to read beats two that agree.
+        if (key && (key.bucket ?? 'none') !== 'none') {
+            return key.alias ? quoteIdent(key.alias) : columnExpression(key);
+        }
+        if (!aggregated || key) return ref(s.table, s.column);
         const agg = matches.find(c => (c.aggregate ?? 'none') !== 'none');
         // `withCollisionAliases` names every aggregate, so the alias is always
         // there; the expression is a fallback that should not be reachable.

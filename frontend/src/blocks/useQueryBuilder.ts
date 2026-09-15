@@ -36,6 +36,7 @@ import {
     removeHavingNode,
     restoreJoin,
     setAggregate,
+    setBucket,
     setJoinMode,
     tablesInScope,
     toggleAllColumns,
@@ -46,8 +47,10 @@ import {
 } from './builder-ops';
 import {
     aggregatesFor,
+    bucketsFor,
     emptyBuilder,
     type Aggregate,
+    type DateBucket,
     type BuilderState,
     type FilterNode,
     type JoinMode,
@@ -201,6 +204,16 @@ export function useQueryBuilder({
                 setState(b => setAggregate(b, table.name, column, aggregate as Aggregate)),
             aggregatesFor: column =>
                 aggregatesFor(table.columns.find(c => c.name === column)?.type),
+            bucketOf: column =>
+                state.columns.find(
+                    c =>
+                        c.table.toLowerCase() === table.name.toLowerCase() &&
+                        c.column.toLowerCase() === column.toLowerCase(),
+                )?.bucket ?? 'none',
+            onBucket: (column, bucket) =>
+                setState(b => setBucket(b, table.name, column, bucket as DateBucket)),
+            bucketsFor: column =>
+                bucketsFor(table.columns.find(c => c.name === column)?.type),
             reachable: canReach(state, table.name, relationships),
         }),
         [state, relationships],

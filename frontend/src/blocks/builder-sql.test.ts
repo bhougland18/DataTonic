@@ -1,6 +1,7 @@
 ﻿import { describe, expect, it } from 'vitest';
 import {
     collidingNames,
+    columnExpression,
     filterSql,
     generateSql,
     selectExpression,
@@ -10,6 +11,7 @@ import {
     ALL_OPERATORS,
     aggregatesFor,
     arity,
+    bucketsFor,
     emptyBuilder,
     filterIsComplete,
     newGroup,
@@ -19,6 +21,7 @@ import {
 } from './builder-types';
 import type { SqlStudioTable } from '../sqleditor/types';
 import type { ErdRelationship } from '../erd/model';
+import { vlTypeOf } from './chart-shapes';
 
 const t = (name: string, cols: string[], from: string): SqlStudioTable => ({
     name,
@@ -823,5 +826,182 @@ describe('ORDER BY in an aggregated query', () => {
             opts,
         );
         expect(sql).toContain('ORDER BY Item.Item');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Date bucketing (DAA.105)
+// ---------------------------------------------------------------------------
+//
+// Every SQL assertion here was first run against the real workspace database
+// (`Duckle_new_workspace/data/infor.duckdb`) rather than reasoned about — the
+// handoff's standing instruction, and the reason the `date_trunc` over VARCHAR
+// case below is stated as a fact rather than a guess.
+
+const DATED_TABLES: SqlStudioTable[] = [
+    {
+        name: 'PurchaseOrder',
+        kind: 'upstream',
+        columns: [
+            { name: 'PurchaseOrder', type: 'VARCHAR' },
+            { name: 'PurchaseOrderDate', type: 'DATE' },
+            { name: 'Vendor', type: 'VARCHAR' },
+        ],
+        from: 'duckle_src."PurchaseOrder"',
+    },
+];
+const datedOpts = { tables: DATED_TABLES, relationships: [] as ErdRelationship[] };
+
+describe('bucketsFor', () => {
+    it.each(['DATE', 'TIMESTAMP', 'TIMESTAMP WITH TIME ZONE', 'datetime', 'TIME'])(
+        'offers buckets on %s',
+        type => {
+            expect(bucketsFor(type)).toContain('month');
+        },
+    );
+
+    // Measured, not assumed: DuckDB answers `No function matches the given name
+    // and argument types 'date_trunc(STRING_LITERAL, VARCHAR)'` — the same dead
+    // end `sum` over a VARCHAR is, so the control is absent rather than broken.
+    it.each(['VARCHAR', 'INTEGER', 'BOOLEAN', 'DOUBLE'])('offers none on %s', type => {
+        expect(bucketsFor(type)).toEqual([]);
+    });
+
+    // Both type vocabularies, as `aggregatesFor` learned to do the hard way.
+    // A DESCRIBE gives SQL spellings; a run preview gives Duckle's own names,
+    // which `crates/metadata` serializes as plain `date` / `timestamp` — no
+    // `date32`-style suffix, so the trap that cost `float64` its aggregates
+    // does not recur here. Pinned rather than assumed.
+    it.each(["date", "timestamp"])("recognises %s, the name a run actually reports", type => {
+        expect(bucketsFor(type)).toContain("month");
+    });
+
+    // The deliberate asymmetry with `aggregatesFor`, which is permissive here.
+    // Being permissive would put a date dropdown on every column of a workspace
+    // whose columns were all text until they were typed.
+    it('offers NOTHING when the type is unknown, unlike aggregatesFor', () => {
+        expect(bucketsFor(undefined)).toEqual([]);
+        expect(aggregatesFor(undefined)).toContain('sum');
+    });
+
+    // One date test, shared. Two would drift into a column that can be bucketed
+    // but plots as a category.
+    it('agrees with the chart matcher about what a date is', () => {
+        for (const type of ['DATE', 'TIMESTAMP', 'VARCHAR', 'INTEGER']) {
+            expect(bucketsFor(type).length > 0).toBe(vlTypeOf(type) === 'temporal');
+        }
+    });
+});
+
+describe('columnExpression with a bucket', () => {
+    it('truncates the column', () => {
+        expect(
+            columnExpression(col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'month' })),
+        ).toBe("date_trunc('month', PurchaseOrder.PurchaseOrderDate)");
+    });
+
+    it('leaves the column alone at none', () => {
+        expect(
+            columnExpression(col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'none' })),
+        ).toBe('PurchaseOrder.PurchaseOrderDate');
+    });
+
+    // Aggregate OUTSIDE the bucket: `date_trunc('month', count(x))` is not a
+    // thing, and this is the only order that composes.
+    it('nests the aggregate outside the bucket', () => {
+        expect(
+            columnExpression(
+                col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'month', aggregate: 'count' }),
+            ),
+        ).toBe("count(date_trunc('month', PurchaseOrder.PurchaseOrderDate))");
+    });
+});
+
+describe('a bucketed column is named', () => {
+    // Left alone DuckDB heads the column `date_trunc('month', …)`, which is the
+    // expression rather than a heading.
+    it('gets the bucket as its alias', () => {
+        const [c] = withCollisionAliases([
+            col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'month' }),
+        ]);
+        expect(c.alias).toBe('month PurchaseOrder.PurchaseOrderDate');
+    });
+
+    it('names both parts when both apply, outside-in', () => {
+        const [c] = withCollisionAliases([
+            col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'month', aggregate: 'count' }),
+        ]);
+        expect(c.alias).toBe('count month PurchaseOrder.PurchaseOrderDate');
+    });
+
+    it('leaves a hand-written name alone', () => {
+        const [c] = withCollisionAliases([
+            col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'month', alias: 'Month' }),
+        ]);
+        expect(c.alias).toBe('Month');
+    });
+});
+
+describe('generateSql buckets dates', () => {
+    const trend = build({
+        anchor: 'PurchaseOrder',
+        columns: [
+            col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'month' }),
+            col('PurchaseOrder', 'PurchaseOrder', { aggregate: 'count' }),
+        ],
+    });
+
+    // THE mistake this control exists to stop: writing the bucket in SELECT and
+    // the raw column in GROUP BY does not error — it groups by the day and
+    // labels the result a month.
+    it('groups by the same expression it selects', () => {
+        const sql = generateSql(trend, datedOpts);
+        expect(sql).toContain(
+            'SELECT date_trunc(\'month\', PurchaseOrder.PurchaseOrderDate) AS "month PurchaseOrder.PurchaseOrderDate"',
+        );
+        expect(sql).toContain("GROUP BY date_trunc('month', PurchaseOrder.PurchaseOrderDate)");
+        expect(sql).not.toContain('GROUP BY PurchaseOrder.PurchaseOrderDate');
+    });
+
+    // The raw column is in neither SELECT nor GROUP BY, so DuckDB rejects it
+    // with `must appear in the GROUP BY clause` — the same failure a summarised
+    // column has, and the alias is the same answer.
+    it('sorts a bucketed grouping key by its alias, not the raw column', () => {
+        const sql = generateSql(
+            {
+                ...trend,
+                sort: [{ table: 'PurchaseOrder', column: 'PurchaseOrderDate', dir: 'asc' }],
+            },
+            datedOpts,
+        );
+        expect(sql).toContain('ORDER BY "month PurchaseOrder.PurchaseOrderDate"');
+    });
+
+    it('still sorts an UNBUCKETED grouping key by the column itself', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [
+                    col('PurchaseOrder', 'Vendor'),
+                    col('PurchaseOrder', 'PurchaseOrder', { aggregate: 'count' }),
+                ],
+                sort: [{ table: 'PurchaseOrder', column: 'Vendor', dir: 'asc' }],
+            }),
+            datedOpts,
+        );
+        expect(sql).toContain('ORDER BY PurchaseOrder.Vendor');
+    });
+
+    // A bucket on its own creates no GROUP BY: grouping is a consequence of
+    // aggregating (plan §6), and that rule does not change here.
+    it('does not group when nothing is aggregated', () => {
+        const sql = generateSql(
+            build({
+                anchor: 'PurchaseOrder',
+                columns: [col('PurchaseOrder', 'PurchaseOrderDate', { bucket: 'month' })],
+            }),
+            datedOpts,
+        );
+        expect(sql).not.toContain('GROUP BY');
     });
 });
