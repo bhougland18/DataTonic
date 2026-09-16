@@ -20,8 +20,10 @@ import {
     ChartColumn,
     ChartColumnBig,
     ChartLine,
+    ChartNoAxesGantt,
     ChartPie,
     ChartScatter,
+    ChartSpline,
     Grid3x3,
     type LucideIcon,
 } from 'lucide-react';
@@ -51,6 +53,11 @@ const ICONS: Record<ChartType, LucideIcon> = {
     // as one at 13px — boxes on a scale.
     boxplot: ChartCandlestick,
     rect: Grid3x3,
+    // Nested horizontal bars on a common scale — the closest lucide has to the
+    // shape, and it reads as one at 13px where a target-and-arrow does not.
+    bullet: ChartNoAxesGantt,
+    // A bare curve with no axes on it — which is the whole idea.
+    sparkline: ChartSpline,
 };
 
 /** How many near misses to show. Past two it stops being advice and becomes a list. */

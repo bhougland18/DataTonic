@@ -38,6 +38,68 @@ interface VegaChartProps {
 
 const DATASET = 'dive';
 
+/**
+ * Top-level keys that make a spec MULTI-VIEW rather than a single chart.
+ *
+ * Worth knowing here because Vega-Lite refuses `width: 'container'` and
+ * `autosize: 'fit'` on all of them — it warns twice and ignores both, and the
+ * chart renders at whatever its inner view asked for. Measured: a faceted
+ * sparkline table drew at 150px inside a 760px panel, with nothing in the
+ * console the app surfaces.
+ */
+const COMPOSED_KEYS = ['facet', 'concat', 'hconcat', 'vconcat', 'repeat'];
+
+const isComposed = (spec: Record<string, unknown>) => COMPOSED_KEYS.some(k => k in spec);
+
+/** Below this a panel is not a chart any more, however narrow the container. */
+const MIN_CHILD_WIDTH = 40;
+
+/**
+ * Size a composed view to its container, by measuring rather than by asking.
+ *
+ * Vega-Lite compiles `facet` and `repeat` to a Vega spec whose inner panel
+ * width is the `child_width` signal, and the CHROME around it — the row header,
+ * the axis, the padding — is a constant that does not move when the panel
+ * does. So one correction is exact: render once, read what the whole scene
+ * actually spans, and the difference is the chrome.
+ *
+ * Measured off the SCENEGRAPH, not the DOM. The wrapper element reports a stale
+ * width straight after a re-run, which reads as "the fit did nothing" when the
+ * fit has in fact already worked.
+ *
+ * And it has to be measured, not reserved: the chrome was 49px for `Apples` and
+ * 130px for `Wound Care Consumables` in the same layout. Any fixed allowance is
+ * wrong for one of them.
+ *
+ * Idempotent, so it doubles as the resize handler — it reads the current
+ * `child_width` back out of the view rather than tracking it here.
+ */
+async function fitComposed(view: Result['view'], available: number): Promise<void> {
+    let child: unknown;
+    try {
+        child = view.signal('child_width');
+    } catch {
+        // A composed spec whose inner width is not a signal (an explicit size,
+        // or a `concat` of differently-sized views). It asked for a size; leave
+        // it at it.
+        return;
+    }
+    if (typeof child !== 'number' || !Number.isFinite(available) || available <= 0) return;
+    // `Scene` is typed as the root mark rather than the wrapper vega actually
+    // returns, so the shape is asserted here rather than fought with.
+    const scene = view.scenegraph() as unknown as {
+        root?: { bounds?: { x1: number; x2: number } };
+    };
+    const bounds = scene.root?.bounds;
+    if (!bounds) return;
+    const chrome = bounds.x2 - bounds.x1 - child;
+    const target = Math.max(MIN_CHILD_WIDTH, available - chrome);
+    // Sub-pixel churn is not worth a re-render, and this runs on every resize.
+    if (Math.abs(target - child) < 1) return;
+    view.signal('child_width', target);
+    await view.runAsync();
+}
+
 /** Brand-token Vega config (lemon/orange/maya/slate; success = maya, no green). */
 function vegaConfig(theme: 'light' | 'dark') {
     const ink = theme === 'dark' ? '#ecf0f7' : '#1b2030';
@@ -47,6 +109,12 @@ function vegaConfig(theme: 'light' | 'dark') {
         range: { category: ['#ffd84d', '#ff7a45', '#2eafff', '#ed5f22', '#aab3c5'] },
         axis: { labelColor: ink, titleColor: ink, gridColor: grid, domainColor: grid, tickColor: grid },
         legend: { labelColor: ink, titleColor: ink },
+        // A facet's row/column labels are `header`, not `axis` — a separate
+        // config family that nothing needed until the sparkline table arrived.
+        // Without it the labels keep Vega's near-black default and vanish into
+        // the dark theme, which reads as a rendering fault rather than a
+        // missing setting.
+        header: { labelColor: ink, titleColor: ink },
         title: { color: ink },
         view: { stroke: 'transparent' },
     };
@@ -70,17 +138,33 @@ export function VegaChart({
         if (!el) return;
         let cancelled = false;
         let view: Result['view'] | null = null;
+        let observer: ResizeObserver | null = null;
         void (async () => {
             try {
                 const { default: embed } = await import('vega-embed');
                 const full: Record<string, unknown> = rows
                     ? { ...spec, data: { name: DATASET }, datasets: { [DATASET]: rows } }
                     : { ...spec };
+                const composed = isComposed(full);
                 if (fit && full.width === undefined) {
-                    full.width = 'container';
-                    full.autosize = { type: 'fit', contains: 'padding' };
+                    if (composed) {
+                        // `'container'` is refused here, so the inner panel gets
+                        // a NUMBER — the container width as a first guess, which
+                        // overshoots by the chrome and is corrected below.
+                        const inner = full.spec;
+                        if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+                            const child = inner as Record<string, unknown>;
+                            if (child.width === undefined) child.width = el.clientWidth;
+                            full.spec = child;
+                        }
+                    } else {
+                        full.width = 'container';
+                        full.autosize = { type: 'fit', contains: 'padding' };
+                    }
                 }
-                if (height != null && full.height === undefined) full.height = height;
+                // A composed spec sizes itself per panel; a top-level height is
+                // as unwelcome there as a top-level width.
+                if (height != null && full.height === undefined && !composed) full.height = height;
                 const res = await embed(el, full as unknown as VisualizationSpec, {
                     actions: false,
                     renderer: 'canvas',
@@ -92,12 +176,23 @@ export function VegaChart({
                 }
                 view = res.view;
                 viewRef.current = res.view;
+                if (composed && fit) {
+                    await fitComposed(res.view, el.clientWidth);
+                    // The panel is resizable — collapsing the dives rail changes
+                    // it — and nothing re-embeds for that. `width: 'container'`
+                    // handles the single-view case itself; this is the other one.
+                    observer = new ResizeObserver(() => {
+                        void fitComposed(res.view, el.clientWidth);
+                    });
+                    observer.observe(el);
+                }
             } catch (e) {
                 if (el) el.textContent = `Chart error: ${String(e)}`;
             }
         })();
         return () => {
             cancelled = true;
+            observer?.disconnect();
             if (view) view.finalize();
             viewRef.current = null;
         };

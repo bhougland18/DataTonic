@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { checkShape, shapeFor, type Field } from './chart-shapes';
+import { thumbSpec } from './chart-thumbnails';
 import {
     assignChannel,
     escapeField,
@@ -642,5 +643,422 @@ describe('field names Vega-Lite reads as structure', () => {
         expect(unescapeField('count Item\\.Item')).toBe('count Item.Item');
         expect(unescapeField('tags\\[0\\]\\.name')).toBe('tags[0].name');
         expect(unescapeField('plain')).toBe('plain');
+    });
+});
+
+// The bullet graph, the first chart here spelled as LAYERS rather than as one
+// mark. Both halves matter: `buildSpec` has to write a stack Vega-Lite paints in
+// the right order, and `readSpec` has to get it back — a saved dive that reopens
+// in JSON mode is the save-then-reopen failure this module exists to prevent.
+describe('the bullet graph', () => {
+    const bullet = (): ChartSpecState => ({
+        chart: 'bullet',
+        encoding: {
+            label: { field: 'Region', type: 'nominal' },
+            measure: { field: 'actual', type: 'quantitative' },
+            target: { field: 'target', type: 'quantitative' },
+            range1: { field: 'poor', type: 'quantitative' },
+            range2: { field: 'fair', type: 'quantitative' },
+            range3: { field: 'good', type: 'quantitative' },
+        },
+    });
+
+    const layerFields = (spec: Record<string, unknown>) =>
+        (spec.layer as Record<string, unknown>[]).map(l => {
+            const enc = l.encoding as Record<string, Record<string, unknown>>;
+            const mark = l.mark as Record<string, unknown>;
+            return `${mark.type}:${enc.x.field}`;
+        });
+
+    // The bars all start at zero and overlap, so the LARGEST range has to go
+    // down first or it paints over the two inside it.
+    it('stacks the ranges largest first, then the measure, then the target', () => {
+        expect(layerFields(buildSpec(bullet()))).toEqual([
+            'bar:good',
+            'bar:fair',
+            'bar:poor',
+            'bar:actual',
+            'tick:target',
+        ]);
+    });
+
+    it('hoists the row label so every layer shares it', () => {
+        const spec = buildSpec(bullet()) as Record<string, unknown>;
+        expect(spec.encoding).toEqual({
+            y: {
+                field: 'Region',
+                type: 'nominal',
+                scale: { paddingInner: 0.34, paddingOuter: 0.17 },
+                sort: null,
+                title: null,
+            },
+        });
+        // No top-level mark or encoding.x: this is not a single view.
+        expect(spec.mark).toBeUndefined();
+    });
+
+    // Vega-Lite merges the layers' x axes into ONE, and the merge JOINS distinct
+    // titles — leave them alone and the axis reads `good, fair, poor, actual,
+    // target`. Identical titles merge to themselves, so the measure decides the
+    // label once and every layer repeats it. `chart-spec.vega.test.ts` compiles
+    // this and reads the axis back, which is the half that proves it.
+    it('writes the same axis label on every layer', () => {
+        const layers = buildSpec(bullet()).layer as Record<string, unknown>[];
+        const titles = layers.map(
+            l => (l.encoding as Record<string, Record<string, unknown>>).x.title,
+        );
+        expect(titles).toEqual(['actual', 'actual', 'actual', 'actual', 'actual']);
+    });
+
+    it('repeats a renamed label and a number format across the layers too', () => {
+        const state = bullet();
+        state.encoding.measure = { field: 'actual', type: 'quantitative', title: 'Spend', format: ',.0f' };
+        const layers = buildSpec(state).layer as Record<string, unknown>[];
+        const xs = layers.map(l => (l.encoding as Record<string, Record<string, unknown>>).x);
+        expect(xs.map(x => x.title)).toEqual(Array(5).fill('Spend'));
+        expect(xs.map(x => x.axis)).toEqual(Array(5).fill({ format: ',.0f' }));
+    });
+
+    // A bullet graph is read as a LIST, and the order of a list is a decision
+    // somebody made in the SQL. Alphabetical is Vega-Lite's default and is the
+    // one order a reader is guaranteed not to have asked for.
+    it('keeps the rows in the order the query returned them', () => {
+        const spec = buildSpec(bullet()) as Record<string, unknown>;
+        expect((spec.encoding as Record<string, Record<string, unknown>>).y.sort).toBeNull();
+    });
+
+    it('draws without ranges — they are optional', () => {
+        const { range1: _1, range2: _2, range3: _3, ...encoding } = bullet().encoding;
+        const spec = buildSpec({ chart: 'bullet', encoding });
+        expect(layerFields(spec)).toEqual(['bar:actual', 'tick:target']);
+    });
+
+    it('carries no data, width or height, like every other chart here', () => {
+        const spec = buildSpec(bullet());
+        expect(spec.data).toBeUndefined();
+        expect(spec.width).toBeUndefined();
+        expect(spec.height).toBeUndefined();
+    });
+
+    it('round-trips through readSpec', () => {
+        expect(readSpec(buildSpec(bullet()))).toEqual(bullet());
+    });
+
+    it('round-trips without ranges, and with a title', () => {
+        const { range1: _1, range2: _2, range3: _3, ...encoding } = bullet().encoding;
+        const state: ChartSpecState = {
+            chart: 'bullet',
+            encoding,
+            title: 'Spend against budget',
+            subtitle: 'FY25',
+        };
+        expect(readSpec(buildSpec(state))).toEqual(state);
+    });
+
+    it('round-trips a renamed measure and an axis format', () => {
+        const state = bullet();
+        state.encoding.measure = {
+            ...state.encoding.measure!,
+            title: 'Actual spend',
+            format: ',.0f',
+        };
+        expect(readSpec(buildSpec(state))).toEqual(state);
+    });
+
+    // §3.2 again: the STATE holds the real column name, the SPEC the escaped one.
+    it('escapes a dotted column name in the layers and gives it back whole', () => {
+        const state = bullet();
+        state.encoding.measure = { field: 'sum Item.Cost', type: 'quantitative' };
+        const layers = buildSpec(state).layer as Record<string, unknown>[];
+        const x = (layers[3].encoding as Record<string, Record<string, unknown>>).x;
+        expect(x.field).toBe('sum Item\\.Cost');
+        expect(readSpec(buildSpec(state))?.encoding.measure?.field).toBe('sum Item.Cost');
+    });
+
+    describe('what it refuses to own', () => {
+        // The mark colours are what tell OUR bullet graph from somebody else's
+        // bar-and-tick stack. Hand-edit one and the spec stays in JSON, which is
+        // the same bargain MODELLED_KEYS strikes for the single-mark charts.
+        it('refuses a bullet whose colours were changed by hand', () => {
+            const spec = buildSpec(bullet());
+            const layers = spec.layer as Record<string, unknown>[];
+            (layers[0].mark as Record<string, unknown>).color = '#ff0000';
+            expect(readSpec(spec)).toBeNull();
+        });
+
+        it('refuses a layered spec that is not a bullet graph', () => {
+            expect(
+                readSpec({
+                    $schema: VL_SCHEMA,
+                    layer: [
+                        { mark: 'line', encoding: { x: { field: 'a', type: 'quantitative' } } },
+                        { mark: 'rule', encoding: { y: { field: 'b', type: 'quantitative' } } },
+                    ],
+                }),
+            ).toBeNull();
+        });
+
+        it('refuses a bullet with its layers out of order', () => {
+            const spec = buildSpec(bullet());
+            const layers = spec.layer as Record<string, unknown>[];
+            spec.layer = [layers[2], layers[1], layers[0], layers[3], layers[4]];
+            expect(readSpec(spec)).toBeNull();
+        });
+
+        it('refuses a bullet with no target', () => {
+            const spec = buildSpec(bullet());
+            spec.layer = (spec.layer as unknown[]).slice(0, 4);
+            expect(readSpec(spec)).toBeNull();
+        });
+
+        it('refuses a transform, as every other chart does', () => {
+            const spec = buildSpec(bullet());
+            spec.transform = [{ filter: 'datum.actual > 0' }];
+            expect(readSpec(spec)).toBeNull();
+        });
+    });
+
+    it('reports a channel pointing at a column the result lost', () => {
+        const fields = [f('Region', 'nominal'), f('actual', 'quantitative')];
+        expect(missingFields(bullet(), fields).sort()).toEqual(['fair', 'good', 'poor', 'target']);
+    });
+
+    // The generic channel machinery has to reach the bullet's channels too, or
+    // the picker would be dead for every one of them.
+    it('offers and assigns columns on a bullet channel', () => {
+        const need = shapeFor('bullet')!.variants[0].needs.find(n => n.channel === 'range2')!;
+        const fields = [
+            f('Region', 'nominal'),
+            f('actual', 'quantitative'),
+            f('target', 'quantitative'),
+        ];
+        const state: ChartSpecState = { chart: 'bullet', encoding: bullet().encoding };
+        // A category is not offered for a range: the contract filters the list.
+        expect(channelOptions(state, need, fields).map(o => o.field)).toEqual(['actual', 'target']);
+        const next = assignChannel(state, need, fields, 'target');
+        expect(next.encoding.range2?.field).toBe('target');
+        // And an optional channel can be cleared again.
+        expect(assignChannel(next, need, fields, null).encoding.range2).toBeUndefined();
+    });
+
+    it('lists the channels it actually encodes', () => {
+        const { range1: _1, range2: _2, ...encoding } = bullet().encoding;
+        expect(encodedChannels({ chart: 'bullet', encoding })).toEqual([
+            'label',
+            'measure',
+            'target',
+            'range3',
+        ]);
+    });
+
+    it('is what the matcher proposes, end to end', () => {
+        const fields = [
+            f('Region', 'nominal'),
+            f('actual', 'quantitative'),
+            f('target', 'quantitative'),
+        ];
+        const state = stateFromVerdict(checkShape(fields, 'bullet'))!;
+        expect(state).toEqual(
+            stateFromEncoding('bullet', {
+                label: { field: 'Region', type: 'nominal' },
+                measure: { field: 'actual', type: 'quantitative' },
+                target: { field: 'target', type: 'quantitative' },
+            }),
+        );
+        expect(layerFields(buildSpec(state))).toEqual(['bar:actual', 'tick:target']);
+    });
+});
+
+// The bullet thumbnail is the only LAYERED card, so it cannot go through
+// `thumb()` and has to repeat the mark colours by hand. Two copies of a palette
+// drift, and the drift is invisible — a card in slightly the wrong grey looks
+// fine until it is next to the chart it stands for.
+describe('the bullet thumbnail matches the chart it depicts', () => {
+    const colours = (spec: Record<string, unknown>) =>
+        (spec.layer as { mark: Record<string, unknown> }[]).map(l => l.mark.color);
+
+    it('uses the same layer colours, in the same order', () => {
+        const real = buildSpec({
+            chart: 'bullet',
+            encoding: {
+                label: { field: 'c', type: 'nominal' },
+                measure: { field: 'v', type: 'quantitative' },
+                target: { field: 't', type: 'quantitative' },
+                range1: { field: 'r1', type: 'quantitative' },
+                range2: { field: 'r2', type: 'quantitative' },
+                range3: { field: 'r3', type: 'quantitative' },
+            },
+        });
+        expect(colours(thumbSpec('bullet'))).toEqual(colours(real));
+    });
+
+    it('draws the same marks in the same order', () => {
+        const marks = (spec: Record<string, unknown>) =>
+            (spec.layer as { mark: Record<string, unknown> }[]).map(l => l.mark.type);
+        expect(marks(thumbSpec('bullet'))).toEqual([
+            'bar',
+            'bar',
+            'bar',
+            'bar',
+            'tick',
+        ]);
+    });
+});
+
+// Tufte's sparkline in a table, and the first FACETED spec here — where the
+// bullet graph is layered. Both of its interesting decisions are things a
+// reading of the JSON would pass straight over.
+describe('the sparkline table', () => {
+    const spark = (): ChartSpecState => ({
+        chart: 'sparkline',
+        encoding: {
+            label: { field: 'Category', type: 'nominal' },
+            x: { field: 'Month', type: 'temporal' },
+            y: { field: 'Spend', type: 'quantitative' },
+        },
+    });
+
+    const inner = (spec: Record<string, unknown>) => spec.spec as Record<string, unknown>;
+    const row = (spec: Record<string, unknown>) =>
+        (spec.facet as Record<string, Record<string, unknown>>).row;
+
+    it('facets by the row label and traces x against y inside', () => {
+        const spec = buildSpec(spark());
+        expect(row(spec).field).toBe('Category');
+        const enc = inner(spec).encoding as Record<string, Record<string, unknown>>;
+        expect(enc.x.field).toBe('Month');
+        expect(enc.y.field).toBe('Spend');
+        expect(spec.mark).toBeUndefined();
+    });
+
+    // EVERY ROW GETS ITS OWN Y SCALE. Vega-Lite shares scales across facets by
+    // default, and over categories spending between 1k and 9k that squashed all
+    // five rows into near-flat lines — a table of horizontal rules that looked
+    // like a styling problem and was a meaning problem.
+    it('resolves y independently, which is what makes it a sparkline', () => {
+        expect(buildSpec(spark()).resolve).toEqual({ scale: { y: 'independent' } });
+    });
+
+    it('draws no axes at all — that is the difference from a small line chart', () => {
+        const enc = inner(buildSpec(spark())).encoding as Record<string, Record<string, unknown>>;
+        expect(enc.x.axis).toBeNull();
+        expect(enc.y.axis).toBeNull();
+    });
+
+    // An area declares a zero baseline; a sparkline's y is deliberately not
+    // zero-based, because the SHAPE is the content and zero-anchoring flattens
+    // it. Filling it would draw a quantity claim the chart refuses to label.
+    it('traces a line off a non-zero baseline, not a filled area', () => {
+        const view = inner(buildSpec(spark()));
+        expect((view.mark as Record<string, unknown>).type).toBe('line');
+        const enc = view.encoding as Record<string, Record<string, unknown>>;
+        expect(enc.y.scale).toEqual({ zero: false });
+    });
+
+    // The row height is the design — Tufte's point is that a sparkline is
+    // word-sized — so it is the one size a spec here carries. The WIDTH is not,
+    // because that is a property of the surface: `VegaChart` supplies it.
+    it('fixes the row height and leaves the width to the renderer', () => {
+        const spec = buildSpec(spark());
+        expect(inner(spec).height).toBe(22);
+        expect(inner(spec).width).toBeUndefined();
+        expect(spec.width).toBeUndefined();
+        expect(spec.height).toBeUndefined();
+        expect(spec.data).toBeUndefined();
+    });
+
+    // `sort: null` — how every other chart here says "leave the rows alone" —
+    // is SILENTLY IGNORED on a facet row. Rendered and compared: `sort: null`
+    // and no sort at all give the identical alphabetical order. Only an
+    // explicit array of values works, and baking the categories into the spec
+    // would tie it to one result. So this chart cannot offer query order, and
+    // writes the ordering it DOES use rather than leaving it implicit.
+    it('always states the row order, and never as null', () => {
+        expect(row(buildSpec(spark())).sort).toBe('ascending');
+        const desc = spark();
+        desc.encoding.label = { ...desc.encoding.label!, sort: 'descending' };
+        expect(row(buildSpec(desc)).sort).toBe('descending');
+    });
+
+    it('labels rows upright and left-aligned, like a table', () => {
+        const header = row(buildSpec(spark())).header as Record<string, unknown>;
+        expect(header.labelAngle).toBe(0);
+        expect(header.labelAlign).toBe('left');
+    });
+
+    it('round-trips through readSpec', () => {
+        expect(readSpec(buildSpec(spark()))).toEqual(spark());
+    });
+
+    it('round-trips a descending order, a row-label title and a chart title', () => {
+        const state: ChartSpecState = {
+            ...spark(),
+            title: 'Spend by category',
+            subtitle: 'FY26',
+        };
+        state.encoding.label = { ...state.encoding.label!, sort: 'descending', title: 'Category' };
+        expect(readSpec(buildSpec(state))).toEqual(state);
+    });
+
+    // §3.2 once more, now through a facet field.
+    it('escapes a dotted column name and gives it back whole', () => {
+        const state = spark();
+        state.encoding.y = { field: 'sum Item.Cost', type: 'quantitative' };
+        const enc = inner(buildSpec(state)).encoding as Record<string, Record<string, unknown>>;
+        expect(enc.y.field).toBe('sum Item\\.Cost');
+        expect(readSpec(buildSpec(state))?.encoding.y?.field).toBe('sum Item.Cost');
+    });
+
+    describe('what it refuses to own', () => {
+        it('refuses a faceted spec that is not a sparkline table', () => {
+            expect(
+                readSpec({
+                    $schema: VL_SCHEMA,
+                    facet: { row: { field: 'c', type: 'nominal' } },
+                    spec: { mark: 'bar', encoding: { x: { field: 'v', type: 'quantitative' } } },
+                }),
+            ).toBeNull();
+        });
+
+        // Re-adding the resolve silently would change what somebody's
+        // hand-edited chart says — it is the difference between five shapes and
+        // five flat lines.
+        it('refuses one whose independent y was taken away', () => {
+            const spec = buildSpec(spark());
+            delete spec.resolve;
+            expect(readSpec(spec)).toBeNull();
+        });
+
+        it('refuses a row height that is not the sparkline height', () => {
+            const spec = buildSpec(spark());
+            inner(spec).height = 80;
+            expect(readSpec(spec)).toBeNull();
+        });
+
+        it('refuses a spec that baked in a width', () => {
+            const spec = buildSpec(spark());
+            inner(spec).width = 300;
+            expect(readSpec(spec)).toBeNull();
+        });
+
+        it('refuses a different mark', () => {
+            const spec = buildSpec(spark());
+            (inner(spec).mark as Record<string, unknown>).type = 'area';
+            expect(readSpec(spec)).toBeNull();
+        });
+    });
+
+    it('reports a channel pointing at a column the result lost', () => {
+        const fields = [f('Category', 'nominal'), f('Month', 'temporal')];
+        expect(missingFields(spark(), fields)).toEqual(['Spend']);
+    });
+
+    it('is what the matcher proposes, end to end', () => {
+        const fields = [
+            f('Category', 'nominal'),
+            f('Month', 'temporal'),
+            f('Spend', 'quantitative'),
+        ];
+        expect(stateFromVerdict(checkShape(fields, 'sparkline'))).toEqual(spark());
     });
 });

@@ -13,15 +13,28 @@ describe('thumbSpec', () => {
         expect(thumbSpec(type)).toBeTruthy();
     });
 
+    /**
+     * The view a thumbnail's size and encoding actually live on.
+     *
+     * A FACETED thumbnail cannot carry either at the top level — Vega-Lite
+     * refuses a top-level width on a facet, which is the same rule that sent
+     * `VegaChart` looking for `child_width`. So the size moves inward with the
+     * view, and the assertions follow it rather than being relaxed.
+     */
+    const sized = (spec: Record<string, unknown>): Record<string, unknown> =>
+        'facet' in spec ? (spec.spec as Record<string, unknown>) : spec;
+
     it.each(TYPES)('%s carries its own data and a fixed size', type => {
-        const spec = thumbSpec(type) as Record<string, Record<string, unknown[]>>;
-        expect(spec.data.values.length).toBeGreaterThan(0);
-        expect(spec.width).toBeDefined();
-        expect(spec.height).toBeDefined();
+        const spec = thumbSpec(type) as Record<string, unknown>;
+        expect((spec.data as { values: unknown[] }).values.length).toBeGreaterThan(0);
+        const view = sized(spec);
+        expect(view.width).toBeDefined();
+        expect(view.height).toBeDefined();
     });
 
     it.each(TYPES)('%s encodes at least one channel', type => {
-        expect(Object.keys(thumbSpec(type).encoding as object).length).toBeGreaterThan(0);
+        const view = sized(thumbSpec(type) as Record<string, unknown>);
+        expect(Object.keys(view.encoding as object).length).toBeGreaterThan(0);
     });
 
     it('hands back a fresh object each time, since vega may mutate what it is given', () => {

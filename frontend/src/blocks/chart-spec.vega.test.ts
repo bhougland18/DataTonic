@@ -14,9 +14,15 @@
 import { describe, expect, it } from 'vitest';
 import { compile } from 'vega-lite';
 import * as vega from 'vega';
-import { CHART_SHAPES, checkShape, type Field } from './chart-shapes';
+import {
+    CHART_SHAPES,
+    checkShape,
+    fieldsFromColumns,
+    identifierColumns,
+    type Field,
+} from './chart-shapes';
 import { thumbSpec } from './chart-thumbnails';
-import { buildSpec, stateFromVerdict, type ChartSpecState } from './chart-spec';
+import { buildSpec, readSpec, stateFromVerdict, type ChartSpecState } from './chart-spec';
 
 const f = (name: string, vlType: Field['vlType']): Field => ({ name, vlType });
 
@@ -267,5 +273,271 @@ describe('every thumbnail compiles', () => {
         // The thumbnail carries its own rows; the harness supplies the data.
         delete (spec as { data?: unknown }).data;
         expect(compileIssues(spec)).toEqual([]);
+    });
+});
+
+// The end of the same thread, rendered rather than asserted. The whole point of
+// preferring a name over a key is what somebody READS along the bottom of the
+// chart, and only a rendered scale domain can say what that is.
+//
+// Runs the real path: result columns → the joins drawn on the Schema step →
+// fields → verdict → state → spec → Vega. A break anywhere in it shows up here.
+describe('a bar chart is labelled with names, not IDs', () => {
+    const COLUMNS = [
+        { name: 'Vendor', type: 'int64' },
+        { name: 'VendorName', type: 'string' },
+        { name: 'n', type: 'int64' },
+    ];
+    const ROWS = [
+        { Vendor: 4021, VendorName: 'MEDLINE', n: 137 },
+        { Vendor: 1180, VendorName: 'CARDINAL', n: 92 },
+        { Vendor: 7714, VendorName: 'AESCULAP', n: 64 },
+    ];
+
+    async function xDomain(fields: Field[]): Promise<unknown[]> {
+        const state = stateFromVerdict(checkShape(fields, 'bar'))!;
+        const vg = compile({ ...buildSpec(state), data: { values: ROWS } } as never);
+        const view = new vega.View(vega.parse(vg.spec), { renderer: 'none' });
+        await view.runAsync();
+        return (view.scale('x').domain() as unknown[]).slice().sort();
+    }
+
+    it('draws the vendor names when the joins are known', async () => {
+        const keys = identifierColumns([{ fromColumn: 'Vendor', toColumn: 'Vendor' }]);
+        expect(await xDomain(fieldsFromColumns(COLUMNS, keys))).toEqual([
+            'AESCULAP',
+            'CARDINAL',
+            'MEDLINE',
+        ]);
+    });
+
+    it('and the heights are the count, not the ID', async () => {
+        const keys = identifierColumns([{ fromColumn: 'Vendor', toColumn: 'Vendor' }]);
+        const state = stateFromVerdict(checkShape(fieldsFromColumns(COLUMNS, keys), 'bar'))!;
+        const vg = compile({ ...buildSpec(state), data: { values: ROWS } } as never);
+        const view = new vega.View(vega.parse(vg.spec), { renderer: 'none' });
+        await view.runAsync();
+        // 137, not 4021: the IDs are an order of magnitude bigger, so a domain
+        // that reached them would be unmistakable.
+        expect((view.scale('y').domain() as number[])[1]).toBeLessThan(1000);
+    });
+});
+
+// The bullet graph, through the compiler AND the renderer.
+//
+// It needs both more than any chart here. The sweep above only ever sees the
+// encoding the MATCHER proposes, and a bullet graph's ranges are deliberately
+// never auto-filled — so the sweep compiles a two-layer bullet and the
+// five-layer one nobody had checked is the one people will draw.
+//
+// And a layered spec is the silent-failure shape: five marks sharing two scales,
+// where a wrong field binding or a lost layer still produces a chart that looks
+// like a chart.
+describe('the bullet graph compiles and draws', () => {
+    const ROWS = [
+        { Region: 'North', actual: 270, target: 250, poor: 150, fair: 225, good: 300 },
+        { Region: 'South', actual: 180, target: 250, poor: 150, fair: 225, good: 300 },
+        { Region: 'East', actual: 305, target: 250, poor: 150, fair: 225, good: 300 },
+    ];
+
+    const state: ChartSpecState = {
+        chart: 'bullet',
+        encoding: {
+            label: { field: 'Region', type: 'nominal' },
+            measure: { field: 'actual', type: 'quantitative' },
+            target: { field: 'target', type: 'quantitative' },
+            range1: { field: 'poor', type: 'quantitative' },
+            range2: { field: 'fair', type: 'quantitative' },
+            range3: { field: 'good', type: 'quantitative' },
+        },
+    };
+
+    async function view(s: ChartSpecState) {
+        const vg = compile({ ...buildSpec(s), data: { values: ROWS } } as never);
+        const v = new vega.View(vega.parse(vg.spec), { renderer: 'none' });
+        await v.runAsync();
+        return v;
+    }
+
+    it('compiles clean with all five layers', () => {
+        expect(compileIssues({ ...buildSpec(state), data: { values: ROWS } })).toEqual([]);
+    });
+
+    // `VegaChart` injects these three at render time, and Vega-Lite REFUSES them
+    // on a faceted spec — which is why this is layered rather than a copy of the
+    // `facet_bullet` example. If that ever changes, every bullet silently drops
+    // to 200px wide.
+    it('takes the size and data VegaChart injects, as a single view would', () => {
+        expect(
+            compileIssues({
+                ...buildSpec(state),
+                data: { values: ROWS },
+                width: 400,
+                height: 120,
+                autosize: { type: 'fit', contains: 'padding' },
+            }),
+        ).toEqual([]);
+    });
+
+    // The scale has to reach the widest RANGE, not just the measure — that is
+    // what makes the ranges a backdrop the measure sits inside rather than three
+    // bars in their own right.
+    it('shares one x scale across the layers, spanning the widest range', () => {
+        return view(state).then(v => {
+            const domain = v.scale('x').domain() as number[];
+            expect(domain[0]).toBe(0);
+            expect(domain[1]).toBeGreaterThanOrEqual(305);
+        });
+    });
+
+    // Alphabetical would be North, South, East → East, North, South.
+    it('keeps the rows in query order rather than sorting them alphabetically', async () => {
+        const v = await view(state);
+        expect(v.scale('y').domain()).toEqual(['North', 'South', 'East']);
+    });
+
+    it('sorts them when asked to', async () => {
+        const v = await view({
+            ...state,
+            encoding: { ...state.encoding, label: { ...state.encoding.label!, sort: 'ascending' } },
+        });
+        expect(v.scale('y').domain()).toEqual(['East', 'North', 'South']);
+    });
+
+    // Five layers in, five marks out. A layer whose field did not bind still
+    // produces a mark group, so this counts the ITEMS each one drew: three rows
+    // each, or the layer found nothing.
+    it('binds data in every layer, not just the ones that set the scale', async () => {
+        const v = await view(state);
+        type Group = { marktype?: string; items?: unknown[] };
+        const root = v.scenegraph() as unknown as { root: { items: Group[] } };
+        const counts = (root.root.items[0] as unknown as { items: Group[] }).items
+            .filter(g => g.marktype === 'rect' || g.marktype === 'rule')
+            .map(g => g.items?.length);
+        expect(counts).toEqual([3, 3, 3, 3, 3]);
+    });
+
+    // The axis title is what the layer merge gets wrong, in BOTH directions, and
+    // neither shows up in the spec JSON — only in `vg.spec.axes` after a compile.
+    //
+    // Leave the layers' titles alone and Vega-Lite JOINS them: the axis reads
+    // `good, fair, poor, actual, target`. Mute the other four with `title: null`
+    // to stop that, and the nulls beat the measure — the axis loses its name
+    // entirely and the Label control does nothing, whatever anyone types.
+    describe('the shared axis label', () => {
+        const titles = (s: ChartSpecState) => {
+            const vg = compile({ ...buildSpec(s), data: { values: ROWS } } as never);
+            const axes = (vg.spec as unknown as { axes: { scale: string; title?: unknown }[] }).axes;
+            return axes.filter(a => a.scale === 'x').map(a => a.title);
+        };
+
+        it('names the measure, once, and never joins the layers', () => {
+            expect(titles(state)).toEqual([undefined, 'actual']);
+        });
+
+        it('takes the label somebody typed', () => {
+            const named = {
+                ...state,
+                encoding: {
+                    ...state.encoding,
+                    measure: { ...state.encoding.measure!, title: 'Actual spend' },
+                },
+            };
+            expect(titles(named)).toEqual([undefined, 'Actual spend']);
+            // And it survives the round trip rather than being read back onto
+            // whichever layer happened to be first.
+            expect(readSpec(buildSpec(named))).toEqual(named);
+        });
+
+        it('can be hidden', () => {
+            const hidden = {
+                ...state,
+                encoding: {
+                    ...state.encoding,
+                    measure: { ...state.encoding.measure!, title: null },
+                },
+            };
+            // Vega-Lite drops a null title rather than carrying it through, so
+            // the compiled axis simply has none — which is what hiding it means.
+            expect(titles(hidden)).toEqual([undefined, undefined]);
+            expect(readSpec(buildSpec(hidden))).toEqual(hidden);
+        });
+    });
+
+    it('still compiles clean with no ranges at all', () => {
+        const { range1: _1, range2: _2, range3: _3, ...encoding } = state.encoding;
+        expect(
+            compileIssues({ ...buildSpec({ chart: 'bullet', encoding }), data: { values: ROWS } }),
+        ).toEqual([]);
+    });
+});
+
+// The sparkline table's one load-bearing claim, checked against the COMPILER
+// rather than against the JSON this module wrote.
+//
+// "Every row gets its own y scale" is not visible in the spec — `resolve` is
+// four words — and getting it wrong does not error, warn, or draw an empty
+// chart. It draws five horizontal rules that look like a styling problem. So
+// the assertion is on where Vega-Lite PUT the scale: inside the facet cell is
+// per-row, at the top level is shared.
+describe('a sparkline table gives every row its own scale', () => {
+    const state = stateFromVerdict(
+        checkShape(
+            [f('Category', 'nominal'), f('Month', 'temporal'), f('Spend', 'quantitative')],
+            'sparkline',
+        ),
+    )!;
+
+    const scalePlaces = (spec: Record<string, unknown>) => {
+        const vg = compile({ ...spec, data: { values: [] } } as never);
+        const out = vg.spec as unknown as {
+            scales?: { name: string }[];
+            marks?: { name?: string; scales?: { name: string }[] }[];
+        };
+        return {
+            top: (out.scales ?? []).map(s => s.name),
+            cell: (out.marks ?? []).flatMap(m => (m.scales ?? []).map(s => s.name)),
+        };
+    };
+
+    it('compiles clean', () => {
+        expect(compileIssues(buildSpec(state))).toEqual([]);
+    });
+
+    it('puts y inside the facet cell, and keeps x shared', () => {
+        const { top, cell } = scalePlaces(buildSpec(state));
+        // x shared: the rows are read down a common timeline.
+        expect(top).toContain('x');
+        expect(top).not.toContain('y');
+        expect(cell).toContain('child_y');
+    });
+
+    // The contrast, so the assertion above is not just describing whatever the
+    // compiler happens to do: without `resolve`, y lands at the top level and is
+    // one domain for every row.
+    it('would share one y domain without the resolve — the flat-lines bug', () => {
+        const shared = buildSpec(state);
+        delete shared.resolve;
+        const { top, cell } = scalePlaces(shared);
+        expect(top).toContain('y');
+        expect(cell).not.toContain('child_y');
+    });
+
+    // `VegaChart` sets this signal to fit the container, having measured the
+    // chrome around it. If the compiled name ever changes, the sparkline
+    // silently stops resizing.
+    it('exposes the inner width as child_width, which is what VegaChart drives', () => {
+        const vg = compile({ ...buildSpec(state), data: { values: [] } } as never);
+        const names = ((vg.spec as unknown as { signals?: { name: string }[] }).signals ?? []).map(
+            s => s.name,
+        );
+        expect(names).toContain('child_width');
+    });
+
+    // And it must stay drawable at the size the renderer will give it.
+    it('compiles clean with the numeric inner width VegaChart injects', () => {
+        const sized = buildSpec(state);
+        (sized.spec as Record<string, unknown>).width = 520;
+        expect(compileIssues(sized)).toEqual([]);
     });
 });

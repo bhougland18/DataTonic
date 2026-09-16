@@ -17,8 +17,32 @@ import type { SqlStudioColumn } from '../sqleditor/types';
 /** Vega-Lite's four measurement types. */
 export type VlType = 'nominal' | 'ordinal' | 'quantitative' | 'temporal';
 
-/** The encoding channels the built-in marks need between them. */
-export type Channel = 'x' | 'y' | 'color' | 'theta' | 'size';
+/**
+ * The encoding channels the built-in marks need between them.
+ *
+ * The first five are Vega-Lite's own. The rest are the BULLET GRAPH's, and they
+ * are not Vega-Lite channels at all — a bullet graph is a stack of layers, and
+ * `range2` names one of those layers rather than a channel on a mark.
+ *
+ * Kept in the same type on purpose. Everything between the matcher and the
+ * channel picker — `bestPlan`, `materialise`, `channelOptions`, `assignChannel`,
+ * `missingFields` — is written against "a need, and the column on it" and does
+ * not care what Vega-Lite will do with the answer. Giving the bullet graph its
+ * own parallel vocabulary would mean a second copy of all of it. `buildSpec` is
+ * where the difference finally lands, and it is the only place that knows.
+ */
+export type Channel =
+    | 'x'
+    | 'y'
+    | 'color'
+    | 'theta'
+    | 'size'
+    | 'label'
+    | 'measure'
+    | 'target'
+    | 'range1'
+    | 'range2'
+    | 'range3';
 
 export type ChartType =
     | 'bar'
@@ -29,7 +53,9 @@ export type ChartType =
     | 'arc'
     | 'rect'
     | 'boxplot'
-    | 'histogram';
+    | 'histogram'
+    | 'bullet'
+    | 'sparkline';
 
 export interface ChannelNeed {
     channel: Channel;
@@ -43,6 +69,23 @@ export interface ChannelNeed {
      * them what to click.
      */
     label: string;
+    /**
+     * `false` means: offer this channel, but never fill it from the leftovers.
+     *
+     * Every other optional channel takes whatever column is going spare, and
+     * that is right for them — a second category IS a split, a spare number IS
+     * a size. A bullet graph's qualitative ranges are not like that. They are a
+     * JUDGEMENT about what counts as poor, fair and good, and no column in a
+     * result is that by accident. Auto-filling them would draw performance
+     * bands out of whatever numbers happened to be selected, which is the
+     * unasked-for claim `chart-shape-guidance.md` §7 rules out.
+     *
+     * It also keeps the RANKING honest. `unused` is the tiebreak between fitting
+     * charts, so a chart with three greedy optional channels would eat every
+     * spare column and rank above the chart somebody actually wanted — exactly
+     * how the line chart came to beat the bar chart in the key-column bug.
+     */
+    autofill?: boolean;
 }
 
 export interface ShapeVariant {
@@ -113,6 +156,17 @@ export const MIN_DISTRIBUTION_ROWS = 20;
 export interface Field {
     name: string;
     vlType: VlType;
+    /**
+     * This column IDENTIFIES a row rather than describing it.
+     *
+     * Carried SEPARATELY from `vlType` because it has to survive the retyping:
+     * a numeric key becomes `nominal` and is still a key, and a text key was
+     * never retyped at all. `materialise` reads it to break the tie between two
+     * categories — see the note there.
+     *
+     * Absent means unknown, not "not a key". Same rule as everywhere else here.
+     */
+    isKey?: boolean;
 }
 
 /** Channel → field, ready to become a Vega-Lite `encoding` block. */
@@ -208,6 +262,9 @@ export function fieldsFromColumns(
      * Retyped `nominal`, not dropped: counting by vendor ID is a real chart,
      * and an ID makes a perfectly good category. What it is not is a magnitude.
      *
+     * It is also not the BEST category when a name is sitting next to it, which
+     * is the second half of the same finding — see `materialise`.
+     *
      * OPTIONAL, and unknown stays unknown — the same rule `aggregated` follows.
      * The SQL Editor node has no ER model to ask, so it passes nothing and
      * behaves exactly as before rather than guessing from column names.
@@ -218,10 +275,17 @@ export function fieldsFromColumns(
     for (const c of columns) {
         const vlType = vlTypeOf(c.type);
         if (!vlType) continue;
-        // Only a NUMERIC key needs retyping; a text key is already a category,
+        // Only a NUMERIC key needs RETYPING; a text key is already a category,
         // and a temporal one is a date somebody joined on and still a date.
-        const isKey = vlType === 'quantitative' && identifiers?.has(c.name);
-        out.push({ name: c.name, vlType: isKey ? 'nominal' : vlType });
+        //
+        // The FLAG is set for all three, because ranking cares about a
+        // `VendorCode` VARCHAR join column exactly as much as about `Vendor`.
+        const isKey = identifiers?.has(c.name) ?? false;
+        out.push({
+            name: c.name,
+            vlType: isKey && vlType === 'quantitative' ? 'nominal' : vlType,
+            isKey,
+        });
     }
     return out;
 }
@@ -269,6 +333,15 @@ const measure = (channel: Channel, required = true, label = 'a number'): Channel
     channel,
     accepts: ['quantitative'],
     required,
+    label,
+});
+
+/** A bullet graph's qualitative range: optional, and never taken from spares. */
+const range = (channel: Channel, label: string): ChannelNeed => ({
+    channel,
+    accepts: ['quantitative'],
+    required: false,
+    autofill: false,
     label,
 });
 
@@ -440,6 +513,73 @@ export const CHART_SHAPES: ChartShape[] = [
         ],
     },
     {
+        type: 'bullet',
+        label: 'Bullet graph',
+        variants: [
+            {
+                id: 'bullet',
+                label: 'Measure against a target',
+                // Stephen Few's design, from "Bullet Graph Design Specification"
+                // (2005/2010). Five parts: a text LABEL, a quantitative scale, a
+                // featured MEASURE as a bar, a comparative measure as a
+                // perpendicular marker, and two to five qualitative RANGES
+                // behind it all.
+                //
+                // The TARGET is required, and that is the decision that makes
+                // this chart worth having. A bullet graph without its
+                // comparative measure is a bar chart wearing grey stripes — and
+                // if it were optional the contract would match everything a bar
+                // chart matches, which is the same "suggestion list becomes
+                // noise" failure the line chart's refusal of nominal x avoids.
+                needs: [
+                    category('label', true, 'a category to label each row'),
+                    measure('measure', true, 'the number being measured'),
+                    measure('target', true, 'the target to compare it against'),
+                    // Ascending thresholds — poor, then fair, then good. Never
+                    // auto-filled; see `ChannelNeed.autofill`.
+                    range('range1', 'the poor/fair threshold'),
+                    range('range2', 'the fair/good threshold'),
+                    range('range3', 'the top of the scale'),
+                ],
+            },
+        ],
+    },
+    {
+        type: 'sparkline',
+        label: 'Sparkline table',
+        variants: [
+            {
+                id: 'sparkline',
+                label: 'One line per row',
+                // Tufte's sparkline, in Few's table layout: a small multiple per
+                // category, no axes, read as a LIST rather than as a chart.
+                //
+                // Reuses `x` and `y` rather than inventing channels, because
+                // unlike the bullet graph's layers these really are the inner
+                // view's x and y — the only unusual part is that the view is
+                // repeated once per `label`.
+                //
+                // This is the one chart here whose contract the COLUMNS cannot
+                // fully settle. It needs several rows per row-label, and row
+                // multiplicity is not visible in a type — one row per category
+                // gives a panel per category each holding a single point and no
+                // line at all. Same wall as the box plot's grain, same answer:
+                // offer it honestly rather than guess. `DAA.101` is what would
+                // close it.
+                needs: [
+                    category('label', true, 'a category for each row'),
+                    {
+                        channel: 'x',
+                        accepts: ['temporal', 'quantitative'],
+                        required: true,
+                        label: 'a date or number to run along each line',
+                    },
+                    measure('y', true, 'the number to trace'),
+                ],
+            },
+        ],
+    },
+    {
         type: 'boxplot',
         label: 'Box plot',
         distribution: true,
@@ -532,13 +672,19 @@ function bestPlan(needs: ChannelNeed[], fields: Field[]): Plan {
             }
             return;
         }
-        for (const t of needs[i].accepts) {
-            if (left[t] > 0) {
-                left[t] -= 1;
-                acc.push(t);
-                walk(i + 1, left, acc);
-                acc.pop();
-                left[t] += 1;
+        // A channel that is never auto-filled has exactly one branch: empty.
+        // Planning it would reserve a column the encoding then does not use,
+        // and `unused` — the tiebreak between fitting charts — is computed from
+        // the encoding.
+        if (needs[i].autofill !== false) {
+            for (const t of needs[i].accepts) {
+                if (left[t] > 0) {
+                    left[t] -= 1;
+                    acc.push(t);
+                    walk(i + 1, left, acc);
+                    acc.pop();
+                    left[t] += 1;
+                }
             }
         }
         // Leaving a need unfilled is always a branch: an optional channel is
@@ -553,13 +699,42 @@ function bestPlan(needs: ChannelNeed[], fields: Field[]): Plan {
     return best ?? needs.map(() => null);
 }
 
-/** Turn a type plan into real columns, first unused of each type, in order. */
+/** Category channels prefer a column that DESCRIBES over one that identifies. */
+const CATEGORY_TYPES: VlType[] = ['nominal', 'ordinal'];
+
+/**
+ * Turn a type plan into real columns, first unused of each type, in order.
+ *
+ * Column order decides it, with ONE exception: filling a CATEGORY channel, a
+ * non-key column beats a key column that comes before it. `Vendor`(int64) and
+ * `VendorName` are both categories after `fieldsFromColumns` retypes the key,
+ * and `Vendor` is first, so every bar chart came out with ID numbers along the
+ * bottom and the names it already had in hand sitting unused.
+ *
+ * Confined to categories on purpose. A key is a poor LABEL — that is the whole
+ * claim — but it is not a poor number or a poor date: a `date` somebody joined
+ * on is the axis you want, and preferring some other date column over it would
+ * be a worse answer than the one this fixes.
+ *
+ * A tiebreak, never a filter. With only the ID to hand the ID still gets the
+ * channel, because counting by vendor ID is a real chart (`fieldsFromColumns`).
+ */
 function materialise(needs: ChannelNeed[], fields: Field[], plan: Plan): Encoding {
     const used = new Set<number>();
     const encoding: Encoding = {};
+
+    const pick = (t: VlType): number => {
+        const free = (f: Field, j: number) => !used.has(j) && f.vlType === t;
+        if (CATEGORY_TYPES.includes(t)) {
+            const described = fields.findIndex((f, j) => free(f, j) && !f.isKey);
+            if (described >= 0) return described;
+        }
+        return fields.findIndex(free);
+    };
+
     plan.forEach((t, i) => {
         if (!t) return;
-        const idx = fields.findIndex((f, j) => !used.has(j) && f.vlType === t);
+        const idx = pick(t);
         if (idx < 0) return;
         used.add(idx);
         encoding[needs[i].channel] = { field: fields[idx].name, type: t };

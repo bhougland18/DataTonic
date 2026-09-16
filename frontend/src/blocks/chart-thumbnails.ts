@@ -52,8 +52,30 @@ const GRID = ['A', 'B', 'C'].flatMap((a, i) =>
     ['X', 'Y', 'Z'].map((b, j) => ({ a, b, v: (i + 1) * (j + 2) })),
 );
 
+/**
+ * Two bullets, one over target and one well under.
+ *
+ * Both states on the card, because "did it clear the mark" is the only question
+ * a bullet graph answers and a thumbnail showing two passes does not say so.
+ */
+const BULLETS = [
+    { c: 'A', r1: 4, r2: 8, r3: 12, v: 10, t: 8 },
+    { c: 'B', r1: 4, r2: 8, r3: 12, v: 5, t: 9 },
+];
+
+/** Three short series with visibly different SHAPES — rising, dipping, flat-ish. */
+const SPARKS = ['A', 'B', 'C'].flatMap((c, i) =>
+    [0, 1, 2, 3, 4, 5, 6].map(t => ({
+        c,
+        t,
+        v: [t * t, 20 - t * 2 + (t % 2) * 5, 8 + ((t * 5) % 7)][i],
+    })),
+);
+
 /** No axes, no legend, no frame: at this size every one of them is noise. */
 const BARE = { axis: null };
+
+const bulletThumbX = (field: string) => ({ field, type: 'quantitative', ...BARE });
 
 function thumb(
     values: Record<string, unknown>[],
@@ -131,5 +153,57 @@ export function thumbSpec(chart: ChartType): DiveChart {
             return thumb(SPREAD, { type: 'boxplot', size: 16 }, {
                 y: { field: 'v', type: 'quantitative', ...BARE },
             });
+        case 'bullet':
+            // The only LAYERED thumbnail, so it cannot go through `thumb`. Kept
+            // in step with `bulletSpec`'s colours by `chart-spec.test.ts`, which
+            // is the honest way to share them — exporting the constants would
+            // invite a second builder.
+            return {
+                data: { values: BULLETS },
+                encoding: { y: { field: 'c', type: 'nominal', sort: null, ...BARE } },
+                layer: [
+                    { mark: { type: 'bar', color: '#ccd2dc' }, encoding: { x: bulletThumbX('r3') } },
+                    { mark: { type: 'bar', color: '#adb5c2' }, encoding: { x: bulletThumbX('r2') } },
+                    { mark: { type: 'bar', color: '#8b95a8' }, encoding: { x: bulletThumbX('r1') } },
+                    {
+                        mark: { type: 'bar', color: '#2eafff', size: 4 },
+                        encoding: { x: bulletThumbX('v') },
+                    },
+                    {
+                        mark: { type: 'tick', color: '#ff7a45', thickness: 2 },
+                        encoding: { x: bulletThumbX('t') },
+                    },
+                ],
+                width: W,
+                height: H,
+                padding: 2,
+                config: { view: { stroke: null } },
+            };
+        case 'sparkline':
+            // The only FACETED thumbnail. Three rows at 10px rather than the
+            // real 22 — the card has 46px to say "a stack of little lines",
+            // and two rows would read as a comparison instead of a list.
+            return {
+                data: { values: SPARKS },
+                facet: { row: { field: 'c', type: 'nominal', header: null, sort: null } },
+                spacing: 2,
+                spec: {
+                    width: W,
+                    height: 10,
+                    view: { stroke: null },
+                    mark: {
+                        type: 'line',
+                        color: '#2eafff',
+                        strokeWidth: 1.5,
+                        interpolate: 'monotone',
+                    },
+                    encoding: {
+                        x: { field: 't', type: 'quantitative', axis: null },
+                        y: { field: 'v', type: 'quantitative', axis: null, scale: { zero: false } },
+                    },
+                },
+                padding: 2,
+                config: { view: { stroke: null } },
+            };
     }
 }

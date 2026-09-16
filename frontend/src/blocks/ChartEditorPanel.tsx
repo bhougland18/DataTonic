@@ -38,6 +38,15 @@ const CHANNEL_LABEL: Record<Channel, string> = {
     color: 'Colour',
     theta: 'Slice size',
     size: 'Point size',
+    // The bullet graph. Named for what they MEAN rather than for the layer they
+    // become — "Range 2" would be asking somebody to hold the drawing order in
+    // their head, and the order is `buildSpec`'s business.
+    label: 'Row label',
+    measure: 'Measure',
+    target: 'Target',
+    range1: 'Poor up to',
+    range2: 'Fair up to',
+    range3: 'Good up to',
 };
 
 const SORT_LABEL: Record<SortOrder, string> = {

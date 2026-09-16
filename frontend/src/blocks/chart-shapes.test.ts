@@ -497,3 +497,249 @@ describe('key columns are categories, not measures', () => {
         ]);
     });
 });
+
+// Found by Ben on the same result as the block above, once the IDs stopped
+// being bar HEIGHTS: they were still the bar LABELS. `Vendor` is a category
+// after the retyping and comes before `VendorName`, and first-of-its-type wins.
+describe('a category channel prefers a name over a key', () => {
+    const COLUMNS = [
+        { name: 'Vendor', type: 'int64' },
+        { name: 'VendorName', type: 'string' },
+        { name: 'count Item.Item', type: 'int64' },
+    ];
+    const KEYS = identifierColumns([{ fromColumn: 'Vendor', toColumn: 'Vendor' }]);
+
+    it('carries the key flag through the retyping', () => {
+        const fields = fieldsFromColumns(COLUMNS, KEYS);
+        expect(fields.map(x => `${x.name}=${x.vlType}${x.isKey ? ' key' : ''}`)).toEqual([
+            'Vendor=nominal key',
+            'VendorName=nominal',
+            'count Item.Item=quantitative',
+        ]);
+    });
+
+    // A VARCHAR join column is never retyped, so the flag is the only thing
+    // that can tell it from the name beside it.
+    it('flags a text key, which nothing retypes', () => {
+        const fields = fieldsFromColumns(
+            [
+                { name: 'VendorCode', type: 'VARCHAR' },
+                { name: 'VendorName', type: 'VARCHAR' },
+                { name: 'n', type: 'BIGINT' },
+            ],
+            identifierColumns([{ fromColumn: 'VendorCode', toColumn: 'VendorCode' }]),
+        );
+        expect(fields.map(x => x.isKey)).toEqual([true, false, false]);
+        const v = checkShape(fields, 'bar');
+        expect(v.kind === 'fits' && v.encoding.x?.field).toBe('VendorName');
+    });
+
+    it('puts the name on the bar chart axis, not the ID', () => {
+        // The state this inherits: retyping the key had already taken the ID
+        // off the bar HEIGHTS. It left it on the LABELS, because a retyped key
+        // is a category and `Vendor` comes first.
+        const v = checkShape(fieldsFromColumns(COLUMNS, KEYS), 'bar');
+        expect(v.kind === 'fits' && v.encoding.x?.field).toBe('VendorName');
+        expect(v.kind === 'fits' && v.encoding.y?.field).toBe('count Item.Item');
+        // The ID is not thrown away — it is the leftover, free for the split.
+        expect(v.kind === 'fits' && v.unused).not.toContain('count Item.Item');
+    });
+
+    // Horizontal bars put the category on y. Same rule, other channel.
+    it('does the same for the transposed chart', () => {
+        const v = checkShape(fieldsFromColumns(COLUMNS, KEYS), 'barh');
+        expect(v.kind === 'fits' && v.encoding.y?.field).toBe('VendorName');
+    });
+
+    it('does the same for a pie chart, which is all category', () => {
+        const v = checkShape(fieldsFromColumns(COLUMNS, KEYS), 'arc');
+        expect(v.kind === 'fits' && v.encoding.color?.field).toBe('VendorName');
+    });
+
+    // A tiebreak, not a filter: with nothing else to hand the ID is still the
+    // chart, because counting by vendor ID is a real question.
+    it('still uses the key when it is the only category', () => {
+        const fields = fieldsFromColumns(
+            [
+                { name: 'Vendor', type: 'int64' },
+                { name: 'count Item.Item', type: 'int64' },
+            ],
+            KEYS,
+        );
+        const v = checkShape(fields, 'bar');
+        expect(v.kind === 'fits' && v.encoding.x?.field).toBe('Vendor');
+    });
+
+    // Confined to categories. A date somebody joined on is still the axis you
+    // want, and there is no "more descriptive" date to prefer over it.
+    it('leaves a temporal channel alone', () => {
+        const fields = fieldsFromColumns(
+            [
+                { name: 'OrderDate', type: 'date' },
+                { name: 'ShipDate', type: 'date' },
+                { name: 'n', type: 'BIGINT' },
+            ],
+            identifierColumns([{ fromColumn: 'OrderDate', toColumn: 'OrderDate' }]),
+        );
+        const v = checkShape(fields, 'line');
+        expect(v.kind === 'fits' && v.encoding.x?.field).toBe('OrderDate');
+    });
+
+    // Unknown stays unknown: with no ER model to ask, every category is equal
+    // again and plain column order decides. That is the SQL Editor node.
+    it('falls back to column order when no keys are given', () => {
+        const fields = fieldsFromColumns([
+            { name: 'VendorCode', type: 'VARCHAR' },
+            { name: 'VendorName', type: 'VARCHAR' },
+            { name: 'n', type: 'BIGINT' },
+        ]);
+        const v = checkShape(fields, 'bar');
+        expect(v.kind === 'fits' && v.encoding.x?.field).toBe('VendorCode');
+    });
+});
+
+// Stephen Few's bullet graph. The first contract here that is not one mark with
+// channels — `label`/`measure`/`target`/`range1..3` become LAYERS, not Vega-Lite
+// channels, and `chart-spec.ts` is the only thing that knows that.
+describe('the bullet graph', () => {
+    const BULLET = [
+        f('Region', 'nominal'),
+        f('actual', 'quantitative'),
+        f('target', 'quantitative'),
+    ];
+
+    it('fits a category, a measure and a target', () => {
+        const v = checkShape(BULLET, 'bullet');
+        expect(v.kind).toBe('fits');
+        expect(proposeEncoding(v)).toEqual({
+            label: { field: 'Region', type: 'nominal' },
+            measure: { field: 'actual', type: 'quantitative' },
+            target: { field: 'target', type: 'quantitative' },
+        });
+    });
+
+    // The decision that makes the chart worth offering: without its comparative
+    // measure a bullet graph is a bar chart, and it would match everything a bar
+    // chart matches.
+    it('will not draw without a target', () => {
+        const v = checkShape([f('Region', 'nominal'), f('actual', 'quantitative')], 'bullet');
+        expect(v.kind).toBe('close');
+        expect(missingSummary(v)).toBe('needs the target to compare it against');
+    });
+
+    // It is SUGGESTED for a plain category and count, but only as a `close` —
+    // "add a target and this becomes a bullet graph", which is the whole reason
+    // `suggestCharts` keeps near misses. What it must never be is a fit.
+    it('offers itself as a near miss, not as a fit, without a target', () => {
+        const v = suggestCharts(VENDOR_COUNT).find(x => x.chart === 'bullet');
+        expect(v?.kind).toBe('close');
+        expect(suggestCharts(VENDOR_COUNT, false).map(x => x.chart)).not.toContain('bullet');
+    });
+
+    // The ranges are a JUDGEMENT about what counts as good, so no spare column
+    // becomes one by accident.
+    it('never fills a range from the leftover columns', () => {
+        const v = checkShape([...BULLET, f('n', 'quantitative'), f('m', 'quantitative')], 'bullet');
+        expect(v.kind === 'fits' && Object.keys(v.encoding).sort()).toEqual([
+            'label',
+            'measure',
+            'target',
+        ]);
+        expect(v.kind === 'fits' && v.unused.sort()).toEqual(['m', 'n']);
+    });
+
+    // And so the greedy-optional ranking trap does not repeat. `unused` is the
+    // tiebreak between fitting charts, so a chart with three hungry optional
+    // channels climbs it just by being wide enough to swallow the spares — which
+    // is exactly how the line chart came to outrank the bar chart over an ID.
+    //
+    // A bullet graph consumes THREE columns and never more, so every spare
+    // number costs it a place rather than earning one.
+    it('cannot climb the ranking by eating spare columns', () => {
+        const unusedWith = (spares: number) => {
+            const v = checkShape(
+                [...BULLET, ...Array.from({ length: spares }, (_, i) => f(`n${i}`, 'quantitative'))],
+                'bullet',
+            );
+            return v.kind === 'fits' ? v.unused.length : -1;
+        };
+        expect([unusedWith(0), unusedWith(1), unusedWith(3)]).toEqual([0, 1, 3]);
+    });
+
+    // Where it DOES climb is the shape it is for: a bar chart of one category
+    // and two measures leaves the target over, and the bullet graph does not.
+    //
+    // Not asserted as FIRST, because a line chart ties it at zero unused here —
+    // `line` takes a quantitative x, so it offers `actual` against `target` as a
+    // series. That is the pre-existing "a line over two unordered measures"
+    // looseness, not something this contract introduced.
+    it('outranks the bar chart on a category, a measure and a target', () => {
+        const ranked = allCharts(BULLET).filter(v => v.kind === 'fits').map(v => v.chart);
+        expect(ranked.indexOf('bullet')).toBeLessThan(ranked.indexOf('bar'));
+        expect(checkShape(BULLET, 'bullet')).toMatchObject({ kind: 'fits', unused: [] });
+        expect(checkShape(BULLET, 'bar')).toMatchObject({ kind: 'fits', unused: ['target'] });
+    });
+
+    // A range can still be PUT there — it is optional, not absent.
+    it('accepts a range when one is assigned', () => {
+        const needs = CHART_SHAPES.find(s => s.type === 'bullet')!.variants[0].needs;
+        const range = needs.find(n => n.channel === 'range2')!;
+        expect(range.required).toBe(false);
+        expect(range.autofill).toBe(false);
+        expect(range.accepts).toEqual(['quantitative']);
+    });
+});
+
+// Tufte's sparkline in Few's table layout. Reuses `x` and `y` rather than
+// inventing channels — unlike the bullet graph's layers these really are the
+// inner view's axes, and the only unusual part is that the view repeats.
+describe('the sparkline table', () => {
+    const SERIES = [
+        f('Category', 'nominal'),
+        f('Month', 'temporal'),
+        f('Spend', 'quantitative'),
+    ];
+
+    it('fits a category, a timeline and a measure', () => {
+        const v = checkShape(SERIES, 'sparkline');
+        expect(v.kind).toBe('fits');
+        expect(proposeEncoding(v)).toEqual({
+            label: { field: 'Category', type: 'nominal' },
+            x: { field: 'Month', type: 'temporal' },
+            y: { field: 'Spend', type: 'quantitative' },
+        });
+    });
+
+    it('needs a category to split the rows by', () => {
+        const v = checkShape([f('Month', 'temporal'), f('Spend', 'quantitative')], 'sparkline');
+        expect(v.kind).toBe('close');
+        expect(missingSummary(v)).toBe('needs a category for each row');
+    });
+
+    // A number works as well as a date: a sparkline over a period index is the
+    // same chart. Same latitude the line chart's x already has.
+    it('takes a number for the timeline as well as a date', () => {
+        const v = checkShape(
+            [f('Category', 'nominal'), f('Period', 'quantitative'), f('Spend', 'quantitative')],
+            'sparkline',
+        );
+        expect(v.kind).toBe('fits');
+        expect(v.kind === 'fits' && v.encoding.x?.field).toBe('Period');
+    });
+
+    // The honest gap. It needs several rows per row-label, and multiplicity is
+    // not in a column's type — one row per category draws a panel each holding
+    // a single point and no line. The box plot hit the same wall; `DAA.101` is
+    // what would close it. Recorded as a test so the gap is not mistaken for an
+    // oversight.
+    it('cannot yet tell a real series from one row per category', () => {
+        const oneEach = checkShape(SERIES, 'sparkline', { rowCount: 3, aggregated: true });
+        expect(oneEach.kind).toBe('fits');
+    });
+
+    it('is offered alongside the line chart, not instead of it', () => {
+        const charts = suggestCharts(SERIES).map(v => v.chart);
+        expect(charts).toContain('sparkline');
+        expect(charts).toContain('line');
+    });
+});

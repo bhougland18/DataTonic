@@ -80,6 +80,11 @@ export function customId(name: string): string {
  */
 export function variantFromSpec(spec: DiveChart): ShapeVariant | null {
     if (!isRecord(spec)) return null;
+    // A MULTI-VIEW spec's top-level encoding is inherited by its views, not a
+    // contract for one mark. A bullet graph hoists its row label to exactly
+    // there, so without this a saved bullet template would come back as "a
+    // chart needing one category" and draw a bar chart from its label column.
+    if ('layer' in spec || 'facet' in spec || 'concat' in spec || 'repeat' in spec) return null;
     const enc = spec.encoding;
     if (!isRecord(enc)) return null;
 

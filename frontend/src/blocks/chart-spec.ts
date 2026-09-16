@@ -241,6 +241,285 @@ function channelDef(
     return def;
 }
 
+// ---------------------------------------------------------------------------
+// The bullet graph
+// ---------------------------------------------------------------------------
+//
+// Stephen Few's design, and the first chart here that is not ONE MARK WITH
+// CHANNELS — it is a stack of layers, so it gets its own builder and its own
+// reader rather than being forced through `channelDef`.
+//
+// **Layered, NOT faceted**, which is where this departs from the Vega-Lite
+// example (`examples/facet_bullet`). That example facets by title and resolves
+// the x scale INDEPENDENTLY, because it is a dashboard: revenue in $thousands
+// and satisfaction out of five have no common axis. A block's bullet graph
+// comes from ONE query, so every row measures the same thing, and a shared
+// scale is not a simplification — it is the whole point. Comparing vendors
+// against their targets on separate axes would be a chart that invites a
+// comparison it then refuses to support.
+//
+// It also keeps `VegaChart` working. Vega-Lite will not take a top-level
+// `width`/`height` or `autosize: fit` on a faceted spec, and `VegaChart`
+// injects all three — a faceted bullet would have warned and drawn at 200px.
+// A LAYER spec takes them exactly as a single view does.
+
+/**
+ * The qualitative ranges, palest on the outside.
+ *
+ * Few is specific and worth following: shades of ONE hue, never the red/amber/
+ * green that everyone reaches for. Three greys carry "worse to better" without
+ * claiming a verdict, and they survive colour-blindness and a black-and-white
+ * printer, which traffic lights do not.
+ *
+ * Slate rather than neutral grey, so they sit in the brand range. The LIGHTNESS
+ * is a compromise picked by rendering all three candidates on both themes and
+ * looking: `VegaChart` themes the config, not the marks, so one set of values
+ * has to serve both. Few's near-whites are right on the light theme and turn
+ * into the brightest thing on the dark one, where they out-shout the measure
+ * they are supposed to sit behind; a darker slate is right on dark and goes
+ * heavy enough on light to compete with the measure instead. This ramp is the
+ * middle, and it is legible either way.
+ */
+const RANGE_FILL = ['#8b95a8', '#adb5c2', '#ccd2dc'];
+
+/** The featured measure: the most salient thing on the graph. */
+const MEASURE_FILL = '#2eafff';
+
+/** The comparative measure. Few asks for strong contrast against the measure. */
+const TARGET_STROKE = '#ff7a45';
+
+/** Thin, so the ranges read as a backdrop and not as bars in their own right. */
+const MEASURE_SIZE = 9;
+
+/** range1 → range3, ascending thresholds. Index matches `RANGE_FILL`. */
+const RANGE_CHANNELS: Channel[] = ['range1', 'range2', 'range3'];
+
+/**
+ * One layer's x, carrying the axis label EVERY layer has to agree on.
+ *
+ * Vega-Lite merges the layers' x axes into one, and the merge is not "first
+ * wins" — distinct titles are JOINED, so an untouched stack labels its axis
+ * `good, fair, poor, actual, target`. Muting the other four with `title: null`
+ * fixes that and then breaks the Label control instead: the nulls beat the
+ * measure's title and the axis comes out with no name at all, whatever anyone
+ * types. Found by compiling and reading `vg.spec.axes`, not by looking at the
+ * JSON, which is right either way.
+ *
+ * So the title is decided ONCE, from the featured measure, and written
+ * identically to every layer. Identical titles merge to themselves.
+ */
+function bulletX(field: string, title: string | null, format?: string): Record<string, unknown> {
+    const def: Record<string, unknown> = {
+        field: escapeField(field),
+        type: 'quantitative',
+        title,
+    };
+    if (format) def.axis = { format };
+    return def;
+}
+
+/** What the shared x axis is called: the measure's label, or its column name. */
+function bulletAxisTitle(measure?: ChannelSpec): string | null {
+    if (!measure) return null;
+    if (measure.title === null) return null;
+    const t = measure.title?.trim();
+    return t || measure.field || null;
+}
+
+/**
+ * The gap between one bullet and the next.
+ *
+ * Not decoration. Vega-Lite gives a band scale almost no padding by default, so
+ * the RANGE bars — which fill their whole band — touch the rows above and below
+ * and four bullets read as one striped block. The target ticks are band-height
+ * too, so with the bands flush they join into a single rule straight down the
+ * chart and stop looking like a per-row marker at all.
+ *
+ * Found by rendering the thing and looking at it. Every test passed.
+ */
+const BULLET_PADDING = 0.34;
+
+/** The shared row label. Hoisted to the top level, so every layer inherits it. */
+function bulletLabel(c: ChannelSpec): Record<string, unknown> {
+    const def: Record<string, unknown> = {
+        field: escapeField(c.field as string),
+        type: c.type,
+        scale: { paddingInner: BULLET_PADDING, paddingOuter: BULLET_PADDING / 2 },
+    };
+    // `null` — not alphabetical. A bullet graph is read as a LIST, and the
+    // order a list is in is a decision somebody made in the SQL. This is the
+    // same trap `SortOrder.queryOrder` documents, and it is the default here
+    // rather than an option because there is no second axis to rank by.
+    def.sort = c.sort === 'ascending' || c.sort === 'descending' ? c.sort : null;
+    // The rows are labelled; an axis title above them repeats the column name
+    // for no one.
+    if (c.title === null || c.title === undefined) def.title = null;
+    else if (c.title.trim()) def.title = c.title.trim();
+    return def;
+}
+
+function bulletSpec(state: ChartSpecState): DiveChart {
+    const enc = state.encoding;
+    const layers: Record<string, unknown>[] = [];
+    const m = enc.measure;
+    const axisTitle = bulletAxisTitle(m);
+    const format = m?.format;
+
+    // LARGEST first: the bars all start at zero and overlap, so the smallest
+    // range has to be painted last to stay visible.
+    for (let i = RANGE_CHANNELS.length - 1; i >= 0; i -= 1) {
+        const c = enc[RANGE_CHANNELS[i]];
+        if (!c?.field) continue;
+        layers.push({
+            mark: { type: 'bar', color: RANGE_FILL[i] },
+            encoding: { x: bulletX(c.field, axisTitle, format) },
+        });
+    }
+    if (m?.field) {
+        layers.push({
+            mark: { type: 'bar', color: MEASURE_FILL, size: MEASURE_SIZE },
+            encoding: { x: bulletX(m.field, axisTitle, format) },
+        });
+    }
+    const t = enc.target;
+    if (t?.field) {
+        // A TICK, not a bar: the comparative measure is a position on the
+        // scale, and a bar from zero would read as a second quantity.
+        layers.push({
+            mark: { type: 'tick', color: TARGET_STROKE, thickness: 2 },
+            encoding: { x: bulletX(t.field, axisTitle, format) },
+        });
+    }
+
+    const spec: Record<string, unknown> = { $schema: VL_SCHEMA };
+    const title = state.title?.trim();
+    const subtitle = state.subtitle?.trim();
+    if (title) spec.title = subtitle ? { text: title, subtitle } : title;
+    if (enc.label?.field) spec.encoding = { y: bulletLabel(enc.label) };
+    spec.layer = layers;
+    return spec;
+}
+
+// ---------------------------------------------------------------------------
+// The sparkline table
+// ---------------------------------------------------------------------------
+//
+// Tufte's sparkline in Few's table layout, and the first FACETED spec here.
+//
+// Faceted where the bullet graph is layered, and for the opposite reason. A
+// bullet graph's rows measure one thing and must share a scale; a sparkline
+// table is read as a LIST of shapes, one line per category, where the question
+// is "which of these is rising" and not "which is biggest". Faceting is what
+// gives each row its own panel.
+//
+// `VegaChart` had to learn this shape before it could be drawn: Vega-Lite
+// refuses a top-level `width: 'container'` on a facet, so the renderer now
+// measures the chrome and sets the inner `child_width` itself (see
+// `fitComposed`). That is why this writes no width — the same invariant every
+// other chart here keeps.
+
+/**
+ * Height of ONE sparkline row, and the one size a spec here carries.
+ *
+ * A deliberate exception, on the same footing as the gallery thumbnails. Tufte's
+ * point is that a sparkline is word-sized: the row height is not a rendering
+ * choice that a bigger panel should stretch, it is what makes a column of them
+ * scannable. Three categories in a tall panel should be three thin lines with
+ * space under them, not three fat bands.
+ *
+ * Width is NOT here, and that is the split: the width is genuinely a property
+ * of the surface, so `VegaChart` supplies it.
+ */
+const SPARK_HEIGHT = 22;
+
+/** Gap between rows. Enough to separate, too little to read as separate charts. */
+const SPARK_SPACING = 4;
+
+const SPARK_STROKE = '#2eafff';
+
+function sparklineSpec(state: ChartSpecState): DiveChart {
+    const enc = state.encoding;
+    const label = enc.label;
+    const x = enc.x;
+    const y = enc.y;
+
+    const row: Record<string, unknown> = {
+        field: escapeField(label?.field ?? ''),
+        type: label?.type ?? 'nominal',
+        header: {
+            // Left-aligned and upright: these are row LABELS in a table, and a
+            // rotated label is the thing that stops a table being scannable.
+            labelAngle: 0,
+            labelAlign: 'left',
+            title: label?.title === null || label?.title === undefined ? null : label.title.trim(),
+        },
+        // ALPHABETICAL by default, and this is the one chart here that cannot
+        // offer query order.
+        //
+        // `sort: null` — which is how every other chart says "leave the rows
+        // alone" — is SILENTLY IGNORED on a facet row. Rendered and checked: a
+        // facet with `sort: null` and a facet with no `sort` at all produce the
+        // identical alphabetical order. The only thing Vega-Lite accepts for an
+        // arbitrary order is an explicit ARRAY of the values, and baking the
+        // categories into the spec would tie it to one result — the same
+        // failure the custom-template contract exists to avoid.
+        //
+        // So it is written out rather than left implicit, because an ordering
+        // nobody chose should at least be visible in the JSON.
+        sort: label?.sort === 'descending' ? 'descending' : 'ascending',
+    };
+
+    const inner: Record<string, unknown> = {
+        height: SPARK_HEIGHT,
+        view: { stroke: null },
+        // A LINE, not the filled area the Vega-Lite example uses. An area
+        // declares a zero baseline, and a sparkline's y axis is deliberately not
+        // zero-based — the whole point is the SHAPE of the variation, which
+        // zero-anchoring flattens away. Filling it would draw a quantity claim
+        // the chart then refuses to label.
+        mark: { type: 'line', color: SPARK_STROKE, strokeWidth: 1.5, interpolate: 'monotone' },
+        encoding: {
+            // No axes at all. That is what makes it a sparkline rather than a
+            // small line chart, and it is why the row label has to carry the
+            // naming.
+            x: { field: escapeField(x?.field ?? ''), type: x?.type ?? 'temporal', axis: null },
+            y: {
+                field: escapeField(y?.field ?? ''),
+                type: 'quantitative',
+                axis: null,
+                scale: { zero: false },
+            },
+        },
+    };
+
+    const spec: Record<string, unknown> = { $schema: VL_SCHEMA };
+    const title = state.title?.trim();
+    const subtitle = state.subtitle?.trim();
+    if (title) spec.title = subtitle ? { text: title, subtitle } : title;
+    spec.facet = { row };
+    spec.spacing = SPARK_SPACING;
+    spec.spec = inner;
+    // EVERY ROW GETS ITS OWN Y SCALE, and without this the chart is worthless.
+    //
+    // Vega-Lite shares scales across facets by default, which is right for most
+    // small multiples and exactly wrong here. Rendered over five categories
+    // spending between 1k and 9k, one shared domain squashed all five into
+    // near-flat lines — a table of identical horizontal rules. It looked like a
+    // styling problem and was a meaning problem.
+    //
+    // The opposite call to the bullet graph's shared scale, from the opposite
+    // question. A bullet graph asks "did this clear its target", which is a
+    // comparison of magnitudes and needs one axis. A sparkline asks "what is
+    // this one DOING" — the shape is the content, and a shape you cannot see is
+    // not a smaller answer, it is no answer.
+    //
+    // x stays SHARED: the rows are read down a common timeline, and rows over
+    // different periods would be a table that invites a comparison it cannot
+    // support.
+    spec.resolve = { scale: { y: 'independent' } };
+    return spec;
+}
+
 /**
  * The Vega-Lite spec for this state — no data, no width, no height.
  *
@@ -250,6 +529,9 @@ function channelDef(
  * "one spec, many deliverables" claim rests on.
  */
 export function buildSpec(state: ChartSpecState): DiveChart {
+    if (state.chart === 'bullet') return bulletSpec(state);
+    if (state.chart === 'sparkline') return sparklineSpec(state);
+
     const encoding: Record<string, unknown> = {};
     for (const ch of Object.keys(state.encoding) as Channel[]) {
         const c = state.encoding[ch];
@@ -280,9 +562,14 @@ export function buildSpec(state: ChartSpecState): DiveChart {
  *
  * The two families this excludes on purpose rather than by omission:
  * `transform`, because plan §9 puts shaping in the SQL where it is visible and
- * reusable; and the multi-view keys (`layer`, `facet`, `concat`, `repeat`),
- * which `chart-shape-guidance.md` §9 put out of scope — the matcher describes
- * ONE mark with its channels.
+ * reusable; and the multi-view keys (`facet`, `concat`, `repeat`), which
+ * `chart-shape-guidance.md` §9 put out of scope — the matcher describes ONE
+ * mark with its channels.
+ *
+ * `layer` is the ONE exception, and it is not handled here: `readSpec` sends a
+ * layered spec to `readBullet` before it gets this far. The bullet graph earns
+ * that because it is still a small closed record — a label, a measure, a
+ * target, three thresholds — that happens to be SPELLED as layers.
  */
 const MODELLED_KEYS = ['$schema', 'mark', 'encoding', 'title'];
 
@@ -440,6 +727,227 @@ function readChannel(channel: Channel, raw: unknown): ChannelSpec | null {
     return c;
 }
 
+/** The top-level keys a bullet graph is allowed to carry. */
+const BULLET_KEYS = ['$schema', 'encoding', 'layer', 'title'];
+
+/**
+ * One bullet layer back to (channel, field), or null if it is not one of ours.
+ *
+ * The title and the format are returned ALONGSIDE the channel rather than put
+ * on it. They describe the shared axis and are written to every layer, so
+ * reading each layer's copy onto its own channel would relabel the ranges
+ * "actual" and then write those labels back out on the next save.
+ */
+function readBulletLayer(
+    raw: unknown,
+): { channel: Channel; spec: ChannelSpec; title: unknown; format?: string } | null {
+    if (!isRecord(raw)) return null;
+    if (Object.keys(raw).some(k => k !== 'mark' && k !== 'encoding')) return null;
+    const mark = raw.mark;
+    if (!isRecord(mark) || typeof mark.color !== 'string') return null;
+    const enc = raw.encoding;
+    if (!isRecord(enc) || Object.keys(enc).some(k => k !== 'x')) return null;
+
+    const x = enc.x;
+    if (!isRecord(x) || typeof x.field !== 'string' || x.type !== 'quantitative') return null;
+    if (Object.keys(x).some(k => k !== 'field' && k !== 'type' && k !== 'title' && k !== 'axis')) {
+        return null;
+    }
+    if (x.title !== null && typeof x.title !== 'string') return null;
+
+    const spec: ChannelSpec = { field: unescapeField(x.field), type: 'quantitative' };
+    let format: string | undefined;
+    if (x.axis !== undefined) {
+        if (!isRecord(x.axis)) return null;
+        if (Object.keys(x.axis).some(k => k !== 'format')) return null;
+        if (typeof x.axis.format !== 'string') return null;
+        format = x.axis.format;
+    }
+    const out = { spec, title: x.title, format };
+
+    if (mark.type === 'tick') {
+        if (mark.color !== TARGET_STROKE) return null;
+        if (Object.keys(mark).some(k => !['type', 'color', 'thickness'].includes(k))) return null;
+        return { ...out, channel: 'target' };
+    }
+    if (mark.type !== 'bar') return null;
+    if (Object.keys(mark).some(k => !['type', 'color', 'size'].includes(k))) return null;
+    if (mark.color === MEASURE_FILL) return { ...out, channel: 'measure' };
+    const i = RANGE_FILL.indexOf(mark.color);
+    return i < 0 ? null : { ...out, channel: RANGE_CHANNELS[i] };
+}
+
+/**
+ * A bullet graph back as state, or `null` for any other layered spec.
+ *
+ * Matched STRICTLY — the layer order, the mark colours, the keys on each
+ * channel def. That is deliberately unforgiving: a layered spec is the one
+ * shape a person is most likely to have hand-built into something these
+ * controls would quietly flatten, and the mark colours are what tell our bullet
+ * graph from somebody else's bar-and-tick stack. Change a colour in the JSON
+ * tab and the spec stays in JSON, which is the same bargain `MODELLED_KEYS`
+ * already strikes for the single-mark charts.
+ */
+function readBullet(spec: Record<string, unknown>): ChartSpecState | null {
+    if (Object.keys(spec).some(k => !BULLET_KEYS.includes(k))) return null;
+    const layers = spec.layer;
+    if (!Array.isArray(layers) || layers.length < 2) return null;
+
+    const encoding: Partial<Record<Channel, ChannelSpec>> = {};
+    let lastRange = RANGE_CHANNELS.length;
+    let axis: { title: unknown; format?: string } | null = null;
+    for (let i = 0; i < layers.length; i += 1) {
+        const read = readBulletLayer(layers[i]);
+        if (!read) return null;
+        if (read.channel in encoding) return null;
+        // Every layer carries the same axis label and format, because that is
+        // the only way Vega-Lite's axis merge keeps either. A spec where they
+        // differ was not written here.
+        if (axis === null) axis = { title: read.title, format: read.format };
+        else if (axis.title !== read.title || axis.format !== read.format) return null;
+        // The ranges come largest first, and the measure and the target come
+        // after all of them. Anything else is a spec `bulletSpec` would not
+        // have written, so reading it as one would reorder the layers on save.
+        if (RANGE_CHANNELS.includes(read.channel)) {
+            const at = RANGE_CHANNELS.indexOf(read.channel);
+            if (at >= lastRange) return null;
+            lastRange = at;
+        } else if (read.channel === 'measure') {
+            if (i !== layers.length - 2) return null;
+        } else if (i !== layers.length - 1) return null;
+        encoding[read.channel] = read.spec;
+    }
+    if (!encoding.measure || !encoding.target || !axis) return null;
+
+    // The axis belongs to the featured measure — that is where the Label and
+    // the number format are edited. `bulletAxisTitle` DEFAULTS the label to the
+    // measure's column name, so reading that back as an explicit title would
+    // fill the Label box in by itself on every reopen.
+    if (axis.title !== null && axis.title !== encoding.measure.field) {
+        encoding.measure.title = axis.title as string;
+    } else if (axis.title === null) {
+        encoding.measure.title = null;
+    }
+    if (axis.format) encoding.measure.format = axis.format;
+
+    const encRaw = spec.encoding;
+    if (!isRecord(encRaw) || Object.keys(encRaw).some(k => k !== 'y')) return null;
+    const y = encRaw.y;
+    if (!isRecord(y) || typeof y.field !== 'string') return null;
+    if (Object.keys(y).some(k => !['field', 'type', 'sort', 'title', 'scale'].includes(k))) {
+        return null;
+    }
+    if (typeof y.type !== 'string' || !VL_TYPES.includes(y.type as VlType)) return null;
+    if (y.sort !== null && y.sort !== 'ascending' && y.sort !== 'descending') return null;
+    // The row padding is fixed, not a refinement — a spec with a different one
+    // is not a spec these controls wrote, and owning it would overwrite it.
+    if (!isRecord(y.scale)) return null;
+    if (y.scale.paddingInner !== BULLET_PADDING) return null;
+
+    const label: ChannelSpec = { field: unescapeField(y.field), type: y.type as VlType };
+    if (y.sort === 'ascending' || y.sort === 'descending') label.sort = y.sort;
+    if (typeof y.title === 'string') label.title = y.title;
+    else if (y.title !== null) return null;
+    encoding.label = label;
+
+    const state: ChartSpecState = { chart: 'bullet', encoding };
+    const title = spec.title;
+    if (typeof title === 'string') state.title = title;
+    else if (isRecord(title)) {
+        if (Object.keys(title).some(k => k !== 'text' && k !== 'subtitle')) return null;
+        if (typeof title.text === 'string') state.title = title.text;
+        if (typeof title.subtitle === 'string') state.subtitle = title.subtitle;
+    } else if (title !== undefined) return null;
+    return state;
+}
+
+/** The top-level keys a sparkline table is allowed to carry. */
+const SPARK_KEYS = ['$schema', 'facet', 'spacing', 'spec', 'resolve', 'title'];
+
+/**
+ * A sparkline table back as state, or `null` for any other faceted spec.
+ *
+ * Matched as strictly as `readBullet`, and for the same reason: everything
+ * outside the three fields is a constant `sparklineSpec` wrote, so a spec where
+ * one of them differs is not ours, and owning it would quietly overwrite the
+ * difference on the next save.
+ */
+function readSparkline(spec: Record<string, unknown>): ChartSpecState | null {
+    if (Object.keys(spec).some(k => !SPARK_KEYS.includes(k))) return null;
+    if (spec.spacing !== SPARK_SPACING) return null;
+    // Independent y is what makes it a sparkline rather than five flat lines,
+    // so a spec without it is not one of ours — and quietly re-adding it would
+    // change what somebody's hand-edited chart says.
+    const resolve = spec.resolve;
+    if (!isRecord(resolve) || Object.keys(resolve).some(k => k !== 'scale')) return null;
+    if (!isRecord(resolve.scale) || Object.keys(resolve.scale).some(k => k !== 'y')) return null;
+    if (resolve.scale.y !== 'independent') return null;
+
+    const facet = spec.facet;
+    if (!isRecord(facet) || Object.keys(facet).some(k => k !== 'row')) return null;
+    const row = facet.row;
+    if (!isRecord(row)) return null;
+    if (Object.keys(row).some(k => !['field', 'type', 'header', 'sort'].includes(k))) return null;
+    if (typeof row.field !== 'string') return null;
+    if (typeof row.type !== 'string' || !VL_TYPES.includes(row.type as VlType)) return null;
+    if (row.sort !== 'ascending' && row.sort !== 'descending') return null;
+    const header = row.header;
+    if (!isRecord(header)) return null;
+    if (header.labelAngle !== 0 || header.labelAlign !== 'left') return null;
+    if (header.title !== null && typeof header.title !== 'string') return null;
+
+    const inner = spec.spec;
+    if (!isRecord(inner)) return null;
+    if (Object.keys(inner).some(k => !['height', 'view', 'mark', 'encoding'].includes(k))) {
+        return null;
+    }
+    // The row height is the design, not a refinement — see `SPARK_HEIGHT`. A
+    // different one is somebody's own chart. And a WIDTH means the spec was
+    // saved with a size baked in, which is the thing every chart here avoids.
+    if (inner.height !== SPARK_HEIGHT) return null;
+    const mark = inner.mark;
+    if (!isRecord(mark)) return null;
+    if (mark.type !== 'line' || mark.color !== SPARK_STROKE) return null;
+    if (mark.interpolate !== 'monotone') return null;
+
+    const encRaw = inner.encoding;
+    if (!isRecord(encRaw) || Object.keys(encRaw).some(k => k !== 'x' && k !== 'y')) return null;
+    const rawX = encRaw.x;
+    const rawY = encRaw.y;
+    if (!isRecord(rawX) || !isRecord(rawY)) return null;
+    if (rawX.axis !== null || rawY.axis !== null) return null;
+    if (typeof rawX.field !== 'string' || typeof rawY.field !== 'string') return null;
+    if (typeof rawX.type !== 'string' || !VL_TYPES.includes(rawX.type as VlType)) return null;
+    if (rawY.type !== 'quantitative') return null;
+
+    const label: ChannelSpec = {
+        field: unescapeField(row.field),
+        type: row.type as VlType,
+    };
+    // `ascending` is what `sparklineSpec` writes when nothing was chosen, so
+    // reading it back as a choice would fill the Order control in by itself.
+    if (row.sort === 'descending') label.sort = 'descending';
+    if (typeof header.title === 'string') label.title = header.title;
+
+    const state: ChartSpecState = {
+        chart: 'sparkline',
+        encoding: {
+            label,
+            x: { field: unescapeField(rawX.field), type: rawX.type as VlType },
+            y: { field: unescapeField(rawY.field), type: 'quantitative' },
+        },
+    };
+
+    const title = spec.title;
+    if (typeof title === 'string') state.title = title;
+    else if (isRecord(title)) {
+        if (Object.keys(title).some(k => k !== 'text' && k !== 'subtitle')) return null;
+        if (typeof title.text === 'string') state.title = title.text;
+        if (typeof title.subtitle === 'string') state.subtitle = title.subtitle;
+    } else if (title !== undefined) return null;
+    return state;
+}
+
 /**
  * A spec back as editable state, or `null` when these controls cannot model it.
  *
@@ -451,6 +959,10 @@ function readChannel(channel: Channel, raw: unknown): ChannelSpec | null {
  */
 export function readSpec(spec: DiveChart): ChartSpecState | null {
     if (!isRecord(spec)) return null;
+    // The two multi-view shapes these controls own. Every other layered or
+    // faceted spec still falls through to `null` and stays in JSON, as before.
+    if ('layer' in spec) return readBullet(spec);
+    if ('facet' in spec) return readSparkline(spec);
     if (Object.keys(spec).some(k => !MODELLED_KEYS.includes(k))) return null;
 
     const mark = markType(spec);
