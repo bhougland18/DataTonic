@@ -455,6 +455,12 @@ fn ensure_pixeltable_if_used(app: &tauri::AppHandle, pipeline: &PipelineDoc) {
     }
 }
 
+/// `preview_rows` is the rows captured per node; `None` keeps the 100-row
+/// default. Raised by surfaces that RENDER the rows rather than tabulate them —
+/// a chart draws every row it is given, so the default silently changes what the
+/// picture says: a bar chart loses bars, and a small-multiple chart loses whole
+/// panels, with nothing on screen to say which. See
+/// [`DuckdbEngine::with_preview_rows`].
 #[tauri::command]
 async fn run_pipeline(
     app: tauri::AppHandle,
@@ -463,8 +469,13 @@ async fn run_pipeline(
     pipeline_id: Option<String>,
     pipeline_name: Option<String>,
     workspace_path: Option<String>,
+    preview_rows: Option<usize>,
 ) -> Result<RunResult, String> {
     let engine = engine()?.for_new_run();
+    let engine = match preview_rows {
+        Some(n) => engine.with_preview_rows(n),
+        None => engine,
+    };
     *CURRENT_RUN.lock().unwrap_or_else(|p| p.into_inner()) = Some(engine.clone());
     // Resolve ${ENV:NAME} from the OS environment before running, so canvas runs
     // see process env vars like the headless runner does (issue #137). The

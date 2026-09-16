@@ -35,7 +35,7 @@ import {
     unresolvedAttachSources,
 } from './sources';
 import { probeAll } from './probe';
-import { runBlockSql } from './run';
+import { BLOCK_ROW_LIMIT, runBlockSql } from './run';
 import SourcesPanel from './SourcesPanel';
 import SqlCatalogPanel from './SqlCatalogPanel';
 import SavedQueriesPanel from './SavedQueriesPanel';
@@ -468,7 +468,8 @@ export default function BlocksStudio({
     );
 
     const run = useCallback(
-        (text: string) => runBlockSql(text, workspacePath, 'Block', activeGroup?.dbPath ?? null),
+        (text: string) =>
+            runBlockSql(text, workspacePath, 'Block', activeGroup?.dbPath ?? null, BLOCK_ROW_LIMIT),
         [workspacePath, activeGroup],
     );
 
@@ -1874,17 +1875,22 @@ export default function BlocksStudio({
                                                     className="blk-charts-vega"
                                                 />
                                             ) : null}
-                                            {/* The row cap is the engine's
-                                                preview limit, not this step's.
-                                                Said because a chart over a
-                                                truncated result is a chart that
-                                                means something slightly
-                                                different. */}
-                                            {lastRun.result.rows.length >= 100 ? (
+                                            {/* The cap is raised for this step
+                                                (`BLOCK_ROW_LIMIT`) rather than
+                                                gone. Still said when a result
+                                                reaches it, because a chart over
+                                                a truncated result is a chart
+                                                that means something slightly
+                                                different, and at this size it is
+                                                whole CATEGORIES that go missing
+                                                rather than a few rows. */}
+                                            {lastRun.result.rows.length >= BLOCK_ROW_LIMIT ? (
                                                 <p className="blk-charts-cap">
                                                     Drawn over the first{' '}
                                                     {lastRun.result.rows.length} rows — a run
                                                     returns a preview, not the whole result.
+                                                    Narrow the query to be sure nothing is
+                                                    missing.
                                                 </p>
                                             ) : null}
                                         </div>

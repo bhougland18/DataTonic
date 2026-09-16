@@ -123,6 +123,7 @@ async function runViaSse(
     pipelineName?: string | null,
     workspacePath?: string | null,
     targetNodeId?: string,
+    previewRows?: number,
 ): Promise<RunResult | null> {
     const fail = (error: string): RunResult => ({
         status: 'error',
@@ -142,6 +143,8 @@ async function runViaSse(
                 workspacePath: workspacePath ?? null,
                 // Present for run-to-here (partial); omitted/null = full run.
                 targetNodeId: targetNodeId ?? null,
+                // Rows per node preview. Null keeps the engine's 100-row default.
+                previewRows: previewRows ?? null,
             }),
         });
         if (!res.ok || !res.body) return fail('run failed: HTTP ' + res.status);
@@ -187,12 +190,30 @@ export async function runPipeline(
     pipelineId?: string,
     workspacePath?: string | null,
     pipelineName?: string | null,
+    /**
+     * Rows captured per node preview. Omitted keeps the engine's 100-row default.
+     *
+     * For a surface that RENDERS the rows rather than tabulating them. A grid
+     * shows a glance and says so; a chart draws every row it is given, so the
+     * default quietly changes what the picture means — a bar chart loses bars,
+     * a small-multiple chart loses whole panels, and nothing on screen says
+     * which. Clamped engine-side, so asking for too much is not a foot-gun.
+     */
+    previewRows?: number,
 ): Promise<RunResult | null> {
     if (!isTauri() && !isWebBackend()) return null;
     // Web edition streams progress over SSE so the live per-node animation works
     // just like the desktop Channel.
     if (isWebBackend()) {
-        return runViaSse({ nodes, edges }, onEvent, pipelineId, pipelineName, workspacePath);
+        return runViaSse(
+            { nodes, edges },
+            onEvent,
+            pipelineId,
+            pipelineName,
+            workspacePath,
+            undefined,
+            previewRows,
+        );
     }
     const channel = new Channel<PipelineEvent>();
     if (onEvent) channel.onmessage = onEvent;
@@ -203,6 +224,7 @@ export async function runPipeline(
             pipelineId: pipelineId ?? null,
             pipelineName: pipelineName ?? null,
             workspacePath: workspacePath ?? null,
+            previewRows: previewRows ?? null,
         });
     } catch (err) {
         console.error('runPipeline failed', err);

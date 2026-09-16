@@ -149,6 +149,14 @@ impl From<EngineError> for InspectError {
 const PREVIEW_LIMIT: usize = 8;
 /// Rows captured per stage during a run (shown in the node Preview tab).
 const PREVIEW_ROW_LIMIT: usize = 100;
+/// Ceiling on [`DuckdbEngine::with_preview_rows`].
+///
+/// A preview travels as JSON through a marker file and then over the IPC
+/// channel, so the cost is real and paid per node. The limit is here rather
+/// than at the call site because it protects the field: a caller asking for
+/// everything gets a chart, not an out-of-memory. Well above any number of
+/// marks a chart can usefully draw.
+const MAX_PREVIEW_ROWS: usize = 100_000;
 
 /// Upper bound on input rows for xf.ai.dedupe. The stage compares every row
 /// against all previously-kept rows (O(N^2) cosine), so an unbounded input can
@@ -171,6 +179,8 @@ pub struct DuckdbEngine {
     cancel: Arc<AtomicBool>,
     /// Whether per-node preview rows are wanted. See [`DuckdbEngine::without_previews`].
     previews: bool,
+    /// How many preview rows to read per node. See [`DuckdbEngine::with_preview_rows`].
+    preview_rows: usize,
     /// Substitutions a job passes to everything it runs, however deep.
     ///
     /// A job's return file is named by whoever called it, but the rows may be written from
@@ -384,6 +394,7 @@ impl DuckdbEngine {
     pub fn new(bin: PathBuf) -> Self {
         Self {
             previews: true,
+            preview_rows: PREVIEW_ROW_LIMIT,
             bin,
             inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -487,6 +498,28 @@ impl DuckdbEngine {
         self
     }
 
+    /// Read `rows` preview rows per node instead of the default 100.
+    ///
+    /// The default exists because a preview is a GLANCE — a grid somebody
+    /// scrolls to see that the shape is right — and paying for more rows than
+    /// that on every node of every run is waste.
+    ///
+    /// A CHART is the case that breaks the assumption. It does not sample its
+    /// rows, it draws all of them, so the cap silently changes what the picture
+    /// says: a bar chart loses bars, and a small-multiple chart loses whole
+    /// panels, with nothing on screen to say which. Surfaces that render rather
+    /// than tabulate raise this deliberately, per call.
+    ///
+    /// Per-ENGINE rather than per-node because a preview limit is a property of
+    /// what the caller intends to do with the rows, and one caller intends one
+    /// thing. Raising it for a real multi-node pipeline would read every node's
+    /// preview at the new size, which is why the surfaces that raise it run a
+    /// single synthesized node (see `runBlockSql`).
+    pub fn with_preview_rows(mut self, rows: usize) -> Self {
+        self.preview_rows = rows.clamp(1, MAX_PREVIEW_ROWS);
+        self
+    }
+
     /// A clone of this engine carrying a FRESH, independent cancel flag, for a
     /// new top-level run. Each run owns its own cancellation scope: cancelling
     /// (or a stale cancel from) one run must not stop another concurrent run,
@@ -498,6 +531,7 @@ impl DuckdbEngine {
             bin: self.bin.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             previews: self.previews,
+            preview_rows: self.preview_rows,
             // A new run is a new identity; carrying the previous one forward
             // would file this run's log lines under that run.
             run_id: None,
@@ -525,6 +559,7 @@ impl DuckdbEngine {
             bin: self.bin.clone(),
             cancel: Arc::clone(&self.cancel),
             previews: false,
+            preview_rows: self.preview_rows,
             run_id: None,
             artifacts: Arc::new(std::sync::Mutex::new(Vec::new())),
             outputs: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -3218,7 +3253,7 @@ impl DuckdbEngine {
                 batched_sql.push_str(&format!(
                     "COPY (SELECT * FROM {} LIMIT {}) TO '{}' (FORMAT 'json', ARRAY false);\n",
                     plan::quote_ident(&stage.node_id),
-                    PREVIEW_ROW_LIMIT,
+                    self.preview_rows,
                     path_to_sql(&rows),
                 ));
             }
@@ -3630,7 +3665,7 @@ impl DuckdbEngine {
             sql.push_str(&format!(
                 " SELECT * FROM (DESCRIBE {q}); SELECT * FROM {q} LIMIT {lim};",
                 q = q,
-                lim = PREVIEW_ROW_LIMIT
+                lim = self.preview_rows
             ));
         }
         // -bail makes a missing relation fail the whole invocation; treat
@@ -8515,5 +8550,46 @@ mod file_op_overwrite {
         assert!(dst.exists(), "the archive should have been written");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod preview_rows_tests {
+    use super::{DuckdbEngine, MAX_PREVIEW_ROWS, PREVIEW_ROW_LIMIT};
+    use std::path::PathBuf;
+
+    fn engine() -> DuckdbEngine {
+        DuckdbEngine::new(PathBuf::from("duckdb"))
+    }
+
+    #[test]
+    fn defaults_to_the_preview_limit() {
+        assert_eq!(engine().preview_rows, PREVIEW_ROW_LIMIT);
+    }
+
+    #[test]
+    fn takes_a_raised_limit() {
+        assert_eq!(engine().with_preview_rows(5_000).preview_rows, 5_000);
+    }
+
+    // The ceiling is here rather than at the call site so it protects the field:
+    // a caller asking for everything gets a chart, not an out-of-memory.
+    #[test]
+    fn clamps_an_unreasonable_request() {
+        assert_eq!(engine().with_preview_rows(usize::MAX).preview_rows, MAX_PREVIEW_ROWS);
+    }
+
+    // Zero rows is a preview that cannot say anything, and it would read as
+    // "the query returned nothing" rather than as a setting.
+    #[test]
+    fn never_drops_to_zero() {
+        assert_eq!(engine().with_preview_rows(0).preview_rows, 1);
+    }
+
+    // A new top-level run keeps the limit: it is the caller's intent for what
+    // the rows are FOR, and that does not reset because a run began.
+    #[test]
+    fn survives_for_new_run() {
+        assert_eq!(engine().with_preview_rows(5_000).for_new_run().preview_rows, 5_000);
     }
 }

@@ -62,6 +62,14 @@ interface QueryPaneProps {
     runToken?: number | string;
 }
 
+/**
+ * Rows this grid will put in the DOM at once.
+ *
+ * Five times what a run used to return, so nothing that worked before is
+ * clipped by it; well under what a chart now asks for. See `shownRows`.
+ */
+const GRID_ROW_LIMIT = 500;
+
 // One editor + its own results grid. Used full-width for the main query and,
 // when the AI drafts, side-by-side so both can be run and compared. Keeps its
 // own result/sort so switching panes doesn't lose anything.
@@ -138,6 +146,9 @@ export default function QueryPane({
 
     const sortedRows = useMemo(() => {
         if (!result || !sort) return result?.rows ?? [];
+        // Sorting happens over ALL the rows, before the display cap below —
+        // sorting a truncated list and calling it "largest first" would be a
+        // different and wronger answer than showing fewer rows.
         const { col, dir } = sort;
         const factor = dir === 'asc' ? 1 : -1;
         return [...result.rows].sort((a, b) => {
@@ -150,6 +161,20 @@ export default function QueryPane({
             return String(av).localeCompare(String(bv)) * factor;
         });
     }, [result, sort]);
+
+    /**
+     * Rows put in the DOM. Not a cap on the RESULT — see the count in the head.
+     *
+     * This table is not virtualised: every row becomes a `<tr>` with a cell per
+     * column. That was free while a run returned 100 rows and stopped being free
+     * the moment charts started asking for thousands (`BLOCK_ROW_LIMIT`), which
+     * they need because a chart draws its rows rather than sampling them. The
+     * grid does not — a grid is read by scrolling, and nobody scrolls five
+     * thousand rows looking for one.
+     */
+    const shownRows = sortedRows.length > GRID_ROW_LIMIT
+        ? sortedRows.slice(0, GRID_ROW_LIMIT)
+        : sortedRows;
 
     const toggleSort = (col: string) =>
         setSort(s =>
@@ -209,6 +234,9 @@ export default function QueryPane({
                     <>
                         <span className="sqlstudio-res-ok">
                             {result.rows.length} row{result.rows.length === 1 ? '' : 's'}
+                            {result.rows.length > GRID_ROW_LIMIT
+                                ? ` · showing the first `
+                                : ''}
                         </span>
                         {result.durationMs != null && (
                             <span className="sqlstudio-res-m">
@@ -245,7 +273,7 @@ export default function QueryPane({
                             </tr>
                         </thead>
                         <tbody>
-                            {sortedRows.map((row, i) => (
+                            {shownRows.map((row, i) => (
                                 <tr key={i}>
                                     <td className="rownum">{i + 1}</td>
                                     {result.columns.map(c => {

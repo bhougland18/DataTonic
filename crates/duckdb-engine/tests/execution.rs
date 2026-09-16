@@ -22526,3 +22526,52 @@ fn snk_manticore_splits_rows_into_batches() {
         second
     );
 }
+
+/// A raised preview limit really does reach the rows a run hands back.
+///
+/// The unit tests cover the field; this covers the WIRING, which is the half
+/// that silently does nothing if the limit is read in the wrong place — and
+/// "silently" is the whole problem here. A chart drawn over a truncated result
+/// is not a smaller chart, it is a chart that says something else, and nothing
+/// about it looks wrong.
+///
+/// Both halves are asserted from ONE fixture, because the interesting claim is
+/// the difference: the same 250-row source gives 100 rows by default and 250
+/// when asked.
+#[test]
+fn a_raised_preview_limit_returns_more_rows() {
+    let engine = engine_or_skip!();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut csv = String::from("id,n\n");
+    for i in 1..=250 {
+        csv.push_str(&format!("{i},{}\n", i * 2));
+    }
+    let path = write_file(tmp.path(), "many.csv", &csv);
+    let out = out_path(tmp.path(), "out.csv");
+
+    let pipeline = doc(
+        json!([
+            node("s", "src.csv", json!({ "path": &path, "hasHeader": true })),
+            node("k", "snk.csv", json!({ "path": &out, "hasHeader": true }))
+        ]),
+        json!([main_edge("e1", "s", "k")]),
+    );
+
+    let rows_for = |e: &DuckdbEngine| -> usize {
+        let r = e.execute_pipeline(&pipeline);
+        assert_eq!(r.status, "ok", "{:?}", r.error);
+        r.preview
+            .iter()
+            .find(|p| p.node_id == "s")
+            .expect("a preview for the source")
+            .rows
+            .len()
+    };
+
+    assert_eq!(rows_for(&engine), 100, "the default is still a glance");
+    assert_eq!(
+        rows_for(&engine.clone().with_preview_rows(5_000)),
+        250,
+        "a raised limit reads the whole 250-row source, not the first 100"
+    );
+}

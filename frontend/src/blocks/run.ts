@@ -17,6 +17,21 @@ import { stripTerminator } from '../sqleditor/qualify';
 import type { SqlRunResult } from '../sqleditor/types';
 
 /**
+ * Rows a Blocks run asks for, so a chart is drawn over the data and not over a
+ * sample of it.
+ *
+ * RAISED, not removed, and the distinction is the point. The engine will go to
+ * 100,000 (`MAX_PREVIEW_ROWS`) but a chart with 100,000 marks answers no
+ * question, and the rows travel as JSON through a marker file and the IPC
+ * channel on every run. Five thousand covers what the charts here can actually
+ * say — twenty categories over ten years of months for a small-multiple, which
+ * is past the point where a reader can hold it — and the step still SAYS when a
+ * result hit the ceiling, because a truncated chart means something slightly
+ * different and nothing else on screen would show it.
+ */
+export const BLOCK_ROW_LIMIT = 5000;
+
+/**
  * Run arbitrary read-only SQL against the durable source and return the grid.
  *
  * `database`, when given, is a DuckDB file the query needs attached. We do not
@@ -47,12 +62,24 @@ import type { SqlRunResult } from '../sqleditor/types';
  * Errors are returned in the result rather than thrown: `QueryPane` renders
  * `error` inline, and a rejected promise would surface as an unhandled failure
  * in the pane instead of a message the user can act on.
+ *
+ * `rowLimit` raises the engine's 100-row preview cap for this run. Omitted
+ * keeps it. The cap is right for a GRID — a preview is a glance, and the grid
+ * says how many rows it is showing — and wrong for a CHART, which draws every
+ * row it is handed. The cap does not make a chart smaller, it makes it say
+ * something else: bars go missing, and a small-multiple chart loses whole
+ * panels with nothing on screen to mark the loss.
+ *
+ * Safe here, and only here, because this synthesizes a SINGLE node. The limit
+ * is per-engine, so raising it on a real multi-node pipeline would read every
+ * node's preview at the new size.
  */
 export async function runBlockSql(
     sql: string,
     workspacePath?: string | null,
     label = 'Block',
     database?: string | null,
+    rowLimit?: number,
 ): Promise<SqlRunResult> {
     const start = performance.now();
     sql = stripTerminator(sql);
@@ -72,6 +99,7 @@ export async function runBlockSql(
             'blocks_studio',
             workspacePath ?? null,
             label,
+            rowLimit,
         );
         const durationMs = performance.now() - start;
         if (!result) {

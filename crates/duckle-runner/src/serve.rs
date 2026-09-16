@@ -1276,6 +1276,13 @@ fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    // Preview rows per node, for a caller that RENDERS them rather than
+    // tabulating them: a chart draws every row it is given, so the 100-row
+    // default silently changes what the picture says. Same knob the desktop
+    // `run_pipeline` command takes, because the web editor's Blocks step is the
+    // same step — a chart that fills in on one edition and truncates on the
+    // other is the kind of difference nobody thinks to look for.
+    let preview_rows = args.get("previewRows").and_then(|v| v.as_u64()).map(|n| n as usize);
     // SSE response head (no Content-Length; we stream until the run ends).
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
@@ -1286,6 +1293,10 @@ fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(
     // synchronous, so events stream first, the result line follows).
     let mut ev = stream.try_clone().map_err(|e| e.to_string())?;
     let engine = crate::prepared_engine(state.duckdb.clone(), &state.workspace);
+    let engine = match preview_rows {
+        Some(n) => engine.with_preview_rows(n),
+        None => engine,
+    };
     // Run-to-here is still a run, and the one an operator is most likely to
     // want to find again.
     let receipt = begin_editor_run(
