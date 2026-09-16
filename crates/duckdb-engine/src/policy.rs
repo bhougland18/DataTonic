@@ -462,16 +462,236 @@ fn network_allowlist() -> Option<BTreeSet<String>> {
 ///   extensions that are already on disk, and turning it off breaks ordinary
 ///   local queries.
 ///
-/// Known residual: an explicit `INSTALL` of a core extension still succeeds,
-/// because extension download does not go through the disabled filesystems.
-/// Naming that extension's filesystem above is what keeps it from reaching
-/// anything.
+/// Explicit `INSTALL` is handled separately: generated preludes become
+/// `LOAD`-only and the execution boundary rejects raw `INSTALL` SQL.
 pub const DUCKDB_OFF_NETWORK: &str = concat!(
     "SET disabled_filesystems=",
     "'HTTPFileSystem,S3FileSystem,AzureBlobStorageFileSystem,GCSFileSystem';\n",
     "SET allow_community_extensions=false;\n",
     "SET autoinstall_known_extensions=false;\n",
 );
+
+/// Load an extension without allowing a restricted run to download it.
+pub fn duckdb_extension_prelude(name: &str, community: bool) -> String {
+    if duckdb_external_io_denied() {
+        return format!("LOAD {name}; ");
+    }
+    if community {
+        format!("INSTALL {name} FROM community; LOAD {name}; ")
+    } else {
+        format!("INSTALL {name}; LOAD {name}; ")
+    }
+}
+
+/// Is there a dot-command where a statement could begin?
+///
+/// A dot-command is not SQL: the CLI intercepts it and runs it itself, so no
+/// DuckDB setting and no component deny reaches it. `.shell` and `.system` run
+/// a program, `.read` reads any file the process can and `.output` writes one -
+/// which makes a `code.sql` body a way to do what the `code.shell` component
+/// does, while a policy denying that component looks on.
+///
+/// Duckle generates none, so refusing them costs nothing, and no valid SQL
+/// statement begins with a dot either - it is a syntax error today. The CLI
+/// wants the dot in column 0; this is deliberately broader, because being
+/// broader refuses only what already fails to parse and stays correct if the
+/// CLI ever stops caring about the column.
+pub fn contains_dot_command(sql: &str) -> bool {
+    scan(sql).dot_command
+}
+
+/// Refuse SQL that must not reach the CLI, for either reason.
+///
+/// Called from EVERY place that hands SQL to the CLI, because there is no one
+/// boundary they share: `run()` covers the per-stage path, `execute_batched`
+/// spawns its own child, and `apply_duckdb_sql` is a third. A guard in `run()`
+/// alone let the DEFAULT path through - measured, as a real download from
+/// extensions.duckdb.org under an enforcing policy.
+///
+/// One call rather than two at each of those, because the thing this module
+/// keeps relearning is that a rule living in one place and not its twin is how
+/// a guard goes missing.
+pub fn refuse_unsafe_sql(sql: &str) -> Result<(), String> {
+    let found = scan(sql);
+    if found.dot_command {
+        return Err(concat!(
+            "policy: a DuckDB dot-command (a line beginning with `.`) is not SQL. The CLI runs ",
+            "it directly, so nothing the policy says about components or settings applies to it. ",
+            "Remove it, or use the code.shell component if a command is genuinely intended."
+        )
+        .into());
+    }
+    if found.install && duckdb_external_io_denied() {
+        return Err(concat!(
+            "policy: DuckDB INSTALL is disabled in restricted-network mode; ",
+            "pre-install the extension and use LOAD"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// What one walk of the SQL found at statement position.
+#[derive(Default)]
+struct Scan {
+    install: bool,
+    dot_command: bool,
+}
+
+/// Detect the SQL command that can download an extension.
+pub fn contains_explicit_install(sql: &str) -> bool {
+    scan(sql).install
+}
+
+/// One walk of the SQL, ignoring quoted strings, dollar-quoted bodies and
+/// comments, and looking only where a statement starts.
+///
+/// Both things it looks for are statement-position things, and a second walk
+/// would be a second copy of the quoting rules to keep in step - which is the
+/// bug this module has already had, in another form.
+fn scan(sql: &str) -> Scan {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    // INSTALL can only be the first word of a statement, so that is the only
+    // place worth looking. Starts true: the very beginning is a statement start.
+    let mut at_statement_start = true;
+    let mut found = Scan::default();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'"' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // A comment is whitespace to the parser, so it does not move a
+            // statement off its opening position: `/* generated */ INSTALL x;`
+            // is still an INSTALL, and that is a real shape here because these
+            // preludes are generated with a provenance comment in front.
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            // A dollar-quoted body is a string. Without this arm an apostrophe
+            // inside `$$...$$` opened the single-quote branch, which found no
+            // close, consumed to end of input, and hid every statement after
+            // it - so the detector answered "no" to a payload that then
+            // downloaded an extension. A lone `$` (a positional parameter) is
+            // not a dollar quote and must not swallow anything.
+            b'$' => match dollar_quote_tag(bytes, i) {
+                Some(tag_len) => {
+                    let tag = &bytes[i..i + tag_len];
+                    i += tag_len;
+                    while i < bytes.len() {
+                        if bytes[i] == b'$' && bytes[i..].starts_with(tag) {
+                            i += tag_len;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                None => i += 1,
+            },
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &bytes[start..i];
+                // Only where a statement STARTS. `install` is an unreserved
+                // keyword in the pinned DuckDB, so it is a legal identifier:
+                // `SELECT 1 AS install` is ordinary SQL and refusing it broke
+                // real queries, and only under a policy.
+                if at_statement_start && word.eq_ignore_ascii_case(b"install") {
+                    found.install = true;
+                }
+                // `FORCE INSTALL x` is the same command in two words, so FORCE
+                // does not end the statement's opening position.
+                at_statement_start = at_statement_start && word.eq_ignore_ascii_case(b"force");
+                continue;
+            }
+            // Not SQL: the CLI runs it. Only where a statement could begin,
+            // which is exactly where the CLI looks.
+            b'.' if at_statement_start => {
+                found.dot_command = true;
+                i += 1;
+                continue;
+            }
+            b';' => {
+                at_statement_start = true;
+                i += 1;
+                continue;
+            }
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            _ => i += 1,
+        }
+        // Anything that is not whitespace, a comment, a `;` or the opening word
+        // of a statement means we are inside one.
+        at_statement_start = false;
+    }
+    found
+}
+
+/// The length of a dollar-quote opener at `at` (`$$` or `$tag$`), or None when
+/// this `$` opens nothing - a positional parameter like `$1`, or a bare `$`.
+///
+/// A tag is what DuckDB accepts between the dollars: letters, digits and
+/// underscores, not starting with a digit.
+fn dollar_quote_tag(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut j = at + 1;
+    if bytes.get(j) == Some(&b'$') {
+        return Some(2);
+    }
+    if bytes.get(j).is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    while bytes.get(j).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+        j += 1;
+    }
+    match bytes.get(j) {
+        Some(&b'$') if j > at + 1 => Some(j - at + 1),
+        _ => None,
+    }
+}
 
 /// Must DuckDB be taken off the network for this run?
 ///
@@ -832,6 +1052,141 @@ mod tests {
         }
         p.narrow_with(layer, "test");
         p
+    }
+
+    #[test]
+    fn install_detector_ignores_text_and_comments() {
+        assert!(contains_explicit_install("SET x=1; INSTALL httpfs;"));
+        assert!(contains_explicit_install("/* generated */\nInStAlL spatial;"));
+        assert!(!contains_explicit_install("SELECT 'INSTALL httpfs';"));
+        assert!(!contains_explicit_install("-- INSTALL httpfs;\nSELECT 1;"));
+        assert!(!contains_explicit_install("SELECT installer FROM users;"));
+    }
+
+    /// A dollar-quoted body is a string, and the scanner has to know that.
+    ///
+    /// Without a `$` arm, an apostrophe inside `$$...$$` opens the single-quote
+    /// branch, which finds no closing quote and consumes to end of input - so
+    /// every statement after it is invisible and the detector answers "no".
+    /// Reproduced end to end against the pinned CLI as a real download from
+    /// extensions.duckdb.org under an enforcing policy, so this is the guard
+    /// failing open rather than a near-miss.
+    #[test]
+    fn a_dollar_quoted_string_does_not_hide_what_follows_it() {
+        assert!(
+            contains_explicit_install("SELECT $$it's$$ AS a; INSTALL httpfs;"),
+            "an apostrophe inside $$...$$ desynced the scanner"
+        );
+        assert!(
+            contains_explicit_install("SELECT $tag$it's$tag$ AS a; INSTALL httpfs;"),
+            "a tagged dollar quote desynced the scanner"
+        );
+        // The other direction: the word inside the literal is text, not a command.
+        assert!(!contains_explicit_install("SELECT $$INSTALL httpfs$$ AS a;"));
+        assert!(!contains_explicit_install("SELECT $q$INSTALL httpfs$q$ AS a;"));
+        // A lone `$` is not a dollar quote. A positional parameter must not
+        // swallow the rest of the statement.
+        assert!(contains_explicit_install("SELECT $1; INSTALL httpfs;"));
+    }
+
+    /// A dot-command is not SQL. The CLI runs it itself, so it is not bound by
+    /// anything the policy says about components or about DuckDB settings.
+    ///
+    /// `.shell` and `.system` run a program. `.read` reads any file the process
+    /// can, `.output` and `.once` write one. So a pipeline whose SQL body starts
+    /// a line with `.shell` gets command execution on the host - which is what
+    /// the `code.shell` component IS, except that denying that component in a
+    /// policy does nothing about this route.
+    ///
+    /// Measured on the pinned 1.5.4: the CLI honours it only where a statement
+    /// could begin. Indented, mid-statement, or inside a string literal it is
+    /// ordinary SQL and fails to parse or is data.
+    #[test]
+    fn a_dot_command_is_found_where_a_statement_could_begin() {
+        assert!(contains_dot_command("SELECT 1;\n.shell echo hi"));
+        assert!(contains_dot_command(".shell echo hi"));
+        assert!(contains_dot_command("SELECT 1;\n.read /etc/passwd"));
+        assert!(contains_dot_command("SELECT 1;\n.output /tmp/x"));
+        // Indented is not a dot-command to the CLI, but no valid statement
+        // starts with a dot either, so refusing it costs nothing and keeps this
+        // correct if the CLI ever stops caring about the column.
+        assert!(contains_dot_command("SELECT 1;\n   .shell echo hi"));
+    }
+
+    /// And the places a dot is ordinary, which is most of them.
+    #[test]
+    fn an_ordinary_dot_is_not_a_command() {
+        assert!(!contains_dot_command("SELECT a.b FROM t;"));
+        assert!(!contains_dot_command("SELECT * FROM my_schema.my_table;"));
+        assert!(!contains_dot_command("SELECT 1.5 AS a;"));
+        // Inside a string literal it is data - measured: the CLI returns it.
+        assert!(!contains_dot_command("SELECT '\n.shell echo hi\n' AS a;"));
+        assert!(!contains_dot_command("SELECT $$\n.shell echo hi\n$$ AS a;"));
+        // And in a comment it is a comment.
+        assert!(!contains_dot_command("-- .shell echo hi\nSELECT 1;"));
+        assert!(!contains_dot_command("/*\n.shell echo hi\n*/\nSELECT 1;"));
+    }
+
+    /// The refusal is NOT conditional on a network policy, unlike INSTALL.
+    ///
+    /// INSTALL only matters where the operator asked for a restricted network.
+    /// A dot-command reaches the shell and the filesystem whatever the policy
+    /// says, and Duckle never generates one, so there is nothing to weigh.
+    #[test]
+    fn a_dot_command_is_refused_with_no_policy_at_all() {
+        std::env::remove_var("DUCKLE_POLICY_FILE");
+        assert!(
+            refuse_unsafe_sql("SELECT 1;\n.shell echo hi").is_err(),
+            "a dot-command must be refused even where no policy is configured"
+        );
+        assert!(
+            refuse_unsafe_sql("SELECT a.b FROM t;").is_ok(),
+            "ordinary SQL must still run"
+        );
+    }
+
+    /// The shape a SQL console reaches: `query` wraps what the user typed in
+    /// `DESCRIBE (...)`, so closing the paren and ending the statement puts the
+    /// next line at a statement start inside SQL we composed ourselves.
+    ///
+    /// Measured on the pinned 1.5.4, on exactly this string: `.shell whoami`
+    /// answered with the username, and `.output` wrote a file with no shell
+    /// involved at all. Both while the SQL around them ran normally.
+    ///
+    /// A dot with a statement still open is a parse error instead - the CLI
+    /// wants an empty statement buffer, which is what `at_statement_start`
+    /// tracks, so the two agree on where to look.
+    #[test]
+    fn the_wrapper_a_sql_console_composes_cannot_be_closed_into_a_dot_command() {
+        let wrapped = |typed: &str| format!("DESCRIBE ({typed});\nSELECT 1;");
+        assert!(
+            refuse_unsafe_sql(&wrapped("SELECT 1);\n.shell whoami\n--")).is_err(),
+            "closing the wrapper and starting a statement must not smuggle a dot-command"
+        );
+        assert!(
+            refuse_unsafe_sql(&wrapped("SELECT 1);\n.output /tmp/x\n--")).is_err(),
+            ".output writes a file without a shell, so it is the same problem"
+        );
+        assert!(
+            refuse_unsafe_sql(&wrapped("SELECT a.b FROM t")).is_ok(),
+            "the wrapper around ordinary SQL must still run"
+        );
+    }
+
+    /// `install` is an UNRESERVED keyword in the pinned DuckDB 1.5.4, so it is a
+    /// legal identifier. Refusing it wherever it appears fails ordinary SQL, and
+    /// only under a policy, which is a confusing way to find out.
+    #[test]
+    fn the_detector_only_looks_where_a_statement_starts() {
+        assert!(!contains_explicit_install("SELECT 1 AS install;"));
+        assert!(!contains_explicit_install("SELECT install FROM t;"));
+        assert!(!contains_explicit_install("CREATE VIEW v AS SELECT 1 AS install;"));
+        // Still caught where it really is the command, including the two-word
+        // form DuckDB accepts.
+        assert!(contains_explicit_install("INSTALL httpfs;"));
+        assert!(contains_explicit_install("   install httpfs;"));
+        assert!(contains_explicit_install("FORCE INSTALL httpfs;"));
+        assert!(contains_explicit_install("SELECT 1; force install httpfs;"));
     }
 
     /// The headline case: an agent writes a pipeline that would write to

@@ -6693,17 +6693,24 @@ impl DuckdbEngine {
         // Per node, so two artifact-reading nodes in one pipeline cannot
         // overwrite each other's list.
         let list = format!("duckle_artifacts_{}", metric_ident(tag));
+        // The prefix goes HERE and nowhere else in this walk. This is the one
+        // statement that reads the upstream view, so it is the one that can
+        // resolve an `s3://` scan and therefore the one that needs the
+        // credentials; every stage is a fresh CLI session, so a secret created
+        // for some other invocation is already gone. Reading the list back
+        // touches only the local table written just below it.
         crate::apply_duckdb_sql(
             &self.bin,
             db,
             &format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT row_number() OVER () AS duckle_rn, * FROM {}",
+                "{}CREATE OR REPLACE TABLE {} AS SELECT row_number() OVER () AS duckle_rn, * FROM {}",
+                secret_prefix,
                 plan::quote_ident(&list),
                 plan::quote_ident(view)
             ),
         )?;
 
-        let result = self.drain_artifact_list(db, secret_prefix, input, &list, &mut visit);
+        let result = self.drain_artifact_list(db, input, &list, &mut visit);
         // Dropped whether the walk succeeded or not: the list is scratch, and
         // leaving it behind would grow the run database every time.
         let _ = crate::apply_duckdb_sql(
@@ -6714,10 +6721,13 @@ impl DuckdbEngine {
         result
     }
 
+    /// Reads back the table `for_each_artifact_input` just wrote, which is
+    /// local to the run database. No credentials are taken, because none are
+    /// needed and a parameter that is threaded here is one an author can
+    /// mistake for the place the remote read happens.
     fn drain_artifact_list(
         &self,
         db: &Path,
-        secret_prefix: &str,
         input: &plan::ArtifactInput,
         list: &str,
         visit: &mut impl FnMut(ResolvedArtifact) -> Result<(), EngineError>,
@@ -6730,8 +6740,7 @@ impl DuckdbEngine {
             let rows = self.run_rows(
                 Some(db),
                 &format!(
-                    "{}SELECT * FROM {} WHERE duckle_rn > {} AND duckle_rn <= {} ORDER BY duckle_rn",
-                    secret_prefix,
+                    "SELECT * FROM {} WHERE duckle_rn > {} AND duckle_rn <= {} ORDER BY duckle_rn",
                     plan::quote_ident(list),
                     offset,
                     offset + batch_size
@@ -8786,6 +8795,7 @@ impl DuckdbEngine {
     pub(crate) fn run_html_source(
         &self,
         db: &Path,
+        secret_prefix: &str,
         spec: &HtmlSourceSpec,
     ) -> Result<String, EngineError> {
         self.check_cancelled()?;
@@ -9020,7 +9030,7 @@ impl DuckdbEngine {
             Ok(next)
         };
         if from_upstream {
-            self.for_each_artifact_input(db, "", &spec.input, &spec.node_id, |a| {
+            self.for_each_artifact_input(db, secret_prefix, &spec.input, &spec.node_id, |a| {
                 handle(&a.uri, &a.sha256, &a.row).map(|_| ())
             })?;
         } else {
@@ -9249,6 +9259,7 @@ impl DuckdbEngine {
     pub(crate) fn run_xml_source(
         &self,
         db: &Path,
+        secret_prefix: &str,
         spec: &XmlSourceSpec,
         artifacts: &mut Vec<crate::ArtifactRef>,
     ) -> Result<String, EngineError> {
@@ -9317,7 +9328,7 @@ impl DuckdbEngine {
             // bounded-parts machinery from #283 then bounds the WHOLE corpus
             // rather than each file, so a million small documents cannot do
             // what one huge document already could not.
-            self.for_each_artifact_input(db, "", &spec.input, &spec.node_id, |artifact| {
+            self.for_each_artifact_input(db, secret_prefix, &spec.input, &spec.node_id, |artifact| {
                 let (uri, source_sha, upstream_row) =
                     (&artifact.uri, &artifact.sha256, &artifact.row);
                 self.check_cancelled()?;
@@ -12764,7 +12775,10 @@ impl DuckdbEngine {
         *ANSWER.get_or_init(|| {
             self.run(
                 None,
-                "INSTALL arrow FROM community; LOAD arrow; SELECT 1;",
+                &format!(
+                    "{}SELECT 1;",
+                    crate::policy::duckdb_extension_prelude("arrow", true)
+                ),
                 true,
             )
             .is_ok()
@@ -17182,7 +17196,8 @@ impl DuckdbEngine {
             .map(|d| format!(", DATA_PATH '{}'", d.replace('\\', "/").replace('\'', "''")))
             .unwrap_or_default();
         let attach = format!(
-            "INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:{}' AS duckle_src (READ_ONLY{}); ",
+            "{}ATTACH 'ducklake:{}' AS duckle_src (READ_ONLY{}); ",
+            crate::policy::duckdb_extension_prelude("ducklake", false),
             path, data_path
         );
         let node_q = plan::quote_ident(&spec.node_id);
@@ -17885,10 +17900,11 @@ impl DuckdbEngine {
         // Phase 1: stage upstream into a named table that the next CLI
         // invocation will see.
         let stage_sql = format!(
-            "{secret}INSTALL fts; LOAD fts; \
+            "{secret}{fts} \
              DROP TABLE IF EXISTS {staging}; \
              CREATE TABLE {staging} AS SELECT * FROM {upstream};",
             secret = secret_prefix,
+            fts = crate::policy::duckdb_extension_prelude("fts", false),
             staging = staging,
             upstream = upstream,
         );
@@ -17914,12 +17930,13 @@ impl DuckdbEngine {
             None => String::new(),
         };
         let index_sql = format!(
-            "{secret}INSTALL fts; LOAD fts; \
+            "{secret}{fts} \
              PRAGMA create_fts_index('{staging_raw}', '{id_col}', {text_args}); \
              CREATE OR REPLACE TABLE {node} AS \
                SELECT *, {match_expr} AS {output_q} FROM {staging} \
                WHERE {match_expr} IS NOT NULL{order_limit};",
             secret = secret_prefix,
+            fts = crate::policy::duckdb_extension_prelude("fts", false),
             staging_raw = spec.staging_table.replace('\'', "''"),
             id_col = spec.id_col.replace('\'', "''"),
             text_args = text_args,
@@ -21391,14 +21408,19 @@ pub(crate) fn xsd_contract_fingerprint(docs: &[(String, String)]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Where a workspace remembers the schema contracts it has accepted.
+/// The workspace whose accepted schema contracts apply.
 ///
 /// `None` when there is no workspace, exactly like [`known_hosts_path`]: with
 /// nowhere to remember, the check degrades to the old accept-anything
 /// behaviour rather than refusing every run.
-pub(crate) fn xsd_contracts_path() -> Option<std::path::PathBuf> {
-    let ws = std::env::var("DUCKLE_WORKSPACE").ok().filter(|s| !s.is_empty())?;
-    Some(std::path::Path::new(&ws).join(".duckle").join("xsd_contracts"))
+///
+/// This is the workspace and not the store file, because every `xsd_contract`
+/// entry point takes the workspace - accepting one has to lock it.
+fn xsd_workspace() -> Option<std::path::PathBuf> {
+    std::env::var("DUCKLE_WORKSPACE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// The contract already accepted for this schema root, if any.
@@ -21406,41 +21428,16 @@ pub(crate) fn xsd_contracts_path() -> Option<std::path::PathBuf> {
 /// One `<uri> <fingerprint>` per line, `#` for comments. Greppable, and a line
 /// can be deleted by hand - which is the whole escape hatch when a publisher
 /// legitimately reissues a schema.
-pub(crate) fn read_xsd_contract(path: &std::path::Path, uri: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .find_map(|l| {
-            let (u, fp) = l.split_once(char::is_whitespace)?;
-            (u == uri).then(|| fp.trim().to_string())
-        })
+pub(crate) fn read_xsd_contract(workspace: &std::path::Path, uri: &str) -> Option<String> {
+    crate::xsd_contract::accepted(workspace, uri)
 }
 
 /// Accept a contract. Best-effort: a workspace that cannot be written still
 /// runs, because failing a run over bookkeeping would be a worse failure than
-/// the one being prevented.
-fn record_xsd_contract(path: &std::path::Path, uri: &str, fingerprint: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    // Replace any line for this uri rather than appending a second one: unlike
-    // a host behind a load balancer, a schema root has exactly one accepted
-    // contract at a time, and two lines would make "which one held?" ambiguous.
-    let mut out: Vec<String> = existing
-        .lines()
-        .filter(|l| {
-            let t = l.trim();
-            if t.is_empty() || t.starts_with('#') {
-                return true;
-            }
-            t.split_once(char::is_whitespace).map(|(u, _)| u != uri).unwrap_or(true)
-        })
-        .map(str::to_string)
-        .collect();
-    out.push(format!("{uri} {fingerprint}"));
-    let _ = std::fs::write(path, out.join("\n") + "\n");
+/// the one being prevented. That now covers a workspace whose store lock is
+/// held by somebody else for longer than the wait allows.
+fn record_xsd_contract(workspace: &std::path::Path, uri: &str, fingerprint: &str) {
+    let _ = crate::xsd_contract::accept(workspace, uri, fingerprint);
 }
 
 /// #315: hold the parser contract still, or say plainly that it moved.
@@ -21463,14 +21460,14 @@ pub(crate) fn check_xsd_contract(
     if policy.eq_ignore_ascii_case("allow") {
         return Ok(());
     }
-    let path = match xsd_contracts_path() {
-        Some(p) => p,
+    let ws = match xsd_workspace() {
+        Some(w) => w,
         None => return Ok(()),
     };
-    let accepted = match read_xsd_contract(&path, uri) {
+    let accepted = match read_xsd_contract(&ws, uri) {
         Some(a) => a,
         None => {
-            record_xsd_contract(&path, uri, fingerprint);
+            record_xsd_contract(&ws, uri, fingerprint);
             return Ok(());
         }
     };
@@ -21485,14 +21482,14 @@ pub(crate) fn check_xsd_contract(
              change to the parser itself and not only to a file. It is also what a \
              legitimate reissue looks like. To accept it, delete the line for {uri} from \
              {} and the next run will record the new one.",
-            path.display()
+            crate::xsd_contract::path(&ws).display()
         )));
     }
     eprintln!(
         "duckle: xsd: the schema set behind {uri} changed ({accepted} -> {fingerprint}); \
          accepting it because changePolicy is warn. Set it to fail to require approval."
     );
-    record_xsd_contract(&path, uri, fingerprint);
+    record_xsd_contract(&ws, uri, fingerprint);
     Ok(())
 }
 
@@ -21641,7 +21638,7 @@ pub(crate) fn verify_sftp_host_key(
 /// #315: a schema set is a parser contract, and it must not move unnoticed.
 #[cfg(test)]
 mod xsd_contract_tests {
-    use super::{check_xsd_contract, read_xsd_contract, xsd_contract_fingerprint, xsd_contracts_path};
+    use super::{check_xsd_contract, read_xsd_contract, xsd_contract_fingerprint};
 
     // DUCKLE_WORKSPACE is process-wide, so these take the SAME lock every other
     // workspace-env test takes. A private mutex here would only serialise these
@@ -21696,9 +21693,8 @@ mod xsd_contract_tests {
         let fp = xsd_contract_fingerprint(&set(&[("schemas/company.xsd", "aa")]));
         assert!(check_xsd_contract(uri, &fp, "fail").is_ok(), "first sight must not refuse");
 
-        let path = xsd_contracts_path().expect("workspace");
         assert_eq!(
-            read_xsd_contract(&path, uri).as_deref(),
+            read_xsd_contract(tmp.path(), uri).as_deref(),
             Some(fp.as_str()),
             "it has to be remembered, or every run is a first run"
         );
@@ -21724,9 +21720,8 @@ mod xsd_contract_tests {
         assert!(err.contains(uri), "must name the schema: {err}");
         assert!(err.contains("xsd_contracts"), "must say where to accept it: {err}");
 
-        let path = xsd_contracts_path().expect("workspace");
         assert_eq!(
-            read_xsd_contract(&path, uri).as_deref(),
+            read_xsd_contract(tmp.path(), uri).as_deref(),
             Some(first.as_str()),
             "a refused change must NOT be recorded, or the next run passes silently"
         );
@@ -21748,14 +21743,13 @@ mod xsd_contract_tests {
         let moved = xsd_contract_fingerprint(&set(&[("schemas/a.xsd", "bb")]));
         check_xsd_contract(uri, &moved, "warn").expect("warn must not refuse");
 
-        let path = xsd_contracts_path().expect("workspace");
         assert_eq!(
-            read_xsd_contract(&path, uri).as_deref(),
+            read_xsd_contract(tmp.path(), uri).as_deref(),
             Some(moved.as_str()),
             "warn accepts, so the new contract is what is remembered"
         );
         // And exactly one line for the uri, not two.
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = std::fs::read_to_string(crate::xsd_contract::path(tmp.path())).unwrap();
         assert_eq!(
             text.lines().filter(|l| l.starts_with(uri)).count(),
             1,
@@ -21775,9 +21769,8 @@ mod xsd_contract_tests {
 
         let uri = "schemas/b.xsd";
         check_xsd_contract(uri, "anything", "allow").expect("allow never refuses");
-        let path = xsd_contracts_path().expect("workspace");
         assert!(
-            read_xsd_contract(&path, uri).is_none(),
+            read_xsd_contract(tmp.path(), uri).is_none(),
             "allow must not write a contract somebody did not ask for"
         );
 
@@ -23953,5 +23946,67 @@ mod source_path_of_tests {
         // Only a single-letter prefix is a drive. A key that legitimately
         // contains a colon keeps it.
         assert_eq!(source_path_of("s3://bucket/odd:name/f.txt"), "odd:name/f.txt");
+    }
+}
+
+#[cfg(test)]
+mod artifact_input_tests {
+    use super::*;
+
+    /// The prefix carries the pipeline's cloud credentials, and every stage is
+    /// a fresh CLI session, so it belongs on whichever statement does the
+    /// remote read.
+    ///
+    /// #282 moved the corpus list out of memory and into a table, and put the
+    /// prefix on the read of that LOCAL scratch table - which needs nothing -
+    /// while leaving the statement that materialises the upstream view bare.
+    /// That is the statement that resolves an `s3://` read. The resolver it
+    /// replaced, `resolve_artifact_inputs`, still has it the right way round,
+    /// so this is a rule that stayed correct in one twin and was lost in the
+    /// other.
+    ///
+    /// An ATTACH stands in for a secret: session-scoped in exactly the same
+    /// way, and local, so the view is unreadable without the prefix and
+    /// readable with it.
+    #[test]
+    fn the_prefix_reaches_the_statement_that_reads_the_upstream_view() {
+        let Some(bin) = std::env::var("DUCKLE_DUCKDB_BIN")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: set DUCKLE_DUCKDB_BIN to a duckdb CLI to run");
+            return;
+        };
+        let engine = DuckdbEngine::new(bin.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let side = tmp.path().join("side.db");
+        let run = tmp.path().join("run.db");
+        let posix = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+
+        // The upstream relation sits behind something only the prefix opens.
+        crate::apply_duckdb_sql(&bin, &side, "CREATE TABLE t AS SELECT 'file:///a.pdf' AS uri")
+            .unwrap();
+        let prefix = format!("ATTACH '{}' AS side; ", posix(&side));
+        crate::apply_duckdb_sql(
+            &bin,
+            &run,
+            &format!("{prefix}CREATE VIEW v AS SELECT * FROM side.t"),
+        )
+        .unwrap();
+
+        let input = plan::ArtifactInput {
+            from_view: Some("v".into()),
+            ..Default::default()
+        };
+        let mut seen: Vec<String> = Vec::new();
+        let n = engine
+            .for_each_artifact_input(&run, &prefix, &input, "n1", |a| {
+                seen.push(a.uri);
+                Ok(())
+            })
+            .expect("the upstream view must be readable with the prefix the pipeline was given");
+        assert_eq!(n, 1);
+        assert_eq!(seen, vec!["file:///a.pdf".to_string()]);
     }
 }

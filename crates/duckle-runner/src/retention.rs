@@ -181,9 +181,21 @@ fn protected_events(
     // but two pipelines can publish one asset, which is the same reason
     // catalog::freshness compares instead of assuming.
     let mut newest: std::collections::BTreeMap<&str, &Event> = std::collections::BTreeMap::new();
+    // Asked once per DISTINCT asset, not once per asset per event.
+    //
+    // `declares_freshness` depends only on the asset, and it is not a lookup:
+    // it scans the ownership rules and COMPILES each glob as it goes
+    // (sla.rs:114-123). Assets repeat across every publication of the same
+    // table, so the event count was pure waste. Measured on a synthetic
+    // workspace of 200k events over 200 assets: 400,000 calls became 201, and
+    // this pass went from 255ms to 26ms - half of a prune's whole decision.
+    let mut declares: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
     for event in all_events {
         for asset in &event.assets {
-            if !sla::declares_freshness(owners, asset) {
+            let declared = *declares
+                .entry(asset.as_str())
+                .or_insert_with(|| sla::declares_freshness(owners, asset));
+            if !declared {
                 continue;
             }
             let better = match newest.get(asset.as_str()) {
@@ -209,24 +221,66 @@ pub fn plan_ledgers(
     workspace: &Path,
     policy: &Policy,
 ) -> (Vec<LedgerPrune>, std::collections::BTreeSet<String>) {
+    let d = decide(workspace, policy);
+    (
+        report(policy, &d),
+        duckle_duckdb_engine::materialize::referenced_runs(&d.kept_events, &d.kept_deliveries),
+    )
+}
+
+/// The rows one decision implies, for the preview and for the prune alike.
+///
+/// Shared for the same reason `decide` is. The preview and the prune describing
+/// the same decision in different words is the drift this module keeps having
+/// to close, and building the rows in only one of them is how it comes back.
+fn report(policy: &Policy, d: &Decision) -> Vec<LedgerPrune> {
+    let mut out = Vec::new();
+    if let Some(days) = policy.deliveries_days {
+        out.push(LedgerPrune {
+            category: "deliveries".into(),
+            records: d.dropped_deliveries,
+            kept: d.kept_deliveries.len(),
+            reason: format!(
+                "delivered more than {days} days ago; pending and failed are kept, and so is                  anything whose publication is still on the log"
+            ),
+        });
+    }
+    if let Some(days) = policy.materializations_days {
+        out.push(LedgerPrune {
+            category: "materializations".into(),
+            records: d.dropped_events,
+            kept: d.kept_events.len(),
+            reason: format!(
+                "published more than {days} days ago, unreferenced, and superseded; a subscription can only replay what is still here, and the last publication of each asset is kept so freshness can still see it"
+            ),
+        });
+    }
+    out
+}
+
+/// What a prune would leave behind, computed ONCE.
+///
+/// `plan_ledgers` turns this into a report and `apply_ledgers` writes it. They
+/// used to work it out separately, which is the one thing a dry run must never
+/// do - and it had already drifted: a rule added to the planner was absent from
+/// the writer, so the preview and the prune disagreed about what survived.
+struct Decision {
+    kept_deliveries: Vec<duckle_duckdb_engine::subscribe::Delivery>,
+    kept_events: Vec<duckle_duckdb_engine::materialize::Event>,
+    dropped_deliveries: usize,
+    dropped_events: usize,
+}
+
+fn decide(workspace: &Path, policy: &Policy) -> Decision {
     use duckle_duckdb_engine::{materialize, subscribe};
     let all_deliveries = subscribe::deliveries(workspace);
     let all_events = materialize::read(workspace);
-    let mut out = Vec::new();
 
     // Deliveries first: what survives here decides what protects an event.
     let (kept_deliveries, dropped_deliveries) = match policy.deliveries_days {
         Some(days) => subscribe::retain(&all_deliveries, &horizon(days)),
         None => (all_deliveries.values().cloned().collect(), Vec::new()),
     };
-    if let Some(days) = policy.deliveries_days {
-        out.push(LedgerPrune {
-            category: "deliveries".into(),
-            records: dropped_deliveries.len(),
-            kept: kept_deliveries.len(),
-            reason: format!("delivered more than {days} days ago; pending and failed are kept"),
-        });
-    }
 
     let owners = duckle_duckdb_engine::catalog::load_owners(workspace).unwrap_or_default();
     let protected = protected_events(&all_events, &kept_deliveries, &owners);
@@ -234,46 +288,96 @@ pub fn plan_ledgers(
         Some(days) => materialize::retain(&all_events, &horizon(days), &protected),
         None => (all_events.clone(), Vec::new()),
     };
-    if let Some(days) = policy.materializations_days {
-        out.push(LedgerPrune {
-            category: "materializations".into(),
-            records: dropped_events.len(),
-            kept: kept_events.len(),
-            reason: format!(
-                "published more than {days} days ago, unreferenced, and superseded; a subscription can only replay what is still here, and the last publication of each asset is kept so freshness can still see it"
-            ),
-        });
-    }
 
-    (out, materialize::referenced_runs(&kept_events, &kept_deliveries))
+    // And the same rule the other way round, which was missing.
+    //
+    // A delivered record is the ONLY thing that says a publication has already
+    // been consumed: `subscribe::pending` derives what is owed as
+    // (subscription x event) minus the recorded deliveries. Prune the record
+    // while its event is still on the log and the pump hands the consumer the
+    // same publication again - the pipeline runs a second time and appends its
+    // rows a second time.
+    //
+    // Not an exotic configuration. The two horizons are independent flags, and
+    // keeping publication history longer than delivery noise is the natural
+    // setting. It also happens at EQUAL horizons, because the freshness rule
+    // deliberately holds an SLA'd asset's last publication back past its own
+    // horizon while the delivery ages out on schedule - and that case repeats
+    // every prune, on exactly the stalled asset the SLA is watching.
+    //
+    // Re-adding a delivery cannot change which events are kept: its event is
+    // already among them, so there is no second round to compute.
+    let kept_event_ids: std::collections::BTreeSet<&str> =
+        kept_events.iter().map(|e| e.event_id.as_str()).collect();
+    let (readded, dropped_deliveries): (Vec<_>, Vec<_>) = dropped_deliveries
+        .into_iter()
+        .partition(|d| kept_event_ids.contains(d.event_id.as_str()));
+
+    Decision {
+        kept_deliveries: kept_deliveries.into_iter().chain(readded).collect(),
+        dropped_deliveries: dropped_deliveries.len(),
+        dropped_events: dropped_events.len(),
+        kept_events,
+    }
 }
 
 /// Carry out a ledger prune by rewriting each ledger to what survived.
+///
+/// What comes back is what HAPPENED, not what was planned. Both writers return
+/// a `Result` and both used to be dropped with `let _ =`, so a prune that wrote
+/// nothing still answered with the forecast and audited it as a removal. That
+/// is no longer a disk-error-only concern: the delivery ledger takes a store
+/// lock now, so a pump holding it is an ordinary operational reason to fail.
 pub fn apply_ledgers(workspace: &Path, policy: &Policy) -> Vec<LedgerPrune> {
     use duckle_duckdb_engine::{materialize, subscribe};
-    let (planned, _) = plan_ledgers(workspace, policy);
-    if planned.iter().all(|p| p.records == 0) {
-        return planned;
+    // ONE decision, for the writes AND for what is reported. `plan_ledgers`
+    // working out its own was the drift the comment on `decide` warns about,
+    // reintroduced one level up: two reads standing side by side are not one
+    // decision just because they usually agree.
+    let d = decide(workspace, policy);
+    let mut rows = report(policy, &d);
+    if rows.iter().all(|p| p.records == 0) {
+        return rows;
     }
-    let all_deliveries = subscribe::deliveries(workspace);
-    let (kept_deliveries, _) = match policy.deliveries_days {
-        Some(days) => subscribe::retain(&all_deliveries, &horizon(days)),
-        None => (all_deliveries.values().cloned().collect(), Vec::new()),
-    };
-    if policy.deliveries_days.is_some() {
-        let _ = subscribe::keep_only(workspace, &kept_deliveries);
-    }
-    if let Some(days) = policy.materializations_days {
-        let all_events = materialize::read(workspace);
-        let owners = duckle_duckdb_engine::catalog::load_owners(workspace).unwrap_or_default();
-        let protected = protected_events(&all_events, &kept_deliveries, &owners);
-        let (kept, _) = materialize::retain(&all_events, &horizon(days), &protected);
-        let _ = materialize::keep_only(workspace, &kept);
+    for row in rows.iter_mut() {
+        let wrote = match row.category.as_str() {
+            "deliveries" => subscribe::keep_only(workspace, &d.kept_deliveries),
+            // The horizon goes down with the write, and only if the write
+            // succeeded. `materialize::reconcile` rebuilds an event from the
+            // run record behind it, and run history keeps records by count
+            // while this prunes by age - so without knowing how far the sweep
+            // reached, the reconciler would read a surviving record, find no
+            // event, and put back the publication just removed.
+            "materializations" => materialize::keep_only(workspace, &d.kept_events).and_then(|()| {
+                match policy.materializations_days {
+                    Some(days) => materialize::record_pruned_before(workspace, &horizon(days)),
+                    None => Ok(()),
+                }
+            }),
+            // Not unreachable-by-luck: a category added to `report` and not
+            // here would otherwise report a removal nobody performed, which is
+            // the exact defect this function was fixed for.
+            other => Err(format!("no writer for ledger category {other:?}")),
+        };
+        if let Err(e) = wrote {
+            // Say so, and report nothing removed. A prune is idempotent and
+            // runs again, so skipping one costs nothing - but a SILENT skip
+            // reads as "nothing was old enough", and a workspace whose prune
+            // never once succeeds grows without bound, which is the thing this
+            // exists to prevent. (`alerts::update_state` makes the opposite
+            // call for its own lock and is right to: it records a side effect
+            // that already happened and has no later retry.)
+            eprintln!("duckle: retention: {} not pruned: {e}", row.category);
+            row.kept += row.records;
+            row.records = 0;
+            row.reason = format!("not pruned: {e}");
+        }
     }
     // AC5: a prune is auditable, and that has to cover the ledgers too. Records
     // removed without a trace are exactly the ones an operator would later have
-    // to reason about from their absence.
-    let removed: Vec<String> = planned
+    // to reason about from their absence. Built from what was written, so the
+    // audit cannot claim a removal that did not happen.
+    let removed: Vec<String> = rows
         .iter()
         .filter(|p| p.records > 0)
         .map(|p| format!("{} {}", p.records, p.category))
@@ -286,7 +390,7 @@ pub fn apply_ledgers(workspace: &Path, policy: &Policy) -> Vec<LedgerPrune> {
             Some(format!("removed {}", removed.join(", "))),
         );
     }
-    planned
+    rows
 }
 
 fn file_age_days(p: &Path, now: SystemTime) -> Option<u64> {
@@ -414,6 +518,15 @@ pub fn plan(workspace: &Path, policy: &Policy) -> Vec<Removal> {
         for (_, p, bytes) in dated.into_iter().skip(keep) {
             let run_id = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             if referenced.contains(&run_id) {
+                continue;
+            }
+            // Nor one whose run has not finished. A receipt is written at
+            // `begin` and not rewritten until `finish`, so a long backfill has
+            // an OLD mtime for hours while it is still in flight, and a prune
+            // ordered by mtime reaches it first - deleting exactly the record
+            // that says a run is happening. `retry::prune` has always skipped
+            // these; this copy of the rule did not.
+            if duckle_duckdb_engine::retry::is_in_flight(workspace, &run_id) {
                 continue;
             }
             out.push(Removal {
@@ -770,6 +883,120 @@ mod reference_aware {
         );
     }
 
+    /// A prune that could not write must not report that it did.
+    ///
+    /// `apply_ledgers` built its answer from `plan_ledgers` - a FORECAST - and
+    /// dropped both writers' `Result` with `let _ =`. So a prune that wrote
+    /// nothing still printed "removed N record(s)" and wrote an audit line
+    /// saying so, and with `--json` the operator was handed the forecast under
+    /// a `"dryRun": false` object without the prune result reaching them at
+    /// all. That is the mode a cron uses.
+    ///
+    /// Now easier to hit than it was: the delivery ledger takes a store lock,
+    /// so a pump holding it is an ordinary operational reason for the write to
+    /// fail, not just a disk error.
+    ///
+    /// The failure here is made by putting a DIRECTORY where the writer stages
+    /// its temp file, which fails fast and deterministically - holding the
+    /// store lock would work too but costs the full five second wait.
+    #[test]
+    fn a_ledger_prune_that_could_not_write_reports_nothing_removed() {
+        let ws = tempfile::tempdir().unwrap();
+        let old = "2026-01-01T00:00:00Z";
+        let mut ledger = std::collections::BTreeMap::new();
+        ledger.insert(
+            "dlv-1".to_string(),
+            subscribe::Delivery {
+                delivery_id: "dlv-1".into(),
+                subscription_id: "s1".into(),
+                event_id: "mat-1".into(),
+                pipeline_id: "consumer".into(),
+                state: subscribe::DeliveryState::Delivered,
+                attempts: 1,
+                last_error: None,
+                run_id: Some("run-c".into()),
+                at: old.into(),
+                parameters: Default::default(),
+                parameter_error: None,
+            },
+        );
+        subscribe::save_deliveries(ws.path(), &ledger).unwrap();
+
+        // The writer stages through `<ledger>.tmp`; a directory there cannot be
+        // written over, so the save fails while the READ still sees the record.
+        let staging = subscribe::deliveries_path(ws.path()).with_extension("json.tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let policy = Policy { deliveries_days: Some(1), ..Default::default() };
+        let out = apply_ledgers(ws.path(), &policy);
+
+        let row = out
+            .iter()
+            .find(|l| l.category == "deliveries")
+            .expect("a deliveries row");
+        assert_eq!(
+            row.records, 0,
+            "a prune that wrote nothing reported {} removed: {}",
+            row.records, row.reason
+        );
+        assert!(
+            row.reason.contains("not pruned"),
+            "the row has to say why nothing went: {}",
+            row.reason
+        );
+        // And the record really is still there, which is what makes the old
+        // answer a lie rather than a rounding difference.
+        assert_eq!(subscribe::deliveries(ws.path()).len(), 1, "the record was not removed");
+        let audit = ws.path().join("logs").join("audit.ndjson");
+        let text = std::fs::read_to_string(&audit).unwrap_or_default();
+        assert!(
+            !text.contains("deliveries"),
+            "a prune that removed nothing must not be audited as one that did: {text}"
+        );
+    }
+
+    /// A prune tells the reconciler how far it swept, so what it removed does
+    /// not come straight back.
+    ///
+    /// The two halves of this live in different crates and neither is wrong on
+    /// its own: retention prunes the event log by AGE, and run history keeps
+    /// records by COUNT, so the record behind a pruned event is still sitting
+    /// there. `materialize::reconcile` reads that record, finds no event, and
+    /// concludes the append was lost - putting back a publication somebody
+    /// deliberately removed. `subscribe::pending` then owes its delivery again
+    /// and the consumer runs a second time on old data.
+    ///
+    /// Measured before the watermark existed: reconcile re-added it every time.
+    #[test]
+    fn a_prune_tells_the_reconciler_how_far_it_swept() {
+        use duckle_duckdb_engine::materialize;
+        let ws = tempfile::tempdir().unwrap();
+        publish(ws.path(), "run-1", "2026-09-04");
+        assert_eq!(materialize::read(ws.path()).len(), 1, "the publication is on the log");
+        assert_eq!(materialize::pruned_before(ws.path()), None, "nothing swept yet");
+
+        // Everything is older than a zero-day horizon, so the prune takes it.
+        let policy = Policy { materializations_days: Some(0), ..Default::default() };
+        let rows = apply_ledgers(ws.path(), &policy);
+        assert!(
+            rows.iter().any(|r| r.category == "materializations" && r.records == 1),
+            "the prune did not report removing the event: {rows:?}"
+        );
+        assert!(materialize::read(ws.path()).is_empty(), "the event was not removed");
+        assert!(
+            materialize::pruned_before(ws.path()).is_some(),
+            "a prune that swept the log did not say how far"
+        );
+
+        // The run record outlived its event, exactly as it does in production.
+        let rebuilt = materialize::reconcile(ws.path(), &["producer".to_string()]);
+        assert!(
+            rebuilt.is_empty(),
+            "the reconciler put back what the prune removed: {rebuilt:?}"
+        );
+        assert!(materialize::read(ws.path()).is_empty(), "the log was rebuilt from swept history");
+    }
+
     /// A bare prune still removes nothing, ledgers included.
     #[test]
     fn no_policy_prunes_no_records() {
@@ -889,5 +1116,123 @@ mod reference_aware {
         let kept: Vec<String> =
             materialize::read(ws.path()).into_iter().map(|e| e.event_id).collect();
         assert_eq!(kept, ["newest"], "the superseded publications are history");
+    }
+
+    /// The protection was one-way, and the missing direction re-runs work.
+    ///
+    /// An event a retained delivery names is protected. Nothing protected a
+    /// DELIVERY whose event is retained - and `subscribe::pending` derives what
+    /// is owed as (subscription x event) MINUS the recorded deliveries, so the
+    /// delivered record is the only thing saying "this publication has already
+    /// been consumed". Prune it while its event is still on the log and the pump
+    /// hands the consumer pipeline the same publication a second time.
+    ///
+    /// The horizons are independent flags, so this is not an exotic setting:
+    /// keeping publication history longer than delivery noise is the natural
+    /// one. It also happens at EQUAL horizons, because the freshness rule
+    /// deliberately holds an SLA'd asset's last publication back past its own.
+    #[test]
+    fn a_delivery_is_kept_while_the_event_it_consumed_is() {
+        let ws = tempfile::tempdir().unwrap();
+        let old = "2026-01-01T00:00:00Z";
+        materialize::keep_only(
+            ws.path(),
+            &[materialize::Event {
+                event_id: "mat-1".into(),
+                pipeline_id: "producer".into(),
+                run_id: Some("run-1".into()),
+                release_id: None,
+                partition_key: None,
+                trigger: "scheduled".into(),
+                committed_at: old.into(),
+                assets: vec!["/data/a.parquet".into()],
+            }],
+        )
+        .unwrap();
+        let mut ledger = std::collections::BTreeMap::new();
+        ledger.insert(
+            "dlv-1".to_string(),
+            subscribe::Delivery {
+                delivery_id: "dlv-1".into(),
+                subscription_id: "s1".into(),
+                event_id: "mat-1".into(),
+                pipeline_id: "consumer".into(),
+                state: subscribe::DeliveryState::Delivered,
+                attempts: 1,
+                last_error: None,
+                run_id: Some("run-c".into()),
+                at: old.into(),
+                parameters: Default::default(),
+                parameter_error: None,
+            },
+        );
+        subscribe::save_deliveries(ws.path(), &ledger).unwrap();
+
+        // Deliveries have a horizon; publications do not, so the event stays.
+        apply_ledgers(ws.path(), &Policy { deliveries_days: Some(1), ..Default::default() });
+
+        assert_eq!(
+            materialize::read(ws.path()).len(),
+            1,
+            "precondition: the publication is still on the log"
+        );
+        assert_eq!(
+            subscribe::deliveries(ws.path()).len(),
+            1,
+            "the record saying this publication was already consumed was pruned, so the pump \
+             owes it again and the consumer pipeline runs a second time on the same data"
+        );
+    }
+
+    /// And the other side, so "keep it" does not become "keep everything": once
+    /// the event is gone too, the delivered record is history and goes with it.
+    #[test]
+    fn a_delivery_whose_event_has_gone_is_history() {
+        let ws = tempfile::tempdir().unwrap();
+        let old = "2026-01-01T00:00:00Z";
+        materialize::keep_only(
+            ws.path(),
+            &[materialize::Event {
+                event_id: "mat-1".into(),
+                pipeline_id: "producer".into(),
+                run_id: None,
+                release_id: None,
+                partition_key: None,
+                trigger: "scheduled".into(),
+                committed_at: old.into(),
+                assets: vec!["/data/a.parquet".into()],
+            }],
+        )
+        .unwrap();
+        let mut ledger = std::collections::BTreeMap::new();
+        ledger.insert(
+            "dlv-1".to_string(),
+            subscribe::Delivery {
+                delivery_id: "dlv-1".into(),
+                subscription_id: "s1".into(),
+                event_id: "mat-1".into(),
+                pipeline_id: "consumer".into(),
+                state: subscribe::DeliveryState::Delivered,
+                attempts: 1,
+                last_error: None,
+                run_id: Some("run-c".into()),
+                at: old.into(),
+                parameters: Default::default(),
+                parameter_error: None,
+            },
+        );
+        subscribe::save_deliveries(ws.path(), &ledger).unwrap();
+
+        // No owners.json, so no freshness SLA holds the event back either.
+        apply_ledgers(
+            ws.path(),
+            &Policy { deliveries_days: Some(1), materializations_days: Some(1), ..Default::default() },
+        );
+
+        assert!(materialize::read(ws.path()).is_empty(), "the publication aged out");
+        assert!(
+            subscribe::deliveries(ws.path()).is_empty(),
+            "and its delivery is history with it"
+        );
     }
 }

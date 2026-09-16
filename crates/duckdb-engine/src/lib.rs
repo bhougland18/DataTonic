@@ -84,6 +84,7 @@ pub mod trust;
 pub mod tls;
 pub mod watermark;
 pub mod xsd;
+pub mod xsd_contract;
 mod connectors;
 pub use connectors::remote_fingerprint;
 mod run_log;
@@ -547,6 +548,7 @@ impl DuckdbEngine {
     /// stdout. Cancellation-aware: polls the child and kills it if a
     /// cancel was requested.
     fn run(&self, db: Option<&Path>, sql: &str, json: bool) -> Result<String, EngineError> {
+        crate::policy::refuse_unsafe_sql(sql).map_err(EngineError::Query)?;
         if !self.bin.exists() {
             return Err(EngineError::Config(format!(
                 "DuckDB engine isn't installed (expected at {}). Open Setup to install it.",
@@ -580,8 +582,26 @@ impl DuckdbEngine {
         if allow_unsigned_extensions() {
             cmd.arg("-unsigned");
         }
-        cmd.arg("-bail").arg("-c").arg(sql);
-        cmd.stdin(Stdio::null())
+        // The SQL goes in on STDIN, not as `-c <sql>`.
+        //
+        // It carries the secret preamble - `CREATE SECRET ... (KEY_ID '...',
+        // SECRET '...')` for S3, Azure and every ATTACH that needs a password -
+        // and an argv is not private. On Linux any local user can read
+        // /proc/<pid>/cmdline while the child runs, and `ps` shows it on most
+        // systems. `execute_batched` has always fed its script through stdin
+        // for this reason; this path did not, so the per-stage executor put on
+        // the command line exactly what the batched one took care to keep off
+        // it.
+        //
+        // Safe here specifically because stdout and stderr are already drained
+        // by the threads below. The known hazard with a piped stdin is that the
+        // CLI then fully buffers stdout and flushes only at exit, which breaks
+        // reading it incrementally - a sentinel-framed persistent session. This
+        // reads to EOF and waits for exit, so buffering until exit costs
+        // nothing. Measured on the pinned 1.5.4: `-json` output arrives intact,
+        // a failing statement still exits 1, and a clean one exits 0.
+        cmd.arg("-bail");
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // No console flash on Windows for the per-stage spawns.
@@ -624,6 +644,16 @@ impl DuckdbEngine {
             let _ = stderr_pipe.read_to_end(&mut buf);
             buf
         });
+
+        // Written only once both readers are running, so a script larger than a
+        // pipe buffer cannot stall against a child that is blocked writing
+        // output nobody is taking. Dropped straight after, because the CLI
+        // reads to EOF and the handle staying open would hold it there.
+        if let Some(mut stdin_pipe) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin_pipe.write_all(sql.as_bytes());
+            let _ = stdin_pipe.flush();
+        }
 
         let status = loop {
             match child.try_wait() {
@@ -1276,7 +1306,7 @@ impl DuckdbEngine {
             p.push(' ');
         }
         if format == "azureblob" {
-            p.push_str("INSTALL azure; LOAD azure; ");
+            p.push_str(&crate::policy::duckdb_extension_prelude("azure", false));
         }
         // What the RUN path loads for this component, asked OF the run path
         // rather than kept as a second list here.
@@ -2375,8 +2405,12 @@ impl DuckdbEngine {
                     Some(RuntimeSpec::PdfSource(spec)) => {
                         self.run_pdf_source(&db_path, &secret_prefix, spec)
                     }
-            Some(RuntimeSpec::HtmlSource(spec)) => self.run_html_source(&db_path, spec),
-            Some(RuntimeSpec::XmlSource(spec)) => self.run_xml_source(&db_path, spec, &mut artifacts),
+            Some(RuntimeSpec::HtmlSource(spec)) => {
+                self.run_html_source(&db_path, &secret_prefix, spec)
+            }
+            Some(RuntimeSpec::XmlSource(spec)) => {
+                self.run_xml_source(&db_path, &secret_prefix, spec, &mut artifacts)
+            }
                     Some(RuntimeSpec::XmlSink(spec)) => self.run_xml_sink(&db_path, spec),
                     Some(RuntimeSpec::AvroSink(spec)) => self.run_avro_sink(&db_path, spec),
                     Some(RuntimeSpec::QvdSink(spec)) => self.run_qvd_sink(&db_path, spec),
@@ -3238,6 +3272,15 @@ impl DuckdbEngine {
                     path_to_sql(&marker),
                 )),
             }
+        }
+
+        // The batched executor is its own CLI entry point: it never calls
+        // `run()`, so the guard there covered the per-stage path and left the
+        // DEFAULT one open. A pure-SQL stage carries its body verbatim, so an
+        // INSTALL in one really did download an extension under an enforcing
+        // policy until this line existed.
+        if let Err(e) = crate::policy::refuse_unsafe_sql(&batched_sql) {
+            return RunResult::failed(total_start, e);
         }
 
         let mut cmd = std::process::Command::new(&self.bin);
@@ -4986,6 +5029,9 @@ pub(crate) fn write_arrayrows_to(
 /// the process env is empty (tests, embedded hosts).
 pub(crate) fn apply_duckdb_sql(bin: &Path, db: &Path, sql: &str) -> Result<(), EngineError> {
     use std::process::Command;
+    // The third CLI entry point, reached from the connectors and the output
+    // cache. Same reason as the other two.
+    crate::policy::refuse_unsafe_sql(sql).map_err(EngineError::Query)?;
     let mut cmd = Command::new(bin);
     #[cfg(windows)]
     {
@@ -5011,11 +5057,15 @@ pub(crate) fn apply_duckdb_sql(bin: &Path, db: &Path, sql: &str) -> Result<(), E
         .arg("-c")
         .arg(sql)
         .output()
-        .map_err(|e| EngineError::Query(format!("duckdb CLI for rest source: {}", e)))?;
+        .map_err(|e| EngineError::Query(format!("duckdb CLI: {}", e)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // Named for the helper, not for one of its callers. This started as the
+        // rest source's own materialize and now has nine callers - an artifact
+        // list, a spill, the output cache, the finalizers - so saying "rest
+        // source" sent anyone reading a failed cache restore to the wrong node.
         return Err(EngineError::Query(format!(
-            "rest source materialize failed: {}",
+            "duckdb statement failed: {}",
             stderr.chars().take(500).collect::<String>()
         )));
     }
@@ -7962,7 +8012,7 @@ mod oracle_insert_all_tests {
 
 #[cfg(test)]
 mod resource_pragma_tests {
-    use super::resource_pragmas;
+    use super::{resource_pragmas, DuckdbEngine};
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -7972,6 +8022,15 @@ mod resource_pragma_tests {
             "DUCKLE_THREADS",
             "DUCKLE_TEMP_DIR",
             "DUCKLE_MAX_TEMP_DIR_SIZE",
+            // The policy pair is cleared here too, because this mutex only
+            // serialises THIS module: the rest of the suite runs beside it, and
+            // a leaked DUCKLE_POLICY_FILE makes an unrelated test think it is in
+            // a restricted-network run. That reaches further than it looks -
+            // the policy decides prelude text and is consulted wherever SQL
+            // meets the CLI - so a leak is cleared on the way in rather than
+            // relied on being cleared on the way out.
+            "DUCKLE_POLICY_FILE",
+            "DUCKLE_WORKSPACE",
         ] {
             std::env::remove_var(k);
         }
@@ -8002,17 +8061,36 @@ network:
         .unwrap();
         std::env::set_var("DUCKLE_POLICY_FILE", &pol);
 
-        let p = resource_pragmas(None, None);
-
+        // Everything that reads the policy happens here, and the variable is
+        // cleared before a single assertion runs.
+        //
+        // Not for tidiness: `assert!` panics, so a removal placed after the
+        // assertions is SKIPPED by the first one that fails, and
+        // DUCKLE_POLICY_FILE then stays set for the rest of the process. This
+        // module's mutex does not help, because the other two thousand tests
+        // are not holding it. One failing assertion here would turn into
+        // unrelated failures elsewhere, which is a bad way to find out.
+        let pragmas = resource_pragmas(None, None);
+        let prelude = crate::policy::duckdb_extension_prelude("httpfs", false);
+        let refusal = DuckdbEngine::new("missing-duckdb".into())
+            .run(None, "INSTALL httpfs;", false)
+            .unwrap_err()
+            .to_string();
         std::env::remove_var("DUCKLE_POLICY_FILE");
+
         assert!(
-            p.contains("disabled_filesystems"),
-            "DuckDB could still read https:// itself, outside the allowlist: {p}"
+            pragmas.contains("disabled_filesystems"),
+            "DuckDB could still read https:// itself, outside the allowlist: {pragmas}"
         );
         assert!(
-            p.contains("allow_community_extensions=false"),
-            "an extension carrying its own network code would still load: {p}"
+            pragmas.contains("allow_community_extensions=false"),
+            "an extension carrying its own network code would still load: {pragmas}"
         );
+        assert_eq!(
+            prelude, "LOAD httpfs; ",
+            "restricted runs must never emit an extension download"
+        );
+        assert!(refusal.contains("INSTALL is disabled"), "raw install escaped: {refusal}");
     }
 
     /// And an environment with no policy is not hardened, so an ordinary local
