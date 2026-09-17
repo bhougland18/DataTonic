@@ -9942,6 +9942,82 @@ fn snk_and_src_kafka_roundtrip_via_real_broker() {
     assert!(n >= 3, "expected at least 3 records consumed, got {}", n);
 }
 
+/// Run one rabbit node against a plain TCP listener and report whether a socket
+/// was ever opened, plus the run's error text.
+///
+/// Not a broker: it accepts and closes, so the AMQP handshake fails - but only
+/// AFTER a connection was made, and making one is the thing under test.
+fn rabbit_opens_a_socket(nodes: impl Fn(u16) -> Value, edges: Value) -> (bool, String) {
+    let engine = engine().expect("DUCKLE_DUCKDB_BIN");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = accepted.clone();
+    let handle = std::thread::spawn(move || {
+        for stream in incoming_bounded(&listener, 1) {
+            if stream.is_ok() {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    let r = engine.execute_pipeline(&doc(nodes(port), edges));
+    let _ = handle.join();
+    (
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        r.error.unwrap_or_default(),
+    )
+}
+
+/// src.rabbit and snk.rabbit reach the broker at all.
+///
+/// The round-trip test below needs a real broker and skips without one, which
+/// is how this went unnoticed. lapin 4 moved its async runtime into a DEFAULT
+/// feature; the major bump kept lapin 2's `default-features = false` line
+/// verbatim, so every connect failed with "no default configured runtime"
+/// before opening a socket - source and sink both.
+#[test]
+fn rabbit_source_and_sink_open_a_socket_to_the_broker() {
+    if engine().is_none() {
+        eprintln!("skipping: set DUCKLE_DUCKDB_BIN to a duckdb CLI to run");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let out = out_path(tmp.path(), "out.csv");
+    let (opened, err) = rabbit_opens_a_socket(
+        |port| {
+            json!([
+                node("r", "src.rabbit", json!({
+                    "url": format!("amqp://guest:guest@127.0.0.1:{port}/%2f"),
+                    "queue": "q1",
+                    "maxMessages": 1,
+                    "timeoutMs": 2000,
+                })),
+                node("k", "snk.csv", json!({ "path": out, "hasHeader": true })),
+            ])
+        },
+        json!([main_edge("e", "r", "k")]),
+    );
+    assert!(!err.contains("no default configured runtime"), "src.rabbit has no async runtime: {err}");
+    assert!(opened, "src.rabbit never opened a socket to the broker: {err}");
+
+    let csv = write_file(tmp.path(), "in.csv", "id\n1\n");
+    let (opened, err) = rabbit_opens_a_socket(
+        |port| {
+            json!([
+                node("s", "src.csv", json!({ "path": csv, "hasHeader": true })),
+                node("r", "snk.rabbit", json!({
+                    "url": format!("amqp://guest:guest@127.0.0.1:{port}/%2f"),
+                    "exchange": "",
+                    "routingKey": "q1",
+                })),
+            ])
+        },
+        json!([main_edge("e", "s", "r")]),
+    );
+    assert!(!err.contains("no default configured runtime"), "snk.rabbit has no async runtime: {err}");
+    assert!(opened, "snk.rabbit never opened a socket to the broker: {err}");
+}
+
 #[test]
 fn snk_and_src_rabbit_roundtrip_via_real_broker() {
     // Env-gated. Set DUCKLE_RABBITMQ_URL to an amqp:// URL
@@ -11218,6 +11294,71 @@ fn src_webhook_collects_inbound_http_requests() {
     assert_eq!(ev2, "login");
 }
 
+/// A webhook sender is told the truth about the RUN, not just about the node.
+///
+/// src.webhook answered 200 as soon as its rows were in the run's database, and
+/// a sender does not retry a 200. When a later node then failed, the rows were
+/// gone with the failed run and the event was lost. The answer now waits for
+/// the run: 200 when it succeeded, 503 so the sender retries when it did not.
+#[test]
+fn a_webhook_sender_is_told_to_retry_when_the_run_fails_after_the_webhook() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let engine = engine_or_skip!();
+    let send = |port: u16| {
+        std::thread::spawn(move || {
+            let body = r#"{"id":1,"event":"signup"}"#;
+            for _ in 0..200 {
+                if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+                    let req = format!(
+                        "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(req.as_bytes());
+                    let mut resp = String::new();
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+                    let _ = s.read_to_string(&mut resp);
+                    return resp.lines().next().unwrap_or("").to_string();
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            String::from("never connected")
+        })
+    };
+    let free_port = || TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let tmp = tempfile::tempdir().unwrap();
+    let pipeline = |port: u16, sql: &str| {
+        doc(
+            json!([
+                node("w", "src.webhook", json!({ "port": port, "maxRequests": 1, "timeoutMs": 15000 })),
+                node("q", "code.sql", json!({ "sql": sql })),
+                node("k", "snk.csv", json!({ "path": out_path(tmp.path(), "out.csv"), "hasHeader": true })),
+            ]),
+            json!([main_edge("e1", "w", "q"), main_edge("e2", "q", "k")]),
+        )
+    };
+
+    let port = free_port();
+    let client = send(port);
+    let r = engine.execute_pipeline(&pipeline(port, "SELECT * FROM input JOIN no_such_table USING (id)"));
+    assert_ne!(r.status, "ok", "the downstream node was meant to fail");
+    let answer = client.join().unwrap();
+    assert!(
+        answer.contains("503"),
+        "the sender was told its event was delivered by a run that failed: {answer}"
+    );
+
+    let port = free_port();
+    let client = send(port);
+    let r = engine.execute_pipeline(&pipeline(port, "SELECT * FROM input"));
+    assert_eq!(r.status, "ok", "{:?}", r.error);
+    let answer = client.join().unwrap();
+    assert!(answer.contains("200"), "a successful run must still answer 200: {answer}");
+}
+
 /// #258: a cost ceiling with no prices could never fire. Caught at COMPILE
 /// time, so `duckle validate` reports it rather than a run discovering it after
 /// the first stage has started spending.
@@ -11269,7 +11410,7 @@ fn a_cost_ceiling_with_no_prices_does_not_compile() {
 /// input into the output with no error and no way to notice.
 #[test]
 fn an_expanded_field_never_overwrites_an_upstream_column() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -11280,8 +11421,10 @@ fn an_expanded_field_never_overwrites_an_upstream_column() {
         for stream in incoming_bounded(&listener, 2) {
             let Ok(mut stream) = stream else { break };
             stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
-            let mut buf = [0u8; 8192];
-            let _ = stream.read(&mut buf);
+            // The whole request, body included. One read could leave the POST body
+            // unread, and on Windows closing a socket with unread bytes resets it, so
+            // the client saw "connection aborted" instead of this reply.
+            let _ = drain_http_request(&mut stream);
             // The model returns a field named like the caller's own column.
             let inner = r#"{\"id\": 999, \"score\": 1}"#;
             let body = format!(r#"{{"choices":[{{"message":{{"content":"{inner}"}}}}]}}"#);
@@ -16297,7 +16440,7 @@ fn src_html_extracts_columns_by_selector_including_attributes() {
 /// Which is exactly what the incomplete outcome from #258 is for.
 #[test]
 fn a_pagination_walk_cut_short_by_a_failure_is_incomplete() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -16312,8 +16455,10 @@ fn a_pagination_walk_cut_short_by_a_failure_is_incomplete() {
         for stream in incoming_bounded(&listener, 4) {
             let Ok(mut stream) = stream else { break };
             stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
+            // The whole request, body included. One read could leave the POST body
+            // unread, and on Windows closing a socket with unread bytes resets it, so
+            // the client saw "connection aborted" instead of this reply.
+            let _ = drain_http_request(&mut stream);
             let i = count.fetch_add(1, Ordering::SeqCst);
             // Page 1 answers and names page 2. Page 2 fails, so the link to
             // page 3 is never seen and the walk ends there.
@@ -18300,7 +18445,7 @@ fn changed_emits_a_row_only_when_the_remote_fingerprint_moves() {
     let name = "changedpoll";
 
     // Three HEADs: same ETag twice, then a different one.
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
@@ -18308,8 +18453,10 @@ fn changed_emits_a_row_only_when_the_remote_fingerprint_moves() {
         for (i, stream) in incoming_bounded(&listener, 3).enumerate() {
             let mut stream = match stream { Ok(s) => s, Err(_) => break };
             stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
-            let mut buf = [0u8; 2048];
-            let _ = stream.read(&mut buf);
+            // The whole request, body included. One read could leave the POST body
+            // unread, and on Windows closing a socket with unread bytes resets it, so
+            // the client saw "connection aborted" instead of this reply.
+            let _ = drain_http_request(&mut stream);
             // The third probe reports a different object.
             let etag = if i < 2 { "aaa111" } else { "bbb222" };
             let resp = format!(
@@ -18799,7 +18946,7 @@ fn artifact_copy_skips_what_is_already_there_without_re_reading_it() {
 
     // The source is served over HTTP so the stub can COUNT how many times the
     // bytes were actually fetched. A skip that still downloads is not a skip.
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -18810,8 +18957,10 @@ fn artifact_copy_skips_what_is_already_there_without_re_reading_it() {
                 Err(_) => break,
             };
             stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
-            let mut buf = [0u8; 2048];
-            let _ = stream.read(&mut buf);
+            // The whole request, body included. One read could leave the POST body
+            // unread, and on Windows closing a socket with unread bytes resets it, so
+            // the client saw "connection aborted" instead of this reply.
+            let _ = drain_http_request(&mut stream);
             let _ = tx.send(());
             let body = "hello world";
             let resp = format!(
@@ -18909,7 +19058,7 @@ fn artifact_copy_cannot_escape_the_destination_prefix() {
     std::fs::create_dir_all(&dest_dir).unwrap();
     let out = out_path(tmp.path(), "landed.csv");
 
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -18919,8 +19068,10 @@ fn artifact_copy_cannot_escape_the_destination_prefix() {
                 Err(_) => break,
             };
             stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
-            let mut buf = [0u8; 2048];
-            let _ = stream.read(&mut buf);
+            // The whole request, body included. One read could leave the POST body
+            // unread, and on Windows closing a socket with unread bytes resets it, so
+            // the client saw "connection aborted" instead of this reply.
+            let _ = drain_http_request(&mut stream);
             let body = "pwned";
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -19312,7 +19463,7 @@ fn src_pdf_fetches_a_remote_document_and_leaves_no_spool_behind() {
     let tmp = tempfile::tempdir().unwrap();
     let bytes = minimal_pdf(&["Remote page one", "Remote page two"]);
 
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let served = bytes.clone();
@@ -19323,8 +19474,10 @@ fn src_pdf_fetches_a_remote_document_and_leaves_no_spool_behind() {
                 Err(_) => break,
             };
             stream.set_read_timeout(Some(std::time::Duration::from_millis(400))).ok();
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
+            // The whole request, body included. One read could leave the POST body
+            // unread, and on Windows closing a socket with unread bytes resets it, so
+            // the client saw "connection aborted" instead of this reply.
+            let _ = drain_http_request(&mut stream);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n",

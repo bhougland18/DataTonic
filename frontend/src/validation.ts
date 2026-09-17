@@ -65,11 +65,20 @@ export function validatePipeline(
     // A node alias names its output relation, so two nodes can't share one and
     // an alias can't shadow another node's id (the engine rejects both at
     // compile time; surface it here as an inline error first).
+    //
+    // Compared the way DuckDB compares identifiers, because the name becomes a
+    // view: ASCII case folded, so "Orders" and "orders" are one view and the
+    // second replaced the first, and a node reading "Orders" silently got the
+    // other node's rows. Only ASCII - "Ärger" and "ärger" stay two views - which
+    // is the engine's node_sql_name rule too.
+    const fold = (s: string) => s.replace(/[A-Z]/g, c => c.toLowerCase());
+    const foldedIds = new Set(nodes.map(n => fold(n.id)));
     const aliasOwner = new Map<string, string>();
     for (const node of nodes) {
         const alias = typeof node.data.alias === 'string' ? node.data.alias.trim() : '';
-        if (!alias || alias === node.id) continue;
-        if (nodeIds.has(alias)) {
+        const folded = fold(alias);
+        if (!alias || folded === fold(node.id)) continue;
+        if (foldedIds.has(folded)) {
             push({
                 severity: 'error',
                 code: 'alias-collides-with-id',
@@ -77,7 +86,7 @@ export function validatePipeline(
                 nodeId: node.id,
             });
         }
-        const prior = aliasOwner.get(alias);
+        const prior = aliasOwner.get(folded);
         if (prior) {
             push({
                 severity: 'error',
@@ -86,7 +95,7 @@ export function validatePipeline(
                 nodeId: node.id,
             });
         } else {
-            aliasOwner.set(alias, node.id);
+            aliasOwner.set(folded, node.id);
         }
     }
 
@@ -280,12 +289,12 @@ export function validatePipeline(
         }
     }
 
-    // ---- Cycle detection on data-flow edges ----
+    // ---- Cycle detection on data and trigger edges ----
     if (hasCycle(nodes, edges)) {
         push({
             severity: 'error',
             code: 'cycle',
-            message: 'Pipeline contains a cycle in the data-flow graph.',
+            message: 'Pipeline contains a cycle: its data or trigger links lead back to a node they start from.',
         });
     }
 
@@ -293,7 +302,9 @@ export function validatePipeline(
     // Two contexts defining the same bare key share one slot in
     // buildContextVars' flat map, so `${KEY}` silently resolves to whichever
     // context is last in repo order. Warn (not error) and point at the
-    // unambiguous `${context.KEY}` form. A single context never collides.
+    // unambiguous form, which is keyed by the context's NAME - `${Prod.KEY}` -
+    // in buildContextVars and the engine alike. The literal `${context.KEY}` it
+    // used to suggest resolves nowhere. A single context never collides.
     for (const c of contextKeyCollisions(repo)) {
         push({
             severity: 'warning',
@@ -301,7 +312,7 @@ export function validatePipeline(
             message:
                 `Variable "${c.key}" is defined by ${c.contexts.length} contexts ` +
                 `(${c.contexts.join(', ')}); a bare \${${c.key}} resolves to only one. ` +
-                `Use \${context.${c.key}} to pick a specific context.`,
+                `Use ${c.contexts.map(name => `\${${name}.${c.key}}`).join(' or ')} to pick a specific context.`,
         });
     }
 
@@ -330,11 +341,10 @@ function hasCycle(
         adj.set(n.id, []);
         inDegree.set(n.id, 0);
     }
-    const dataEdges = edges.filter(e => {
-        const t = (e.data as { connectionType?: string } | undefined)?.connectionType;
-        return !t || t === 'main' || t === 'lookup' || t === 'reject' || t === 'filter';
-    });
-    for (const e of dataEdges) {
+    // Every edge, triggers included, as the engine orders a run: a trigger says
+    // "after this", so a loop closed by one is a cycle the engine refuses. On
+    // data edges alone such a pipeline validated clean and failed at Run.
+    for (const e of edges) {
         if (!adj.has(e.source) || !adj.has(e.target)) continue;
         adj.get(e.source)!.push(e.target);
         inDegree.set(e.target, (inDegree.get(e.target) ?? 0) + 1);

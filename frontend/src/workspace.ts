@@ -124,27 +124,31 @@ async function fs(): Promise<FsLib> {
 }
 
 // Encrypt / decrypt a connection payload's sensitive fields (password, tokens,
-// keys) via the desktop crypto commands, which use a per-workspace key under
-// `.duckle/keys/`. On any error we fall back to the original payload so a save
-// never loses data and a load never blocks. `${...}` placeholders and
-// non-secret fields are left untouched by the command.
+// keys) via the crypto commands, which use a per-workspace key under
+// `.duckle/keys/`. `${...}` placeholders and non-secret fields are left
+// untouched by the command.
+//
+// Encrypting throws rather than falling back. It used to return the payload it
+// was given on any error, so a server that refused to encrypt (a role that may
+// not) had the password written to connections/*.json in clear text, and a
+// backend without the command - which the web shim answers with null - had the
+// connection overwritten with `null`. A failed save keeps the item changed, so
+// the editor retries it; decrypting stays lenient so a load never blocks.
 async function encryptConnectionPayload(
     workspace: string,
     connectionId: string,
     payload: unknown,
 ): Promise<unknown> {
-    try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const enc = await invoke<string>('connection_encrypt_payload', {
-            workspace,
-            connectionId,
-            payloadJson: JSON.stringify(payload),
-        });
-        return JSON.parse(enc);
-    } catch (err) {
-        console.error('encrypt connection failed', err);
-        return payload;
+    const { invoke } = await import('@tauri-apps/api/core');
+    const enc = await invoke<string | null>('connection_encrypt_payload', {
+        workspace,
+        connectionId,
+        payloadJson: JSON.stringify(payload),
+    });
+    if (typeof enc !== 'string') {
+        throw new Error('connection_encrypt_payload is not available on this backend');
     }
+    return JSON.parse(enc);
 }
 
 async function decryptConnectionPayload(
@@ -426,16 +430,18 @@ async function loadAndMigrateV1(path: string): Promise<WorkspaceState | null> {
 export async function saveMetadata(
     path: string,
     metadata: { engine?: string; jobs?: unknown; activeJobId?: string },
-): Promise<void> {
-    if (!hasBackend()) return;
+): Promise<boolean> {
+    if (!hasBackend()) return true;
     try {
         await ensureDir(path);
         await writeJson(joinPath(path, METADATA_FILE), {
             version: 2,
             ...metadata,
         });
+        return true;
     } catch (err) {
         console.error('saveMetadata failed', err);
+        return false;
     }
 }
 
@@ -446,8 +452,8 @@ export async function saveMetadata(
 export async function saveRepository(
     path: string,
     items: Array<Record<string, unknown>>,
-): Promise<void> {
-    if (!hasBackend()) return;
+): Promise<boolean> {
+    if (!hasBackend()) return true;
     try {
         await ensureDir(path);
         const stripped = items.map(i => {
@@ -456,9 +462,31 @@ export async function saveRepository(
             return rest;
         });
         await writeJson(joinPath(path, REPOSITORY_FILE), stripped);
+        return true;
     } catch (err) {
         console.error('saveRepository failed', err);
+        return false;
     }
+}
+
+/**
+ * The Save button: the active pipeline, the repository and the metadata, now.
+ *
+ * True only when all three were written. The button used to clear the unsaved
+ * marker before writing, skip the web edition altogether, and clear it even when
+ * a write failed - so a tab could read as saved with nothing on disk.
+ */
+export async function saveNow(
+    path: string,
+    pipelineId: string,
+    pipeline: unknown,
+    repo: Array<Record<string, unknown>>,
+    metadata: { engine?: string; jobs?: unknown; activeJobId?: string },
+): Promise<boolean> {
+    const wrotePipeline = pipeline === undefined ? true : await savePipelineFile(path, pipelineId, pipeline);
+    const wroteRepo = await saveRepository(path, repo);
+    const wroteMeta = await saveMetadata(path, metadata);
+    return wrotePipeline && wroteRepo && wroteMeta;
 }
 
 /**

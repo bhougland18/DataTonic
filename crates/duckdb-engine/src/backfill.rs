@@ -546,26 +546,63 @@ pub fn list(workspace: &Path) -> Vec<Backfill> {
 /// process was killed and one still going look identical from outside, and
 /// they call for opposite responses.
 pub fn reconcile(workspace: &Path, live_pids: &dyn Fn(u32) -> bool) -> Vec<String> {
-    let mut changed = Vec::new();
-    for mut b in list(workspace) {
-        if b.pid.is_some_and(|pid| live_pids(pid)) {
-            continue;
+    list(workspace)
+        .into_iter()
+        .filter(|b| reclaim_abandoned(workspace, b, live_pids))
+        .map(|b| b.id)
+        .collect()
+}
+
+/// A backfill as a retry must see it: slices a dead executor left `running`
+/// reclaimed as `interrupted` first.
+///
+/// Retrying moves only `failed` and `interrupted` slices, and serve's startup
+/// was the only thing that reclaimed a killed executor's `running` ones. So a
+/// backfill killed under the CLI or MCP, or under a serve that stayed up, could
+/// not be retried or finished: retry answered that there was nothing to retry,
+/// and the slice could never be claimed again. A live executor's slices are
+/// left alone, exactly as at startup.
+pub fn load_for_retry(
+    workspace: &Path,
+    id: &str,
+    live_pids: &dyn Fn(u32) -> bool,
+) -> Result<Backfill, String> {
+    let b = load(workspace, id)?;
+    if reclaim_abandoned(workspace, &b, live_pids) {
+        return load(workspace, id);
+    }
+    Ok(b)
+}
+
+/// Reclaim one backfill's abandoned `running` slices; true when any were.
+fn reclaim_abandoned(workspace: &Path, b: &Backfill, live_pids: &dyn Fn(u32) -> bool) -> bool {
+    if b.pid.is_some_and(|pid| live_pids(pid)) {
+        return false;
+    }
+    if !b.partitions.iter().any(|p| p.state == State::Running) {
+        return false;
+    }
+    // Decided again inside the store lock, on the plan as it is NOW. The
+    // listing above is a snapshot, and a bare save from it would overwrite
+    // whatever landed since: a slice that finished, or an executor that
+    // started back up and claimed the plan under its own pid.
+    let reclaimed = update(workspace, &b.id, |plan| {
+        if plan.pid.is_some_and(|pid| live_pids(pid)) {
+            return false;
         }
         let mut touched = false;
-        for p in b.partitions.iter_mut() {
+        for p in plan.partitions.iter_mut() {
             if p.state == State::Running {
                 p.state = State::Interrupted;
                 touched = true;
             }
         }
         if touched {
-            b.pid = None;
-            if save(workspace, &b).is_ok() {
-                changed.push(b.id.clone());
-            }
+            plan.pid = None;
         }
-    }
-    changed
+        touched
+    });
+    matches!(reclaimed, Ok((_, true)))
 }
 
 #[cfg(test)]
@@ -736,6 +773,36 @@ mod tests {
             State::Running,
             "a live backfill must not be reaped"
         );
+    }
+
+    /// The reported case, with a real second process and the liveness answer
+    /// production uses.
+    ///
+    /// The test above injects its predicate with made-up pids, so it proves the
+    /// reconcile LOGIC and cannot see what serve actually passed: "only this
+    /// process is alive". That reaped a live backfill run by another process,
+    /// and a retry then started its still-running slice a second time.
+    #[test]
+    fn a_backfill_run_by_another_live_process_is_not_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut executor = crate::runlock::test_sleeper();
+        let mut b = plan(("2020-01-01", "2020-01-02"));
+        b.id = "bf-elsewhere".into();
+        b.pid = Some(executor.id());
+        b.partitions[0].state = State::Running;
+        save(tmp.path(), &b).unwrap();
+
+        let changed = reconcile(tmp.path(), &crate::runlock::process_alive);
+        assert!(changed.is_empty(), "a live executor's backfill was reaped: {changed:?}");
+        let now = load(tmp.path(), "bf-elsewhere").unwrap();
+        assert_eq!(now.partitions[0].state, State::Running, "its slice is still running");
+        assert_eq!(now.pid, Some(executor.id()), "and it still belongs to that executor");
+
+        executor.kill().expect("kill the executor");
+        executor.wait().expect("reap it");
+        let changed = reconcile(tmp.path(), &crate::runlock::process_alive);
+        assert_eq!(changed, vec!["bf-elsewhere".to_string()], "a dead executor's slice was not reclaimed");
+        assert_eq!(load(tmp.path(), "bf-elsewhere").unwrap().partitions[0].state, State::Interrupted);
     }
 
     #[test]

@@ -146,7 +146,12 @@ tar = "0.4"
 # RabbitMQ / AMQP 0.9.1 client. Pure Rust, async. Same block_on
 # pattern as Kafka/NATS. Publishes to an exchange + routing key;
 # pulls from a queue with a per-message timeout for batch ETL.
-lapin = { version = "4", default-features = false, features = ["rustls"] }
+#
+# `default-runtime` is not optional. lapin 4 moved its async runtime into a
+# default feature, so this line - correct for lapin 2 - stopped carrying one when
+# only the version number changed, and every connect failed with "no default
+# configured runtime" before opening a socket. Tokio is already in the tree.
+lapin = { version = "4", default-features = false, features = ["rustls", "default-runtime"] }
 # FTP / FTPS client. Pure Rust, synchronous API (fits the per-stage
 # blocking model - no block_on dance). Rustls-backed TLS keeps the
 # build self-contained on every OS.
@@ -283,5 +288,12 @@ flate2 = "1"
 
 # flock(2) for the cross-process run lock. Windows uses a share-mode open,
 # which is in std, so this is unix-only. Already in the tree transitively.
+# Also kill(pid, 0) for `runlock::process_alive`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# OpenProcess + GetExitCodeProcess for `runlock::process_alive`, which std has
+# no equivalent of on Windows. 0.61 is already compiled into the tree for tokio,
+# so this adds two feature flags rather than a dependency.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

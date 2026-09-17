@@ -469,10 +469,6 @@ fn run_with(args: Args) -> Result<bool, String> {
     // environment, then secrets.env, then a decrypted secrets.enc.
     let env_file = workspace.join("secrets.env");
     apply_env_pass(&mut doc, &workspace, &env_file)?;
-    // Stamp the dynamic date/time builtins (${date}/${datetime}/...) at run
-    // time. A built bundle deliberately ships these unresolved so each run
-    // (e.g. a daily cron of the same artifact) writes a fresh-dated path.
-    duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
     // #305: run parameters, through the same typed boundary the console uses,
     // so an invalid value fails here rather than inside the run. Empty for an
     // ordinary headless run, which is what this path has always done; a retry
@@ -493,7 +489,11 @@ fn run_with(args: Args) -> Result<bool, String> {
     // (a file-loaded pipeline doesn't go through the by-id resolver, so these
     // would otherwise pass through literally; foreach children already resolve
     // them). Makes ${workspace}-relative pipelines portable in headless runs.
-    context::apply_workspace_context(&mut doc, &workspace);
+    // Then stamp the dynamic date/time builtins (${date}/${datetime}/...) at run
+    // time, after the context as on every run surface. A built bundle
+    // deliberately ships these unresolved so each run (e.g. a daily cron of the
+    // same artifact) writes a fresh-dated path.
+    context::apply_workspace_context_then_time(&mut doc, &workspace);
     let log_dir = args.log_dir.clone().unwrap_or_else(|| workspace.join("logs"));
     std::env::set_var("DUCKLE_WORKSPACE", &workspace);
     std::env::set_var("DUCKLE_LOG_DIR", &log_dir);
@@ -609,9 +609,12 @@ fn run_with(args: Args) -> Result<bool, String> {
         if target.is_some() { "partial" } else { "manual" },
     );
     record.run_id = Some(run_id);
-    duckle_duckdb_engine::append_run_record(&workspace, &name, record);
+    let recorded = duckle_duckdb_engine::record_run(&workspace, &name, record);
 
     println!("status   : {}", result.status);
+    if !recorded {
+        println!("recorded : no - see the message above; the run itself is not repeated");
+    }
     println!("duration : {} ms", result.duration_ms);
     if let Some(err) = &result.error {
         println!("error    : {err}");
@@ -977,8 +980,7 @@ fn run_artifact(payload: Vec<u8>) -> ExitCode {
     // placeholders (resolve_workspace_portable). Re-resolve them here against the
     // run-host workspace, exactly as run() does for file-loaded pipelines, so a
     // cross-OS artifact resolves correct paths instead of the build host's.
-    duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
-    context::apply_workspace_context(&mut doc, &ws_root);
+    context::apply_workspace_context_then_time(&mut doc, &ws_root);
 
     eprintln!("duckle-runner: {} (artifact, workspace {})", pipeline.display(), ws_root.display());
     // No canvas here, so per-node preview rows have nobody to show them to:
@@ -1704,7 +1706,9 @@ ies)"),
             "subscriptions",
             "trigger-cycle",
             format!(
-                "these pipelines would trigger each other forever: {cycle}. Narrow the assets a                  subscription matches, or set a producer, so the chain does not come back to                  where it started."
+                "these pipelines would trigger each other forever: {cycle}. Narrow the assets a \
+                 subscription matches, or set a producer, so the chain does not come back to \
+                 where it started."
             ),
         ));
         if !json_out && !machine {
@@ -1756,8 +1760,7 @@ fn run_side_for_review(
     // Resolve placeholders the same way a normal headless run does.
     let env_file = workspace.join("secrets.env");
     apply_env_pass(&mut doc, workspace, &env_file)?;
-    context::apply_time_builtins(&mut doc);
-    context::apply_workspace_context(&mut doc, workspace);
+    context::apply_workspace_context_then_time(&mut doc, workspace);
     std::env::set_var("DUCKLE_WORKSPACE", workspace);
     let res = engine.execute_pipeline(&doc);
     if res.status != "ok" {
@@ -1778,8 +1781,7 @@ fn drift_after(
         serde_json::from_value(av.clone()).map_err(|e| format!("invalid pipeline: {e}"))?;
     let env_file = ws.join("secrets.env");
     apply_env_pass(&mut adoc, ws, &env_file)?;
-    context::apply_time_builtins(&mut adoc);
-    context::apply_workspace_context(&mut adoc, ws);
+    context::apply_workspace_context_then_time(&mut adoc, ws);
     std::env::set_var("DUCKLE_WORKSPACE", ws);
     Ok(duckle_duckdb_engine::drift::schema_drift(engine, &adoc))
 }
@@ -2458,6 +2460,10 @@ fn run_retry() -> ExitCode {
         return ExitCode::from(2);
     };
     let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
+    // A run killed under the CLI is marked in flight until something reconciles
+    // it, and without a console nothing did. This is where an operator comes
+    // for that run.
+    duckle_duckdb_engine::recovery::reclaim_abandoned(&workspace);
 
     // The receipt names the pipeline, so a retry does not ask the operator to
     // remember which file a run came from.
@@ -2798,7 +2804,9 @@ fn run_retention() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: duckle-runner retention status|prune [--workspace DIR] [--json]                  [--dry-run] [--cache-days N] [--logs-days N] [--receipts-keep N]                  [--materializations-days N] [--deliveries-days N]"
+                "usage: duckle-runner retention status|prune [--workspace DIR] [--json] \
+                 [--dry-run] [--cache-days N] [--logs-days N] [--receipts-keep N] \
+                 [--materializations-days N] [--deliveries-days N]"
             );
             ExitCode::from(2)
         }

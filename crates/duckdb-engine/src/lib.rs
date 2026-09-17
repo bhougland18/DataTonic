@@ -81,6 +81,9 @@ pub mod pyenv;
 pub mod schedules;
 pub mod talend;
 pub mod trust;
+pub mod launch_env;
+pub mod ndjson;
+pub mod recovery;
 pub mod tls;
 pub mod watermark;
 pub mod xsd;
@@ -91,7 +94,7 @@ mod run_log;
 mod util;
 pub(crate) use util::*;
 pub use util::{is_secret_prop_key, literal_secrets};
-pub use history::{append_run_record, load_run_history, RunRecord};
+pub use history::{append_run_record, load_run_history, record_run, RunRecord};
 pub use plan::{CompiledPipeline, PipelineDoc, Stage, StageKind};
 use plan::{
     quote_ident, AiChunkSpec, AiClassifySpec, AiDedupeSpec, AiEmbedSpec, AiLlmSpec, AiOnInvalid,
@@ -209,6 +212,11 @@ pub struct DuckdbEngine {
     /// from a probe makes the next real run see no changes - the schema preview
     /// silently eats the data it was only supposed to look at.
     probing: bool,
+    /// src.webhook connections waiting to hear how THIS run ended, so they are
+    /// answered from the run's outcome rather than the node's. Set per run by
+    /// [`DuckdbEngine::execute_pipeline_with_events`]; `None` outside a run,
+    /// where the node answers as soon as its rows are stored.
+    webhook_acks: Option<Arc<std::sync::Mutex<Vec<std::net::TcpStream>>>>,
 }
 
 impl std::fmt::Debug for DuckdbEngine {
@@ -374,6 +382,7 @@ impl DuckdbEngine {
             skip_nodes: Default::default(),
             run_id: None,
             probing: false,
+            webhook_acks: None,
         }
     }
 
@@ -490,6 +499,7 @@ impl DuckdbEngine {
             inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             // A real run is not a probe, whatever this engine was.
             probing: false,
+            webhook_acks: None,
         }
     }
 
@@ -510,6 +520,7 @@ impl DuckdbEngine {
             skip_nodes: Default::default(),
             inherited_subs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             probing: true,
+            webhook_acks: None,
         }
     }
 
@@ -928,7 +939,9 @@ impl DuckdbEngine {
         // declining to save state.
         if format == "ducklake.maintain" {
             return Err(EngineError::Unsupported(
-                "src.ducklake.maintain cannot be autodetected: finding out what it returns would                  mean performing the maintenance operation. It emits what it did, so run it to                  see the columns."
+                "src.ducklake.maintain cannot be autodetected: finding out what it returns would \
+                 mean performing the maintenance operation. It emits what it did, so run it to \
+                 see the columns."
                     .to_string(),
             ));
         }
@@ -1365,7 +1378,41 @@ impl DuckdbEngine {
 
     /// Execute a pipeline, optionally only the subgraph upstream of
     /// `target`, streaming [`PipelineEvent`]s through `on_event`.
+    ///
+    /// A src.webhook in the run holds its senders' connections until the run
+    /// ends and answers from the run's outcome: 200 when the whole run
+    /// succeeded, 503 otherwise so the sender retries. It used to answer 200 as
+    /// soon as its own rows were stored, and senders do not retry a 200, so an
+    /// event whose run then failed further down was lost. The held connections
+    /// belong to this run alone - one engine can drive several runs at once,
+    /// and a child pipeline answers its own.
     pub fn execute_pipeline_with_events<F>(
+        &self,
+        doc: &PipelineDoc,
+        target: Option<&str>,
+        pipeline_name: Option<&str>,
+        user_on_event: F,
+    ) -> RunResult
+    where
+        F: FnMut(PipelineEvent),
+    {
+        use std::io::Write;
+        let acks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let run = DuckdbEngine { webhook_acks: Some(Arc::clone(&acks)), ..self.clone() };
+        let result = run.execute_pipeline_in_run(doc, target, pipeline_name, user_on_event);
+        let answer: &[u8] = if result.status == "ok" {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        } else {
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\nConnection: close\r\n\r\nretry"
+        };
+        for mut sender in acks.lock().unwrap_or_else(|p| p.into_inner()).drain(..) {
+            let _ = sender.write_all(answer);
+            let _ = sender.flush();
+        }
+        result
+    }
+
+    fn execute_pipeline_in_run<F>(
         &self,
         doc: &PipelineDoc,
         target: Option<&str>,
@@ -3973,9 +4020,7 @@ impl DuckdbEngine {
                 .nodes
                 .iter()
                 .find(|n| &n.id == name)
-                .and_then(|n| n.data.alias.as_deref())
-                .map(str::trim)
-                .filter(|a| !a.is_empty() && a != name)
+                .and_then(|n| plan::node_sql_name(n.data.alias.as_deref(), name))
             {
                 sql.push_str(&format!(
                     "CREATE OR REPLACE VIEW {} AS SELECT {} WHERE 1=0;
@@ -8349,12 +8394,14 @@ mod inspect_prelude_tests {
             let prelude = engine.source_prelude(format, &props);
             assert!(
                 prelude.contains("SECRET"),
-                "autodetect of {format:?} reads a cloud URL with credentials set and creates no                  secret, so it authenticates as nobody: {prelude:?}"
+                "autodetect of {format:?} reads a cloud URL with credentials set and creates no \
+                 secret, so it authenticates as nobody: {prelude:?}"
             );
         }
         assert!(
             checked >= 4,
-            "only {checked} credentialled format(s) were exercised - the props are no longer              enough to make a secret, so this test proves nothing"
+            "only {checked} credentialled format(s) were exercised - the props are no longer \
+             enough to make a secret, so this test proves nothing"
         );
     }
 

@@ -9103,7 +9103,8 @@ impl DuckdbEngine {
         // it were the whole thing.
         if let Some(reason) = walk_cut_short {
             return Ok(format!(
-                "{}{} html: the page walk stopped early, so these {} row(s) are not the whole                  result",
+                "{}{} html: the page walk stopped early, so these {} row(s) are not the whole \
+                 result",
                 crate::INCOMPLETE_MARKER,
                 reason,
                 count
@@ -9179,7 +9180,9 @@ impl DuckdbEngine {
                     // network because one of its files said so. That is the
                     // unpinned fetch nobody asked for.
                     return Err(format!(
-                        "{loc} is remote, but the schema it is imported from is a local file. A                          local schema set is not allowed to fetch over the network. Point at a                          local copy of it."
+                        "{loc} is remote, but the schema it is imported from is a local file. A \
+                         local schema set is not allowed to fetch over the network. Point at a \
+                         local copy of it."
                     ));
                 }
                 let text = if child_remote {
@@ -12195,10 +12198,17 @@ impl DuckdbEngine {
             // Read request bytes until headers parse + body fully consumed.
             let (method, path, headers, body) = match read_http_request(&mut stream) {
                 Ok(req) => req,
-                Err(e) => {
-                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                Err((code, e)) => {
+                    let reason = match code {
+                        411 => "Length Required",
+                        _ => "Bad Request",
+                    };
+                    let _ = stream.write_all(
+                        format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .as_bytes(),
+                    );
                     let _ = stream.flush();
-                    eprintln!("webhook: skipping malformed request: {}", e);
+                    eprintln!("webhook: skipping request ({code}): {}", e);
                     continue;
                 }
             };
@@ -12246,6 +12256,16 @@ impl DuckdbEngine {
         }
         let count = rows.len();
         let materialized = materialize_jsonobjects_as_table(&self.bin, db, &spec.node_id, &rows);
+        // Inside a run, the answer waits for the run: rows in the run's database
+        // are not delivered until the run that reads them succeeds. See
+        // `execute_pipeline_with_events`.
+        if let (Some(acks), true) = (&self.webhook_acks, materialized.is_ok()) {
+            acks.lock().unwrap_or_else(|p| p.into_inner()).extend(pending);
+            return Ok(format!(
+                "webhook: collected {} request(s) on :{} -> {}",
+                count, spec.port, spec.node_id
+            ));
+        }
         // Persist-then-ack: 200 once the rows are durably written; 503 on
         // failure so a well-behaved sender retries instead of dropping the
         // event. A sender that already timed out waiting will also retry,
@@ -13761,7 +13781,10 @@ impl DuckdbEngine {
                                         // the output.
                                         if row.get(k).is_some() {
                                             return Err(EngineError::Query(format!(
-                                                "ai.llm: the reply has a field {k:?}, which is                                                  already a column on the input row - expanding it                                                  would overwrite the caller's own value. Rename                                                  the column, or turn off expanding the reply."
+                                                "ai.llm: the reply has a field {k:?}, which is \
+                                                 already a column on the input row - expanding it \
+                                                 would overwrite the caller's own value. Rename \
+                                                 the column, or turn off expanding the reply."
                                             )));
                                         }
                                         obj.insert(k.clone(), v.clone());
@@ -16125,11 +16148,12 @@ impl DuckdbEngine {
         // Applied to everything that reaches the wire, because an API may take
         // its cursor in any of them.
         let sub = |t: &str| t.replace(INCREMENTAL_PLACEHOLDER, &mark);
+        let sub_url = |t: &str| fill_incremental_url(t, &mark);
         let spec = &{
             let mut s2 = spec.clone();
             if s2.incremental_field.is_some() {
-                s2.url = sub(&s2.url);
-                s2.url_template = s2.url_template.as_deref().map(sub);
+                s2.url = sub_url(&s2.url);
+                s2.url_template = s2.url_template.as_deref().map(sub_url);
                 s2.body = s2.body.as_deref().map(sub);
                 s2.headers = s2.headers.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
             }
@@ -16802,7 +16826,8 @@ impl DuckdbEngine {
                 .unwrap_or(true);
             if failed > 0 {
                 eprintln!(
-                    "duckle: rest: {failed} parent(s) failed, so the incremental mark was NOT                      advanced - the next run re-reads this window rather than stepping over it"
+                    "duckle: rest: {failed} parent(s) failed, so the incremental mark was NOT \
+                     advanced - the next run re-reads this window rather than stepping over it"
                 );
             }
             if moved && failed == 0 {
@@ -18639,11 +18664,27 @@ pub(crate) const INCREMENTAL_PLACEHOLDER: &str = "{incremental}";
 /// ISO-8601 work without a date parser, since it sorts lexically by design. A
 /// format that does not sort lexically (`03/04/2026`) is not usable as a cursor
 /// here, and would not be usable as one against the API either.
+/// The URL with `{incremental}` filled in, the mark percent-encoded like every
+/// other value spliced into a URL. Raw, a `+02:00` offset reached the API as a
+/// space. A body or header takes the mark as it is.
+pub(crate) fn fill_incremental_url(url: &str, mark: &str) -> String {
+    url.replace(INCREMENTAL_PLACEHOLDER, &percent_encode_path(mark))
+}
+
 pub(crate) fn mark_is_newer(candidate: &str, current: &str) -> bool {
-    match (candidate.parse::<f64>(), current.parse::<f64>()) {
-        (Ok(a), Ok(b)) => a > b,
-        _ => candidate > current,
+    if let (Ok(a), Ok(b)) = (candidate.parse::<f64>(), current.parse::<f64>()) {
+        return a > b;
     }
+    // Two RFC 3339 timestamps are compared as the instants they name. As text a
+    // fractional second sorted before the whole second (`.` is below `Z`) and an
+    // offset sorted by its local clock, so the mark could stop at an older row.
+    if let (Ok(a), Ok(b)) = (
+        chrono::DateTime::parse_from_rfc3339(candidate),
+        chrono::DateTime::parse_from_rfc3339(current),
+    ) {
+        return a > b;
+    }
+    candidate > current
 }
 
 /// Raise `mark` to this row's value, if the row carries a higher one.
@@ -19862,6 +19903,13 @@ pub(crate) fn context_vars_for_workspace(ws: &Path) -> std::collections::HashMap
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    // #204: read every context, then merge lowest priority first, as the desktop
+    // and `context::build_context_vars` do. This loader merged in repository
+    // order and ignored `priority`, so on every path that resolves through it -
+    // the runner, both servers, child pipelines - a base context listed after a
+    // production override won, and a scheduled run used values the desktop did
+    // not. Stable, so contexts on one layer keep repository order.
+    let mut loaded: Vec<(String, serde_json::Value)> = Vec::new();
     for it in repo.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         if it.get("type").and_then(|v| v.as_str()) != Some("context") {
             continue;
@@ -19880,6 +19928,10 @@ pub(crate) fn context_vars_for_workspace(ws: &Path) -> std::collections::HashMap
             Some(v) => v,
             None => continue,
         };
+        loaded.push((name.to_string(), payload));
+    }
+    loaded.sort_by_key(|(_, p)| p.get("priority").and_then(|v| v.as_i64()).unwrap_or(0));
+    for (name, payload) in &loaded {
         if let Some(vars) = payload.get("variables").and_then(|v| v.as_array()) {
             for v in vars {
                 if let (Some(k), Some(val)) = (
@@ -20362,6 +20414,55 @@ mod connector_helper_tests {
     use super::{bson_flag_matches, jsonnative_quote_inner, python_temp_paths};
     use mongodb::bson::Bson;
 
+    /// #257: a REST incremental mark that is an RFC 3339 timestamp is compared
+    /// as the instant it names. Compared as text, a fractional second sorted
+    /// BEFORE the whole second (`.` is below `Z`) and an offset sorted by its
+    /// local clock, so the mark stopped at an older row and the next run asked
+    /// for, and appended, the same rows again.
+    #[test]
+    fn an_rfc3339_mark_is_compared_as_an_instant_not_as_text() {
+        use super::mark_is_newer;
+        assert!(
+            mark_is_newer("2026-09-17T10:00:00.5Z", "2026-09-17T10:00:00Z"),
+            "half a second later is newer"
+        );
+        assert!(
+            mark_is_newer("2026-09-17T11:00:00Z", "2026-09-17T12:00:00+02:00"),
+            "11:00Z is an hour after 12:00+02:00"
+        );
+        assert!(
+            !mark_is_newer("2026-09-17T12:00:00+02:00", "2026-09-17T11:00:00Z"),
+            "12:00+02:00 is an hour before 11:00Z"
+        );
+        assert!(
+            !mark_is_newer("2026-09-17T10:00:00+00:00", "2026-09-17T10:00:00Z"),
+            "one instant spelled two ways is not newer"
+        );
+        // Everything that already worked still does.
+        assert!(mark_is_newer("2026-03-05", "2026-01-01"));
+        assert!(mark_is_newer("10", "9"), "numbers compare as numbers");
+        assert!(mark_is_newer("2026-03-05T00:00:00Z", "1970-01-01"), "mixed forms fall back to text");
+    }
+
+    /// #257: the mark is percent-encoded where it enters a URL, like every other
+    /// value spliced into one. Raw, a `+02:00` offset reached the API as a space
+    /// and the API answered for a different time or refused the request.
+    #[test]
+    fn the_incremental_mark_is_encoded_where_it_enters_a_url() {
+        assert_eq!(
+            super::fill_incremental_url(
+                "https://api.example/changes?since={incremental}",
+                "2026-09-17T12:00:00+02:00"
+            ),
+            "https://api.example/changes?since=2026-09-17T12%3A00%3A00%2B02%3A00"
+        );
+        assert_eq!(
+            super::fill_incremental_url("https://api.example/c?since={incremental}", "2026-03-05"),
+            "https://api.example/c?since=2026-03-05",
+            "a mark with nothing to escape is unchanged"
+        );
+    }
+
     #[test]
     fn a_url_template_names_a_column_or_fails_loudly() {
         // #257. A template naming a column the upstream does not have must fail
@@ -20415,7 +20516,6 @@ mod connector_helper_tests {
         assert_eq!(w(Some("Wed, 21 Oct 2026 07:28:00 GMT"), 1), 1_000);
     }
 
-    #[test]
     /// #258: an OpenAI-COMPATIBLE endpoint may accept `response_format` and
     /// ignore it, so the reply is re-checked here. Prose where an object was
     /// asked for is the failure this exists to catch.
@@ -20774,6 +20874,43 @@ mod context_var_tests {
         assert_eq!(vars.get("MotherDuck.MOTHERDUCK_TOKEN").map(String::as_str), Some("tok-123"));
         // Built-in workspace placeholder is exposed too.
         assert!(vars.contains_key("workspace"));
+    }
+
+    /// #204 on the headless path. `apply_workspace_context` - the runner, both
+    /// servers and every child pipeline - reads contexts through this loader,
+    /// which merged them in repository order and ignored `priority`. The desktop
+    /// layers them, so a base context listed after a production override won
+    /// headless and a scheduled run used the base values the desktop run did not.
+    #[test]
+    fn a_higher_priority_context_wins_whatever_the_repository_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("repository.json"),
+            r#"[{"id":"env","name":"Prod","type":"context"},
+                {"id":"base","name":"Base","type":"context"}]"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join("contexts")).unwrap();
+        std::fs::write(
+            ws.join("contexts").join("base.json"),
+            r#"{"priority":0,"variables":[{"key":"DB_HOST","value":"localhost"},{"key":"RETRIES","value":"3"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("contexts").join("env.json"),
+            r#"{"priority":10,"variables":[{"key":"DB_HOST","value":"prod.internal"}]}"#,
+        )
+        .unwrap();
+
+        let vars = context_vars_for_workspace(ws);
+        assert_eq!(
+            vars.get("DB_HOST").map(String::as_str),
+            Some("prod.internal"),
+            "the higher layer must win regardless of repository order"
+        );
+        assert_eq!(vars.get("RETRIES").map(String::as_str), Some("3"), "the base still fills what the layer leaves");
+        assert_eq!(vars.get("Base.DB_HOST").map(String::as_str), Some("localhost"), "a named reference still reaches its own context");
     }
 
     #[test]
@@ -21530,13 +21667,7 @@ fn record_known_host(path: &std::path::Path, hostport: &str, fingerprint: &str) 
             return;
         }
     }
-    use std::io::Write as _;
-    let line = format!("{} {}\n", hostport, fingerprint);
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+    let _ = crate::ndjson::append_records(path, &format!("{} {}", hostport, fingerprint));
 }
 
 /// Strip the `SHA256:` prefix and surrounding space. Base64 is

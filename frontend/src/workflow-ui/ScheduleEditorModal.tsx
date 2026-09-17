@@ -13,6 +13,8 @@ import {
     X,
 } from 'lucide-react';
 import { isTauri } from '../tauri-dialog';
+import { isWebBackend } from '../web-fs';
+import { scheduleActionError, scheduleForSave } from '../schedule-save';
 import {
     runHistory,
     scheduleDelete,
@@ -145,13 +147,10 @@ export default function ScheduleEditorModal({
                         type: 'interval',
                         seconds: joinInterval(editing.intervalValue, editing.intervalUnit),
                     };
-        const draft: Schedule = {
-            id: editing.id,
-            pipeline_id: pipelineId,
-            name: editing.name.trim() || 'Schedule',
-            enabled: editing.enabled,
-            kind,
-        };
+        const draft = scheduleForSave(
+            schedules.find(s => s.id === editing.id),
+            { id: editing.id, pipelineId, name: editing.name, enabled: editing.enabled, kind },
+        );
         try {
             await scheduleUpsert(draft);
             setEditing(null);
@@ -165,8 +164,9 @@ export default function ScheduleEditorModal({
 
     const handleDelete = async (id: string) => {
         setBusy(true);
+        setError(null);
         try {
-            await scheduleDelete(id);
+            setError(await scheduleActionError(() => scheduleDelete(id)));
             await refresh();
         } finally {
             setBusy(false);
@@ -175,8 +175,9 @@ export default function ScheduleEditorModal({
 
     const handleRunNow = async (id: string) => {
         setBusy(true);
+        setError(null);
         try {
-            await scheduleRunNow(id);
+            setError(await scheduleActionError(() => scheduleRunNow(id)));
             await refresh();
         } finally {
             setBusy(false);
@@ -198,6 +199,15 @@ export default function ScheduleEditorModal({
                             <div className="modal-subtitle">
                                 Pipeline: <b>{pipelineName}</b>
                             </div>
+                            {isWebBackend() ? (
+                                // This editor stores schedules but does not fire
+                                // them; without saying so a saved schedule looks
+                                // armed and never runs.
+                                <div className="modal-subtitle">
+                                    Saved to this workspace. They fire where{' '}
+                                    <code>duckle-runner serve</code> runs, not in this editor.
+                                </div>
+                            ) : null}
                         </div>
                     </div>
                     <button
@@ -257,6 +267,7 @@ export default function ScheduleEditorModal({
                                         />
                                     ))
                                 )}
+                                {error ? <div className="modal-error">{error}</div> : null}
                             </div>
                             <button
                                 type="button"

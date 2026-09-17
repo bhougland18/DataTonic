@@ -144,7 +144,21 @@ async function runViaSse(
                 targetNodeId: targetNodeId ?? null,
             }),
         });
-        if (!res.ok || !res.body) return fail('run failed: HTTP ' + res.status);
+        if (!res.ok) {
+            // The server says why it refused - a bad pipeline, a connection it
+            // could not resolve, a role that may not run - as JSON or plain text.
+            // Only the status reached the editor before.
+            const text = (await res.text().catch(() => '')).trim();
+            let reason = text;
+            try {
+                const parsed = JSON.parse(text) as { error?: unknown };
+                if (typeof parsed.error === 'string') reason = parsed.error;
+            } catch {
+                // plain text: use it as it is
+            }
+            return fail(`run failed: HTTP ${res.status}${reason ? ` - ${reason}` : ''}`);
+        }
+        if (!res.body) return fail('run failed: HTTP ' + res.status);
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buf = '';
@@ -354,7 +368,10 @@ export async function runHistory(
     workspacePath: string,
     pipelineId: string,
 ): Promise<RunRecord[]> {
-    if (!isTauri()) return [];
+    // The web edition's server keeps the same runs/<id>.json history. This
+    // returned at once outside the desktop app, so the web History tab always
+    // said there was no run history.
+    if (!isTauri() && !isWebBackend()) return [];
     try {
         return await invoke<RunRecord[]>('run_history', {
             workspacePath,
@@ -384,7 +401,10 @@ export async function watermarkList(
     workspacePath: string,
     pipelineName: string,
 ): Promise<WatermarkEntry[]> {
-    if (!isTauri()) return [];
+    // The web edition's server answers watermark_list, watermark_set and
+    // watermark_clear. These returned at once outside the desktop app, so the
+    // web Backfill panel could neither show nor change saved state.
+    if (!isTauri() && !isWebBackend()) return [];
     try {
         return await invoke<WatermarkEntry[]>('watermark_list', {
             workspacePath,
@@ -404,7 +424,7 @@ export async function watermarkSet(
     value: string,
     valueType?: string,
 ): Promise<void> {
-    if (!isTauri()) return;
+    if (!isTauri() && !isWebBackend()) return;
     await invoke('watermark_set', {
         workspacePath,
         pipelineName,
@@ -420,7 +440,7 @@ export async function watermarkClear(
     pipelineName: string,
     nodeId: string,
 ): Promise<void> {
-    if (!isTauri()) return;
+    if (!isTauri() && !isWebBackend()) return;
     await invoke('watermark_clear', { workspacePath, pipelineName, nodeId });
 }
 
@@ -501,6 +521,11 @@ export async function engineInstall(
     onProgress?: (p: InstallProgress) => void,
     modelId?: string,
 ): Promise<string> {
+    // Engines install beside the desktop app. The server has no engine_install,
+    // so this used to resolve empty and Duckie's Retry reported an install.
+    if (isWebBackend()) {
+        throw new Error('Engines are not installed from the web editor: Duckie chat is only available in the desktop app.');
+    }
     const channel = new Channel<InstallProgress>();
     if (onProgress) channel.onmessage = onProgress;
     return await invoke<string>('engine_install', { engine, modelId, onProgress: channel });
@@ -765,7 +790,9 @@ export async function workspaceCiStatus(workspacePath: string): Promise<CiStatus
 }
 
 export async function cancelPipeline(): Promise<void> {
-    if (!isTauri()) return;
+    // The web edition asks its server too. This returned at once outside the
+    // desktop app, so Stop sent nothing and the run went on to write its sinks.
+    if (!isTauri() && !isWebBackend()) return;
     try {
         await invoke('cancel_pipeline');
     } catch (err) {
@@ -1004,6 +1031,15 @@ export type Schedule = {
     name: string;
     enabled: boolean;
     kind: ScheduleKind;
+    /**
+     * Set through the server's schedule API (#318, #296). No desktop control edits
+     * these, but the desktop upsert replaces the whole record, so an editor must
+     * send back what it loaded or saving wipes them.
+     */
+    timezone?: string;
+    exclude?: { weekdays?: string[]; dates?: string[] };
+    misfire?: 'skip' | 'latest' | 'all';
+    catchup?: { maxCatchupRuns: number; maxCatchupAgeDays: number };
     last_run_at?: string;
     last_run_status?: 'ok' | 'error' | 'cancelled';
     last_run_duration_ms?: number;
@@ -1020,8 +1056,12 @@ export async function scheduleSetWorkspace(path: string | null): Promise<void> {
     }
 }
 
+// The web edition reads and writes the same schedule store through its server.
+// These used to return at once outside the desktop app, so the web dialog said
+// "No schedules yet" while schedules.json held some, and a save closed the form
+// as if it had worked while nothing was stored.
 export async function scheduleList(): Promise<Schedule[]> {
-    if (!isTauri()) return [];
+    if (!isTauri() && !isWebBackend()) return [];
     // Deliberately not caught. Swallowing the failure into an empty array told
     // the user they had no schedules when the truth was that schedules.json
     // could not be read - and the schedules were still on disk. The caller
@@ -1030,16 +1070,23 @@ export async function scheduleList(): Promise<Schedule[]> {
 }
 
 export async function scheduleUpsert(schedule: Schedule): Promise<Schedule | null> {
-    if (!isTauri()) return null;
+    if (!isTauri() && !isWebBackend()) return null;
     return await invoke<Schedule>('schedule_upsert', { schedule });
 }
 
 export async function scheduleDelete(id: string): Promise<void> {
-    if (!isTauri()) return;
+    if (!isTauri() && !isWebBackend()) return;
     await invoke('schedule_delete', { id });
 }
 
 export async function scheduleRunNow(id: string): Promise<RunResult | null> {
+    // The web editor does not fire schedules; `duckle-runner serve` does. Saying
+    // so beats a button that silently does nothing.
+    if (isWebBackend()) {
+        throw new Error(
+            'Run now is not available in the web editor: schedules fire under duckle-runner serve. Use Run to run the pipeline here.',
+        );
+    }
     if (!isTauri()) return null;
     return await invoke<RunResult>('schedule_run_now', { id });
 }
@@ -1243,6 +1290,14 @@ export async function buildBundle(
     passphrase?: string,
     targetOs?: TargetOs,
 ): Promise<string> {
+    // A bundle is an executable written where Duckle runs, and the web edition
+    // has nowhere in the browser to put one. The server has no build command,
+    // so this used to resolve empty and Build did nothing at all.
+    if (isWebBackend()) {
+        throw new Error(
+            `Build is not available in the web editor. On the server, run: duckle-runner build --workspace <workspace> --pipeline-id ${pipelineId} --out <file>`,
+        );
+    }
     return await invoke<string>('build_pipeline_bundle', {
         workspacePath,
         pipelineId,
@@ -1272,6 +1327,14 @@ export type McpConnInfo = {
  * paths plus a ready-to-paste `claude mcp add` command and mcpServers JSON.
  */
 export async function mcpConnectionInfo(): Promise<McpConnInfo> {
+    // duckle-mcp speaks stdio, so it has to run on the computer the AI client
+    // runs on, which a browser cannot set up. The server has no command for it,
+    // so this used to resolve empty and the dialog spun forever.
+    if (isWebBackend()) {
+        throw new Error(
+            'Connecting an AI client is not available in the web editor: duckle-mcp runs on the same computer as Claude, so set it up from the desktop app there.',
+        );
+    }
     return await invoke<McpConnInfo>('mcp_connection_info');
 }
 
@@ -1309,7 +1372,24 @@ export async function settingsGetProxy(workspace: string): Promise<string | null
  * in-app updater through the proxy.
  */
 export async function settingsSetProxy(workspace: string, url: string | null): Promise<void> {
+    refuseMachineSettingOnWeb('proxy');
     await invoke('settings_set_proxy', { workspace, url });
+}
+
+/**
+ * The web edition has no command for the settings that configure the machine
+ * running pipelines - proxy, AI endpoint, power, memory cap, unsigned extensions,
+ * context file - and the web shim turns a missing command into a quiet success,
+ * so Settings said "Saved" while nothing was stored. There they are the server's
+ * to set, and letting a browser change them on a shared server would be wrong
+ * anyway, so saving one says where it lives instead.
+ */
+function refuseMachineSettingOnWeb(what: string): void {
+    if (isWebBackend()) {
+        throw new Error(
+            `The ${what} setting is not saved from the web editor: it belongs to the server running duckle-runner, and is set there with its flags and environment.`,
+        );
+    }
 }
 
 // ---- Per-workspace memory cap (#102) -----------------------------------
@@ -1329,6 +1409,7 @@ export async function settingsGetMemoryLimit(workspace: string): Promise<number 
  * DUCKLE_MEMORY_LIMIT for every run (batched and per-stage). Pass null to clear.
  */
 export async function settingsSetMemoryLimit(workspace: string, mb: number | null): Promise<void> {
+    refuseMachineSettingOnWeb('memory limit');
     await invoke('settings_set_memory_limit', { workspace, mb });
 }
 
@@ -1364,6 +1445,7 @@ export async function settingsGetPower(workspace: string): Promise<PowerConfig> 
  * run that tries to spill.
  */
 export async function settingsSetPower(workspace: string, cfg: Omit<PowerConfig, 'cpuCount'>): Promise<void> {
+    refuseMachineSettingOnWeb('power');
     await invoke('settings_set_power', {
         workspace,
         maxConcurrentRuns: cfg.maxConcurrentRuns,
@@ -1388,6 +1470,7 @@ export async function settingsGetAllowUnsigned(workspace: string): Promise<boole
  * CLI (via DUCKLE_ALLOW_UNSIGNED_EXTENSIONS). Default off keeps signed-only.
  */
 export async function settingsSetAllowUnsigned(workspace: string, allow: boolean): Promise<void> {
+    refuseMachineSettingOnWeb('unsigned extensions');
     await invoke('settings_set_allow_unsigned', { workspace, allow });
 }
 
@@ -1405,6 +1488,7 @@ export async function settingsGetContextFile(workspace: string): Promise<string 
 
 /** Persist the global-context file path. Pass null to clear. */
 export async function settingsSetContextFile(workspace: string, path: string | null): Promise<void> {
+    refuseMachineSettingOnWeb('context file');
     await invoke('settings_set_context_file', { workspace, path });
 }
 
@@ -1441,6 +1525,7 @@ export async function settingsSetAi(
     workspace: string,
     cfg: { baseUrl: string | null; model: string | null; apiKey: string | null },
 ): Promise<void> {
+    refuseMachineSettingOnWeb('AI endpoint');
     await invoke('settings_set_ai', {
         workspace,
         baseUrl: cfg.baseUrl,

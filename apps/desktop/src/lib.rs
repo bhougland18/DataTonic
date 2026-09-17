@@ -93,6 +93,11 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // A self-update moves the running exe aside and it can only be
+            // removed once that process has exited, which is this launch.
+            if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from)) {
+                std::thread::spawn(move || self_update::sweep_leftovers(&dir));
+            }
             // Resolve where the downloaded DuckDB CLI lives, so the
             // engine can shell out to it. The binary may not exist yet
             // (first run installs it via the setup screen); the engine
@@ -773,10 +778,10 @@ fn pipeline_trust_report(
     if check_drift.unwrap_or(false) {
         if let Ok(mut doc) = serde_json::from_value::<PipelineDoc>(pipeline.clone()) {
             let engine = engine()?;
-            duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
             if let Some(ws) = workspace_path.as_deref() {
                 duckle_duckdb_engine::context::apply_workspace_context(&mut doc, std::path::Path::new(ws));
             }
+            duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
             let resolved = serde_json::to_value(&doc).map_err(|e| e.to_string())?;
             return Ok(duckle_duckdb_engine::trust::trust_report(&resolved, Some(&engine)));
         }
@@ -817,6 +822,14 @@ fn schedule_set_workspace(path: String) -> Result<(), String> {
         // layer so REST / cloud connectors and the updater route through it
         // without the user setting a system env var (#80).
         app_settings::apply_for_workspace(&path);
+        // Runs and backfill slices a killed or quit Duckle left marked
+        // `running`. Only a console starting up reconciled them, so a workspace
+        // used from this app stayed "in flight" for good. Liveness is an OS
+        // check, so a run another process is still doing is left alone.
+        let ws = PathBuf::from(&path);
+        std::thread::spawn(move || {
+            duckle_duckdb_engine::recovery::reclaim_abandoned(&ws);
+        });
     }
     let p = if path.is_empty() {
         None
@@ -1085,37 +1098,10 @@ fn workspace_catalog_annotate(
 /// does rather than inventing a second way to connect.
 #[tauri::command]
 fn workspace_catalog_inspect(workspace: String, asset: String) -> Result<Vec<String>, String> {
-    use duckle_duckdb_engine::catalog;
-    let ws = std::path::Path::new(&workspace);
-    let cat = catalog::load(ws)?.ok_or("no catalog has been built for this workspace yet")?;
-    let touch = cat
-        .touches
-        .iter()
-        .find(|t| t.asset == asset && t.component_id.starts_with("src."))
-        .ok_or_else(|| {
-            format!("nothing in this workspace READS {asset}, so there is no node to inspect it through")
-        })?;
-
-    // Re-read the pipeline for that node's live properties: the catalog keeps
-    // names, not configuration, and inspecting needs the connection details.
-    let path = catalog::discover_pipeline_files(ws)
-        .into_iter()
-        .find(|p| p.file_stem().map(|s| s.to_string_lossy() == touch.pipeline_id.as_str()).unwrap_or(false))
-        .ok_or_else(|| format!("pipeline {} is no longer in this workspace", touch.pipeline_id))?;
-    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let node = doc
-        .get("nodes")
-        .and_then(|n| n.as_array())
-        .and_then(|nodes| {
-            nodes.iter().find(|n| n.get("id").and_then(|i| i.as_str()) == Some(&touch.node_id))
-        })
-        .ok_or_else(|| format!("node {} is no longer in {}", touch.node_id, touch.pipeline_id))?;
-    let props = node.pointer("/data/properties").cloned().unwrap_or(serde_json::Value::Null);
-    let format = touch.component_id.strip_prefix("src.").unwrap_or(&touch.component_id);
-
+    let (format, props) =
+        duckle_duckdb_engine::catalog::inspect_target(std::path::Path::new(&workspace), &asset)?;
     let engine = engine()?;
-    let inspection = engine.inspect(format, props).map_err(|e| e.to_string())?;
+    let inspection = engine.inspect(&format, props).map_err(|e| e.to_string())?;
     Ok(inspection.schema.iter().map(|c| c.name.clone()).collect())
 }
 
@@ -1595,6 +1581,11 @@ fn inflate_embedded(compressed: &[u8]) -> Result<Vec<u8>, String> {
 /// entirely (the common case once a feature has been used), so the ~0.1-0.3s
 /// inflate is paid at most once per app version.
 fn write_embedded_if_changed(dest: &std::path::Path, compressed: &[u8]) -> Result<(), String> {
+    // What an earlier, locked swap in this directory left behind. Here rather
+    // than in write_if_changed, which is skipped once a binary is staged.
+    if let Some(dir) = dest.parent() {
+        self_update::sweep_leftovers(dir);
+    }
     let stamp = dest.with_extension("stamp");
     let want = env!("DUCKLE_BUILD_EPOCH");
     if dest.exists() {

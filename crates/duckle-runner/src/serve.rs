@@ -19,7 +19,7 @@
 //! any pipeline in the workspace, so it is open only on loopback and refuses
 //! to start on any other host without a credential: see console_auth.
 
-use duckle_duckdb_engine::{append_run_record, load_run_history, DuckdbEngine, PipelineDoc, RunRecord};
+use duckle_duckdb_engine::{load_run_history, DuckdbEngine, PipelineDoc, RunRecord};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -227,6 +227,10 @@ struct State {
     /// done. `running` above is pipeline ids only and cannot answer "how is
     /// run X going" - a different question.
     runs: Mutex<std::collections::HashMap<String, LiveRun>>,
+    /// #325: delivery outcomes the ledger would not take, by delivery id. See
+    /// `pump_deliveries`: held so the next tick writes them instead of running
+    /// the consumer a second time.
+    unrecorded_deliveries: Mutex<HashMap<String, duckle_duckdb_engine::subscribe::Delivery>>,
 }
 
 /// #259: one asynchronous run. `finished` is None while it is queued or
@@ -278,52 +282,7 @@ pub fn run() -> Result<(), String> {
     std::env::set_var("DUCKLE_LOG_DIR", workspace.join("logs"));
     apply_workspace_memory_limit(&workspace);
 
-    // #259: anything still marked `running` was not finished by a process that
-    // is alive now, because this one is starting. Say so, rather than leaving a
-    // receipt claiming a run is in progress forever. `interrupted` is
-    // deliberately distinct from `error`: the run did not fail, it stopped
-    // being observed, and a caller that conflates them retries work that may
-    // well have completed.
-    let reclaimed =
-        duckle_duckdb_engine::retry::reconcile(&workspace, &|pid| pid == std::process::id());
-    if !reclaimed.is_empty() {
-        eprintln!(
-            "duckle: {} run(s) were still marked running and are now interrupted: {}",
-            reclaimed.len(),
-            reclaimed.join(", ")
-        );
-    }
-    // #295: and the same for a backfill's slices, which had the reconciler but
-    // no caller. A slice left `running` by a killed process is not claimable
-    // (only `requested` is) and `retry` only moves `failed` and `interrupted`,
-    // so nothing could ever pick it up again and the backfill was stuck for
-    // good. This is the one call that makes it recoverable.
-    let slices =
-        duckle_duckdb_engine::backfill::reconcile(&workspace, &|pid| pid == std::process::id());
-    if !slices.is_empty() {
-        eprintln!(
-            "duckle: {} backfill(s) had slices still marked running and are now interrupted: {}",
-            slices.len(),
-            slices.join(", ")
-        );
-    }
-    // #325: and the third reconciler that had no caller. A publication whose
-    // event append failed is a gap in an index, not lost work - the run record
-    // carries everything the event does. But nothing rebuilt it, so the
-    // warning history.rs prints ("will not be seen until the log is
-    // reconciled") named a recovery that never came, and the downstream
-    // consumer simply never ran. Bounded by the sweep watermark, so it rebuilds
-    // gaps without putting back what retention removed.
-    let rebuilt = duckle_duckdb_engine::materialize::reconcile(
-        &workspace,
-        &discover_pipelines(&workspace).into_iter().map(|(_, id, _)| id).collect::<Vec<_>>(),
-    );
-    if !rebuilt.is_empty() {
-        eprintln!(
-            "duckle: {} publication event(s) were missing from the log and have been rebuilt",
-            rebuilt.len()
-        );
-    }
+    reconcile_at_startup(&workspace);
 
     // Decide who may use this console before binding anything. An exposed bind
     // with no credential does not refuse to start any more - it comes up
@@ -341,7 +300,8 @@ pub fn run() -> Result<(), String> {
     let supplied = args.token.clone().or_else(|| std::env::var("DUCKLE_CONSOLE_TOKEN").ok());
     if supplied.as_deref().is_some_and(|t| t.trim().is_empty()) {
         return Err(
-            "a console credential was supplied but is empty. Set DUCKLE_CONSOLE_TOKEN (or              --token) to a real value, or remove it entirely to set the server up from a browser. Refusing to start rather than opening an administrator claim window."
+            "a console credential was supplied but is empty. Set DUCKLE_CONSOLE_TOKEN (or \
+             --token) to a real value, or remove it entirely to set the server up from a browser. Refusing to start rather than opening an administrator claim window."
                 .to_string(),
         );
     }
@@ -370,6 +330,7 @@ pub fn run() -> Result<(), String> {
         },
         oidc_endpoints: Mutex::new(None),
         oidc_logins: Mutex::new(Default::default()),
+        unrecorded_deliveries: Mutex::new(Default::default()),
     });
 
     // Fold any pre-unification console store into schedules.json before the
@@ -474,6 +435,57 @@ struct WebState {
     /// Who may use this editor. Same policy object the console uses, so one
     /// set of accounts covers both.
     console: console_auth::Console,
+    /// Runs the editor started that are still going, for the Stop button.
+    editor_runs: EditorRuns,
+}
+
+/// Editor runs in flight on this server, so the Stop button can reach them.
+///
+/// Stop did nothing in the web edition: the browser never asked the server, and
+/// each run built a throwaway engine nobody held a handle to, so a stopped run
+/// kept going and still wrote its sinks. Each run is tagged with who started
+/// it, because on a shared server one person's Stop must not end another's run.
+#[derive(Default)]
+struct EditorRuns {
+    next: std::sync::atomic::AtomicU64,
+    runs: Mutex<HashMap<u64, (String, DuckdbEngine)>>,
+}
+
+impl EditorRuns {
+    /// Register a run for as long as the returned guard lives.
+    fn start(&self, owner: &str, engine: &DuckdbEngine) -> EditorRun<'_> {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, (owner.to_string(), engine.clone()));
+        EditorRun { runs: self, id }
+    }
+
+    /// Ask every run `owner` started to stop; how many that was.
+    fn cancel(&self, owner: &str) -> usize {
+        let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut n = 0;
+        for (who, engine) in runs.values() {
+            if who == owner {
+                engine.request_cancel();
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+/// Removes its run from [`EditorRuns`] when dropped, a panicking run included.
+struct EditorRun<'a> {
+    runs: &'a EditorRuns,
+    id: u64,
+}
+
+impl Drop for EditorRun<'_> {
+    fn drop(&mut self) {
+        self.runs.runs.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
+    }
 }
 
 pub fn run_web() -> Result<(), String> {
@@ -492,52 +504,7 @@ pub fn run_web() -> Result<(), String> {
     std::env::set_var("DUCKLE_LOG_DIR", workspace.join("logs"));
     apply_workspace_memory_limit(&workspace);
 
-    // #259: anything still marked `running` was not finished by a process that
-    // is alive now, because this one is starting. Say so, rather than leaving a
-    // receipt claiming a run is in progress forever. `interrupted` is
-    // deliberately distinct from `error`: the run did not fail, it stopped
-    // being observed, and a caller that conflates them retries work that may
-    // well have completed.
-    let reclaimed =
-        duckle_duckdb_engine::retry::reconcile(&workspace, &|pid| pid == std::process::id());
-    if !reclaimed.is_empty() {
-        eprintln!(
-            "duckle: {} run(s) were still marked running and are now interrupted: {}",
-            reclaimed.len(),
-            reclaimed.join(", ")
-        );
-    }
-    // #295: and the same for a backfill's slices, which had the reconciler but
-    // no caller. A slice left `running` by a killed process is not claimable
-    // (only `requested` is) and `retry` only moves `failed` and `interrupted`,
-    // so nothing could ever pick it up again and the backfill was stuck for
-    // good. This is the one call that makes it recoverable.
-    let slices =
-        duckle_duckdb_engine::backfill::reconcile(&workspace, &|pid| pid == std::process::id());
-    if !slices.is_empty() {
-        eprintln!(
-            "duckle: {} backfill(s) had slices still marked running and are now interrupted: {}",
-            slices.len(),
-            slices.join(", ")
-        );
-    }
-    // #325: and the third reconciler that had no caller. A publication whose
-    // event append failed is a gap in an index, not lost work - the run record
-    // carries everything the event does. But nothing rebuilt it, so the
-    // warning history.rs prints ("will not be seen until the log is
-    // reconciled") named a recovery that never came, and the downstream
-    // consumer simply never ran. Bounded by the sweep watermark, so it rebuilds
-    // gaps without putting back what retention removed.
-    let rebuilt = duckle_duckdb_engine::materialize::reconcile(
-        &workspace,
-        &discover_pipelines(&workspace).into_iter().map(|(_, id, _)| id).collect::<Vec<_>>(),
-    );
-    if !rebuilt.is_empty() {
-        eprintln!(
-            "duckle: {} publication event(s) were missing from the log and have been rebuilt",
-            rebuilt.len()
-        );
-    }
+    reconcile_at_startup(&workspace);
     // The editor writes files, edits connections and runs pipelines, so it is
     // at least as powerful as the console and gets the same rule: loopback is
     // open, anything else needs a credential before the socket is bound.
@@ -556,6 +523,7 @@ pub fn run_web() -> Result<(), String> {
         host: args.host.clone(),
         run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::load(&workspace)),
         console,
+        editor_runs: EditorRuns::default(),
     });
     let addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {}: {}", addr, e))?;
@@ -595,17 +563,31 @@ pub fn run_web() -> Result<(), String> {
     Ok(())
 }
 
+/// A token that was accepted, with no session to show for it.
+///
+/// Answered as a failure, with no cookie and no "allowed" audit line: a cookie
+/// for a session that was never written fails on the next request with nothing
+/// to explain it, and the audit log would record a sign-in that never took.
+fn session_not_saved(why: &str) -> Reply {
+    eprintln!("duckle-runner: a sign-in was accepted but its session could not be saved: {why}");
+    respond_err(
+        "503 Service Unavailable",
+        "the token was accepted, but the session could not be saved, so you are not signed in. Try again.",
+    )
+}
+
 /// Exchange a token for a session cookie, for the editor.
 fn web_sign_in(state: &WebState, req: &Request) -> Reply {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
     let token = body.get("token").and_then(|v| v.as_str()).unwrap_or("");
     match state.console.sign_in(token) {
-        Some((sid, who)) => {
+        Ok(Some((sid, who))) => {
             audit::record(&state.workspace, Some(&who), "session.sign_in", "editor", audit::Outcome::Allowed);
             respond_json(&json!({ "label": who.label, "role": who.role.as_str() }))
                 .with_header(session_cookie_header(&sid, req.forwarded_proto.as_deref()))
         }
-        None => {
+        Err(e) => session_not_saved(&e),
+        Ok(None) => {
             audit::record(&state.workspace, None, "session.sign_in", "editor", audit::Outcome::Unauthenticated);
             respond_err("401 Unauthorized", "that token was not accepted")
         }
@@ -669,7 +651,7 @@ fn handle_web(mut stream: TcpStream, state: &WebState) -> Result<(), String> {
             audit::Outcome::Allowed,
         );
         let body = req.body.clone();
-        return run_stream(&mut stream, state, &body);
+        return run_stream(&mut stream, state, &who, &body);
     }
     let reply = route_web(&req, state);
     write_reply(&mut stream, &reply)
@@ -732,7 +714,7 @@ fn route_web(req: &Request, state: &WebState) -> Reply {
             // opaque "Failed to fetch". Catch it and answer with a real 500 the
             // editor can show.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                dispatch_cmd(state, &cmd, &req.body)
+                dispatch_cmd(state, &who, &cmd, &req.body)
             }));
             return match outcome {
                 Ok(r) => r,
@@ -880,7 +862,7 @@ fn connection_secret_cmd(workspace: &Path, cmd: &str, body: &[u8]) -> Result<Str
     }
 }
 
-fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
+fn dispatch_cmd(state: &WebState, who: &console_auth::Identity, cmd: &str, body: &[u8]) -> Reply {
     match cmd {
         // Drives the editor's runtime indicator offline -> ready.
         "ping" => respond_json(&Value::String("pong".into())),
@@ -901,6 +883,54 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
                 Ok(v) => respond_json(&v),
                 Err(e) => respond_err("500 Internal Server Error", &e.to_string()),
             }
+        }
+        // The Schedules dialog. These had no web implementation, and the shim
+        // turns a missing command into an empty answer, so the list always read
+        // "No schedules yet" and a save was dropped as if it had worked. They
+        // edit the workspace's one schedule store under the same rules as the
+        // desktop. This editor does not FIRE schedules; `duckle-runner serve` on
+        // the same workspace does, and the dialog says so.
+        "schedule_list" => match duckle_duckdb_engine::schedules::load(&state.workspace) {
+            Ok(list) => respond_json(&serde_json::to_value(&list).unwrap_or(json!([]))),
+            Err(e) => respond_err("500 Internal Server Error", &e),
+        },
+        "schedule_upsert" => {
+            use duckle_duckdb_engine::schedules;
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let mut schedule: schedules::Schedule =
+                match serde_json::from_value(args.get("schedule").cloned().unwrap_or(Value::Null)) {
+                    Ok(s) => s,
+                    Err(e) => return respond_err("400 Bad Request", &format!("bad schedule: {e}")),
+                };
+            if let Err(e) = schedules::validate(&schedule) {
+                return respond_err("400 Bad Request", &e);
+            }
+            if schedule.id.is_empty() {
+                schedule.id = schedules::new_id();
+            }
+            // The process that fires it arms its own next run.
+            schedule.next_run_at = None;
+            let saved = schedule.clone();
+            match schedules::update(&state.workspace, move |list| schedules::merge_saved(list, saved)) {
+                Ok(_) => respond_json(&serde_json::to_value(&schedule).unwrap_or(Value::Null)),
+                Err(e) => respond_err("500 Internal Server Error", &e),
+            }
+        }
+        "schedule_delete" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let Some(id) = args.get("id").and_then(Value::as_str).map(str::to_string) else {
+                return respond_err("400 Bad Request", "missing id");
+            };
+            match duckle_duckdb_engine::schedules::update(&state.workspace, move |list| {
+                list.retain(|s| s.id != id)
+            }) {
+                Ok(_) => respond_json(&json!({ "ok": true })),
+                Err(e) => respond_err("500 Internal Server Error", &e),
+            }
+        }
+        // The Stop button: the caller's own runs, never anyone else's.
+        "cancel_pipeline" => {
+            respond_json(&json!({ "cancelled": state.editor_runs.cancel(&who.label) }))
         }
         // Connection secrets, encrypted at rest with the same AES-256-GCM
         // primitives and the same per-workspace key the desktop app uses, so a
@@ -939,19 +969,26 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
             }
             // Same placeholder resolution as /api/run (execute_one) and the
             // desktop: expand ${ENV:KEY} secrets - so a connection field stored as
-            // ${ENV:...} still resolves after ref injection (#166 stage 2) - and the
-            // ${date}/${datetime} builtins, before the workspace-context pass.
+            // ${ENV:...} still resolves after ref injection (#166 stage 2) - then the
+            // workspace context, then the ${date}/${datetime} builtins.
             let env_file = state.workspace.join("secrets.env");
             if let Err(e) = crate::apply_env_pass(&mut doc, &state.workspace, &env_file) {
                 return respond_err("400 Bad Request", &e);
             }
-            duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
-            duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
+            duckle_duckdb_engine::context::apply_workspace_context_then_time(&mut doc, &state.workspace);
             let name = args.get("pipelineName").and_then(|v| v.as_str()).unwrap_or("web").to_string();
-            let (_guard, pool, queued_ms) = state.run_lock.acquire(&doc.resource_pool);
             let engine = DuckdbEngine::new(state.duckdb.clone());
-            let receipt =
-                begin_editor_run(&state.workspace, &doc, &name, "web", Some((pool, queued_ms)));
+            // Registered before the queue, so a Stop pressed while it waits lands.
+            let _running = state.editor_runs.start(&who.label, &engine);
+            let (_guard, pool, queued_ms) = state.run_lock.acquire(&doc.resource_pool);
+            let receipt = begin_editor_run(
+                &state.workspace,
+                &doc,
+                &name,
+                args.get("pipelineId").and_then(|v| v.as_str()),
+                "web",
+                Some((pool, queued_ms)),
+            );
             let result = engine.execute_pipeline_named(&doc, &name);
             duckle_duckdb_engine::retry::finish(
                 &state.workspace,
@@ -959,6 +996,7 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
                 &result.status,
                 duckle_duckdb_engine::retry::nodes_of(&result),
             );
+            record_editor_history(&state.workspace, args.get("pipelineId").and_then(|v| v.as_str()), &result, "web");
             match serde_json::to_value(&result) {
                 Ok(v) => respond_json(&v),
                 Err(e) => respond_err("500 Internal Server Error", &e.to_string()),
@@ -980,6 +1018,28 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
         //
         // The workspace is ALWAYS this server's, never the one in the payload:
         // a browser must not be able to point a state edit at another folder.
+        // The global context file's values, which the editor needs before a run:
+        // to know which ${KEY} is already bound, and to let the file win over a
+        // static context default as it does on the desktop. This server's own
+        // workspace is read, never the one the request names.
+        "settings_load_context_vars" => respond_json(
+            &serde_json::to_value(duckle_duckdb_engine::context::context_file_vars(&state.workspace))
+                .unwrap_or(json!({})),
+        ),
+        // The History tab. Same answer as the desktop's run_history: this
+        // pipeline's retained runs, newest first. The id names the history file,
+        // so one that is not a plain file name is refused.
+        "run_history" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            match args.get("pipelineId").and_then(|v| v.as_str()).filter(|id| plain_file_name(id)) {
+                Some(id) => {
+                    let mut records = load_run_history(&state.workspace, id);
+                    records.reverse();
+                    respond_json(&serde_json::to_value(&records).unwrap_or(json!([])))
+                }
+                None => respond_err("400 Bad Request", "missing or invalid pipelineId"),
+            }
+        }
         "watermark_list" => {
             let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
             match args.get("pipelineName").and_then(|v| v.as_str()) {
@@ -1183,8 +1243,7 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
             let check_drift = args.get("checkDrift").and_then(|v| v.as_bool()).unwrap_or(false);
             if check_drift {
                 if let Ok(mut doc) = serde_json::from_value::<PipelineDoc>(pipeline.clone()) {
-                    duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
-                    duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
+                    duckle_duckdb_engine::context::apply_workspace_context_then_time(&mut doc, &state.workspace);
                     let resolved = match serde_json::to_value(&doc) {
                         Ok(v) => v,
                         Err(e) => return respond_err("500 Internal Server Error", &e.to_string()),
@@ -1196,6 +1255,48 @@ fn dispatch_cmd(state: &WebState, cmd: &str, body: &[u8]) -> Reply {
             }
             let report = duckle_duckdb_engine::trust::trust_report(&pipeline, None);
             respond_json(&report)
+        }
+        // The Data Catalog panel: the engine calls the desktop commands make,
+        // against this server's workspace, never the one the request names.
+        "workspace_catalog" => catalog_reply(duckle_duckdb_engine::catalog::view(&state.workspace)),
+        "workspace_catalog_rebuild" => catalog_reply(
+            duckle_duckdb_engine::catalog::build_and_save(&state.workspace)
+                .and_then(|_| duckle_duckdb_engine::catalog::view(&state.workspace)),
+        ),
+        "workspace_catalog_annotate" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let text = |key: &str| args.get(key).and_then(|v| v.as_str()).map(str::to_string);
+            let tags = args
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|list| list.iter().filter_map(|t| t.as_str().map(str::to_string)).collect());
+            match duckle_duckdb_engine::catalog::annotate(
+                &state.workspace,
+                args.get("pipelines").and_then(|v| v.as_bool()).unwrap_or(false),
+                &text("name").unwrap_or_default(),
+                text("owner"),
+                text("contact"),
+                text("description"),
+                tags,
+            ) {
+                Ok(()) => catalog_reply(duckle_duckdb_engine::catalog::view(&state.workspace)),
+                Err(e) => respond_err("400 Bad Request", &e),
+            }
+        }
+        "workspace_catalog_inspect" => {
+            let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let asset = args.get("asset").and_then(|v| v.as_str()).unwrap_or_default();
+            match duckle_duckdb_engine::catalog::inspect_target(&state.workspace, asset) {
+                Ok((format, props)) => match DuckdbEngine::new(state.duckdb.clone()).inspect(&format, props) {
+                    Ok(inspection) => respond_json(&json!(inspection
+                        .schema
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>())),
+                    Err(e) => respond_err("422 Unprocessable Entity", &e.to_string()),
+                },
+                Err(e) => respond_err("400 Bad Request", &e),
+            }
         }
         // Tells the browser editor which server workspace it is editing, so it
         // can auto-load it (there is no native folder picker on the web).
@@ -1236,6 +1337,8 @@ fn begin_editor_run(
     workspace: &std::path::Path,
     doc: &PipelineDoc,
     name: &str,
+    // The id the editor saved the pipeline under, which names its file.
+    pipeline_id: Option<&str>,
     trigger: &str,
     // #289: recorded on the receipt so an editor or streaming run answers the
     // same "which pool, and how long did it wait" as a scheduled one.
@@ -1243,12 +1346,21 @@ fn begin_editor_run(
 ) -> duckle_duckdb_engine::retry::RunReceipt {
     let hash = duckle_duckdb_engine::retry::pipeline_hash(doc);
     let run_id = duckle_duckdb_engine::retry::new_run_id(name, trigger);
+    // The editor saves a pipeline as pipelines/<id>.json, so that is the file a
+    // retry has to read. The receipt used the display name, which is not a file,
+    // and retry could not find the pipeline of any web run. Both values come
+    // from the browser, so one that is not a plain file name does not get to
+    // name a path.
+    let stem = pipeline_id
+        .filter(|id| plain_file_name(id))
+        .or(Some(name).filter(|n| plain_file_name(n)))
+        .unwrap_or("web");
     let receipt = duckle_duckdb_engine::retry::begin(
         workspace,
         &run_id,
         trigger,
         name,
-        &workspace.join("pipelines").join(format!("{name}.json")).display().to_string(),
+        &workspace.join("pipelines").join(format!("{stem}.json")).display().to_string(),
         &hash,
         None,
     );
@@ -1276,9 +1388,35 @@ fn begin_editor_run(
     }
 }
 
+/// A value from the browser that may name a file: not empty, not `.` or `..`,
+/// and with no separator, drive colon or NUL.
+fn plain_file_name(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', ':', '\0'])
+}
+
+/// Add an editor run to its pipeline's run history, which the History tab
+/// reads, as the desktop does for its own runs. A run with no usable id has no
+/// history file to add to.
+fn record_editor_history(
+    workspace: &Path,
+    pipeline_id: Option<&str>,
+    result: &duckle_duckdb_engine::RunResult,
+    trigger: &str,
+) {
+    if let Some(id) = pipeline_id.filter(|id| plain_file_name(id)) {
+        let record = RunRecord::from_result_in(workspace, id, result, trigger);
+        duckle_duckdb_engine::record_run(workspace, id, record);
+    }
+}
+
 /// `event: result` line. The frontend turns these back into the same live
 /// per-node animation the desktop gets from the Tauri Channel.
-fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(), String> {
+fn run_stream(
+    stream: &mut TcpStream,
+    state: &WebState,
+    who: &console_auth::Identity,
+    body: &[u8],
+) -> Result<(), String> {
     let args: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let mut doc: PipelineDoc = match serde_json::from_value(args.get("pipeline").cloned().unwrap_or(Value::Null)) {
         Ok(d) => d,
@@ -1294,14 +1432,13 @@ fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(
     }
     // Same placeholder resolution as /api/run (execute_one) and the desktop:
     // expand ${ENV:KEY} secrets - so a connection field stored as ${ENV:...}
-    // still resolves after ref injection (#166 stage 2) - and the
-    // ${date}/${datetime} builtins, before the workspace-context pass.
+    // still resolves after ref injection (#166 stage 2) - then the workspace
+    // context, then the ${date}/${datetime} builtins.
     let env_file = state.workspace.join("secrets.env");
     if let Err(e) = crate::apply_env_pass(&mut doc, &state.workspace, &env_file) {
         return write_reply(stream, &respond_err("400 Bad Request", &e));
     }
-    duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
-    duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
+    duckle_duckdb_engine::context::apply_workspace_context_then_time(&mut doc, &state.workspace);
     let name = args.get("pipelineName").and_then(|v| v.as_str()).unwrap_or("web").to_string();
     // Optional run-to-here target: when set, the engine runs only the subgraph
     // up to and including this node (partial run).
@@ -1315,17 +1452,20 @@ fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(
     stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
 
+    let engine = DuckdbEngine::new(state.duckdb.clone());
+    // Registered before the queue, so a Stop pressed while it waits lands.
+    let _running = state.editor_runs.start(&who.label, &engine);
     let (_guard, pool, queued_ms) = state.run_lock.acquire(&doc.resource_pool);
     // A second handle to the same socket for the event callback (the run is
     // synchronous, so events stream first, the result line follows).
     let mut ev = stream.try_clone().map_err(|e| e.to_string())?;
-    let engine = DuckdbEngine::new(state.duckdb.clone());
     // Run-to-here is still a run, and the one an operator is most likely to
     // want to find again.
     let receipt = begin_editor_run(
         &state.workspace,
         &doc,
         &name,
+        args.get("pipelineId").and_then(|v| v.as_str()),
         if target.is_some() { "web-partial" } else { "web" },
         Some((pool, queued_ms)),
     );
@@ -1341,12 +1481,25 @@ fn run_stream(stream: &mut TcpStream, state: &WebState, body: &[u8]) -> Result<(
         &result.status,
         duckle_duckdb_engine::retry::nodes_of(&result),
     );
+    record_editor_history(
+        &state.workspace,
+        args.get("pipelineId").and_then(|v| v.as_str()),
+        &result,
+        if target.is_some() { "web-partial" } else { "web" },
+    );
     let rj = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string());
     stream
         .write_all(format!("event: result\ndata: {}\n\n", rj).as_bytes())
         .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn catalog_reply(view: Result<duckle_duckdb_engine::catalog::CatalogView, String>) -> Reply {
+    match view {
+        Ok(view) => respond_json(&json!(view)),
+        Err(e) => respond_err("500 Internal Server Error", &e),
+    }
 }
 
 /// Web-editor autodetect (issue #148). The browser cannot read the server's
@@ -1907,7 +2060,11 @@ fn api_backfill_action(state: &Arc<State>, req: &Request) -> Reply {
             let Some(id) = body.get("id").and_then(Value::as_str) else {
                 return respond_err("400 Bad Request", "retry needs an id");
             };
-            let mut plan = match backfill::load(&ws, id) {
+            let mut plan = match backfill::load_for_retry(
+                &ws,
+                id,
+                &duckle_duckdb_engine::runlock::process_alive,
+            ) {
                 Ok(p) => p,
                 Err(e) => return respond_err("404 Not Found", &e),
             };
@@ -2185,6 +2342,10 @@ fn oidc_route(req: &Request, state: &State) -> Reply {
     // Audit carries the provider's STABLE subject, not the display name: a
     // name or an email can be reassigned to a different person, and an audit
     // trail that follows the label rather than the identity is worse than none.
+    let sid = match state.console.sign_in_external(&identity.actor(), identity.role) {
+        Ok(sid) => sid,
+        Err(e) => return session_not_saved(&e),
+    };
     audit::record(
         &state.workspace,
         None,
@@ -2192,7 +2353,6 @@ fn oidc_route(req: &Request, state: &State) -> Reply {
         &format!("{} as {}", identity.actor(), identity.role.as_str()),
         audit::Outcome::Allowed,
     );
-    let sid = state.console.sign_in_external(&identity.actor(), identity.role);
     Reply {
         status: "302 Found".into(),
         content_type: "text/plain; charset=utf-8".into(),
@@ -2821,12 +2981,13 @@ fn sign_in(state: &State, req: &Request) -> Reply {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
     let token = body.get("token").and_then(|v| v.as_str()).unwrap_or("");
     match state.console.sign_in(token) {
-        Some((sid, who)) => {
+        Ok(Some((sid, who))) => {
             audit::record(&state.workspace, Some(&who), "session.sign_in", "-", audit::Outcome::Allowed);
             respond_json(&json!({ "label": who.label, "role": who.role.as_str() }))
                 .with_header(session_cookie_header(&sid, req.forwarded_proto.as_deref()))
         }
-        None => {
+        Err(e) => session_not_saved(&e),
+        Ok(None) => {
             audit::record(
                 &state.workspace,
                 None,
@@ -2843,6 +3004,34 @@ fn sign_in(state: &State, req: &Request) -> Reply {
 
 /// Scan the workspace for pipeline files (a `.json` with a top-level `nodes`
 /// array), skipping bookkeeping folders. Returns (absolute path, id, value).
+/// Put right what an earlier process left behind, before this one takes work.
+///
+/// One function for `serve` and `web`, which each carried an identical copy of
+/// this - and had each been handed the same wrong answer to "is that process
+/// alive": only this one. So starting either declared EVERY other process's
+/// live runs and backfill slices interrupted, including the desktop's own when
+/// it opened the web panel, and a backfill retry then ran a still-running slice
+/// a second time beside itself. Liveness is now actually checked.
+fn reconcile_at_startup(workspace: &Path) {
+    // Runs and backfill slices a dead process left `running`, shared with every
+    // other surface that opens a workspace.
+    duckle_duckdb_engine::recovery::reclaim_abandoned(workspace);
+    // #325: and the third reconciler that had no caller. A publication whose
+    // event append failed is a gap in an index, not lost work - the run record
+    // carries everything the event does. Bounded by the sweep watermark, so it
+    // rebuilds gaps without putting back what retention removed.
+    let rebuilt = duckle_duckdb_engine::materialize::reconcile(
+        workspace,
+        &discover_pipelines(workspace).into_iter().map(|(_, id, _)| id).collect::<Vec<_>>(),
+    );
+    if !rebuilt.is_empty() {
+        eprintln!(
+            "duckle: {} publication event(s) were missing from the log and have been rebuilt",
+            rebuilt.len()
+        );
+    }
+}
+
 fn discover_pipelines(workspace: &Path) -> Vec<(PathBuf, String, Value)> {
     let mut out = Vec::new();
     // One walk, shared with the catalog. Each keeping its own copy of the
@@ -3436,17 +3625,14 @@ fn migrate_legacy_schedules(workspace: &Path) {
     }
 }
 
-/// The `cron` crate expects a 6- or 7-field expression (seconds first). Accept a
-/// standard 5-field cron ("min hour dom mon dow") by prepending a "0 " seconds
-/// field; pass a 6/7-field expression through. Returns None for any other field
-/// count so a malformed expression is rejected rather than silently ignored.
-fn normalize_cron(expr: &str) -> Option<String> {
-    match expr.split_whitespace().count() {
-        5 => Some(format!("0 {}", expr)),
-        6 | 7 => Some(expr.to_string()),
-        _ => None,
-    }
-}
+/// The shared normaliser, not a copy of it.
+///
+/// serve kept its own `normalize_cron` after `cronzone` gained one "so the two
+/// schedulers cannot drift", and then they drifted: when the shared one learned
+/// to translate crontab weekdays, this copy went on validating the old way, so
+/// the console refused `0 9 * * 0` - Sunday in standard cron - that the
+/// evaluator would have run correctly.
+use duckle_duckdb_engine::cronzone::normalize_cron;
 
 /// The next time an enabled schedule is expected to fire, as an RFC3339 string
 /// for the console to display beside "last run" (discussion #155). Cron uses the
@@ -3530,21 +3716,24 @@ fn save_schedule_at(workspace: &Path, body: &Value) -> Result<Value, String> {
     if let Some(tz) = body.get("timezone").and_then(|v| v.as_str()) {
         duckle_duckdb_engine::cronzone::resolve_zone(Some(tz))?;
     }
-    let timezone: Option<String> = body
-        .get("timezone")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string);
+    // The same three answers as `planId`, because the console's own save sends no
+    // zone and no calendar: an absent key leaves what the schedule has alone, an
+    // empty zone means the machine's own, and anything else replaces it.
+    let timezone: Option<Option<String>> = body.get("timezone").map(|v| {
+        v.as_str().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
+    });
     // #296: a maintenance calendar is checked where it is written. A misspelled
     // weekday excludes nothing, which looks exactly like no exclusion at all
     // until the day it was supposed to cover arrives.
-    let exclude: duckle_duckdb_engine::cronzone::Exclusions = match body.get("exclude").cloned() {
-        Some(v) => serde_json::from_value(v)
-            .map_err(|e| format!("Invalid exclude calendar: {e}"))?,
-        None => Default::default(),
+    let exclude: Option<duckle_duckdb_engine::cronzone::Exclusions> = match body.get("exclude").cloned() {
+        Some(v) => Some(
+            serde_json::from_value(v).map_err(|e| format!("Invalid exclude calendar: {e}"))?,
+        ),
+        None => None,
     };
-    exclude.validate()?;
+    if let Some(calendar) = &exclude {
+        calendar.validate()?;
+    }
     // Seconds are what the store holds. A console that sends only minutes is
     // still honoured, but one that echoes back the intervalSeconds it was given
     // keeps a sub-minute schedule exactly as the desktop editor set it.
@@ -3584,6 +3773,14 @@ fn save_schedule_at(workspace: &Path, body: &Value) -> Result<Value, String> {
                 if let Some(wanted) = plan_id.clone() {
                     s.plan_id = wanted;
                 }
+                // Validated above and then dropped here, once: changing the zone
+                // of an existing schedule answered ok and left it on the old clock.
+                if let Some(zone) = timezone.clone() {
+                    s.timezone = zone;
+                }
+                if let Some(calendar) = exclude.clone() {
+                    s.exclude = calendar;
+                }
                 // A changed trigger invalidates the time this process armed.
                 s.next_run_at = None;
             }
@@ -3594,8 +3791,8 @@ fn save_schedule_at(workspace: &Path, body: &Value) -> Result<Value, String> {
                 enabled,
                 plan_id: plan_id.clone().flatten(),
                 kind,
-                timezone: timezone.clone(),
-                exclude: exclude.clone(),
+                timezone: timezone.clone().flatten(),
+                exclude: exclude.clone().unwrap_or_default(),
                 // #296: this route does not edit the misfire policy, so a
                 // schedule it CREATES takes the default (skip), which is the
                 // behaviour every schedule had before the policy existed.
@@ -3766,6 +3963,28 @@ fn delivery_params(
 /// which is the state that otherwise looks identical to "never triggered".
 fn pump_deliveries(state: &State) {
     use duckle_duckdb_engine::subscribe::{self, DeliveryState};
+    // An outcome is written to the ledger, or held until it can be. The write
+    // used to be ignored, and a delivery whose consumer HAD run but was never
+    // written down still looked owed, so every tick ran the consumer again: a
+    // duplicate run per tick for as long as the ledger stayed unwritable.
+    let held = || state.unrecorded_deliveries.lock().unwrap_or_else(|p| p.into_inner());
+    let record_or_hold = |delivery: subscribe::Delivery| {
+        if let Err(e) = subscribe::record(&state.workspace, delivery.clone()) {
+            eprintln!(
+                "duckle-runner: the outcome of {} for {} could not be recorded ({e}); \
+                 holding it so the consumer is not run again",
+                delivery.event_id, delivery.pipeline_id
+            );
+            held().insert(delivery.delivery_id.clone(), delivery);
+        }
+    };
+    // What earlier ticks could not write, first.
+    let waiting: Vec<subscribe::Delivery> = held().values().cloned().collect();
+    for delivery in waiting {
+        if subscribe::record(&state.workspace, delivery.clone()).is_ok() {
+            held().remove(&delivery.delivery_id);
+        }
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let pending = subscribe::pending(&state.workspace, &now);
     if pending.is_empty() {
@@ -3803,6 +4022,10 @@ fn pump_deliveries(state: &State) {
             .map(|e| (e.event_id.clone(), e))
             .collect();
     for mut delivery in pending {
+        // Its outcome is known and only the write is missing.
+        if held().contains_key(&delivery.delivery_id) {
+            continue;
+        }
         delivery.attempts += 1;
         // A subscription binding a field the publication does not carry is a
         // standing misconfiguration, and it fails HERE - before a run exists -
@@ -3810,15 +4033,16 @@ fn pump_deliveries(state: &State) {
         if let Some(why) = delivery.parameter_error.clone() {
             delivery.state = DeliveryState::Failed;
             delivery.last_error = Some(format!("parameters could not be bound: {why}"));
-            let _ = subscribe::record(&state.workspace, delivery);
+            record_or_hold(delivery);
             continue;
         }
         if let Some(loop_path) = looping.get(&delivery.pipeline_id) {
             delivery.state = DeliveryState::Failed;
             delivery.last_error = Some(format!(
-                "not delivered: {loop_path} would trigger each other forever. Narrow the assets                  this subscription matches, or set a producer."
+                "not delivered: {loop_path} would trigger each other forever. Narrow the assets \
+                 this subscription matches, or set a producer."
             ));
-            let _ = subscribe::record(&state.workspace, delivery);
+            record_or_hold(delivery);
             continue;
         }
         let Some(file) = pipes.get(&delivery.pipeline_id).map(|p| p.display().to_string()) else {
@@ -3828,7 +4052,7 @@ fn pump_deliveries(state: &State) {
             delivery.state = DeliveryState::Failed;
             delivery.last_error =
                 Some(format!("no pipeline {:?} in this workspace", delivery.pipeline_id));
-            let _ = subscribe::record(&state.workspace, delivery);
+            record_or_hold(delivery);
             continue;
         };
         // The same on-disk lock a scheduled run takes. Two runs of one pipeline
@@ -3876,7 +4100,7 @@ fn pump_deliveries(state: &State) {
                 );
             }
         }
-        let _ = subscribe::record(&state.workspace, delivery);
+        record_or_hold(delivery);
     }
 }
 
@@ -3987,12 +4211,12 @@ fn execute_one_with(
 
     // Same placeholder resolution as `duckle-runner run`: saved Salesforce
     // connection refs first (#166 stage 2, so a connection field stored as
-    // ${ENV:...} still expands), then ${ENV:KEY} secrets, then the dynamic
-    // ${date}/${datetime}/... builtins.
+    // ${ENV:...} still expands), then ${ENV:KEY} secrets, then the parameters
+    // and the workspace context, and the dynamic ${date}/${datetime}/... builtins
+    // last.
     duckle_secrets::resolve_connection_refs(&state.workspace, &mut doc.nodes)?;
     let env_file = state.workspace.join("secrets.env");
     crate::apply_env_pass(&mut doc, &state.workspace, &env_file)?;
-    duckle_duckdb_engine::context::apply_time_builtins(&mut doc);
     // Per-run input parameters from the dashboard (issue #127) override the
     // static workspace context for this run; applied before the context pass so a
     // supplied value wins and any unset ${KEY} still resolves from the context.
@@ -4021,8 +4245,9 @@ fn execute_one_with(
         duckle_duckdb_engine::context::apply_params_from(&mut doc, &supplied)?;
     // Match the web cmd paths and headless `duckle-runner --pipeline`: resolve
     // ${workspace}/${projectroot} and workspace-relative file paths before run,
-    // so file-loaded pipelines (manual /api/run + scheduled runs) work too.
-    duckle_duckdb_engine::context::apply_workspace_context(&mut doc, &state.workspace);
+    // so file-loaded pipelines (manual /api/run + scheduled runs) work too. The
+    // date builtins follow, as on every run surface.
+    duckle_duckdb_engine::context::apply_workspace_context_then_time(&mut doc, &state.workspace);
 
     let engine = engine.unwrap_or_else(|| DuckdbEngine::new(state.duckdb.clone()));
     // #259: every console execution is addressable, not only the async one.
@@ -4088,7 +4313,7 @@ fn execute_one_with(
     // #259: stamp the id the caller was handed, so a finished async run is
     // still answerable once it has left memory.
     record.run_id = Some(owned_id.clone());
-    let _ = append_run_record(&state.workspace, &id, record);
+    duckle_duckdb_engine::record_run(&state.workspace, &id, record);
     // After the run is recorded, so an unreachable channel can never cost a
     // run its history entry, and never changes the outcome reported below.
     duckle_duckdb_engine::alerts::notify(&state.workspace, &id, &result);
@@ -5173,6 +5398,44 @@ mod tests {
         assert_eq!(plan_of(), None, "an explicit empty planId means 'a pipeline, not a plan'");
     }
 
+    /// #318 and #296 on a schedule that already exists: a zone and an exclusion
+    /// calendar are validated, then applied. The route checked both and applied
+    /// them only when it CREATED the record, so changing the zone of an existing
+    /// schedule answered ok and left it on the old clock.
+    ///
+    /// The same three answers as `planId`: the console's own save sends neither
+    /// key and must not wipe what the API set; a present key replaces; an empty
+    /// zone clears.
+    #[test]
+    fn a_zone_and_calendar_sent_for_an_existing_schedule_are_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let save = |body: serde_json::Value| save_schedule_at(&ws, &body).expect("saves");
+        let stored = || duckle_duckdb_engine::schedules::load(&ws).unwrap()[0].clone();
+
+        save(serde_json::json!({ "id": "p", "enabled": true, "cron": "0 3 * * *",
+            "timezone": "Europe/Brussels", "exclude": { "weekdays": ["sunday"] } }));
+        assert_eq!(stored().timezone.as_deref(), Some("Europe/Brussels"));
+
+        save(serde_json::json!({ "id": "p", "enabled": true, "cron": "0 3 * * *",
+            "timezone": "America/New_York", "exclude": { "dates": ["2026-12-25"] } }));
+        let s = stored();
+        assert_eq!(s.timezone.as_deref(), Some("America/New_York"), "the new zone was dropped");
+        assert_eq!(s.exclude.dates, vec!["2026-12-25".to_string()], "the new calendar was dropped");
+        assert!(s.exclude.weekdays.is_empty(), "a sent calendar replaces the old one");
+
+        // The console toggling it, which sends neither key.
+        save(serde_json::json!({ "id": "p", "enabled": false, "cron": "0 3 * * *" }));
+        let s = stored();
+        assert_eq!(s.timezone.as_deref(), Some("America/New_York"), "a save without a zone wiped it");
+        assert_eq!(s.exclude.dates, vec!["2026-12-25".to_string()], "a save without a calendar wiped it");
+
+        // Asked for explicitly, the zone goes.
+        save(serde_json::json!({ "id": "p", "enabled": true, "cron": "0 3 * * *", "timezone": "" }));
+        assert_eq!(stored().timezone, None, "an explicit empty zone means the machine's own");
+        assert_eq!(duckle_duckdb_engine::schedules::load(&ws).unwrap().len(), 1);
+    }
+
     /// Removing the last administrator leaves a console nobody can administer. Removing
     /// anyone else has nothing to do with that, and an earlier version counted the
     /// surviving admins without checking who was being removed, so deleting an operator
@@ -5269,6 +5532,7 @@ mod tests {
             oidc: None,
             oidc_endpoints: Mutex::new(None),
             oidc_logins: Mutex::new(Default::default()),
+            unrecorded_deliveries: Mutex::new(Default::default()),
         })
     }
 
@@ -5358,7 +5622,42 @@ mod tests {
             oidc: None,
             oidc_endpoints: Mutex::new(None),
             oidc_logins: Mutex::new(Default::default()),
+            unrecorded_deliveries: Mutex::new(Default::default()),
         })
+    }
+
+    /// A sign-in the session store would not take is not a sign-in.
+    ///
+    /// The session write was ignored, so a token that verified was answered 200
+    /// with a cookie naming a session that did not exist, and the audit log said
+    /// "allowed". The browser then failed on its very next request with nothing to
+    /// explain why, and the log recorded a sign-in that never took effect. The
+    /// store refuses here because another connection dropped its sessions table.
+    #[test]
+    fn a_session_that_could_not_be_saved_is_not_handed_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let state = guarded_state(&ws);
+        rusqlite::Connection::open(ws.join(".duckle").join("console.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE sessions")
+            .unwrap();
+
+        let mut req = request("POST", "/api/session", None);
+        req.body = serde_json::to_vec(&serde_json::json!({ "token": "s3cret" })).unwrap();
+        let reply = route_console(&req, &state);
+
+        assert_ne!(reply.code(), 200, "{}", String::from_utf8_lossy(&reply.body));
+        assert!(
+            !reply.headers.iter().any(|h| h.contains(console_auth::SESSION_COOKIE)),
+            "a cookie was set for a session that was never saved: {:?}",
+            reply.headers
+        );
+        let log = crate::audit::read(&ws, &crate::audit::Filter { limit: 50, ..Default::default() }).unwrap();
+        assert!(
+            !log.entries.iter().any(|e| e.action == "session.sign_in" && e.outcome == "allowed"),
+            "the audit log records a sign-in that never took effect"
+        );
     }
 
     /// #300: an operator can alert on failed and queued runs without the UI.
@@ -5562,7 +5861,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let console =
             console_auth::Console::configure(tmp.path(), "0.0.0.0", Some("s3cret")).unwrap();
-        let sid = console.sign_in_external("user-123 (Ada)", console_auth::Role::Operator);
+        let sid = console.sign_in_external("user-123 (Ada)", console_auth::Role::Operator).unwrap();
 
         let header = super::session_cookie_header(&sid, None);
         let sent_back = header
@@ -5590,7 +5889,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let console =
             console_auth::Console::configure(tmp.path(), "0.0.0.0", Some("s3cret")).unwrap();
-        let sid = console.sign_in_external("user-123 (Ada)", console_auth::Role::Operator);
+        let sid = console.sign_in_external("user-123 (Ada)", console_auth::Role::Operator).unwrap();
 
         // Exactly the header the browser will send back, built from the same
         // constant the callback must use.
@@ -5618,6 +5917,7 @@ mod tests {
             host: "0.0.0.0".into(),
             run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
             console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
         };
         let mut req = request("POST", "/api/cmd/complete_node_sql", Some("Bearer s3cret"));
         req.body = serde_json::to_vec(&serde_json::json!({
@@ -5695,6 +5995,52 @@ mod tests {
         );
     }
 
+    /// A backfill killed while serve stayed up: startup is the only place that
+    /// reclaimed a dead executor's `running` slices, and retry moves only failed
+    /// and interrupted ones, so the console could never retry it. `u32::MAX` is
+    /// never a live pid; the partition filter matches nothing, so no executor
+    /// thread is started.
+    #[test]
+    fn a_console_retry_reclaims_a_slice_its_dead_executor_left_running() {
+        use duckle_duckdb_engine::backfill::{self, State};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(ws.join("pipelines")).unwrap();
+        std::fs::write(
+            ws.join("pipelines/daily.json"),
+            r#"{"formatVersion":1,"name":"daily",
+                "partition":{"type":"time","cadence":"day","timezone":"UTC"},
+                "nodes":[],"edges":[]}"#,
+        )
+        .unwrap();
+        let mut plan = duckle_duckdb_engine::backfill_exec::plan_for(
+            &ws,
+            &ws.join("pipelines/daily.json"),
+            "2020-01-01",
+            "2020-01-02",
+            4,
+            None,
+        )
+        .unwrap();
+        plan.pid = Some(u32::MAX);
+        plan.partitions[0].state = State::Running;
+        backfill::save(&ws, &plan).unwrap();
+
+        let state = guarded_state(&ws);
+        let mut req = request("POST", "/api/backfills", Some("Bearer s3cret"));
+        req.body = serde_json::to_vec(&serde_json::json!({
+            "action": "retry", "id": plan.id, "partition": "no-such-slice"
+        }))
+        .unwrap();
+        let reply = route_console(&req, &state);
+        assert_eq!(reply.code(), 200, "{}", String::from_utf8_lossy(&reply.body));
+        assert_eq!(
+            backfill::load(&ws, &plan.id).unwrap().partitions[0].state,
+            State::Interrupted,
+            "the dead executor's slice is still `running`, so no retry can ever pick it up"
+        );
+    }
+
     /// Reading a backfill is a viewer's business; changing one is an
     /// operator's. Left to the catch-all both would need admin, and every
     /// operator would get a 403 with the action logged as "unknown".
@@ -5726,6 +6072,7 @@ mod tests {
             host: "0.0.0.0".into(),
             run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
             console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
         };
         let mut req = request("POST", "/api/cmd/analyze_node_sql", Some("Bearer s3cret"));
         req.body = serde_json::to_vec(&serde_json::json!({
@@ -5774,6 +6121,7 @@ mod tests {
             host: "0.0.0.0".into(),
             run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
             console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
         };
         let mut req = request("POST", "/api/cmd/external_components", Some("Bearer s3cret"));
         req.body = b"{}".to_vec();
@@ -6064,19 +6412,6 @@ mod tests {
         );
     }
 
-    /// A --token caller is an admin, so this proves the role gate rather than the token
-    /// gate: an unknown route falls to admin and a viewer must not reach it.
-    #[test]
-
-    /// `/api/run_stream` executes a pipeline supplied in the request body, and
-    /// resolves this workspace's saved connections into it before running. It was
-    /// dispatched by `handle_web` before `route_web` was ever called, so it ran
-    /// with no cross-origin guard, no sign-in and no role check: an unauthenticated
-    /// POST executed arbitrary work with the workspace's credentials, on an image
-    /// whose entrypoint is `duckle-runner web`.
-    ///
-    /// The gate is asserted here rather than through `handle_web`, which owns a
-
     /// The file bridge sits at operator level while the connection commands require
     /// admin. That gate is worth nothing if the same operator can ask for the key as
     /// a file, so the key and token directories are refused outright.
@@ -6111,6 +6446,14 @@ mod tests {
         );
     }
 
+    /// `/api/run_stream` executes a pipeline supplied in the request body, and
+    /// resolves this workspace's saved connections into it before running. It was
+    /// dispatched by `handle_web` before `route_web` was ever called, so it ran
+    /// with no cross-origin guard, no sign-in and no role check: an unauthenticated
+    /// POST executed arbitrary work with the workspace's credentials, on an image
+    /// whose entrypoint is `duckle-runner web`.
+    ///
+    /// The gate is asserted here rather than through `handle_web`, which owns a
     /// socket. Reverting `web_gate`'s identity check turns this red.
     #[test]
     fn the_streaming_run_route_is_not_reachable_without_credentials() {
@@ -6123,6 +6466,7 @@ mod tests {
             host: "0.0.0.0".into(),
             run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
             console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
         };
 
         let anonymous = request("POST", "/api/run_stream", None);
@@ -6141,6 +6485,501 @@ mod tests {
             .expect("a credentialed operator must still be allowed to run");
     }
 
+    /// #325: a consumer that ran is not run again because its delivery could not
+    /// be written down.
+    ///
+    /// The pump ignored a failed write to the delivery ledger. The delivery then
+    /// still looked owed, so every tick ran the consumer again - a duplicate run
+    /// per tick for as long as the ledger stayed unwritable, which is the one
+    /// thing the delivery id exists to prevent. No DuckDB needed: every attempt,
+    /// even a failing one, leaves a run-history record to count.
+    #[test]
+    fn a_delivery_that_could_not_be_recorded_is_not_run_again() {
+        use duckle_duckdb_engine::{materialize, subscribe};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(ws.join("pipelines")).unwrap();
+        std::fs::write(ws.join("pipelines").join("consumer.json"), r#"{"nodes":[],"edges":[]}"#).unwrap();
+        let sub = subscribe::Subscription {
+            id: "s1".into(),
+            pipeline_id: "consumer".into(),
+            assets: vec!["/lake/orders".into()],
+            producer: None,
+            enabled: true,
+            parameters: Default::default(),
+        };
+        std::fs::write(subscribe::store_path(&ws), serde_json::to_string(&vec![sub]).unwrap()).unwrap();
+        let event = materialize::Event {
+            event_id: "mat-nightly-1".into(),
+            pipeline_id: "nightly".into(),
+            run_id: Some("run-1".into()),
+            release_id: None,
+            partition_key: None,
+            trigger: "scheduled".into(),
+            committed_at: "2026-09-17T10:00:00Z".into(),
+            assets: vec!["/lake/orders".into()],
+        };
+        let log = materialize::log_path(&ws);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, format!("{}\n", serde_json::to_string(&event).unwrap())).unwrap();
+        // The ledger cannot be written: a directory stands where the file goes.
+        std::fs::create_dir_all(subscribe::deliveries_path(&ws)).unwrap();
+
+        let state = local_state(&ws);
+        let runs = || duckle_duckdb_engine::load_run_history(&ws, "consumer").len();
+        super::pump_deliveries(&state);
+        assert_eq!(runs(), 1, "the publication must trigger the consumer once");
+        super::pump_deliveries(&state);
+        assert_eq!(runs(), 1, "an unrecorded delivery was run again on the next tick");
+
+        // Once the ledger can be written, the delivery lands - still without a rerun.
+        std::fs::remove_dir(subscribe::deliveries_path(&ws)).unwrap();
+        super::pump_deliveries(&state);
+        assert_eq!(runs(), 1, "recording the delivery late ran the consumer again");
+        let recorded = subscribe::deliveries(&ws);
+        assert_eq!(recorded.len(), 1, "the delivery never reached the ledger: {recorded:?}");
+        assert_eq!(recorded.values().next().unwrap().state, subscribe::DeliveryState::Delivered);
+    }
+
+    /// #259: a web editor run is recorded against the pipeline FILE, so
+    /// `duckle-runner retry` can find it.
+    ///
+    /// The receipt named `pipelines/<display name>.json`, but the editor saves a
+    /// pipeline under its id, so retry answered "cannot read the pipeline this
+    /// run used" for every web run. The id comes from the browser, so one that is
+    /// not a plain file name is not trusted to name a path.
+    #[test]
+    fn a_web_run_is_recorded_against_the_file_the_editor_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            dist: ws.clone(),
+            host: "0.0.0.0".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
+        };
+        let recorded_path = |id: &str| {
+            let dir = duckle_duckdb_engine::retry::dir(&ws);
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut req = request("POST", "/api/cmd/run_pipeline", Some("Bearer s3cret"));
+            req.body = serde_json::to_vec(&serde_json::json!({
+                "pipeline": { "nodes": [], "edges": [] },
+                "pipelineId": id,
+                "pipelineName": "Orders nightly",
+            }))
+            .unwrap();
+            route_web(&req, &state);
+            let receipts: Vec<_> = std::fs::read_dir(&dir).expect("a receipt was written").flatten().collect();
+            assert_eq!(receipts.len(), 1, "one run, one receipt");
+            let text = std::fs::read_to_string(receipts[0].path()).unwrap();
+            let receipt: serde_json::Value = serde_json::from_str(&text).unwrap();
+            std::path::PathBuf::from(receipt["pipeline_path"].as_str().or(receipt["pipelinePath"].as_str()).unwrap())
+        };
+        assert_eq!(recorded_path("p_7f3a"), ws.join("pipelines").join("p_7f3a.json"));
+        let escaped = recorded_path("../../outside");
+        assert!(
+            escaped.starts_with(ws.join("pipelines")) && !escaped.to_string_lossy().contains(".."),
+            "an id that is not a file name must not name a path: {}",
+            escaped.display()
+        );
+    }
+
+    /// A server run resolves the workspace context before the date builtins, as
+    /// the scheduler and the desktop editor do.
+    ///
+    /// The server stamped `${date}` first, so a context that defines `date` (a
+    /// business date) lost to today's date, and a context value that contains
+    /// `${date}` - `OUT = exports/${date}` - was written into a folder literally
+    /// named `${date}`. The same pipeline wrote somewhere else depending on
+    /// which surface started it.
+    #[test]
+    fn a_server_run_resolves_the_context_before_the_date_builtins() {
+        let Ok(duckdb) = std::env::var("DUCKLE_DUCKDB_BIN") else {
+            eprintln!("skipped: needs DUCKLE_DUCKDB_BIN");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        std::fs::write(ws.join("orders.csv"), "id\n1\n").unwrap();
+        std::fs::write(ws.join("repository.json"), r#"[{"type":"context","id":"c","name":"Default"}]"#).unwrap();
+        std::fs::create_dir_all(ws.join("contexts")).unwrap();
+        std::fs::write(
+            ws.join("contexts").join("c.json"),
+            r#"{"variables":[{"key":"date","value":"2020-01-31"},{"key":"OUT","value":"exports/${date}"}]}"#,
+        )
+        .unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from(duckdb),
+            dist: ws.clone(),
+            host: "127.0.0.1".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "127.0.0.1", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
+        };
+        let root = ws.to_string_lossy().replace('\\', "/");
+        let mut req = request("POST", "/api/cmd/run_pipeline", Some("Bearer s3cret"));
+        req.body = serde_json::to_vec(&serde_json::json!({
+            "pipelineName": "dated",
+            "pipeline": {
+                "nodes": [
+                    { "id": "s", "position": {"x":0,"y":0}, "data": { "label": "in", "componentId": "src.csv",
+                      "properties": { "path": format!("{root}/orders.csv"), "hasHeader": true } } },
+                    { "id": "k", "position": {"x":0,"y":0}, "data": { "label": "out", "componentId": "snk.csv",
+                      "properties": { "path": format!("{root}/${{OUT}}/${{date}}.csv"), "hasHeader": true } } }
+                ],
+                "edges": [ { "id": "e", "source": "s", "target": "k", "data": { "connectionType": "main" } } ]
+            }
+        }))
+        .unwrap();
+        let reply = route_web(&req, &state);
+        let result: serde_json::Value = serde_json::from_slice(&reply.body).unwrap_or_default();
+        assert_eq!(result["status"], "ok", "{result}");
+
+        let folders: Vec<String> = std::fs::read_dir(ws.join("exports"))
+            .expect("the sink wrote under exports/")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(folders.len(), 1, "{folders:?}");
+        assert_ne!(folders[0], "${date}", "a context value's ${{date}} was left literal");
+        assert!(
+            ws.join("exports").join(&folders[0]).join("2020-01-31.csv").exists(),
+            "the context's own date lost to today's: {:?}",
+            std::fs::read_dir(ws.join("exports").join(&folders[0])).unwrap().flatten().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The web editor's Data Catalog shows the workspace's assets and saves what
+    /// is written about them.
+    ///
+    /// The web server had none of the catalog commands, which the web shim turns
+    /// into an empty answer, so the panel said "No assets yet" for a workspace
+    /// full of pipelines and an owner typed into it went nowhere. The panel's four
+    /// commands make the engine calls the desktop makes, against this server's
+    /// workspace rather than the one the request names.
+    #[test]
+    fn the_web_data_catalog_shows_and_annotates_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        std::fs::write(ws.join("orders.csv"), "id,amount\n1,10\n").unwrap();
+        std::fs::create_dir_all(ws.join("pipelines")).unwrap();
+        std::fs::write(
+            ws.join("pipelines").join("p_orders.json"),
+            serde_json::json!({
+                "name": "orders",
+                "nodes": [{ "id": "s", "data": { "componentId": "src.csv",
+                    "properties": { "path": ws.join("orders.csv").to_string_lossy(), "hasHeader": true } } }],
+                "edges": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let duckdb = std::env::var("DUCKLE_DUCKDB_BIN").ok();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from(duckdb.clone().unwrap_or_else(|| "duckdb".into())),
+            dist: ws.clone(),
+            host: "127.0.0.1".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "127.0.0.1", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
+        };
+        let cmd = |name: &str, body: serde_json::Value| {
+            let mut req = request("POST", &format!("/api/cmd/{name}"), Some("Bearer s3cret"));
+            req.body = serde_json::to_vec(&body).unwrap();
+            let reply = route_web(&req, &state);
+            (reply.code(), serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap_or_default())
+        };
+
+        let (code, view) = cmd("workspace_catalog", serde_json::json!({ "workspace": "/somewhere/else" }));
+        assert_eq!(code, 200, "{view}");
+        let asset = view["assets"][0]["id"].as_str().expect("the pipeline's source is an asset").to_string();
+
+        let (code, view) = cmd(
+            "workspace_catalog_annotate",
+            serde_json::json!({ "workspace": "/somewhere/else", "pipelines": false, "name": asset,
+                "owner": "data-eng", "contact": null, "description": null, "tags": ["finance"] }),
+        );
+        assert_eq!(code, 200, "{view}");
+        let annotated = view["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == asset.as_str())
+            .expect("the annotated asset");
+        assert_eq!(annotated["owner"], "data-eng", "{annotated}");
+        assert_eq!(annotated["tags"], serde_json::json!(["finance"]), "{annotated}");
+
+        assert_eq!(cmd("workspace_catalog_rebuild", serde_json::json!({})).0, 200);
+        let (code, refused) = cmd("workspace_catalog_inspect", serde_json::json!({ "asset": "nothing-reads-this" }));
+        assert_eq!(code, 400, "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap_or_default().contains("nothing in this workspace READS"),
+            "{refused}"
+        );
+        if duckdb.is_some() {
+            let (code, columns) = cmd("workspace_catalog_inspect", serde_json::json!({ "asset": asset }));
+            assert_eq!(code, 200, "{columns}");
+            assert_eq!(columns, serde_json::json!(["id", "amount"]));
+        }
+    }
+
+    /// The web editor knows the values in the server's global context file.
+    ///
+    /// The server had no settings_load_context_vars, which the web shim turns into
+    /// an empty answer, so Run asked for a ${KEY} the file defines. And because the
+    /// browser substitutes a static context's value before the run reaches the
+    /// server, a key in both kept the static default where the desktop takes the
+    /// file's value. The workspace named in the request is not the one read.
+    #[test]
+    fn the_web_editor_reads_the_servers_global_context_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(ws.join(".duckle")).unwrap();
+        std::fs::write(ws.join(".duckle").join("settings.json"), r#"{"context_file":"run.env"}"#).unwrap();
+        std::fs::write(ws.join("run.env"), "REGION=eu-west\nBATCH=42\n").unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            dist: ws.clone(),
+            host: "127.0.0.1".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "127.0.0.1", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
+        };
+        let mut req = request("POST", "/api/cmd/settings_load_context_vars", Some("Bearer s3cret"));
+        req.body = serde_json::to_vec(&serde_json::json!({ "workspace": "/somewhere/else" })).unwrap();
+        let reply = route_web(&req, &state);
+        assert_eq!(reply.code(), 200, "{}", String::from_utf8_lossy(&reply.body));
+        let vars: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(vars, serde_json::json!({ "REGION": "eu-west", "BATCH": "42" }));
+    }
+
+    /// The web editor's History tab lists the pipeline's runs, and the runs the
+    /// editor starts are among them.
+    ///
+    /// The server had no run_history command, which the web shim turns into an
+    /// empty answer, and neither editor run path added to run history, so the
+    /// tab always said there was none. Both paths are driven: the command and the
+    /// streaming route over a socket. The id comes from the browser and names the
+    /// history file, so one that is not a plain file name is refused.
+    #[test]
+    fn the_web_history_tab_lists_the_runs_the_editor_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            dist: ws.clone(),
+            host: "127.0.0.1".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "127.0.0.1", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
+        };
+        let cmd = |name: &str, body: serde_json::Value| {
+            let mut req = request("POST", &format!("/api/cmd/{name}"), Some("Bearer s3cret"));
+            req.body = serde_json::to_vec(&body).unwrap();
+            let reply = route_web(&req, &state);
+            (reply.code(), serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap_or_default())
+        };
+        let earlier: duckle_duckdb_engine::RunRecord = serde_json::from_str(
+            r#"{"at":"2026-01-01T00:00:00Z","status":"ok","duration_ms":1,"rows":0,"node_count":1,"trigger":"scheduled"}"#,
+        )
+        .unwrap();
+        duckle_duckdb_engine::append_run_record(&ws, "p_7f3a", earlier).unwrap();
+        let run = serde_json::json!({
+            "pipeline": { "nodes": [], "edges": [] },
+            "pipelineId": "p_7f3a",
+            "pipelineName": "Orders nightly",
+        });
+
+        assert_eq!(cmd("run_pipeline", run.clone()).0, 200);
+
+        let owner = state.console.identify(Some("Bearer s3cret"), None).expect("the owner signs in");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::to_vec(&run).unwrap();
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let (mut stream, _) = listener.accept().unwrap();
+                super::run_stream(&mut stream, &state, &owner, &body)
+            });
+            let mut conn = std::net::TcpStream::connect(addr).unwrap();
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut conn, &mut text);
+            server.join().unwrap().expect("the stream completes");
+            assert!(text.contains("event: result"), "the streamed run did not finish: {text}");
+        });
+
+        let (code, listed) = cmd("run_history", serde_json::json!({ "workspacePath": "/elsewhere", "pipelineId": "p_7f3a" }));
+        assert_eq!(code, 200, "{listed}");
+        let triggers: Vec<&str> = listed
+            .as_array()
+            .expect("a list of runs")
+            .iter()
+            .map(|r| r["trigger"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(triggers, ["web", "web", "scheduled"], "newest first, with both editor runs in it");
+
+        assert_eq!(cmd("run_history", serde_json::json!({ "pipelineId": "../outside" })).0, 400);
+        let mut escaping = run.clone();
+        escaping["pipelineId"] = "../outside".into();
+        cmd("run_pipeline", escaping);
+        assert!(!ws.join("outside.json").exists(), "an id that is not a file name named a history file");
+    }
+
+    /// The web editor's Schedules dialog reads and writes the workspace's real
+    /// schedule store.
+    ///
+    /// The dialog's commands had no web implementation, and the web shim turns a
+    /// missing command into an empty answer: the list always read "No schedules
+    /// yet" while schedules.json held some, and a saved schedule was dropped with
+    /// the dialog closing as if it had worked. Saving goes through the same rules
+    /// as the desktop scheduler, so a bad expression is refused and a re-save
+    /// keeps the run history the store already had.
+    #[test]
+    fn the_web_schedules_dialog_uses_the_workspace_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let state = WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from("duckdb"),
+            dist: ws.clone(),
+            host: "0.0.0.0".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "0.0.0.0", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
+        };
+        let cmd = |name: &str, body: serde_json::Value| {
+            let mut req = request("POST", &format!("/api/cmd/{name}"), Some("Bearer s3cret"));
+            req.body = serde_json::to_vec(&body).unwrap();
+            let reply = route_web(&req, &state);
+            (reply.code(), serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap_or_default())
+        };
+        let nightly = serde_json::json!({
+            "id": "", "pipeline_id": "orders", "name": "Nightly", "enabled": true,
+            "kind": { "type": "cron", "expr": "0 0 3 * * *" }, "timezone": "Europe/Brussels"
+        });
+
+        let (code, saved) = cmd("schedule_upsert", serde_json::json!({ "schedule": nightly }));
+        assert_eq!(code, 200, "{saved}");
+        let id = saved["id"].as_str().expect("a saved schedule gets an id").to_string();
+        assert!(!id.is_empty());
+
+        let (code, list) = cmd("schedule_list", serde_json::json!({}));
+        assert_eq!(code, 200, "{list}");
+        assert_eq!(list.as_array().map(Vec::len), Some(1), "the saved schedule is not listed: {list}");
+        assert_eq!(list[0]["timezone"], "Europe/Brussels");
+
+        // A run recorded by whoever fires it survives a re-save from the dialog.
+        duckle_duckdb_engine::schedules::update(&ws, |l| l[0].last_run_status = Some("ok".into())).unwrap();
+        let mut renamed = list[0].clone();
+        renamed["name"] = "Nightly load".into();
+        renamed.as_object_mut().unwrap().remove("last_run_status");
+        assert_eq!(cmd("schedule_upsert", serde_json::json!({ "schedule": renamed })).0, 200);
+        let stored = &duckle_duckdb_engine::schedules::load(&ws).unwrap()[0];
+        assert_eq!(stored.name, "Nightly load");
+        assert_eq!(stored.last_run_status.as_deref(), Some("ok"), "the re-save wiped the run history");
+
+        let mut broken = nightly.clone();
+        broken["kind"]["expr"] = "not a cron".into();
+        assert_eq!(cmd("schedule_upsert", serde_json::json!({ "schedule": broken })).0, 400);
+        assert_eq!(duckle_duckdb_engine::schedules::load(&ws).unwrap().len(), 1, "a refused save was stored");
+
+        assert_eq!(cmd("schedule_delete", serde_json::json!({ "id": id })).0, 200);
+        assert!(duckle_duckdb_engine::schedules::load(&ws).unwrap().is_empty(), "delete left the schedule");
+    }
+
+    /// The web editor's Stop button stops the run it started, and only that.
+    ///
+    /// Stop did nothing in the web edition: the browser never asked the server,
+    /// and the server kept no handle on a run it could cancel, so the run went on
+    /// and still wrote its sinks. Driven through the real streaming route over a
+    /// socket. The run waits five seconds before its sink, and the Stop is sent
+    /// as soon as the run is registered, so a sink file means Stop did nothing.
+    #[test]
+    fn the_web_stop_button_cancels_the_run_its_caller_started() {
+        let Ok(duckdb) = std::env::var("DUCKLE_DUCKDB_BIN") else {
+            eprintln!("skipped: needs DUCKLE_DUCKDB_BIN");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        std::fs::write(ws.join("in.csv"), "id\n1\n2\n").unwrap();
+        let out = ws.join("out.csv");
+        let state = std::sync::Arc::new(WebState {
+            workspace: ws.clone(),
+            duckdb: std::path::PathBuf::from(duckdb),
+            dist: ws.clone(),
+            host: "127.0.0.1".into(),
+            run_lock: Gates::new(duckle_duckdb_engine::pools::Pools::from_limits(Default::default())),
+            console: console_auth::Console::configure(&ws, "127.0.0.1", Some("s3cret")).unwrap(),
+            editor_runs: Default::default(),
+        });
+        let owner = state.console.identify(Some("Bearer s3cret"), None).expect("the owner signs in");
+        let bob = state.console.create_account("bob", console_auth::Role::Operator).unwrap();
+
+        let pipeline = serde_json::json!({
+            "pipelineName": "stoppable",
+            "pipeline": {
+                "nodes": [
+                    { "id": "s", "position": {"x":0,"y":0}, "data": { "label": "in", "componentId": "src.csv",
+                      "properties": { "path": ws.join("in.csv").to_string_lossy(), "hasHeader": true } } },
+                    { "id": "w", "position": {"x":0,"y":0}, "data": { "label": "wait", "componentId": "ctl.wait",
+                      "properties": { "duration": 5000, "unit": "ms" } } },
+                    { "id": "k", "position": {"x":0,"y":0}, "data": { "label": "out", "componentId": "snk.csv",
+                      "properties": { "path": out.to_string_lossy(), "hasHeader": true } } }
+                ],
+                "edges": [
+                    { "id": "e1", "source": "s", "target": "w", "data": { "connectionType": "main" } },
+                    { "id": "e2", "source": "w", "target": "k", "data": { "connectionType": "main" } }
+                ]
+            }
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let body = serde_json::to_vec(&pipeline).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            super::run_stream(&mut stream, &server_state, &owner, &body)
+        });
+        let client = std::thread::spawn(move || {
+            let mut conn = std::net::TcpStream::connect(addr).unwrap();
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut conn, &mut text);
+            text
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.editor_runs.runs.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the run never started");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let stop = |bearer: &str| {
+            let mut req = request("POST", "/api/cmd/cancel_pipeline", Some(bearer));
+            req.body = b"{}".to_vec();
+            let reply = route_web(&req, &state);
+            assert_eq!(reply.code(), 200, "{}", String::from_utf8_lossy(&reply.body));
+            serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap()["cancelled"].clone()
+        };
+        assert_eq!(stop(&format!("Bearer {bob}")), 0, "another person's Stop must not end this run");
+        assert_eq!(stop("Bearer s3cret"), 1, "the owner's Stop must reach the run");
+
+        server.join().unwrap().expect("the stream completes");
+        let events = client.join().unwrap();
+        assert!(events.contains("\"status\":\"cancelled\""), "the run did not stop: {events}");
+        assert!(!out.exists(), "a stopped run still wrote its sink");
+        assert!(state.editor_runs.runs.lock().unwrap().is_empty(), "a finished run stayed registered");
+    }
+
+    /// A --token caller is an admin, so this proves the role gate rather than the token
+    /// gate: an unknown route falls to admin and a viewer must not reach it.
+    #[test]
     fn a_role_that_is_not_enough_is_refused_not_admitted() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().canonicalize().unwrap();
@@ -6370,6 +7209,7 @@ mod tests {
             oidc: None,
             oidc_endpoints: Mutex::new(None),
             oidc_logins: Mutex::new(Default::default()),
+            unrecorded_deliveries: Mutex::new(Default::default()),
         };
 
         let leaked = read_pipeline_file(&state, "connections/prod-db.json");
@@ -6427,17 +7267,77 @@ mod tests {
         assert_eq!(schedules::load(ws).unwrap().len(), list.len(), "re-imported on restart");
     }
 
+    /// `serve` and `web` reconcile at startup through one function, and it must
+    /// leave another process's live run alone.
+    ///
+    /// Both used to pass "only this process is alive", so starting either one -
+    /// including the desktop opening its web panel on the same workspace -
+    /// declared every other live run interrupted. The other runner here is a
+    /// real, different process.
+    #[test]
+    fn startup_reconcile_leaves_another_processes_live_run_alone() {
+        use duckle_duckdb_engine::retry;
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        #[cfg(windows)]
+        let mut other = std::process::Command::new("cmd")
+            .args(["/C", "ping", "-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the other runner");
+        #[cfg(unix)]
+        let mut other = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the other runner");
+
+        retry::begin(ws, "run-live", "manual", "daily", "/p.json", "hash", None);
+        let mut r = retry::load(ws, "run-live").unwrap();
+        r.pid = Some(other.id());
+        retry::write(ws, &r).unwrap();
+
+        super::reconcile_at_startup(ws);
+        assert_eq!(
+            retry::load(ws, "run-live").unwrap().state,
+            retry::RUNNING,
+            "starting serve declared another process's live run interrupted"
+        );
+
+        other.kill().expect("kill the other runner");
+        other.wait().expect("reap it");
+        super::reconcile_at_startup(ws);
+        assert_eq!(
+            retry::load(ws, "run-live").unwrap().state,
+            retry::INTERRUPTED,
+            "a run whose process has gone was not reclaimed"
+        );
+    }
+
     #[test]
     fn normalize_cron_pads_five_fields_and_validates() {
         // A standard 5-field cron gets a "0 " seconds field prepended so the
         // `cron` crate (which wants 6/7 fields) accepts it, and the result parses.
+        //
+        // And its weekday is translated. This used to assert "0 0 9 * * 1", which
+        // is the string the old code produced and a SUNDAY to the crate - the test
+        // checked the text and never the day, so it held the bug in place. Crontab
+        // 1 is Monday; the crate's Monday is 2.
         let five = normalize_cron("0 9 * * 1").expect("5-field accepted");
-        assert_eq!(five, "0 0 9 * * 1");
+        assert_eq!(five, "0 0 9 * * 2");
         assert!(five.parse::<cron::Schedule>().is_ok(), "padded expr parses");
         // A 6-field expression passes through unchanged and parses.
         let six = normalize_cron("*/30 * * * * *").expect("6-field accepted");
         assert_eq!(six, "*/30 * * * * *");
         assert!(six.parse::<cron::Schedule>().is_ok());
+        // Sunday as crontab writes it. serve validated with its own copy of this
+        // function, which left the 0 alone, and the crate refuses a weekday 0 -
+        // so the console turned away a valid schedule the evaluator would run.
+        let sunday = normalize_cron("0 9 * * 0").expect("5-field accepted");
+        assert!(
+            sunday.parse::<cron::Schedule>().is_ok(),
+            "0 is Sunday in crontab and the console must accept it: {sunday}"
+        );
         // Garbage / wrong field counts are rejected (never fire silently).
         assert!(normalize_cron("not a cron").is_none());
         assert!(normalize_cron("* * *").is_none());
@@ -6608,26 +7508,29 @@ mod tests {
     /// repo; its twin for run receipts was called here twice.
     ///
     /// Read from the source because the symptom is invisible until someone
-    /// kills a backfill and tries to resume it days later. The needle is built
-    /// from pieces so it cannot match itself in this file.
+    /// kills a backfill and tries to resume it days later. Both start paths go
+    /// through one startup reconcile, so the check is that both call it and that
+    /// it reconciles backfills and run receipts. The needles are built from
+    /// pieces so they cannot match themselves in this file.
     #[test]
     fn a_killed_backfill_is_reconciled_when_the_server_starts() {
         let src = include_str!("serve.rs");
-        let needle = format!("backfill::{}(&workspace", "reconcile");
+        let startup = format!("{}(&workspace);", "reconcile_at_startup");
         let calls = src
             .lines()
             .map(str::trim_start)
-            .filter(|l| l.contains(&needle))
+            .filter(|l| l.starts_with(&startup))
             .count();
         assert!(
             calls >= 2,
-            "backfill slices are reconciled at {calls} of the two server start paths, so a              backfill killed mid-run stays stuck in `running` and can never be retried"
+            "the startup reconcile runs at {calls} of the two server start paths, so a \
+             backfill killed mid-run stays stuck in `running` and can never be retried"
         );
-        // And the run-receipt twin is still there, so this test cannot pass by
-        // one having replaced the other.
+        // Both reconcilers live in the engine's shared recovery, whose own test
+        // proves it reclaims receipts and backfill slices by running them.
         assert!(
-            src.contains(&format!("retry::{}(&workspace", "reconcile")),
-            "run receipts are no longer reconciled at startup"
+            src.contains(&format!("recovery::{}(workspace", "reclaim_abandoned")),
+            "runs and backfill slices are no longer reconciled at startup"
         );
     }
 
@@ -6910,6 +7813,7 @@ mod serve_honours_the_schedule {
             oidc: None,
             oidc_endpoints: Mutex::new(None),
             oidc_logins: Mutex::new(Default::default()),
+            unrecorded_deliveries: Mutex::new(Default::default()),
         };
         let projected = load_schedules(&state).expect("a projection");
         let one = projected.get("p").expect("the schedule");

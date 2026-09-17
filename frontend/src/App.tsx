@@ -83,6 +83,7 @@ import { RunStatusContext } from './canvas/run-status-context';
 import { layoutByDependency } from './canvas/layout';
 import { validatePipeline } from './validation';
 import { resolveForRun, discoverParams, builtinVars, buildContextVars } from './run-resolve';
+import { livePreviewable } from './live-preview';
 import WorkspacePickerModal from './workflow-ui/WorkspacePickerModal';
 import { AccountChip, ProfileSetupModal } from './workflow-ui/AccountMenu';
 import {
@@ -102,6 +103,7 @@ import {
     loadWorkspace,
     saveItemPayload,
     saveMetadata,
+    saveNow,
     savePipelineFile,
     saveRepository,
     setWorkspacePath,
@@ -1120,7 +1122,10 @@ export default function App() {
         },
         [activeJobId, markDirty],
     );
-    const { undo, redo } = useUndoRedo(
+    const { undo, redo, noteEdit } = useUndoRedo(
+        // A reload re-reads the files (after a git pull, say), so undo must not
+        // reach back to what was on the canvas before it.
+        `${workspacePathState ?? ''}#${reloadNonce}`,
         activeJobId,
         activePipeline as unknown as CanvasSnapshot,
         applyPipelineSnapshot,
@@ -1820,7 +1825,7 @@ export default function App() {
         // has no preview rows). Debounced so click-dragging a marquee selection
         // does not fire a run per intermediate selection.
         const componentId = (sel?.data as DuckleNodeData | undefined)?.componentId ?? '';
-        if (liveModeRef.current && sel && !componentId.startsWith('snk.')) {
+        if (liveModeRef.current && sel && livePreviewable(componentId)) {
             if (liveTimerRef.current) clearTimeout(liveTimerRef.current);
             const target = sel.id;
             liveTimerRef.current = setTimeout(() => {
@@ -1832,6 +1837,10 @@ export default function App() {
 
     const handleUpdateNode = useCallback(
         (id: string, patch: Partial<DuckleNodeData>) => {
+            // A declared schema shares `data.schema` with run output, so undo
+            // history cannot see the edit on its own; this handler only receives
+            // genuine user edits, so it says so.
+            if ('schema' in patch) noteEdit();
             setNodes(ns =>
                 ns.map(n => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)),
             );
@@ -1847,7 +1856,7 @@ export default function App() {
                 }, 800);
             }
         },
-        [setNodes, markDirty],
+        [setNodes, markDirty, noteEdit],
     );
 
     const selectedNode = useMemo(
@@ -1943,6 +1952,12 @@ export default function App() {
     );
 
     const [runResult, setRunResult] = useState<RunResult | null>(null);
+    // The pipeline the run result belongs to. The canvas badges, the Output tab
+    // and the Problems count show it only while that pipeline is open: a
+    // duplicated pipeline keeps its node ids, so a global result made the copy
+    // look as if it had run.
+    const [runResultFor, setRunResultFor] = useState<string | null>(null);
+    const shownRunResult = runResultFor === activeJobId ? runResult : null;
 
     const handleEvent = useCallback(
         (evt: PipelineEvent) => {
@@ -2105,6 +2120,7 @@ export default function App() {
             }
             setIsRunning(true);
             setRunResult(null);
+            setRunResultFor(activeJobId);
             const start = performance.now();
             try {
                 // Inline SQL routines + substitute ${context.var} (and the
@@ -2154,11 +2170,13 @@ export default function App() {
     // always reaches the latest closure (fresh nodes/edges) at debounce time.
     const triggerLivePreview = useCallback(
         (nodeId: string) => {
+            if (!livePreviewable(nodes.find(n => n.id === nodeId)?.data.componentId)) return;
             if (validation.errorCount > 0) return;
             if (isRunningRef.current) return;
             isRunningRef.current = true;
             setIsRunning(true);
             setRunResult(null);
+            setRunResultFor(activeJobId);
             const start = performance.now();
             const pipelineName = repo.find(r => r.id === activeJobId)?.name ?? activeJobId;
             void settingsLoadContextVars(workspacePathState ?? '')
@@ -2206,7 +2224,7 @@ export default function App() {
         // usual node animation). Skip sinks - running to a sink writes and yields
         // no preview rows. If nothing is selected, the next node you click or
         // edit triggers the preview instead.
-        if (turningOn && selectedNode && !(selectedNode.data.componentId ?? '').startsWith('snk.')) {
+        if (turningOn && selectedNode && livePreviewable(selectedNode.data.componentId)) {
             const target = selectedNode.id;
             liveTimerRef.current = setTimeout(() => {
                 liveTimerRef.current = null;
@@ -2236,17 +2254,22 @@ export default function App() {
     }, [nodes, edges]);
 
     const handleSave = useCallback(() => {
-        // Flush the active pipeline + repo + metadata to disk now, then clear
-        // the tab's unsaved marker. (Autosave is debounced; the explicit
-        // Save button / Ctrl+S gesture writes immediately.)
-        setJobs(js => js.map(j => (j.id === activeJobId ? { ...j, dirty: false } : j)));
-        if (!isInTauri() || !workspacePathState) return;
+        // Flush the active pipeline + repo + metadata to disk now, and clear the
+        // tab's unsaved marker only once that worked. (Autosave is debounced; the
+        // explicit Save button / Ctrl+S gesture writes immediately.) It used to
+        // clear the marker first, skip the web edition, and ignore a failed
+        // write, so a tab read as saved with nothing on disk.
+        if ((!isInTauri() && !isWebBackend()) || !workspacePathState) return;
         const ws = workspacePathState;
         void (async () => {
-            const active = pipelineData[activeJobId];
-            if (active) await savePipelineFile(ws, activeJobId, active);
-            await saveRepository(ws, repo as unknown as Array<Record<string, unknown>>);
-            await saveMetadata(ws, { engine, jobs, activeJobId });
+            const ok = await saveNow(
+                ws,
+                activeJobId,
+                pipelineData[activeJobId],
+                repo as unknown as Array<Record<string, unknown>>,
+                { engine, jobs, activeJobId },
+            );
+            if (ok) setJobs(js => js.map(j => (j.id === activeJobId ? { ...j, dirty: false } : j)));
         })();
     }, [activeJobId, workspacePathState, pipelineData, repo, engine, jobs]);
 
@@ -3082,7 +3105,7 @@ export default function App() {
     // maximized then immediately restored. Do not re-add one.
 
     return (
-        <RunStatusContext.Provider value={runResult?.nodes ?? {}}>
+        <RunStatusContext.Provider value={shownRunResult?.nodes ?? {}}>
         <div className="app">
             <WindowResizeHandles />
             <header
@@ -3478,7 +3501,7 @@ export default function App() {
                         nodes={nodes}
                         planNodes={planNodes}
                         edges={edges}
-                        runResult={runResult}
+                        runResult={shownRunResult}
                         isRunning={isRunning}
                         nodeLabels={nodeLabels}
                         workspacePath={workspacePathState}
@@ -3518,7 +3541,7 @@ export default function App() {
             </main>
 
             <BottomPanel
-                runResult={runResult}
+                runResult={shownRunResult}
                 isRunning={isRunning}
                 nodeLabels={nodeLabels}
                 terminalNodeIds={terminalNodeIds}
@@ -3592,6 +3615,7 @@ export default function App() {
                 <GitPanel
                     workspacePath={workspacePathState}
                     onClose={() => setShowGitPanel(false)}
+                    onFilesChanged={handleReloadWorkspace}
                 />
             ) : null}
 

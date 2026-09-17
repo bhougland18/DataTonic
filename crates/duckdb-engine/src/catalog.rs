@@ -484,6 +484,11 @@ pub fn annotate(
     if name.is_empty() {
         return Err("annotate needs a name".into());
     }
+    // An empty contact or description is a cleared one, stored as absent rather
+    // than as "". `None` still means "not given, leave it alone" - the editor
+    // sends "" to clear, because sending nothing brought the old value back.
+    let cleared = |v: Option<String>| v.map(|s| s.trim().to_string());
+    let (contact, description) = (cleared(contact), cleared(description));
     let mut owners = load_owners(workspace)?;
     let rules = if pipelines { &mut owners.pipelines } else { &mut owners.assets };
 
@@ -493,11 +498,11 @@ pub fn annotate(
             if let Some(v) = owner {
                 rule.owner = v;
             }
-            if contact.is_some() {
-                rule.contact = contact;
+            if let Some(v) = contact {
+                rule.contact = Some(v).filter(|s| !s.is_empty());
             }
-            if description.is_some() {
-                rule.description = description;
+            if let Some(v) = description {
+                rule.description = Some(v).filter(|s| !s.is_empty());
             }
             if let Some(v) = tags {
                 rule.tags = v;
@@ -512,8 +517,8 @@ pub fn annotate(
                 // An annotation with no owner still needs the field; the empty
                 // string reads as "not stated" everywhere it is shown.
                 owner: owner.unwrap_or_default(),
-                contact,
-                description,
+                contact: contact.filter(|s| !s.is_empty()),
+                description: description.filter(|s| !s.is_empty()),
                 tags: tags.unwrap_or_default(),
             },
         ),
@@ -1418,6 +1423,40 @@ pub fn load(workspace: &Path) -> Result<Option<Catalog>, String> {
     serde_json::from_str(&text).map(Some).map_err(|e| format!("parse catalog.json: {e}"))
 }
 
+/// The source node an asset's live schema is read through: its inspect format
+/// and that node's saved properties.
+///
+/// Found by a node that READS the asset, so inspecting authenticates exactly the
+/// way the pipeline does rather than inventing a second way to connect. The
+/// catalog keeps names, not configuration, so the pipeline is re-read for the
+/// node's live properties. Every surface that inspects an asset asks here.
+pub fn inspect_target(workspace: &Path, asset: &str) -> Result<(String, Value), String> {
+    let cat = load(workspace)?.ok_or("no catalog has been built for this workspace yet")?;
+    let touch = cat
+        .touches
+        .iter()
+        .find(|t| t.asset == asset && t.component_id.starts_with("src."))
+        .ok_or_else(|| {
+            format!("nothing in this workspace READS {asset}, so there is no node to inspect it through")
+        })?;
+    let path = discover_pipeline_files(workspace)
+        .into_iter()
+        .find(|p| p.file_stem().map(|s| s.to_string_lossy() == touch.pipeline_id.as_str()).unwrap_or(false))
+        .ok_or_else(|| format!("pipeline {} is no longer in this workspace", touch.pipeline_id))?;
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let doc: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let node = doc
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .and_then(|nodes| {
+            nodes.iter().find(|n| n.get("id").and_then(|i| i.as_str()) == Some(&touch.node_id))
+        })
+        .ok_or_else(|| format!("node {} is no longer in {}", touch.node_id, touch.pipeline_id))?;
+    let props = node.pointer("/data/properties").cloned().unwrap_or(Value::Null);
+    let format = touch.component_id.strip_prefix("src.").unwrap_or(&touch.component_id);
+    Ok((format.to_string(), props))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1692,6 +1731,23 @@ mod tests {
         let rule = &owners.assets[0];
         assert_eq!(rule.description.as_deref(), Some("Second"));
         assert_eq!(rule.owner, "Ingest", "writing a description cleared the owner");
+    }
+
+    /// An empty value clears a field; `None` still leaves it alone. The editor
+    /// sends "" to clear, and an emptied description is stored as absent, not
+    /// as an empty string that reads as a description.
+    #[test]
+    fn an_empty_annotation_clears_the_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        annotate(ws, false, "/lake/orders.parquet", Some("Ingest".into()), Some("ops@x".into()), Some("Orders.".into()), None)
+            .unwrap();
+        annotate(ws, false, "/lake/orders.parquet", Some(String::new()), Some("  ".into()), Some(String::new()), None)
+            .unwrap();
+        let rule = &load_owners(ws).unwrap().assets[0];
+        assert_eq!(rule.owner, "", "the owner was not cleared");
+        assert_eq!(rule.contact, None, "an emptied contact must be absent, not an empty string");
+        assert_eq!(rule.description, None, "an emptied description must be absent, not an empty string");
     }
 
     /// The view joins the graph, ownership, annotations and freshness.
@@ -2636,7 +2692,8 @@ mod freshness_and_the_history_window {
         assert_eq!(
             judged(&after),
             Some(crate::sla::State::Fresh),
-            "an asset written correctly and inside its allowance must not become stale              because OTHER runs pushed its record out of the history window"
+            "an asset written correctly and inside its allowance must not become stale \
+             because OTHER runs pushed its record out of the history window"
         );
     }
 }

@@ -190,6 +190,65 @@ pub fn lock_store(workspace: &Path, name: &str) -> Result<RunLock, String> {
     }
 }
 
+/// Whether the process with this id is running right now.
+///
+/// The liveness answer every `reconcile` needs, and until this existed every
+/// caller supplied a stand-in: serve and web "only this process is alive", a
+/// follower "nothing is". So a second runner on a workspace declared the first
+/// one's live runs, backfill slices and followers interrupted, and a retry then
+/// ran a slice that was still running a second time beside itself.
+///
+/// A run lock would have been the better witness - the OS releases it when the
+/// holder dies, so pid reuse cannot fool it - but backfill slices deliberately
+/// do not take the pipeline's run lock (several run at once and the lock is
+/// exclusive), so a live slice would have read as dead. A pid check is right
+/// for every record `reconcile` looks at. Its one blind spot is a pid reused by
+/// an unrelated process, which leaves a dead run marked running until that
+/// process also exits: a delay, bounded, where the stand-in was a duplicate.
+pub fn process_alive(pid: u32) -> bool {
+    pid == std::process::id() || os_process_alive(pid)
+}
+
+#[cfg(unix)]
+fn os_process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+    if pid <= 0 {
+        // 0 and negatives address process GROUPS to kill(2), not a process.
+        return false;
+    }
+    // Signal 0 delivers nothing and only checks that the pid exists. EPERM
+    // means it exists and belongs to someone else, which is still alive.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn os_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: plain Win32 calls with no pointers but the out-param below, which
+    // is a live stack u32; the handle is closed on every path that opened one.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // A process running as another user can refuse even this query.
+            // Being refused is proof it exists; every other failure is no
+            // such process.
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code: u32 = 0;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        // A process that has exited but still has handles open elsewhere keeps
+        // its object, so opening it succeeds; its exit code is what says it is
+        // over. STILL_ACTIVE is also a legal exit code, a documented quirk that
+        // would read a process which chose to exit with 259 as alive.
+        queried && code == STILL_ACTIVE as u32
+    }
+}
+
 /// Take a lock that lives one level down, under `group`.
 ///
 /// For locks that guard something other than a pipeline run and must never be
@@ -263,9 +322,80 @@ fn acquire_at_reason(path: PathBuf, key: &str) -> AcquireOutcome {
     }
 }
 
+/// A real, DIFFERENT process that sleeps well past any test, for tests that
+/// need "another runner" to actually be another process. Killed by the test.
+#[cfg(test)]
+pub(crate) fn test_sleeper() -> std::process::Child {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "ping", "-n", "60", "127.0.0.1"]);
+        c
+    };
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sleep");
+        c.arg("60");
+        c
+    };
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a sleeping child")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claim `key` just after its only holder was dropped, as a caller would.
+    ///
+    /// On Unix a `flock` belongs to the open file, and a child process spawned
+    /// by ANY thread holds a copy of every open descriptor between its fork and
+    /// its exec. Tests spawn processes all the time - DuckDB, sleepers - so a
+    /// drop that lands inside that window leaves the lock held for the
+    /// microseconds until the child execs, and an immediate re-claim is refused.
+    /// That failed these tests twice on ubuntu CI. Production waits for the next
+    /// tick anyway; a test has to wait too.
+    ///
+    /// A lock that was really never released stays held for the whole window
+    /// and still fails, which is the regression these tests exist to catch. An
+    /// Unusable outcome is retried for the same reason the sibling test gave: a
+    /// runner executing a thousand tests at once can lose an `open` for a moment.
+    fn claim_after_release(ws: &Path, key: &str) -> RunLock {
+        let mut last = String::new();
+        for _ in 0..100 {
+            match try_acquire_reason(ws, key) {
+                AcquireOutcome::Claimed(lock) => return lock,
+                AcquireOutcome::HeldByOther => last = "still held by another holder".into(),
+                AcquireOutcome::Unusable(e) => last = format!("unusable: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("{key} could not be claimed for two seconds after its holder was dropped ({last})");
+    }
+
+    /// A running process is alive, and one that has exited is not.
+    ///
+    /// Every reconcile call site passed a stand-in for this. serve and web said
+    /// "only this process is alive" and a follower said "nothing is", so a
+    /// second runner on the same workspace declared the first one's LIVE runs,
+    /// backfill slices and followers interrupted. A backfill retry then started
+    /// a second execution of a slice that was still running: two DuckDB
+    /// processes writing one sink. Clicking the desktop's "Open web panel" was
+    /// enough, because it starts serve on the same workspace.
+    #[test]
+    fn a_running_process_is_alive_and_an_exited_one_is_not() {
+        assert!(process_alive(std::process::id()), "this process is running");
+
+        let mut child = test_sleeper();
+        let pid = child.id();
+        assert!(process_alive(pid), "a live child must not be called dead");
+
+        child.kill().expect("kill the child");
+        child.wait().expect("reap the child");
+        assert!(!process_alive(pid), "an exited child must not be called alive");
+    }
 
     /// A run someone asks for is refused while the pipeline is already running,
     /// and told why.
@@ -296,10 +426,7 @@ mod tests {
 
         // And releasing frees it, so a finished run does not wedge the next one.
         drop(held);
-        assert!(
-            claim_for_run(ws, "orders_etl").is_ok(),
-            "the lock was not released when the run ended"
-        );
+        claim_after_release(ws, "orders_etl");
     }
 
     #[test]
@@ -322,43 +449,7 @@ mod tests {
         // Releasing lets the next caller through, which is what makes the
         // schedule resume on the following tick rather than stalling.
         drop(first);
-        // Asserted on the CLASSIFIED outcome rather than on `is_some()`.
-        //
-        // `try_acquire` collapses "another holder" and "this workspace cannot
-        // be locked at all" into the same `None`, so when this failed on CI it
-        // said only "lock never became available again" - which is the one
-        // thing that could not have been true, since nothing held it. Three
-        // reds and no way to tell contention from an `open` that failed for an
-        // environmental reason, on a runner executing 1160 tests at once.
-        //
-        // HeldByOther is the real regression and still fails loudly. Unusable
-        // is not what this test is about: the property is that RELEASING lets
-        // the next caller through, not that a file can be opened right now.
-        //
-        // An Unusable outcome is retried briefly rather than failed on. It is
-        // not the property under test, and it is transient by definition: a
-        // read-only mount or a filesystem without locks stays broken for the
-        // whole second, while an `open` that lost a race for a file descriptor
-        // on a runner executing 1160 tests at once clears immediately. A
-        // HeldByOther is never retried - that IS the regression, and retrying
-        // it would hide exactly what this test exists to catch.
-        let mut last = None;
-        for _ in 0..50 {
-            match try_acquire_reason(ws, "nightly-load") {
-                AcquireOutcome::Claimed(_) => return,
-                AcquireOutcome::HeldByOther => {
-                    panic!("the lock was still held after its only holder was dropped")
-                }
-                AcquireOutcome::Unusable(e) => {
-                    last = Some(e.to_string());
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        }
-        panic!(
-            "the workspace could not be locked at all for a second, so this is the              environment rather than the lock: {}",
-            last.unwrap_or_default()
-        );
+        claim_after_release(ws, "nightly-load");
     }
 
     /// The whole point of this module is holding across PROCESSES, so a
